@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>sortify</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='80' font-size='80'>&#127925;</text></svg>">
+</head>
+<body>
+<header>
+  <h1 id="home-link">sortify</h1>
+  <nav>
+    <a id="nav-now">Now</a>
+    <a id="nav-lists">Playlists</a>
+  </nav>
+  <span id="whoami"></span>
+</header>
+
+<main>
+  <section id="view-now" hidden>
+    <div class="triage-top">
+      <span id="now-context" class="hint"></span>
+      <button id="btn-undo-now" disabled>Undo</button>
+    </div>
+    <div id="now-card"><p class="done-msg">Checking what's playing…</p></div>
+  </section>
+
+  <section id="view-setup" hidden>
+    <h2>Connect Spotify</h2>
+    <ol class="setup-steps">
+      <li>Create an app at <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">developer.spotify.com/dashboard</a>.
+        Set the redirect URI to exactly <code>http://127.0.0.1:8888/callback</code> and tick “Web API”.</li>
+      <li>Paste its Client ID:
+        <div class="row">
+          <input id="client-id" placeholder="Client ID" autocomplete="off">
+          <button id="btn-auth-start">Get login link</button>
+        </div>
+      </li>
+      <li id="step-authlink" hidden>
+        <a id="auth-link" target="_blank" rel="noopener">Log in with Spotify →</a>
+        <p class="hint">After approving, the browser lands on a 127.0.0.1 page that fails to load —
+        that's expected. Copy the full address from the address bar and paste it below.</p>
+        <div class="row">
+          <input id="redirect-url" placeholder="http://127.0.0.1:8888/callback?code=…" autocomplete="off">
+          <button id="btn-auth-finish">Finish</button>
+        </div>
+      </li>
+    </ol>
+  </section>
+
+  <section id="view-lists" hidden>
+    <h2>Playlists</h2>
+    <p class="hint">Mark your <b>inputs</b> (where new songs land) and the <b>homes</b> you sort
+    into. Marked playlists stay pinned on top.</p>
+    <input id="pl-filter" placeholder="Filter playlists…" autocomplete="off">
+    <div id="playlists"></div>
+    <div class="actionbar">
+      <button id="btn-save-config" class="primary">Save roles</button>
+    </div>
+  </section>
+
+  <section id="view-triage" hidden>
+    <div class="triage-top">
+      <button id="btn-back">‹ Back</button>
+      <span id="triage-progress"></span>
+      <button id="btn-undo" disabled>Undo</button>
+    </div>
+    <div id="triage-loading" hidden><div class="spinner"></div><p id="loading-msg"></p></div>
+    <div id="card"></div>
+  </section>
+</main>
+
+<div id="picker" hidden>
+  <div class="picker-inner">
+    <input id="picker-filter" placeholder="Filter playlists…">
+    <div id="picker-list"></div>
+    <button id="picker-close">Cancel</button>
+  </div>
+</div>
+
+<div id="toast" hidden></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,422 @@
+"""Thin Spotify Web API client with PKCE auth.
+
+PKCE means no client secret exists anywhere — only the public client ID.
+The refresh token in tokens.json is the long-lived credential.
+
+Spotify requires redirect URIs to be HTTPS or a loopback IP literal, so we
+register http://127.0.0.1:8888/callback and never actually serve it: the
+user copies the URL their browser lands on and pastes it back into the UI.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import secrets
+import threading
+import time
+from collections import deque
+from typing import Iterator
+from urllib.parse import parse_qs, urlencode, urlparse
+
+import httpx
+
+from .store import Store
+
+AUTH_URL = "https://accounts.spotify.com/authorize"
+TOKEN_URL = "https://accounts.spotify.com/api/token"
+API = "https://api.spotify.com/v1"
+REDIRECT_URI = "http://127.0.0.1:8888/callback"
+SCOPES = " ".join(
+    [
+        "playlist-read-private",
+        "playlist-read-collaborative",
+        "playlist-modify-private",
+        "playlist-modify-public",
+        "user-library-read",
+        "user-library-modify",
+        "user-read-currently-playing",
+    ]
+)
+
+LIKED_ID = "liked"  # pseudo-playlist id for the user's Liked Songs
+
+# Local demand ceilings — the hard guarantee against ever earning another
+# multi-hour 429 cooldown. Feb-2026 dev-mode quotas are undocumented and
+# brutal; both limits are deliberately far below anything we've seen trip.
+DAILY_CAP = 1200      # api.spotify.com calls per local day
+WINDOW_CAP = 30       # calls per rolling 60s
+
+# Feb 2026 dev-mode API: playlist entries are "items" containing an "item"
+# (the old "tracks"/"track" naming is gone for apps created after 2026-02-11).
+ITEM_FIELDS = (
+    "items(added_at,is_local,item(uri,id,type,name,duration_ms,"
+    "artists(id,name),album(name,images))),next"
+)
+
+
+class AuthNeeded(Exception):
+    pass
+
+
+class SpotifyError(Exception):
+    def __init__(self, status: int, message: str):
+        self.status = status
+        super().__init__(f"Spotify API {status}: {message}")
+
+
+def pkce_pair() -> tuple[str, str]:
+    verifier = secrets.token_urlsafe(64)
+    return verifier, code_challenge(verifier)
+
+
+def code_challenge(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode()).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+
+def build_auth_url(client_id: str, challenge: str, state: str) -> str:
+    return AUTH_URL + "?" + urlencode(
+        {
+            "client_id": client_id,
+            "response_type": "code",
+            "redirect_uri": REDIRECT_URI,
+            "scope": SCOPES,
+            "code_challenge_method": "S256",
+            "code_challenge": challenge,
+            "state": state,
+        }
+    )
+
+
+def parse_redirect(url: str) -> tuple[str, str]:
+    """Extract (code, state) from the pasted-back redirect URL."""
+    qs = parse_qs(urlparse(url.strip()).query)
+    if "error" in qs:
+        raise SpotifyError(400, f"authorization failed: {qs['error'][0]}")
+    if "code" not in qs:
+        raise SpotifyError(400, "no ?code= in that URL — paste the full address the browser ended up on")
+    return qs["code"][0], qs.get("state", [""])[0]
+
+
+class Spotify:
+    def __init__(self, store: Store):
+        self.store = store
+        self.http = httpx.Client(timeout=25)
+        # Dev-mode 429 cooldowns can last many hours; calling during one is
+        # pointless (and rude), so fail fast until it ends.
+        # Persisted: a server restart must not forget an active cooldown and
+        # poke the API again (that can extend the penalty).
+        self.cooldown_until = float(store.tokens().get("cooldown_until", 0))
+        self._last_call = 0.0
+        self._window: deque[float] = deque()  # timestamps of recent calls
+        self._budget_lock = threading.Lock()
+        # Several browser tabs poll concurrently; without a lock they race to
+        # refresh and rotate each other's refresh token into invalidity.
+        self._refresh_lock = threading.Lock()
+        self._refresh_fail_until = 0.0
+
+    # ---- local demand limiting ---------------------------------------------
+
+    def budget_spent(self) -> int:
+        usage = self.store.usage()
+        return usage["count"] if usage["day"] == time.strftime("%Y-%m-%d") else 0
+
+    def _spend_budget(self) -> None:
+        """One API call's worth of budget; blocks briefly to honor the rolling
+        window, raises if the daily cap is spent."""
+        with self._budget_lock:
+            today = time.strftime("%Y-%m-%d")
+            usage = self.store.usage()
+            if usage["day"] != today:
+                usage = {"day": today, "count": 0}
+            if usage["count"] >= DAILY_CAP:
+                raise SpotifyError(
+                    429, f"local daily budget ({DAILY_CAP} calls) spent — resting until midnight"
+                )
+            now = time.time()
+            while self._window and now - self._window[0] > 60:
+                self._window.popleft()
+            if len(self._window) >= WINDOW_CAP:
+                time.sleep(max(0.0, 60 - (now - self._window[0]) + 0.05))
+            self._window.append(time.time())
+            usage["count"] += 1
+            self.store.save_usage(usage)
+
+    # ---- auth -------------------------------------------------------------
+
+    def start_auth(self, client_id: str) -> str:
+        verifier, challenge = pkce_pair()
+        state = secrets.token_urlsafe(16)
+        tokens = self.store.tokens()
+        tokens["pending"] = {"verifier": verifier, "state": state}
+        self.store.save_tokens(tokens)
+        self.store.update_config(client_id=client_id)
+        return build_auth_url(client_id, challenge, state)
+
+    def finish_auth(self, redirect_url: str) -> dict:
+        tokens = self.store.tokens()
+        pending = tokens.get("pending")
+        if not pending:
+            raise SpotifyError(400, "no auth in progress — start over")
+        code, state = parse_redirect(redirect_url)
+        if state != pending["state"]:
+            raise SpotifyError(400, "state mismatch — start the auth again")
+        resp = self.http.post(
+            TOKEN_URL,
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": REDIRECT_URI,
+                "client_id": self.store.config()["client_id"],
+                "code_verifier": pending["verifier"],
+            },
+        )
+        if resp.status_code != 200:
+            raise SpotifyError(resp.status_code, resp.text)
+        self._store_token_response(resp.json(), clear_pending=True)
+        # The token exchange (accounts.spotify.com) can succeed while the API
+        # (api.spotify.com) is rate-cooled — auth is done either way.
+        cache = self.store.cache()
+        try:
+            me = self.get("/me")
+            cache["me"] = {"id": me["id"], "name": me.get("display_name") or me["id"]}
+            self.store.save_cache(cache)
+        except SpotifyError:
+            pass
+        return cache.get("me") or {"id": None, "name": "connected"}
+
+    def _store_token_response(self, payload: dict, clear_pending: bool = False) -> None:
+        tokens = self.store.tokens()
+        if clear_pending:
+            # Only the authorization-code exchange consumes the pending PKCE
+            # state — a routine refresh must not kill an in-flight login.
+            tokens.pop("pending", None)
+        tokens["access_token"] = payload["access_token"]
+        tokens["expires_at"] = time.time() + payload.get("expires_in", 3600) - 60
+        # Spotify rotates refresh tokens on PKCE refresh; keep the newest.
+        if payload.get("refresh_token"):
+            tokens["refresh_token"] = payload["refresh_token"]
+        self.store.save_tokens(tokens)
+
+    def _access_token(self) -> str:
+        tokens = self.store.tokens()
+        if not tokens.get("refresh_token"):
+            raise AuthNeeded()
+        if time.time() < tokens.get("expires_at", 0) and tokens.get("access_token"):
+            return tokens["access_token"]
+        with self._refresh_lock:
+            # Re-read: another thread may have refreshed while we waited.
+            tokens = self.store.tokens()
+            if time.time() < tokens.get("expires_at", 0) and tokens.get("access_token"):
+                return tokens["access_token"]
+            # A failed refresh must not be retried per poll — that's a storm.
+            if time.time() < self._refresh_fail_until:
+                raise AuthNeeded()
+            resp = self.http.post(
+                TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": tokens["refresh_token"],
+                    "client_id": self.store.config()["client_id"],
+                },
+            )
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 300))
+                self._refresh_fail_until = time.time() + max(retry_after, 300)
+                raise SpotifyError(429, "token endpoint rate limited — backing off")
+            if resp.status_code != 200:
+                self._refresh_fail_until = time.time() + 300
+                raise AuthNeeded()
+            self._store_token_response(resp.json())
+            return self.store.tokens()["access_token"]
+
+    def authed(self) -> bool:
+        return bool(self.store.tokens().get("refresh_token"))
+
+    # ---- request plumbing -------------------------------------------------
+
+    def request(self, method: str, path: str, **kwargs) -> dict | None:
+        if time.time() < self.cooldown_until:
+            mins = int(self.cooldown_until - time.time()) // 60 + 1
+            raise SpotifyError(429, f"in Spotify rate-limit cooldown — try again in ~{mins} min")
+        url = path if path.startswith("http") else API + path
+        for attempt in range(3):
+            self._spend_budget()
+            # Mild throttle: bulk fetches shouldn't burst the 30s rate window.
+            wait = self._last_call + 0.2 - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            self._last_call = time.time()
+            resp = self.http.request(
+                method, url, headers={"Authorization": f"Bearer {self._access_token()}"}, **kwargs
+            )
+            if resp.status_code == 401:
+                # "Permissions missing" = insufficient scope: a refresh can't
+                # fix that, and retrying one per poll hammers the token
+                # endpoint until Spotify slow-walks us. Fail fast instead.
+                if "Permissions missing" in resp.text:
+                    raise SpotifyError(401, "Permissions missing (token lacks a scope)")
+                if attempt == 0:
+                    self.store.save_tokens({**self.store.tokens(), "expires_at": 0})
+                    continue
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 2))
+                if retry_after <= 60 and attempt < 2:
+                    time.sleep(retry_after)
+                    continue
+                # Long Retry-After = dev-mode cooldown (reportedly up to ~18h).
+                # Do not retry into it.
+                self.cooldown_until = time.time() + retry_after
+                self.store.save_tokens(
+                    {**self.store.tokens(), "cooldown_until": self.cooldown_until}
+                )
+                hrs, rem = divmod(retry_after, 3600)
+                human = f"~{hrs}h {rem // 60}m" if hrs else f"~{max(retry_after // 60, 1)} min"
+                raise SpotifyError(
+                    429, f"Spotify rate limit hit — cooldown {human}. Let it rest; retrying extends it."
+                )
+            if resp.status_code >= 400:
+                raise SpotifyError(resp.status_code, resp.text[:300])
+            return resp.json() if resp.content else None
+        raise SpotifyError(429, "rate limited, gave up")
+
+    def get(self, path: str, **kwargs) -> dict:
+        return self.request("GET", path, **kwargs)
+
+    def _paginate(self, path: str, params: dict | None = None) -> Iterator[dict]:
+        page = self.get(path, params=params or {})
+        while True:
+            yield from page.get("items", [])
+            if not page.get("next"):
+                return
+            page = self.get(page["next"])
+
+    # ---- playlists --------------------------------------------------------
+
+    def my_playlists(self) -> list[dict]:
+        me = (self.store.cache().get("me") or {}).get("id")
+        out = []
+        for p in self._paginate("/me/playlists", {"limit": 50}):
+            # Spotify returns partial (or null) objects for some algorithmic
+            # playlists — every field except id is optional here.
+            if not p or not p.get("id"):
+                continue
+            images = p.get("images") or []
+            owner = (p.get("owner") or {}).get("id")
+            meta = p.get("items") or p.get("tracks") or {}
+            out.append(
+                {
+                    "id": p["id"],
+                    "name": p.get("name") or "(untitled)",
+                    "owner": owner,
+                    "editable": owner == me or p.get("collaborative", False),
+                    "total": meta.get("total"),
+                    "snapshot_id": p.get("snapshot_id"),
+                    "image": images[-1].get("url") if images else None,
+                }
+            )
+        return out
+
+    @staticmethod
+    def _slim_track(item: dict) -> dict | None:
+        # Playlist entries use "item" since Feb 2026; /me/tracks still says "track".
+        t = item.get("item") or item.get("track")
+        if not t:
+            return None
+        return {
+            "uri": t.get("uri"),
+            "id": t.get("id"),
+            "name": t.get("name"),
+            "type": t.get("type", "track"),
+            "is_local": item.get("is_local", False),
+            "duration_ms": t.get("duration_ms"),
+            "artists": [
+                {"id": a.get("id"), "name": a.get("name")} for a in t.get("artists", [])
+            ],
+            "album": (t.get("album") or {}).get("name"),
+            "image": ((t.get("album") or {}).get("images") or [{}])[-1].get("url"),
+            "added_at": item.get("added_at"),
+        }
+
+    def playlist_tracks(self, playlist_id: str) -> list[dict]:
+        if playlist_id == LIKED_ID:
+            items = list(self._paginate("/me/tracks", {"limit": 50}))
+        else:
+            try:
+                items = list(
+                    self._paginate(
+                        f"/playlists/{playlist_id}/items",
+                        {"limit": 100, "fields": ITEM_FIELDS},
+                    )
+                )
+            except SpotifyError as e:
+                # If the fields filter is rejected, refetch unfiltered.
+                if e.status != 400:
+                    raise
+                items = list(self._paginate(f"/playlists/{playlist_id}/items", {"limit": 100}))
+        return [t for t in (self._slim_track(i) for i in items) if t and t["uri"]]
+
+    def artists_genres(self, artist_ids: list[str]) -> dict[str, dict]:
+        """Fetch {artist_id: {name, genres}} one by one.
+
+        Feb 2026 removed batch GET /artists?ids=, so bulk profile builds are
+        many single calls — pace them gently and never refetch (callers cache).
+        """
+        out: dict[str, dict] = {}
+        for aid in dict.fromkeys(a for a in artist_ids if a):
+            try:
+                a = self.get(f"/artists/{aid}")
+                out[aid] = {"name": a.get("name"), "genres": a.get("genres", [])}
+            except SpotifyError as e:
+                if e.status == 429:
+                    raise
+                # Dead artist id etc. — cache as genreless so we don't re-ask.
+                out[aid] = {"name": None, "genres": []}
+            time.sleep(0.2)
+        return out
+
+    def currently_playing(self) -> dict | None:
+        """The user's playing track, or None. Includes the playlist context
+        when they're listening to a playlist."""
+        data = self.request("GET", "/me/player/currently-playing")
+        if not data or not data.get("item"):
+            return None
+        t = data["item"]
+        ctx = data.get("context") or {}
+        ctx_uri = ctx.get("uri") or ""
+        return {
+            "track": {
+                "uri": t.get("uri"),
+                "id": t.get("id"),
+                "name": t.get("name"),
+                "type": t.get("type", "track"),
+                "is_local": t.get("is_local", False),
+                "duration_ms": t.get("duration_ms"),
+                "artists": [{"id": a.get("id"), "name": a.get("name")} for a in t.get("artists", [])],
+                "album": (t.get("album") or {}).get("name"),
+                "image": ((t.get("album") or {}).get("images") or [{}])[-1].get("url"),
+            },
+            "is_playing": data.get("is_playing", False),
+            "progress_ms": data.get("progress_ms"),
+            "context_playlist_id": ctx_uri.rsplit(":", 1)[-1] if ctx.get("type") == "playlist" else None,
+        }
+
+    # ---- mutations --------------------------------------------------------
+
+    def add_to_playlist(self, playlist_id: str, uri: str) -> str | None:
+        resp = self.request("POST", f"/playlists/{playlist_id}/items", json={"uris": [uri]})
+        return (resp or {}).get("snapshot_id")
+
+    def remove_from_playlist(self, playlist_id: str, uri: str) -> str | None:
+        if playlist_id == LIKED_ID:
+            # Feb 2026: /me/tracks mutations became the URI-based /me/library.
+            self.request("DELETE", "/me/library", json={"uris": [uri]})
+            return None
+        resp = self.request(
+            "DELETE", f"/playlists/{playlist_id}/items", json={"items": [{"uri": uri}]}
+        )
+        return (resp or {}).get("snapshot_id")
+
+    def save_to_liked(self, uri: str) -> None:
+        self.request("PUT", "/me/library", json={"uris": [uri]})
