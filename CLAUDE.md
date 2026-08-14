@@ -22,8 +22,12 @@ escalating penalties. Therefore:
 - **One account, one ledger** (`~/kode/spotify-ledger`, symlinked in as
   `sortify/account_ledger.py`). Since Jul 2026 quota is counted per developer
   account, so sortify, spotify-autoqueuer and playlistener all spend from
-  `~/state/spotify/account-ledger.json` and all publish cooldowns to it. A 429
-  earned by any one of them stops the other two. Do not decouple them.
+  `~/state/spotify/account-ledger.json`. Do not decouple them.
+- **Only quota trips propagate; rate limits stay local.** On 2026-08-14 sortify
+  was in a 429 cooldown all day while spotify-autoqueuer made 1248 successful
+  calls on another client ID of the same account — rate limits are enforced per
+  client ID. Publishing one to the shared ledger would park every app for hours
+  over a burst only sortify caused. `note_cooldown` enforces this itself.
 - **The two 429s are different animals.** `classify_429` splits a rate limit
   (rolling 30s window, wait seconds, retry) from a Development Mode quota trip
   (`"reason": "QUOTA_EXCEEDED"`, stop for the allowance window, never retry).
