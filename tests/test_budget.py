@@ -1,13 +1,16 @@
+import json
 import time
 
 import pytest
 
+from sortify.account_ledger import ACCOUNT_DAILY_CAP, AccountLedger
 from sortify.spotify import (
     BACKGROUND_DAILY_CAP,
     DAILY_CAP,
     QUIET_AFTER_COOLDOWN,
     Spotify,
     SpotifyError,
+    _next_local_midnight,
 )
 from sortify.store import Store
 
@@ -98,6 +101,56 @@ def test_background_yields_once_day_is_half_spent(tmp_path):
     sp = Spotify(Store(tmp_path))
     sp.store.save_usage({"day": time.strftime("%Y-%m-%d"), "count": DAILY_CAP // 2, "background": 0})
     assert "real usage" in sp.background_block_reason()
+
+
+# ---- the shared account ledger ---------------------------------------------
+
+
+def test_sortify_calls_land_in_the_shared_ledger(tmp_path):
+    sp = Spotify(Store(tmp_path))
+    sp._spend_budget()
+    assert AccountLedger("sortify").app_spent_today() == 1
+
+
+def test_account_cap_binds_even_when_sortifys_own_share_is_free(tmp_path):
+    """The failure the old per-app guards could not see: sortify is nowhere
+    near its own 600, but the account backstop is spent by the siblings."""
+    sp = Spotify(Store(tmp_path))
+    sibling = AccountLedger("autoqueuer")
+    # Seeded rather than spent 8000 times — this is the real on-disk shape.
+    with open(sibling.path, "w") as fh:
+        json.dump(
+            {"day": time.strftime("%Y-%m-%d"), "count": ACCOUNT_DAILY_CAP,
+             "by_app": {"autoqueuer": ACCOUNT_DAILY_CAP}, "cooldown_until": 0,
+             "cooldown_source": "", "cooldown_reason": ""},
+            fh,
+        )
+    assert sp.budget_spent() == 0  # sortify's own ledger is untouched
+    with pytest.raises(SpotifyError, match="account daily budget"):
+        sp._spend_budget()
+
+
+def test_cooldown_recorded_by_a_sibling_app_stops_sortify(tmp_path):
+    sp = Spotify(Store(tmp_path))
+    assert sp.background_block_reason() is None
+    AccountLedger("playlistener").note_cooldown(time.time() + 3600, reason="quota")
+    assert "cooldown" in sp.background_block_reason()
+    with pytest.raises(SpotifyError, match="cooldown"):
+        sp.request("GET", "/me")
+
+
+def test_sortifys_own_cooldown_is_published_to_the_siblings(tmp_path):
+    sp = Spotify(Store(tmp_path))
+    sp.ledger.note_cooldown(time.time() + 3600, reason="quota")
+    until, source, reason = AccountLedger("playlistener").cooldown()
+    assert until > time.time()
+    assert source == "sortify"
+    assert reason == "quota"
+
+
+def test_quota_cooldown_runs_to_the_next_local_midnight():
+    now = time.time()
+    assert now < _next_local_midnight(now) <= now + 86400
 
 
 def test_cooldown_earned_by_another_process_is_seen(tmp_path):

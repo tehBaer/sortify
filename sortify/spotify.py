@@ -21,6 +21,10 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
+from .account_ledger import (ACCOUNT_DAILY_CAP, AccountLedger, InCooldown,
+                             LedgerFull, classify_429)
+from .account_ledger import quota_cooldown_until
+from .account_ledger import next_local_midnight as _next_local_midnight
 from .store import Store
 
 AUTH_URL = "https://accounts.spotify.com/authorize"
@@ -48,7 +52,12 @@ LIKED_ID = "liked"  # pseudo-playlist id for the user's Liked Songs
 # 2026-08-13: the background enricher spent 678 calls in ~70 minutes and
 # earned a ~23h ban. The old 1200/day and 30-per-60s were guesses, and both
 # sat above what actually trips the limiter. Everything here is now below it.
-DAILY_CAP = 600       # api.spotify.com calls per local day, all sources
+# sortify's *share* of the account budget, unchanged at 600. Since Jul 2026
+# Spotify counts quota per developer account, so this is now backed by
+# ACCOUNT_DAILY_CAP in ~/kode/spotify-ledger, which all three apps spend from —
+# and, more importantly, by the shared cooldown recorded there. This stays as a
+# local guard so a missing ledger file still can't uncork us.
+DAILY_CAP = 600       # api.spotify.com calls per local day, sortify's share
 WINDOW_CAP = 12       # calls per rolling 60s
 
 # Proactive background work (genre enrichment) draws from this much smaller
@@ -121,6 +130,10 @@ def parse_redirect(url: str) -> tuple[str, str]:
 class Spotify:
     def __init__(self, store: Store):
         self.store = store
+        # The account-wide budget, shared with playlistener and
+        # spotify-autoqueuer. Spotify counts quota per developer account, so
+        # sortify's own ledger below can only ever be a second opinion.
+        self.ledger = AccountLedger("sortify")
         self.http = httpx.Client(timeout=25)
         # Dev-mode 429 cooldowns can last many hours; calling during one is
         # pointless (and rude), so fail fast until it ends.
@@ -158,6 +171,11 @@ class Spotify:
         persisted = float(self.store.tokens().get("cooldown_until", 0))
         if persisted > self.cooldown_until:
             self.cooldown_until = persisted
+        # A cooldown earned by playlistener or spotify-autoqueuer binds us too —
+        # the 429 is against the developer account, not the client ID.
+        account, _source, _reason = self.ledger.cooldown()
+        if account > self.cooldown_until:
+            self.cooldown_until = account
         return self.cooldown_until
 
     def quiet_until(self) -> float:
@@ -209,6 +227,14 @@ class Spotify:
             if len(self._window) >= WINDOW_CAP:
                 time.sleep(max(0.0, 60 - (now - self._window[0]) + 0.05))
             self._window.append(time.time())
+            # The account-wide ceiling, shared with the sibling apps. Checked
+            # last so the cheap local guards and the window pacing have already
+            # run, and before the local increment so a refusal here leaves both
+            # ledgers agreeing.
+            try:
+                self.ledger.spend(app_cap=DAILY_CAP, account_cap=ACCOUNT_DAILY_CAP)
+            except (InCooldown, LedgerFull) as exc:
+                raise SpotifyError(429, str(exc)) from None
             usage["count"] += 1
             if background:
                 usage["background"] += 1
@@ -333,19 +359,30 @@ class Spotify:
                     continue
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", 2))
-                if retry_after <= 60 and attempt < 2:
+                kind = classify_429(resp.text, retry_after)
+                # Two different limiters with opposite remedies. A rate limit is
+                # a rolling 30s window and wants a few seconds of patience; a
+                # Development Mode quota trip wants the rest of the day, and
+                # retrying into one is what extends it.
+                if kind == "rate" and retry_after <= 60 and attempt < 2:
                     time.sleep(retry_after)
                     continue
-                # Long Retry-After = dev-mode cooldown (reportedly up to ~18h).
-                # Do not retry into it.
-                self.cooldown_until = time.time() + retry_after
+                now = time.time()
+                self.cooldown_until = (
+                    quota_cooldown_until(now, retry_after) if kind == "quota"
+                    else now + retry_after
+                )
                 self.store.save_tokens(
                     {**self.store.tokens(), "cooldown_until": self.cooldown_until}
                 )
-                hrs, rem = divmod(retry_after, 3600)
-                human = f"~{hrs}h {rem // 60}m" if hrs else f"~{max(retry_after // 60, 1)} min"
+                # Tell the siblings: the account is resting, not just sortify.
+                self.ledger.note_cooldown(self.cooldown_until, reason=kind)
+                left = int(self.cooldown_until - now)
+                hrs, rem = divmod(left, 3600)
+                human = f"~{hrs}h {rem // 60}m" if hrs else f"~{max(rem // 60, 1)} min"
+                label = "daily quota spent" if kind == "quota" else "rate limit hit"
                 raise SpotifyError(
-                    429, f"Spotify rate limit hit — cooldown {human}. Let it rest; retrying extends it."
+                    429, f"Spotify {label} — cooldown {human}. Let it rest; retrying extends it."
                 )
             if resp.status_code >= 400:
                 raise SpotifyError(resp.status_code, resp.text[:300])

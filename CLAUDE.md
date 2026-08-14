@@ -15,6 +15,19 @@ escalating penalties. Therefore:
   12/60s across all sources; `BACKGROUND_DAILY_CAP` 40/day for anything proactive.
   These are set from observed damage, not from the docs — raising one needs
   evidence, not optimism. The 2026-08-13 ban came from 678 calls in ~70 minutes.
+- **It is the rate, not the day's total.** spotify-autoqueuer ran 1208 calls on
+  2026-08-14 (~1.8/min) with no penalty, against sortify's 678 at ~9.7/min that
+  earned ~23h. So `WINDOW_CAP` and the pacing are the real protection; the daily
+  caps are runaway backstops. Do not "fix" a 429 by lowering a daily cap.
+- **One account, one ledger** (`~/kode/spotify-ledger`, symlinked in as
+  `sortify/account_ledger.py`). Since Jul 2026 quota is counted per developer
+  account, so sortify, spotify-autoqueuer and playlistener all spend from
+  `~/state/spotify/account-ledger.json` and all publish cooldowns to it. A 429
+  earned by any one of them stops the other two. Do not decouple them.
+- **The two 429s are different animals.** `classify_429` splits a rate limit
+  (rolling 30s window, wait seconds, retry) from a Development Mode quota trip
+  (`"reason": "QUOTA_EXCEEDED"`, stop for the allowance window, never retry).
+  Retrying into a quota trip is what extends it.
 - **Polling pace is the server's to decide.** `/api/now` caches for exactly the
   playing track's remaining runtime and returns `poll_after_ms`; the client just
   obeys it. Never give the frontend its own interval — a 6s poll against a 5s
