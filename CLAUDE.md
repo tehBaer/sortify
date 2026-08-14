@@ -2,20 +2,33 @@
 
 ## Spotify API budget (non-negotiable)
 
-Two multi-hour API lockouts (18h45m and ~24h, Aug 2026) were caused by development
-traffic — probes, warmups, refresh storms — not by real usage. Dev-mode quota is a
-small, undocumented daily allowance with escalating penalties. Therefore:
+Three multi-hour API lockouts (18h45m and ~24h Aug 2026; ~23h on 2026-08-13) were
+caused by our own traffic — probes, warmups, refresh storms, and a background job —
+not by real usage. Dev-mode quota is a small, undocumented daily allowance with
+escalating penalties. Therefore:
 
 - **Never call api.spotify.com directly** (no curl, no httpx scripts, no raw tokens).
   Every manual call goes through `.venv/bin/spx GET <path>` — it shares the app's
   ledger (`data/usage.json`), throttle, and cooldown guard, and refuses beyond
-  **300 dev calls/day**. The remaining budget belongs to the user's real usage.
+  **150 dev calls/day**. The remaining budget belongs to the user's real usage.
+- **Budget layers** (`sortify/spotify.py`): `DAILY_CAP` 600/day and `WINDOW_CAP`
+  12/60s across all sources; `BACKGROUND_DAILY_CAP` 40/day for anything proactive.
+  These are set from observed damage, not from the docs — raising one needs
+  evidence, not optimism. The 2026-08-13 ban came from 678 calls in ~70 minutes.
+- **Polling pace is the server's to decide.** `/api/now` caches for exactly the
+  playing track's remaining runtime and returns `poll_after_ms`; the client just
+  obeys it. Never give the frontend its own interval — a 6s poll against a 5s
+  cache meant every poll missed, ~600 calls/hour from one open tab. Explicit
+  user action (opening the view, refocusing the tab) sends `?force=1`, which
+  skips the TTL but not `NOW_FORCE_MIN_INTERVAL`.
 - **Check `.venv/bin/spx budget` before and after any Spotify-touching work** and
   state the numbers to the user.
 - **No bulk operations on your own initiative** (warmups, mass fetches, full
   rebuilds). Estimate the call cost, ask, and wait for an explicit go.
 - **After a rate-limit cooldown: zero proactive calls.** The user's own usage is
-  the first traffic.
+  the first traffic. The app enforces this too — `QUIET_AFTER_COOLDOWN` keeps
+  background work silent for 6h past a cooldown's end, because resuming the
+  instant one lifted is what earned the 2026-08-13 ban 70 minutes later.
 - **Verify locally first**: `data/cache.json`, server logs, the test suite. A live
   probe is last-resort, single-shot, never in a loop.
 - **Prior art**: `~/kode/spotify-autoqueuer/src/spotify/` (token bucket, 429

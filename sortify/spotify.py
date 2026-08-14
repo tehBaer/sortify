@@ -43,9 +43,28 @@ LIKED_ID = "liked"  # pseudo-playlist id for the user's Liked Songs
 
 # Local demand ceilings — the hard guarantee against ever earning another
 # multi-hour 429 cooldown. Feb-2026 dev-mode quotas are undocumented and
-# brutal; both limits are deliberately far below anything we've seen trip.
-DAILY_CAP = 1200      # api.spotify.com calls per local day
-WINDOW_CAP = 30       # calls per rolling 60s
+# brutal, so these are set from observed damage rather than from the docs.
+#
+# 2026-08-13: the background enricher spent 678 calls in ~70 minutes and
+# earned a ~23h ban. The old 1200/day and 30-per-60s were guesses, and both
+# sat above what actually trips the limiter. Everything here is now below it.
+DAILY_CAP = 600       # api.spotify.com calls per local day, all sources
+WINDOW_CAP = 12       # calls per rolling 60s
+
+# Proactive background work (genre enrichment) draws from this much smaller
+# allowance inside DAILY_CAP. Nothing the user did not ask for gets to spend
+# more than a few dozen calls a day.
+BACKGROUND_DAILY_CAP = 40
+
+# Background work also yields once the day is half spent: at that point the
+# user is clearly using the app, and the rest of the budget is theirs.
+BACKGROUND_YIELD_FRACTION = 0.5
+
+# After a 429 cooldown expires, proactive work stays silent this much longer.
+# Resuming background fetches the instant a cooldown lifted is precisely what
+# earned the 2026-08-13 ban ~70 minutes later; the user's own listening must
+# be the first traffic Spotify sees from us.
+QUIET_AFTER_COOLDOWN = 6 * 3600
 
 # Feb 2026 dev-mode API: playlist entries are "items" containing an "item"
 # (the old "tracks"/"track" naming is gone for apps created after 2026-02-11).
@@ -122,17 +141,67 @@ class Spotify:
         usage = self.store.usage()
         return usage["count"] if usage["day"] == time.strftime("%Y-%m-%d") else 0
 
-    def _spend_budget(self) -> None:
+    def background_spent(self) -> int:
+        usage = self.store.usage()
+        if usage["day"] != time.strftime("%Y-%m-%d"):
+            return 0
+        return usage.get("background", 0)
+
+    def effective_cooldown_until(self) -> float:
+        """Cooldown end, re-read from disk.
+
+        `spx` runs in its own process and shares the same ledger, so a
+        cooldown it earned would otherwise be invisible to the long-lived
+        server until a restart — and we would keep poking a limiter that is
+        already angry.
+        """
+        persisted = float(self.store.tokens().get("cooldown_until", 0))
+        if persisted > self.cooldown_until:
+            self.cooldown_until = persisted
+        return self.cooldown_until
+
+    def quiet_until(self) -> float:
+        """Timestamp until which proactive work must stay silent."""
+        cd = self.effective_cooldown_until()
+        return cd + QUIET_AFTER_COOLDOWN if cd else 0.0
+
+    def background_block_reason(self) -> str | None:
+        """Why proactive work must not run right now — None means it may.
+
+        Checked before every background call rather than once per loop, so a
+        cooldown earned mid-run stops the next one immediately.
+        """
+        now = time.time()
+        if now < self.effective_cooldown_until():
+            mins = int((self.cooldown_until - now) / 60) + 1
+            return f"in rate-limit cooldown (~{mins} min left)"
+        if now < self.quiet_until():
+            mins = int((self.quiet_until() - now) / 60) + 1
+            return f"post-cooldown quiet period (~{mins} min left)"
+        if self.background_spent() >= BACKGROUND_DAILY_CAP:
+            return f"background budget spent ({BACKGROUND_DAILY_CAP}/day) — resting until midnight"
+        yield_at = int(DAILY_CAP * BACKGROUND_YIELD_FRACTION)
+        if self.budget_spent() >= yield_at:
+            return f"day already {yield_at}+ calls in — leaving the rest for real usage"
+        return None
+
+    def _spend_budget(self, background: bool = False) -> None:
         """One API call's worth of budget; blocks briefly to honor the rolling
-        window, raises if the daily cap is spent."""
+        window, raises if the applicable cap is spent."""
         with self._budget_lock:
             today = time.strftime("%Y-%m-%d")
             usage = self.store.usage()
             if usage["day"] != today:
-                usage = {"day": today, "count": 0}
+                usage = {"day": today, "count": 0, "background": 0}
+            usage.setdefault("background", 0)
             if usage["count"] >= DAILY_CAP:
                 raise SpotifyError(
                     429, f"local daily budget ({DAILY_CAP} calls) spent — resting until midnight"
+                )
+            if background and usage["background"] >= BACKGROUND_DAILY_CAP:
+                raise SpotifyError(
+                    429,
+                    f"background budget ({BACKGROUND_DAILY_CAP} calls) spent — resting until midnight",
                 )
             now = time.time()
             while self._window and now - self._window[0] > 60:
@@ -141,6 +210,8 @@ class Spotify:
                 time.sleep(max(0.0, 60 - (now - self._window[0]) + 0.05))
             self._window.append(time.time())
             usage["count"] += 1
+            if background:
+                usage["background"] += 1
             self.store.save_usage(usage)
 
     # ---- auth -------------------------------------------------------------
@@ -236,14 +307,14 @@ class Spotify:
 
     # ---- request plumbing -------------------------------------------------
 
-    def request(self, method: str, path: str, **kwargs) -> dict | None:
-        if time.time() < self.cooldown_until:
+    def request(self, method: str, path: str, background: bool = False, **kwargs) -> dict | None:
+        if time.time() < self.effective_cooldown_until():
             mins = int(self.cooldown_until - time.time()) // 60 + 1
             raise SpotifyError(429, f"in Spotify rate-limit cooldown — try again in ~{mins} min")
         url = path if path.startswith("http") else API + path
         for attempt in range(3):
-            self._spend_budget()
-            # Mild throttle: bulk fetches shouldn't burst the 30s rate window.
+            self._spend_budget(background=background)
+            # Mild throttle: bulk fetches shouldn't burst the rolling window.
             wait = self._last_call + 0.2 - time.time()
             if wait > 0:
                 time.sleep(wait)
@@ -283,6 +354,10 @@ class Spotify:
 
     def get(self, path: str, **kwargs) -> dict:
         return self.request("GET", path, **kwargs)
+
+    def get_background(self, path: str, **kwargs) -> dict:
+        """A GET that draws on the small proactive allowance, not the user's."""
+        return self.request("GET", path, background=True, **kwargs)
 
     def _paginate(self, path: str, params: dict | None = None) -> Iterator[dict]:
         page = self.get(path, params=params or {})
@@ -357,16 +432,19 @@ class Spotify:
                 items = list(self._paginate(f"/playlists/{playlist_id}/items", {"limit": 100}))
         return [t for t in (self._slim_track(i) for i in items) if t and t["uri"]]
 
-    def artists_genres(self, artist_ids: list[str]) -> dict[str, dict]:
+    def artists_genres(self, artist_ids: list[str], background: bool = False) -> dict[str, dict]:
         """Fetch {artist_id: {name, genres}} one by one.
 
         Feb 2026 removed batch GET /artists?ids=, so bulk profile builds are
         many single calls — pace them gently and never refetch (callers cache).
+        `background=True` bills the proactive allowance; callers doing that
+        should pass one id at a time and space the calls out in minutes.
         """
         out: dict[str, dict] = {}
+        fetch = self.get_background if background else self.get
         for aid in dict.fromkeys(a for a in artist_ids if a):
             try:
-                a = self.get(f"/artists/{aid}")
+                a = fetch(f"/artists/{aid}")
                 out[aid] = {"name": a.get("name"), "genres": a.get("genres", [])}
             except SpotifyError as e:
                 if e.status == 429:

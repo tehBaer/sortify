@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import threading
@@ -17,10 +18,21 @@ from pydantic import BaseModel
 
 from . import suggest as sugg
 from .folders import extract_folder_map, home_name_excluded, select_home_ids
-from .spotify import LIKED_ID, AuthNeeded, Spotify, SpotifyError
+from .spotify import (
+    BACKGROUND_DAILY_CAP,
+    DAILY_CAP,
+    LIKED_ID,
+    AuthNeeded,
+    Spotify,
+    SpotifyError,
+)
 from .store import Store
 
 LIKED_TTL = 120  # seconds; Liked Songs has no snapshot_id to validate against
+
+# uvicorn owns the handlers; borrowing its logger is what puts these lines in
+# the journal next to the access log.
+log = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="sortify")
 store = Store()
@@ -67,17 +79,23 @@ def _spotify_error(request, exc: SpotifyError):
 
 @app.get("/api/status")
 def status():
-    from .spotify import DAILY_CAP
-
     cfg = store.config()
+    now = time.time()
     return {
         "has_client_id": bool(cfg.get("client_id")),
         "authed": sp.authed(),
         "me": store.cache().get("me"),
         "input_ids": cfg.get("input_ids", []),
         "home_ids": cfg.get("home_ids", []),
-        "budget": {"spent_today": sp.budget_spent(), "cap": DAILY_CAP},
-        "cooldown_min_left": max(0, int((sp.cooldown_until - time.time()) / 60)),
+        "budget": {
+            "spent_today": sp.budget_spent(),
+            "cap": DAILY_CAP,
+            "background_spent": sp.background_spent(),
+            "background_cap": BACKGROUND_DAILY_CAP,
+        },
+        "cooldown_min_left": max(0, int((sp.effective_cooldown_until() - now) / 60)),
+        # Cooldown is over but proactive work is still holding its breath.
+        "quiet_min_left": max(0, int((sp.quiet_until() - now) / 60)),
     }
 
 
@@ -313,37 +331,75 @@ def triage(playlist_id: str):
 
 # ---- now playing -----------------------------------------------------------
 
-# All tabs share one upstream currently-playing call: 5s TTL while something
-# plays, 20s while idle. N open tabs cost the same as one.
-_now_cache: dict = {"at": 0.0, "value": None}
+# All tabs share one upstream currently-playing call, and the cached answer
+# lives exactly as long as the playing track has left to run — nothing can
+# change before then except a manual skip, and those come in through the
+# forced refresh below. A 3-4 minute track therefore costs one call instead of
+# one every six seconds.
+#
+# The old pairing was a 5s TTL against a 6s client poll, so every single poll
+# missed the cache: ~600 calls/hour just to watch one track play. The client
+# no longer picks an interval at all; the server hands it one (poll_after_ms),
+# because only the server knows when the answer can next change.
+NOW_TTL_IDLE = 60    # paused or silent: nothing advances on its own
+NOW_TTL_MIN = 20     # floor, so a track ending in 2s doesn't mean a call in 2s
+NOW_TTL_MAX = 300    # ceiling, so a very long track still gets re-checked
+NOW_FORCE_MIN_INTERVAL = 10   # fastest a user-triggered refresh may hit upstream
+NOW_ERROR_POLL_MS = 300_000   # cooldown/reauth: sit still, there is nothing to see
+
+_now_cache: dict = {"at": 0.0, "value": None, "ttl": NOW_TTL_IDLE}
 _now_lock = threading.Lock()
 
 
-def _currently_playing_shared() -> dict | None:
+def _now_ttl(value: dict | None) -> float:
+    """How long this answer stays true — the track's remaining runtime."""
+    if not value or not value.get("is_playing"):
+        return NOW_TTL_IDLE
+    duration = (value.get("track") or {}).get("duration_ms")
+    progress = value.get("progress_ms")
+    if not duration or progress is None:
+        return NOW_TTL_MIN
+    remaining = (duration - progress) / 1000
+    return max(NOW_TTL_MIN, min(remaining + 1, NOW_TTL_MAX))
+
+
+def _currently_playing_shared(force: bool = False) -> tuple[dict | None, float]:
+    """(value, seconds until it goes stale). N open tabs still cost one call.
+
+    `force` is for explicit user action — opening the view, coming back to the
+    tab — where the cheap prediction may be wrong because the user skipped.
+    It ignores the TTL but never outruns NOW_FORCE_MIN_INTERVAL.
+    """
     with _now_lock:
         age = time.time() - _now_cache["at"]
-        ttl = 5 if (_now_cache["value"] or {}).get("is_playing") else 20
-        if age < ttl:
-            return _now_cache["value"]
+        if age < (NOW_FORCE_MIN_INTERVAL if force else _now_cache["ttl"]):
+            return _now_cache["value"], max(0.0, _now_cache["ttl"] - age)
         value = sp.currently_playing()
-        _now_cache.update(at=time.time(), value=value)
-        return value
+        ttl = _now_ttl(value)
+        _now_cache.update(at=time.time(), value=value, ttl=ttl)
+        return value, ttl
+
+
+def _poll_after_ms(stale_in: float) -> int:
+    """When the client should come back — just after the cache goes stale, so
+    its next poll is a fetch rather than a wasted round trip."""
+    return max(1000, int(stale_in * 1000) + 500)
 
 
 @app.get("/api/now")
-def now_playing():
+def now_playing(force: bool = False):
     try:
-        np = _currently_playing_shared()
+        np, stale_in = _currently_playing_shared(force=force)
     except SpotifyError as e:
         # Spotify answers 401 "Permissions missing" (or 403) when the token
         # predates the user-read-currently-playing scope.
         if e.status in (401, 403):
-            return {"playing": False, "needs_reauth": True}
+            return {"playing": False, "needs_reauth": True, "poll_after_ms": NOW_ERROR_POLL_MS}
         if e.status == 429:
-            return {"playing": False, "cooldown": str(e)}
+            return {"playing": False, "cooldown": str(e), "poll_after_ms": NOW_ERROR_POLL_MS}
         raise
     if not np:
-        return {"playing": False}
+        return {"playing": False, "poll_after_ms": _poll_after_ms(stale_in)}
 
     state = _ensure_profiles()
     track = np["track"]
@@ -366,6 +422,7 @@ def now_playing():
     ctx = next((p for p in state["playlists"] if p["id"] == ctx_id), None)
     return {
         "playing": True,
+        "poll_after_ms": _poll_after_ms(stale_in),
         "is_playing": np["is_playing"],
         "progress_ms": np["progress_ms"],
         "track": {**track, "sortable": bool(sortable)},
@@ -489,46 +546,71 @@ def undo():
 # ---- background genre enricher ----------------------------------------------
 
 
-def _genre_enricher():
-    """Slowly backfill artist genres from cached playlists, inside the daily
-    budget's headroom. Suggestions work without it; this just sharpens them."""
-    from .spotify import DAILY_CAP
+# One artist at a time, minutes apart. Proactive traffic is the only thing
+# that can earn a multi-hour 429 while nobody is even using the app, so it
+# gets the slowest pace that still makes progress.
+ENRICH_INTERVAL = 300     # seconds between proactive artist fetches
+ENRICH_IDLE_SLEEP = 1800  # recheck interval while blocked or out of work
 
+
+def _next_missing_artist() -> str | None:
+    """One artist id from the cached playlists that has no genres yet."""
+    cache = store.cache()
+    known = cache["artists"]
+    for pl in cache["playlists"].values():
+        for t in pl["tracks"]:
+            for a in t["artists"]:
+                aid = a.get("id")
+                if aid and aid not in known:
+                    return aid
+    return None
+
+
+def _genre_enricher():
+    """Slowly backfill artist genres from cached playlists.
+
+    Deliberately glacial: one artist every few minutes, a few dozen a day,
+    silent for hours after any cooldown, and yielding entirely once the user's
+    own traffic is underway. Suggestions already score on artist overlap
+    without genres — this only sharpens the stated reasons, so it is never
+    worth a single minute of rate-limit penalty.
+
+    It also narrates itself into the server log: a background job that spends
+    the user's quota invisibly is exactly how a multi-hour ban becomes a
+    mystery to the person who did nothing but open the app.
+    """
     while True:
         try:
-            time.sleep(30)
-            if sp.cooldown_until > time.time():
-                time.sleep(600)
+            reason = sp.background_block_reason()
+            if reason:
+                log.info("genre enricher idle — %s", reason)
+                time.sleep(ENRICH_IDLE_SLEEP)
                 continue
-            if sp.budget_spent() > DAILY_CAP * 0.7:
-                time.sleep(1800)
+            aid = _next_missing_artist()
+            if aid is None:
+                log.info("genre enricher idle — every cached artist has genres")
+                time.sleep(ENRICH_IDLE_SLEEP)
                 continue
-            cache = store.cache()
-            known = cache["artists"]
-            missing: list[str] = []
-            for pl in cache["playlists"].values():
-                for t in pl["tracks"]:
-                    for a in t["artists"]:
-                        aid = a.get("id")
-                        if aid and aid not in known and aid not in missing:
-                            missing.append(aid)
-                            if len(missing) >= 5:
-                                break
-                    if len(missing) >= 5:
-                        break
-                if len(missing) >= 5:
-                    break
-            if not missing:
-                time.sleep(600)
-                continue
-            fetched = sp.artists_genres(missing)
-            cache = store.cache()
-            cache["artists"].update(fetched)
-            store.save_cache(cache)
-            if _profile_state.get("artist_info") is not None:
-                _profile_state["artist_info"].update(fetched)
+            fetched = sp.artists_genres([aid], background=True)
+            if fetched:
+                cache = store.cache()
+                cache["artists"].update(fetched)
+                store.save_cache(cache)
+                if _profile_state.get("artist_info") is not None:
+                    _profile_state["artist_info"].update(fetched)
+                log.info(
+                    "genre enricher: %s done (%d/%d background calls today)",
+                    aid, sp.background_spent(), BACKGROUND_DAILY_CAP,
+                )
+            time.sleep(ENRICH_INTERVAL)
+        except SpotifyError as e:
+            # Covers hitting a cap and walking into a fresh cooldown alike.
+            # Back off hard; background_block_reason decides when to resume.
+            log.warning("genre enricher backing off — %s", e)
+            time.sleep(ENRICH_IDLE_SLEEP)
         except Exception:
-            time.sleep(300)
+            log.exception("genre enricher error")
+            time.sleep(ENRICH_IDLE_SLEEP)
 
 
 @app.on_event("startup")

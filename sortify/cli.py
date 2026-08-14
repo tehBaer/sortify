@@ -16,10 +16,12 @@ import json
 import sys
 import time
 
-from .spotify import DAILY_CAP, Spotify, SpotifyError
+from .spotify import BACKGROUND_DAILY_CAP, DAILY_CAP, Spotify, SpotifyError
 from .store import Store
 
-DEV_CAP = 300  # dev traffic stops here; 1200-300 stays reserved for real use
+# Dev traffic stops here, leaving the rest of DAILY_CAP for real use. Scaled
+# down with DAILY_CAP (was 300 of 1200) to keep that reservation intact.
+DEV_CAP = 150
 
 
 def dev_call_allowed(spent_today: int) -> bool:
@@ -32,9 +34,13 @@ def main() -> None:
 
     if not args or args[0] in ("budget", "status"):
         spent = sp.budget_spent()
-        cd = max(0.0, sp.cooldown_until - time.time())
+        cd = max(0.0, sp.effective_cooldown_until() - time.time())
+        quiet = max(0.0, sp.quiet_until() - time.time())
         print(f"today: {spent}/{DAILY_CAP} calls spent · dev ceiling {DEV_CAP}")
+        print(f"  of which background: {sp.background_spent()}/{BACKGROUND_DAILY_CAP}")
         print("cooldown: none" if cd == 0 else f"cooldown: {int(cd / 60)} min left")
+        if cd == 0 and quiet > 0:
+            print(f"background quiet period: {int(quiet / 60)} min left")
         return
 
     method, path = (args[0].upper(), args[1]) if len(args) >= 2 else ("GET", args[0])

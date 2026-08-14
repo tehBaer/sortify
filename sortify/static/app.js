@@ -278,25 +278,25 @@ function stopNowPolling() { clearTimeout(nowTimer); nowTimer = null; }
 function showNow() {
   show("now");
   stopNowPolling();
-  pollNow();
+  pollNow(true);  // opening the view is a request for current truth
 }
 
-// Polling pace matches what's happening: fast only while music plays and the
-// tab is visible. Errors and cooldowns back off hard — N tabs also share one
-// upstream call server-side.
+// The server sets the pace: it knows when the playing track ends, which is the
+// only moment the answer can change by itself. Choosing an interval here too
+// is what used to make every poll a guaranteed cache miss.
 function scheduleNext(ms) {
   stopNowPolling();
-  nowTimer = setTimeout(pollNow, ms);
+  nowTimer = setTimeout(() => pollNow(), ms);
 }
 
-async function pollNow() {
+async function pollNow(force = false) {
   if ($("view-now").hidden) return;
   if (document.hidden) { scheduleNext(15000); return; }
   try {
-    const data = await api("/api/now");
+    const data = await api("/api/now" + (force ? "?force=1" : ""));
     nowState = { ...data, homes: new Map((data.homes || []).map((h) => [h.id, h])) };
     renderNow();
-    scheduleNext(data.playing && data.is_playing ? 6000 : 25000);
+    scheduleNext(data.poll_after_ms || 60000);
   } catch (e) {
     if (e.message === "auth needed") { stopNowPolling(); return; }
     renderNowProblem(e.message);
@@ -490,8 +490,10 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+// Coming back to the tab is the moment a skip is most likely to have happened
+// behind our back, so this one bypasses the predicted TTL.
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && !$("view-now").hidden) pollNow();
+  if (!document.hidden && !$("view-now").hidden) pollNow(true);
 });
 
 boot().catch((e) => { if (e.message !== "auth needed") toast(e.message); });
