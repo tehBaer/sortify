@@ -390,7 +390,17 @@ class Spotify:
                 )
             if resp.status_code >= 400:
                 raise SpotifyError(resp.status_code, resp.text[:300])
-            return resp.json() if resp.content else None
+            if not resp.content:
+                return None
+            try:
+                return resp.json()
+            except ValueError:
+                # Playback endpoints acknowledge success without JSON (and not
+                # always with a truly empty body either). Parsing that
+                # unconditionally turned a working skip into a 500: the track
+                # changed, the user saw an error, and since JSONDecodeError is
+                # not a SpotifyError, callers' cleanup was skipped too.
+                return None
         raise SpotifyError(429, "rate limited, gave up")
 
     def get(self, path: str, **kwargs) -> dict:

@@ -155,3 +155,17 @@ def test_liked_songs_cannot_be_started_as_a_playlist(appmod, monkeypatch):
         appmod.player_play(appmod.PlayIn(input_id=appmod.LIKED_ID))
     assert e.value.status_code == 400
     assert called == []
+
+
+def test_a_success_with_no_json_body_is_not_a_crash(sp, monkeypatch):
+    """Spotify's playback endpoints answer a successful skip with a body that
+    is not JSON. Parsing it unconditionally turned a working skip into a 500 —
+    the track changed, the user saw an error, and because JSONDecodeError is
+    not a SpotifyError the caller's cache invalidation was skipped as well."""
+    record(sp, monkeypatch, FakeResponse(200, text=""))
+    sp.http.request = lambda *a, **k: type(
+        "R", (), {"status_code": 200, "content": b"\n", "headers": {}, "text": "",
+                  "json": lambda self: (_ for _ in ()).throw(ValueError("no json"))}
+    )()
+
+    assert sp.skip_next() is None
