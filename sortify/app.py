@@ -105,7 +105,14 @@ def status():
 
 @app.post("/api/auth/start")
 def auth_start(body: AuthStart):
-    return {"auth_url": sp.start_auth(body.client_id.strip())}
+    # Re-authorising to pick up a new scope is now the common case, and the
+    # client ID is already on file — only first-time setup should have to go
+    # and fetch it. Falling back also stops a blank field from overwriting the
+    # stored id with "".
+    client_id = body.client_id.strip() or (store.config().get("client_id") or "")
+    if not client_id:
+        raise HTTPException(400, "paste the Client ID from your Spotify dashboard app")
+    return {"auth_url": sp.start_auth(client_id)}
 
 
 @app.post("/api/auth/finish")

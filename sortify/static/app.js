@@ -49,8 +49,9 @@ async function boot() {
 }
 
 $("btn-auth-start").onclick = async () => {
+  // Blank is allowed when reconnecting — the server falls back to the stored
+  // Client ID and answers with a readable 400 if there isn't one.
   const clientId = $("client-id").value.trim();
-  if (!clientId) return toast("paste the Client ID first");
   try {
     const { auth_url } = await api("/api/auth/start", { client_id: clientId });
     const a = $("auth-link");
@@ -295,6 +296,17 @@ $("btn-undo").onclick = async () => {
 
 $("btn-back").onclick = () => { triage = null; loadLists(); };
 $("home-link").onclick = () => { triage = null; boot(); };
+// The setup view used to be reachable only when logged out, which meant the
+// one person who needed it — someone already logged in with a token issued
+// before a scope was added — was the one person who could not get to it.
+$("nav-reconnect").onclick = () => {
+  stopNowPolling();
+  triage = null;
+  $("reconnect-hint").hidden = !statusData?.authed;
+  $("client-id").value = "";
+  show("setup");
+};
+
 $("nav-now").onclick = showNow;
 $("nav-lists").onclick = () => { stopNowPolling(); triage = null; loadLists(); };
 

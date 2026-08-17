@@ -13,6 +13,7 @@
   <nav>
     <a id="nav-now">Now</a>
     <a id="nav-lists">Playlists</a>
+    <a id="nav-reconnect" title="Log in again — needed after sortify asks for a new permission">Reconnect</a>
   </nav>
   <span id="whoami"></span>
 </header>
@@ -40,6 +41,9 @@
           <input id="client-id" placeholder="Client ID" autocomplete="off">
           <button id="btn-auth-start">Get login link</button>
         </div>
+        <p id="reconnect-hint" class="hint" hidden>You're already connected — leave this blank
+        to reuse the Client ID sortify already has. Your current login keeps working until you
+        finish, so abandoning halfway is safe.</p>
       </li>
       <li id="step-authlink" hidden>
         <a id="auth-link" target="_blank" rel="noopener">Log in with Spotify →</a>
