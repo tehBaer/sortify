@@ -573,19 +573,74 @@ class SittingIn(BaseModel):
     target_minutes: int = Field(120, gt=0, le=SITTING_MAX_MINUTES)
 
 
+def _claim_reservation(split_playlist_id: str, token: str, **fields: Any) -> bool:
+    """Write `fields` into the active_sitting reservation stamped `token`,
+    iff that exact reservation is still the one on disk.
+
+    `finish_sitting` can legally clear active_sitting to None (or a later
+    start_sitting can replace it) at any point during create_playlist or the
+    add loop, since neither of those is inside this lock — they're network
+    calls. `started_at` doubles as a claim token so a write from THIS
+    materialisation attempt never lands on a reservation that isn't it:
+    the lock only makes each individual read-modify-write atomic, not the
+    whole span between them. (Parameter named split_playlist_id, not
+    playlist_id, so **fields can carry a "playlist_id" key — the sitting
+    playlist's id — without colliding with this function's own argument.)
+    """
+    with _split_lock:
+        payload = store.splits()
+        split = payload["splits"].get(split_playlist_id)
+        active = split.get("active_sitting") if split else None
+        if not active or active.get("started_at") != token:
+            return False
+        active.update(fields)
+        store.save_splits(payload)
+        return True
+
+
+def _reservation_alive(split_playlist_id: str, token: str) -> bool:
+    with _split_lock:
+        split = store.splits()["splits"].get(split_playlist_id)
+        active = split.get("active_sitting") if split else None
+        return bool(active and active.get("started_at") == token)
+
+
+def _abandon_orphaned_playlist(new_id: str, detail: str) -> None:
+    """A concurrent finish discarded the reservation for this sitting while
+    it was still being materialised. The playlist itself is real, though —
+    unfollow it ourselves (the one thing that would otherwise leave the
+    exact litter the recording-before-adds fix exists to prevent) and
+    report a clean error instead of crashing on a vanished record."""
+    try:
+        sp.unfollow_playlist(new_id)
+    except SpotifyError as e:
+        if e.status != 404:
+            raise
+    raise HTTPException(409, detail)
+
+
 @app.post("/api/split/{playlist_id}/sitting")
 def start_sitting(playlist_id: str, body: SittingIn):
     """Materialise one sitting as a disposable playlist. ~24 calls at 2 h,
     structurally capped at 1 + SITTING_MAX_TRACKS + 1 regardless of input.
 
     The sitting is recorded (with the playlist id, as soon as it exists) in
-    two short, lock-protected writes around the actual API calls rather than
-    one write at the very end: a failure partway through the add loop — a
-    429 cooldown landing on track 5 of 22 is the likely real case, but a
-    process restart mid-add has the same shape — must still leave a
-    findable, finishable record. Recording only at the end would instead
-    leave a real playlist in the account that sortify has never heard of and
-    can never unfollow.
+    short, lock-protected writes around the actual API calls rather than one
+    write at the very end: a failure partway through the add loop — a 429
+    cooldown landing on track 5 of 22 is the likely real case, but a process
+    restart mid-add has the same shape — must still leave a findable,
+    finishable record. Recording only at the end would instead leave a real
+    playlist in the account that sortify has never heard of and can never
+    unfollow.
+
+    That same span (create_playlist, then up to SITTING_MAX_TRACKS adds) is
+    also long enough — at WINDOW_CAP pacing, over a minute for a full
+    sitting — for a concurrent `finish` to land on this exact sitting before
+    it's done starting. `_claim_reservation`/`_reservation_alive` detect
+    that (the reservation this call made is gone or superseded) at each
+    checkpoint and unfollow-and-error rather than either crashing on a
+    vanished record or quietly burning the rest of the add budget on a
+    playlist nobody can reach anymore.
     """
     with _split_lock:
         payload = store.splits()
@@ -613,24 +668,29 @@ def start_sitting(playlist_id: str, body: SittingIn):
         # checks above: a second request that reaches this lock next sees a
         # sitting already claimed, even though no Spotify call has happened
         # yet. playlist_id is filled in below once create_playlist returns.
+        # started_at is this reservation's claim token — see
+        # _claim_reservation.
+        token = _now_iso()
         split["active_sitting"] = {"playlist_id": None, "pile_id": pile["id"],
-                                   "uris": [], "started_at": _now_iso()}
+                                   "uris": [], "started_at": token}
         store.save_splits(payload)
 
     new_id = sp.create_playlist(f"▶ {pile['name']}", "sortify sitting — safe to delete")
 
-    with _split_lock:
-        payload = store.splits()
-        payload["splits"][playlist_id]["active_sitting"]["playlist_id"] = new_id
-        store.save_splits(payload)
+    if not _claim_reservation(playlist_id, token, playlist_id=new_id):
+        _abandon_orphaned_playlist(
+            new_id, "the sitting was finished by another request while it was starting")
 
     for uri in uris:
+        if not _reservation_alive(playlist_id, token):
+            _abandon_orphaned_playlist(
+                new_id,
+                "the sitting was finished by another request while tracks were still being added")
         sp.add_to_playlist(new_id, uri)
 
-    with _split_lock:
-        payload = store.splits()
-        payload["splits"][playlist_id]["active_sitting"]["uris"] = uris
-        store.save_splits(payload)
+    if not _claim_reservation(playlist_id, token, uris=uris):
+        _abandon_orphaned_playlist(
+            new_id, "the sitting was finished by another request just as it finished starting")
 
     minutes = sum(durations.get(u, 0) for u in uris) // 60000
     return {"sitting_id": new_id, "uris": uris, "minutes": minutes}

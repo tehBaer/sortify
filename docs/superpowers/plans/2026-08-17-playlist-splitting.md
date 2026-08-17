@@ -1427,8 +1427,12 @@ The spec flags this as Risk 1. `POST /me/playlists` and `DELETE /playlists/{id}/
 Create a throwaway playlist, then remove it (2 calls):
 
 ```bash
-.venv/bin/spx POST /me/playlists --json '{"name":"sortify probe","public":false}'
+.venv/bin/spx POST /me/playlists '{"name":"sortify probe","public":false}'
 ```
+
+(Note added after execution: `spx` takes the JSON body as a bare positional
+third argument, not a `--json` flag — the flag form originally shown here
+does not exist and would have been refused. See `sortify/cli.py`.)
 
 Take the returned `id` and:
 

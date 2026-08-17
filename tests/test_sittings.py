@@ -338,3 +338,87 @@ def test_concurrent_sitting_starts_yield_exactly_one_winner(client):
 
     assert sorted(results) == [200, 409]
     assert sum(1 for c in client.calls if c[0] == "create") == 1
+
+
+# ---- Fix Round 2 -------------------------------------------------------
+#
+# New Important, found while re-reviewing the Critical fix above: the
+# reservation is now written in three separate lock-protected steps spread
+# across the create_playlist call and the whole add loop, and a concurrent
+# `finish` on the SAME sitting is legal at any point in that span — it just
+# clears active_sitting to None. Before fix round 1, nothing was recorded
+# until the very end, so a concurrent finish during start_sitting just
+# 404'd (nothing to finish yet) and start completed cleanly; the
+# recording-before-adds fix reopened a window for exactly the kind of
+# unfindable litter it was meant to close, just shaped differently — a
+# concurrent finish, not a mid-add failure.
+#
+# _claim_reservation/_reservation_alive close it: started_at doubles as a
+# claim token, checked at each write and before each add, so a vanished (or
+# superseded) reservation is detected and the just-created playlist is
+# unfollowed before start_sitting reports a clean 409 instead of crashing
+# on a None.
+
+
+def test_finish_racing_the_in_flight_create_playlist_leaves_no_litter(client, monkeypatch):
+    """A concurrent finish clears active_sitting while create_playlist is
+    still in flight for this call — simulated here as a side effect inside
+    the fake create_playlist itself, standing in for a second request that
+    would otherwise interleave at exactly that point."""
+    def create_then_finish_races_in(name, description=""):
+        s = Store()
+        payload = s.splits()
+        payload["splits"]["PL1"]["active_sitting"] = None
+        s.save_splits(payload)
+        return "NEW1"
+
+    monkeypatch.setattr(appmod.sp, "create_playlist", create_then_finish_races_in)
+    r = client.post("/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30})
+    assert r.status_code == 409
+
+    # The playlist that DID get created is unfollowed rather than left
+    # behind, and no stray record survives for it.
+    assert ("unfollow", "NEW1") in client.calls
+    assert Store().splits()["splits"]["PL1"]["active_sitting"] is None
+
+
+def test_finish_racing_the_add_loop_stops_early_and_unfollows(client, monkeypatch):
+    """A concurrent finish clears active_sitting partway through the add
+    loop. The remaining adds must not run — burning ~24 calls into a
+    playlist nobody can reach anymore — and the playlist must still end up
+    unfollowed rather than orphaned."""
+    added = []
+
+    def flaky_add(pid, uri):
+        added.append(uri)
+        if len(added) == 3:
+            s = Store()
+            payload = s.splits()
+            payload["splits"]["PL1"]["active_sitting"] = None
+            s.save_splits(payload)
+        return "snap"
+
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", flaky_add)
+    r = client.post("/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30})
+    assert r.status_code == 409
+
+    # 6 tracks total for this pile/target; the loop must have stopped well
+    # short of all of them once the reservation vanished after the 3rd.
+    assert len(added) < 6
+    assert client.calls[-1] == ("unfollow", "NEW1")
+    assert Store().splits()["splits"]["PL1"]["active_sitting"] is None
+
+
+def test_uninterrupted_sitting_still_completes_normally(client):
+    """The normal, non-racing path: unchanged behaviour after adding the
+    claim-token checks — same assertions as
+    test_sitting_creates_playlist_and_adds_tracks, kept here as an explicit
+    "nothing regressed" companion to the two race tests above."""
+    r = client.post("/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["sitting_id"] == "NEW1"
+    assert len(body["uris"]) == 6
+    active = Store().splits()["splits"]["PL1"]["active_sitting"]
+    assert active == {"playlist_id": "NEW1", "pile_id": "p1", "uris": body["uris"],
+                      "started_at": active["started_at"]}
