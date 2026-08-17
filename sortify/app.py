@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,9 @@ from .spotify import (
     Spotify,
     SpotifyError,
 )
-from .store import Store
+from .split import split_tracks
+from .store import TAGS_VERSION, Store
+from .tags import LastFm, LastFmError, enrich, load_key
 
 LIKED_TTL = 120  # seconds; Liked Songs has no snapshot_id to validate against
 
@@ -357,6 +360,139 @@ def triage(playlist_id: str):
         "homes": _homes_payload(state, exclude=playlist_id),
         "tracks": tracks_out,
     }
+
+
+# ---- splitting --------------------------------------------------------------
+
+
+class SplitParams(BaseModel):
+    resolution: float = 1.0
+    min_pile: int = 15
+    tag_floor: int = 10
+    max_tags_per_artist: int = 8
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _lastfm_client() -> LastFm | None:
+    key = load_key()
+    return LastFm(key) if key else None
+
+
+def _tag_artists_checked() -> dict:
+    """`store.tag_artists()`, refusing a tags.json shape the splitter can't read.
+
+    Version 1 stored tags pre-filtered, in a different shape than the raw
+    Last.fm tags version 2 expects; feeding a v1 file to `split_tracks` fails
+    deep inside as an unhelpful AttributeError. Catch the mismatch here, with
+    an actionable message, before it gets that far.
+    """
+    envelope = store.tags()
+    version = envelope.get("version")
+    if version != TAGS_VERSION:
+        raise HTTPException(
+            400,
+            f"data/tags.json is version {version!r}, but this build expects "
+            f"version {TAGS_VERSION} (raw Last.fm tags, hygiene applied at "
+            "split time). Move the old file aside and re-run the split.",
+        )
+    return store.tag_artists()
+
+
+def _pile_progress(split: dict) -> list[dict]:
+    decided = split.get("decided", {})
+    out = []
+    for p in split["piles"]:
+        out.append({**p, "decided": sum(1 for u in p["uris"] if u in decided),
+                    "total": len(p["uris"])})
+    return out
+
+
+@app.post("/api/split/{playlist_id}")
+def create_split(playlist_id: str, params: SplitParams = SplitParams()):
+    """Read a playlist, tag its artists via Last.fm, cluster into piles.
+
+    The only Spotify spend is the track read (~15 calls for 1372). Tagging is
+    Last.fm, one request per not-yet-cached artist; clustering is local and
+    free. A Last.fm failure partway through does not lose what was already
+    verified — see `_tag_artists_checked` and the `LastFmError` handling below.
+    """
+    fm = _lastfm_client()
+    if fm is None:
+        raise HTTPException(400, "No Last.fm API key — expected ~/state/sortify/lastfm.json")
+
+    # Checked before the Spotify read: a stale tags.json is a local problem
+    # that should fail for free, not after spending the ~15-call track fetch.
+    cached_artists = _tag_artists_checked()
+
+    tracks = sp.playlist_tracks(playlist_id)
+    if not tracks:
+        raise HTTPException(400, "playlist has no tracks")
+
+    names = {}
+    for t in tracks:
+        for a in t.get("artists", []):
+            if a.get("id"):
+                names.setdefault(a["id"], a.get("name") or "")
+
+    try:
+        artists = enrich(names, cached_artists, fm, _now_iso())
+    except LastFmError as exc:
+        saved = exc.partial if exc.partial is not None else cached_artists
+        store.save_tag_artists(saved)
+        raise HTTPException(
+            502,
+            f"Last.fm tagging stopped after {len(saved)} of {len(names)} "
+            f"artists in this playlist ({exc}); progress was saved — "
+            "re-running the split will resume instead of starting over.",
+        ) from exc
+    store.save_tag_artists(artists)
+
+    cache = store.cache()
+    cache["playlists"].setdefault(playlist_id, {})["tracks"] = tracks
+    store.save_cache(cache)
+
+    piles = split_tracks(tracks, artists, params.model_dump())
+    payload = store.splits()
+    prev = payload["splits"].get(playlist_id, {})
+    payload["splits"][playlist_id] = {
+        "created_at": _now_iso(),
+        "snapshot_id": cache["playlists"][playlist_id].get("snapshot_id"),
+        "params": params.model_dump(),
+        "piles": piles,
+        "decided": prev.get("decided", {}),
+        "active_sitting": None,
+    }
+    store.save_splits(payload)
+    untagged = sum(len(p["uris"]) for p in piles if p["id"] == "untagged")
+    return {"piles": piles, "tagged": len(tracks) - untagged, "untagged": untagged}
+
+
+@app.get("/api/split/{playlist_id}")
+def get_split(playlist_id: str):
+    split = store.splits()["splits"].get(playlist_id)
+    if not split:
+        raise HTTPException(404, "no split for that playlist")
+    return {**split, "piles": _pile_progress(split)}
+
+
+@app.post("/api/split/{playlist_id}/recluster")
+def recluster(playlist_id: str, params: SplitParams = SplitParams()):
+    """Re-cluster from cached tracks and tags. Costs nothing at all."""
+    payload = store.splits()
+    split = payload["splits"].get(playlist_id)
+    if not split:
+        raise HTTPException(404, "no split for that playlist")
+    tracks = store.cache()["playlists"].get(playlist_id, {}).get("tracks", [])
+    if not tracks:
+        raise HTTPException(400, "no cached tracks — run the split again")
+    artists = _tag_artists_checked()
+    split["piles"] = split_tracks(tracks, artists, params.model_dump())
+    split["params"] = params.model_dump()
+    store.save_splits(payload)
+    return {"piles": _pile_progress(split)}
 
 
 # ---- now playing -----------------------------------------------------------

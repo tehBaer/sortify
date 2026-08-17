@@ -119,3 +119,11 @@ class Store:
     def save_tag_artists(self, artists: dict) -> None:
         """Wrap an inner artists map in the current envelope and store it."""
         self._save("tags.json", {"version": TAGS_VERSION, "artists": artists})
+
+    # splits.json: {playlist_id: {piles, decided, params, ...}}
+    # Piles are virtual — materialising them all would cost ~1384 calls.
+    def splits(self) -> dict:
+        return self._load("splits.json", {"version": 1, "splits": {}})
+
+    def save_splits(self, payload: dict) -> None:
+        self._save("splits.json", payload)
