@@ -464,3 +464,82 @@ def test_a_pending_keep_still_in_flight_in_this_process_is_not_retried(client, m
     assert r.status_code == 200
     assert len([c for c in client.calls if c[0] == "add"]) == 1
     assert reentrant_results[0]["changed"] is False
+
+
+# ---- Fix round 2 -------------------------------------------------------------
+
+
+def test_finalize_save_failure_leaves_the_keep_in_flight_not_double_addable(client, monkeypatch):
+    """The `finally` block used to discard `_pending_keeps` BEFORE
+    persisting the cleared "pending" flag. If that save then failed (a disk
+    hiccup — no crash needed at all), the on-disk entry stayed
+    "pending": true while the in-memory set said "not in flight" — the very
+    next plain retry read that combination as an abandoned crash and spent a
+    second, duplicate add for a track that had already landed. Reordering
+    (save first, then discard) fails the other way instead: both disk and
+    memory agree the uri is still in flight, so every retry in THIS process
+    correctly no-ops, and only a real restart (empty `_pending_keeps`) will
+    ever retry it — exactly what the crash-recovery path already handles."""
+    real_save = Store.save_splits
+    n = {"calls": 0}
+
+    def flaky_save(self, payload):
+        n["calls"] += 1
+        if n["calls"] == 2:  # 1st = the reservation write, 2nd = the finalize write
+            raise OSError("disk hiccup")
+        real_save(self, payload)
+
+    monkeypatch.setattr(Store, "save_splits", flaky_save)
+    with pytest.raises(OSError):
+        client.post("/api/split/PL1/decide",
+                    json={"uri": "spotify:track:a", "action": "keep", "to_id": "HOME1"})
+
+    # The add itself landed exactly once...
+    assert client.calls == [("add", "HOME1", "spotify:track:a")]
+    # ...and because the finalize save failed, the discard never ran: the
+    # uri must still read as in-flight in this process.
+    assert ("PL1", "spotify:track:a") in appmod._pending_keeps
+
+    monkeypatch.setattr(Store, "save_splits", real_save)
+    r2 = client.post("/api/split/PL1/decide",
+                     json={"uri": "spotify:track:a", "action": "keep", "to_id": "HOME1"})
+    assert r2.json()["changed"] is False
+    assert len([c for c in client.calls if c[0] == "add"]) == 1  # no double-add
+
+
+def test_abandoned_pending_keep_cannot_be_settled_by_a_different_action(client):
+    """The judgement call from fix round 2: allowing any action to settle an
+    abandoned pending keep opened keep(crash) -> reject (settles the
+    abandoned entry) -> undecide (clears the reject) -> keep again, which
+    could double-add a track with no memory that the first attempt might
+    already have landed. A reject must stay a no-op against an abandoned
+    pending keep, which in turn means undecide (only ever clears a *reject*)
+    can't reach it either — the chain is closed at its first link."""
+    s = Store()
+    payload = s.splits()
+    payload["splits"]["PL1"]["decided"] = {
+        "spotify:track:a": {"action": "keep", "to_id": "HOME1", "at": "x", "pending": True},
+    }
+    s.save_splits(payload)
+    assert ("PL1", "spotify:track:a") not in appmod._pending_keeps  # fresh-process precondition
+
+    r = client.post("/api/split/PL1/decide", json={"uri": "spotify:track:a", "action": "reject"})
+    assert r.status_code == 200
+    assert r.json()["changed"] is False
+    assert client.calls == []
+    d = Store().splits()["splits"]["PL1"]["decided"]["spotify:track:a"]
+    assert d["action"] == "keep" and d.get("pending") is True
+
+    r2 = client.post("/api/split/PL1/decide", json={"uri": "spotify:track:a", "action": "undecide"})
+    assert r2.json()["changed"] is False
+    d2 = Store().splits()["splits"]["PL1"]["decided"]["spotify:track:a"]
+    assert d2["action"] == "keep"
+
+    # The uri is still only retryable as a keep — which is the accepted,
+    # documented, narrower risk (Important 2), not the wide-open one this
+    # closes.
+    r3 = client.post("/api/split/PL1/decide",
+                     json={"uri": "spotify:track:a", "action": "keep", "to_id": "HOME1"})
+    assert r3.status_code == 200
+    assert r3.json()["changed"] is True
+    assert client.calls == [("add", "HOME1", "spotify:track:a")]

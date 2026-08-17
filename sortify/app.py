@@ -911,6 +911,18 @@ def decide(playlist_id: str, body: DecideIn):
     better than the alternative (a keep silently recorded forever for a
     track that was never added, un-retryable, because a plain `"action":
     "keep"` entry is otherwise final).
+
+    An abandoned pending keep may only be settled by ANOTHER keep — a retry
+    of the same operation — never by a different action. Without that
+    restriction, `reject` could settle over an abandoned pending keep too
+    (its outcome is just as "unknown, retry" as a keep's own retry), and a
+    later `undecide` on that reject would erase it completely: keep (crash)
+    -> reject (settles the abandoned pending entry) -> undecide (clears the
+    reject) leaves the uri fully undecided again with no memory that an add
+    might already have landed, and a later keep can then genuinely double-
+    add. Restricting the retry to the same action closes that chain at its
+    first step, and keeps a pending keep resolving the same way an ordinary
+    keep does: only by completing (or re-failing) itself.
     """
     if body.action not in ("keep", "reject", "undecide"):
         raise HTTPException(400, f"unknown action {body.action!r}")
@@ -945,7 +957,20 @@ def decide(playlist_id: str, body: DecideIn):
         settle = (
             previous is None
             or (previous["action"] == "reject" and body.action == "keep")
-            or (previous.get("pending") and not in_flight)
+            # An abandoned pending keep (crash-recovery — see the docstring)
+            # may only be settled by ANOTHER keep, i.e. a retry of the same
+            # operation, never by a different action. Without `body.action
+            # == "keep"` here, a reject could settle over it — turning
+            # "outcome unknown, retry as keep" into a confident, ordinary
+            # reject that remembers nothing about the unresolved add — and a
+            # later `undecide` on that reject would erase it entirely,
+            # opening the uri back up to a fresh keep with no record that an
+            # add might already have landed. Restricting the retry to the
+            # same action closes that whole chain at its first step: a
+            # pending keep now resolves only by completing (or re-failing)
+            # itself, matching the immutable-keep rule everywhere else in
+            # this endpoint.
+            or (previous.get("pending") and body.action == "keep" and not in_flight)
         )
         if not settle:
             # A snapshot, not a guarantee: if `previous` is still `pending`
@@ -1020,13 +1045,26 @@ def decide(playlist_id: str, body: DecideIn):
             # the track landed.
             _cache_move(body.uri, None, body.to_id)
         finally:
+            # Disk first, THEN memory — not the other order. If the save
+            # here fails (a disk hiccup, no crash needed), clearing
+            # `_pending_keeps` first would leave the in-memory state saying
+            # "not in flight" while the on-disk entry still says `"pending":
+            # true`. The very next plain retry in this same process would
+            # then read that combination as an abandoned crash and spend a
+            # second, duplicate add for a track that already landed. Saving
+            # first means a failure here instead leaves both disk AND memory
+            # agreeing the uri is still in flight — indistinguishable from a
+            # genuinely slow call, so every retry in this process correctly
+            # no-ops — and only a real process restart (empty
+            # `_pending_keeps`) will ever retry it, exactly the case the
+            # crash-recovery path above already handles safely.
             with _split_lock:
-                _pending_keeps.discard((playlist_id, body.uri))
                 payload = store.splits()
                 split = payload["splits"].get(playlist_id)
                 if split is not None and body.uri in split["decided"]:
                     split["decided"][body.uri].pop("pending", None)
                     store.save_splits(payload)
+                _pending_keeps.discard((playlist_id, body.uri))
 
     return {
         "ok": True, "remaining": remaining, "changed": True,
