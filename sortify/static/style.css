@@ -138,3 +138,6 @@ kbd {
 }
 #pl-filter { margin-bottom: .6rem; }
 [hidden] { display: none !important; }
+
+/* Now-view playback controls: the switcher takes the space, Next stays snug. */
+#now-controls select { flex: 1; min-width: 0; }

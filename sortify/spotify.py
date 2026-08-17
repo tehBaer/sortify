@@ -40,6 +40,10 @@ SCOPES = " ".join(
         "user-library-read",
         "user-library-modify",
         "user-read-currently-playing",
+        # Skip and "play this input instead" are the only calls that change
+        # playback rather than read it. Tokens issued before this was added
+        # get 401 "Permissions missing" and need a fresh login to fix.
+        "user-modify-playback-state",
     ]
 )
 
@@ -490,27 +494,16 @@ class Spotify:
                 items = list(self._paginate(f"/playlists/{playlist_id}/items", {"limit": 100}))
         return [t for t in (self._slim_track(i) for i in items) if t and t["uri"]]
 
-    def artists_genres(self, artist_ids: list[str], background: bool = False) -> dict[str, dict]:
-        """Fetch {artist_id: {name, genres}} one by one.
+    # ---- playback control -------------------------------------------------
 
-        Feb 2026 removed batch GET /artists?ids=, so bulk profile builds are
-        many single calls — pace them gently and never refetch (callers cache).
-        `background=True` bills the proactive allowance; callers doing that
-        should pass one id at a time and space the calls out in minutes.
-        """
-        out: dict[str, dict] = {}
-        fetch = self.get_background if background else self.get
-        for aid in dict.fromkeys(a for a in artist_ids if a):
-            try:
-                a = fetch(f"/artists/{aid}")
-                out[aid] = {"name": a.get("name"), "genres": a.get("genres", [])}
-            except SpotifyError as e:
-                if e.status == 429:
-                    raise
-                # Dead artist id etc. — cache as genreless so we don't re-ask.
-                out[aid] = {"name": None, "genres": []}
-            time.sleep(0.2)
-        return out
+    def skip_next(self) -> None:
+        self.request("POST", "/me/player/next")
+
+    def play_context(self, playlist_id: str) -> None:
+        """Start a playlist from the top, leaving shuffle as the user set it."""
+        self.request(
+            "PUT", "/me/player/play", json={"context_uri": f"spotify:playlist:{playlist_id}"}
+        )
 
     def currently_playing(self) -> dict | None:
         """The user's playing track, or None. Includes the playlist context

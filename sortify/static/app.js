@@ -338,6 +338,7 @@ async function pollNow(force = false) {
 
 function renderNowProblem(msg) {
   $("now-context").textContent = "";
+  $("now-controls").hidden = true;
   const cd = msg.match(/cooldown — try again in ~(\d+) min/);
   $("now-card").innerHTML = cd
     ? `<p class="done-msg">Spotify has rate-limited the app.<br>
@@ -346,9 +347,58 @@ function renderNowProblem(msg) {
     : `<p class="done-msg">${esc(msg)}</p>`;
 }
 
+// Playback controls only make sense against something actually playing —
+// Spotify 404s these calls when no device is active.
+function paintNowControls(d) {
+  const playable = (d.inputs || []).filter((l) => l.id !== "liked");
+  if (!d.playing || !playable.length) { $("now-controls").hidden = true; return; }
+  const sel = $("now-input-switch");
+  const current = d.context?.id;
+  sel.innerHTML =
+    `<option value="">— play another input —</option>` +
+    playable.map((l) =>
+      `<option value="${esc(l.id)}"${l.id === current ? " selected" : ""}>${esc(l.name)}</option>`
+    ).join("");
+  $("now-controls").hidden = false;
+}
+
+// Spotify needs a moment to settle after a skip before it reports the new
+// track; the server has already dropped its cached answer, so this poll is
+// guaranteed to go upstream rather than repeat what we just replaced.
+function repollAfterPlaybackChange() {
+  setTimeout(() => pollNow(true), 900);
+}
+
+$("btn-now-next").onclick = async () => {
+  const btn = $("btn-now-next");
+  btn.disabled = true;
+  try {
+    await api("/api/player/next", {});
+    repollAfterPlaybackChange();
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+$("now-input-switch").onchange = async (e) => {
+  const id = e.target.value;
+  if (!id) return;
+  try {
+    await api("/api/player/play", { input_id: id });
+    toast("starting…");
+    repollAfterPlaybackChange();
+  } catch (err) {
+    toast(err.message);
+    e.target.value = nowState?.context?.id || "";
+  }
+};
+
 function renderNow() {
   const d = nowState;
   $("btn-undo-now").disabled = nowActions === 0;
+  paintNowControls(d);
   if (d.needs_reauth) {
     $("now-context").textContent = "";
     $("now-card").innerHTML =
@@ -391,7 +441,7 @@ function renderNow() {
     });
     if (!d.suggestions.length) body += '<p class="hint">No confident match — use More…</p>';
     body += `<div class="minor-actions">
-      <button id="btn-now-more"><kbd>m</kbd> More…</button>
+      <button id="btn-now-more"><kbd>m</kbd> Add to…</button>
       ${ctx?.is_input ? '<button id="btn-now-remove" class="danger"><kbd>r</kbd> Remove from input</button>' : ""}
     </div>`;
     const chips = (d.inputs || []).map((l) =>

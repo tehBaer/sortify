@@ -53,6 +53,10 @@ class ConfigIn(BaseModel):
     home_ids: list[str] = []
 
 
+class PlayIn(BaseModel):
+    input_id: str
+
+
 class ActIn(BaseModel):
     action: str  # "move" | "remove"
     uri: str
@@ -218,8 +222,12 @@ def _cached_tracks(pid: str, snapshot_id: str | None) -> list[dict]:
 
 
 def _known_artists() -> dict[str, dict]:
-    """Cached artist genres only — never fetches. Artist-overlap scoring works
-    without genres; the background enricher fills them in within budget."""
+    """Whatever artist data is already cached — never fetches.
+
+    Every entry has empty genres and always will: the Feb-2026 dev-mode API
+    dropped the `genres` field from /artists/{id}. Scoring is therefore pure
+    artist overlap, and suggest.py's genre cosine is a dead branch.
+    """
     return store.cache()["artists"]
 
 
@@ -418,20 +426,9 @@ def now_playing(force: bool = False):
 
     state = _ensure_profiles()
     track = np["track"]
-    # Targeted fetch for just the playing track's artists (≤ a handful of
-    # calls, keeps the current card's genre reasons sharp).
-    missing = [a["id"] for a in track["artists"] if a.get("id") and a["id"] not in state["artist_info"]]
-    if missing:
-        try:
-            fetched = sp.artists_genres(missing)
-        except SpotifyError:
-            fetched = {}
-        if fetched:
-            state["artist_info"].update(fetched)
-            cache = store.cache()
-            cache["artists"].update(fetched)
-            store.save_cache(cache)
-
+    # There used to be a targeted artist fetch here to sharpen the card's genre
+    # reasons. It cost a call per unseen artist to learn nothing: the dev-mode
+    # API no longer returns genres at all.
     sortable = track["type"] == "track" and not track["is_local"] and track.get("id")
     ctx_id = np["context_playlist_id"]
     ctx = next((p for p in state["playlists"] if p["id"] == ctx_id), None)
@@ -453,6 +450,52 @@ def now_playing(force: bool = False):
             for l in state["inputs"]
         ],
     }
+
+
+# ---- playback control ------------------------------------------------------
+
+
+def _playback_call(fn, *args) -> dict:
+    """Run a playback call, translating the two failures that actually happen.
+
+    Both are ordinary states rather than faults — a token issued before the
+    playback scope existed, and nothing currently playing anywhere — and both
+    are actionable, so neither should reach the user as a raw Spotify error.
+    """
+    try:
+        fn(*args)
+    except SpotifyError as e:
+        if e.status in (401, 403):
+            raise HTTPException(
+                400,
+                "Spotify hasn't granted playback control yet — log in again "
+                "(the scope is new) and retry.",
+            )
+        if e.status == 404:
+            raise HTTPException(
+                400,
+                "No active Spotify device — start playing something in Spotify first.",
+            )
+        raise
+    # The now-cache predicts what Spotify would say; we just made that
+    # prediction wrong, and force=1 alone would not help — it still serves the
+    # cache inside NOW_FORCE_MIN_INTERVAL.
+    with _now_lock:
+        _now_cache["at"] = 0.0
+    return {"ok": True}
+
+
+@app.post("/api/player/next")
+def player_next():
+    return _playback_call(sp.skip_next)
+
+
+@app.post("/api/player/play")
+def player_play(body: PlayIn):
+    if body.input_id == LIKED_ID:
+        # Liked Songs has no playlist id, so there is no context_uri for it.
+        raise HTTPException(400, "Liked Songs can't be started as a playlist — play it from Spotify.")
+    return _playback_call(sp.play_context, body.input_id)
 
 
 # ---- actions ---------------------------------------------------------------
@@ -556,81 +599,6 @@ def undo():
         remove_from=entry["to_id"] if entry["added"] else None,
     )
     return {"ok": True, "restored_to": entry["from_id"]}
-
-
-# ---- background genre enricher ----------------------------------------------
-
-
-# One artist at a time, minutes apart. Proactive traffic is the only thing
-# that can earn a multi-hour 429 while nobody is even using the app, so it
-# gets the slowest pace that still makes progress.
-ENRICH_INTERVAL = 300     # seconds between proactive artist fetches
-ENRICH_IDLE_SLEEP = 1800  # recheck interval while blocked or out of work
-
-
-def _next_missing_artist() -> str | None:
-    """One artist id from the cached playlists that has no genres yet."""
-    cache = store.cache()
-    known = cache["artists"]
-    for pl in cache["playlists"].values():
-        for t in pl["tracks"]:
-            for a in t["artists"]:
-                aid = a.get("id")
-                if aid and aid not in known:
-                    return aid
-    return None
-
-
-def _genre_enricher():
-    """Slowly backfill artist genres from cached playlists.
-
-    Deliberately glacial: one artist every few minutes, a few dozen a day,
-    silent for hours after any cooldown, and yielding entirely once the user's
-    own traffic is underway. Suggestions already score on artist overlap
-    without genres — this only sharpens the stated reasons, so it is never
-    worth a single minute of rate-limit penalty.
-
-    It also narrates itself into the server log: a background job that spends
-    the user's quota invisibly is exactly how a multi-hour ban becomes a
-    mystery to the person who did nothing but open the app.
-    """
-    while True:
-        try:
-            reason = sp.background_block_reason()
-            if reason:
-                log.info("genre enricher idle — %s", reason)
-                time.sleep(ENRICH_IDLE_SLEEP)
-                continue
-            aid = _next_missing_artist()
-            if aid is None:
-                log.info("genre enricher idle — every cached artist has genres")
-                time.sleep(ENRICH_IDLE_SLEEP)
-                continue
-            fetched = sp.artists_genres([aid], background=True)
-            if fetched:
-                cache = store.cache()
-                cache["artists"].update(fetched)
-                store.save_cache(cache)
-                if _profile_state.get("artist_info") is not None:
-                    _profile_state["artist_info"].update(fetched)
-                log.info(
-                    "genre enricher: %s done (%d/%d background calls today)",
-                    aid, sp.background_spent(), BACKGROUND_DAILY_CAP,
-                )
-            time.sleep(ENRICH_INTERVAL)
-        except SpotifyError as e:
-            # Covers hitting a cap and walking into a fresh cooldown alike.
-            # Back off hard; background_block_reason decides when to resume.
-            log.warning("genre enricher backing off — %s", e)
-            time.sleep(ENRICH_IDLE_SLEEP)
-        except Exception:
-            log.exception("genre enricher error")
-            time.sleep(ENRICH_IDLE_SLEEP)
-
-
-@app.on_event("startup")
-def _start_enricher():
-    threading.Thread(target=_genre_enricher, daemon=True, name="genre-enricher").start()
 
 
 # ---- static ----------------------------------------------------------------
