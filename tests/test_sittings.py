@@ -382,11 +382,17 @@ def test_finish_racing_the_in_flight_create_playlist_leaves_no_litter(client, mo
     assert Store().splits()["splits"]["PL1"]["active_sitting"] is None
 
 
-def test_finish_racing_the_add_loop_stops_early_and_unfollows(client, monkeypatch):
+def test_finish_racing_the_add_loop_stops_early_without_a_redundant_unfollow(client, monkeypatch):
     """A concurrent finish clears active_sitting partway through the add
     loop. The remaining adds must not run — burning ~24 calls into a
-    playlist nobody can reach anymore — and the playlist must still end up
-    unfollowed rather than orphaned."""
+    playlist nobody can reach anymore — and the record must stay clear.
+
+    Unlike the create_playlist race above, this one must NOT call unfollow
+    again: by this point playlist_id was already successfully recorded into
+    the reservation, and finish_sitting only ever clears a reservation after
+    unfollowing whatever non-None playlist_id it found — so the concurrent
+    finish that cleared this one already unfollowed NEW1 itself. A second
+    unfollow call here would just spend a call to get a 404 back."""
     added = []
 
     def flaky_add(pid, uri):
@@ -405,7 +411,7 @@ def test_finish_racing_the_add_loop_stops_early_and_unfollows(client, monkeypatc
     # 6 tracks total for this pile/target; the loop must have stopped well
     # short of all of them once the reservation vanished after the 3rd.
     assert len(added) < 6
-    assert client.calls[-1] == ("unfollow", "NEW1")
+    assert not any(c[0] == "unfollow" for c in client.calls)
     assert Store().splits()["splits"]["PL1"]["active_sitting"] is None
 
 
@@ -421,4 +427,107 @@ def test_uninterrupted_sitting_still_completes_normally(client):
     assert len(body["uris"]) == 6
     active = Store().splits()["splits"]["PL1"]["active_sitting"]
     assert active == {"playlist_id": "NEW1", "pile_id": "p1", "uris": body["uris"],
-                      "started_at": active["started_at"]}
+                      "started_at": active["started_at"], "claim": active["claim"]}
+
+
+# ---- Fix Round 3 -------------------------------------------------------
+#
+# New Important, found by re-review of round 2: the claim token was
+# `_now_iso()`, whole-second resolution. Two reservations for the SAME
+# playlist minted within one wall-clock second (a zero-cost finish — no
+# unfollow call when playlist_id is still None — immediately followed by a
+# fresh start) compared equal, so a losing reservation's post-network write
+# could land on a winning one's record instead of being refused: exactly the
+# unfindable-litter outcome the round-1/round-2 fixes exist to close, coming
+# back through the one gap a second-resolution token leaves open. Fixed by
+# minting `claim` as a uuid4 instead of reusing the human-readable
+# `started_at` timestamp for identity.
+
+
+def test_reservations_in_the_same_wall_clock_second_do_not_collide(client, monkeypatch):
+    """Forces exactly the scenario a whole-second token cannot distinguish:
+    A reserves, its create_playlist is in flight, a finish clears A's
+    reservation (free — playlist_id is still None, so finish doesn't even
+    call unfollow), and B starts and fully completes a fresh sitting — all
+    inside one _now_iso() tick. Freezes _now_iso so the two reservations'
+    `started_at` really would be byte-identical if that were still the
+    claim; only `claim` (a uuid4, unaffected by freezing the clock) can
+    tell them apart.
+
+    B's own start_sitting call re-enters this same fake create_playlist
+    (it's the only one installed), so the fake distinguishes A's call
+    (the first, outer one, which triggers the race) from B's (the second,
+    nested one, which must behave like an ordinary create_playlist so B's
+    sitting completes normally) with a simple counter.
+    """
+    monkeypatch.setattr(appmod, "_now_iso", lambda: "2026-08-17T12:00:00Z")
+    calls_made = []
+
+    def create_then_race(name, description=""):
+        calls_made.append(name)
+        if len(calls_made) > 1:
+            return "NEW-B"  # B's own (nested) create_playlist call
+        # A's call: while it's "in flight", simulate a concurrent finish
+        # (free — A's playlist_id is still None, so finish doesn't even
+        # call unfollow) followed by a concurrent fresh start_sitting, all
+        # inside the same _now_iso() second.
+        s = Store()
+        payload = s.splits()
+        payload["splits"]["PL1"]["active_sitting"] = None
+        s.save_splits(payload)
+        inner = client.post("/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30})
+        assert inner.status_code == 200  # B must complete cleanly
+        return "NEW-A"
+
+    monkeypatch.setattr(appmod.sp, "create_playlist", create_then_race)
+    r = client.post("/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30})
+
+    # A must lose cleanly (409, its own playlist unfollowed) rather than
+    # silently overwrite B's now-active, genuinely-in-progress reservation.
+    assert r.status_code == 409
+    assert ("unfollow", "NEW-A") in client.calls
+
+    active = Store().splits()["splits"]["PL1"]["active_sitting"]
+    assert active is not None
+    assert active["playlist_id"] == "NEW-B"  # B's record survives untouched
+    assert "NEW-A" not in str(active)  # A never landed in the record at all
+
+
+# Residual flagged alongside the token fix: _abandon_orphaned_playlist's own
+# unfollow call can itself fail (429, 5xx — anything but "already gone").
+# Previously that just propagated as a 502 and dropped the playlist with no
+# record anywhere. _recover_orphan now re-stamps a fresh reservation for it
+# instead, so a later finish can still find and clean it up.
+
+
+def test_abandon_unfollow_failure_restamps_a_findable_reservation(client, monkeypatch):
+    def create_then_lose_race(name, description=""):
+        s = Store()
+        payload = s.splits()
+        payload["splits"]["PL1"]["active_sitting"] = None  # the "finish"
+        s.save_splits(payload)
+        return "NEW1"
+
+    def failing_unfollow(pid):
+        raise SpotifyError(500, "upstream hiccup")
+
+    monkeypatch.setattr(appmod.sp, "create_playlist", create_then_lose_race)
+    monkeypatch.setattr(appmod.sp, "unfollow_playlist", failing_unfollow)
+
+    r = client.post("/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30})
+    assert r.status_code == 502  # the caller's own attempt still failed
+
+    # But the playlist was not simply dropped: a fresh reservation exists
+    # for it, findable by a later finish.
+    active = Store().splits()["splits"]["PL1"]["active_sitting"]
+    assert active is not None
+    assert active["playlist_id"] == "NEW1"
+
+    # And finish can actually clean it up once unfollow works again.
+    monkeypatch.setattr(appmod.sp, "unfollow_playlist",
+                        lambda pid: client.calls.append(("unfollow", pid)))
+    client.calls.clear()
+    r2 = client.post("/api/split/PL1/sitting/finish")
+    assert r2.status_code == 200
+    assert client.calls == [("unfollow", "NEW1")]
+    assert Store().splits()["splits"]["PL1"]["active_sitting"] is None
