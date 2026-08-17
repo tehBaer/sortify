@@ -1,0 +1,301 @@
+"""Last.fm tag layer.
+
+Spotify stopped returning artist genres in development mode — all 717 cached
+artists come back with genres: []. Tags therefore come from Last.fm, which
+covered 29 of 30 sampled artists from this library.
+
+This module has its own HTTP client and its own rate limiter, so tag traffic
+can never be routed through the Spotify budget (or Spotify traffic through
+Last.fm's limiter). tests/test_tags.py asserts that this module never imports
+the Spotify layer, not even transitively.
+
+`enrich` stores tags exactly as Last.fm returned them. Hygiene (`clean_tags`)
+runs at split time instead, because `data/tags.json` is a permanent cache that
+is never re-fetched: anything filtered out here would be unrecoverable without
+~700 fresh requests, and the stoplist and thresholds are certain to need
+tuning once the whole library is visible.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import httpx
+
+# Tags that survive the count floor but say nothing about how music sounds.
+# Every entry here was observed in a real probe of this user's library.
+_JUNK = {
+    "all", "misc", "x", "seen live", "favorites", "favourites", "my music",
+    "albums i own", "under 2000 listeners", "spotify", "10s", "00s", "90s",
+    "80s", "70s", "60s",
+}
+
+_DESCRIPTORS = {
+    "female vocalists", "male vocalists", "female vocalist", "male vocalist",
+    "female fronted", "singer-songwriter women", "oldies", "beautiful",
+    "chill", "cool", "awesome", "love", "sexy", "catchy", "melancholic",
+}
+
+# Nationalities, countries and cities. Last.fm tags these heavily, and left in
+# they produce piles that cut across every genre ("Norwegian", "dutch").
+_PLACES = {
+    "african", "american", "argentina", "australia", "australian", "austrian",
+    "belgian", "brazil", "brazilian", "british", "canada", "canadian", "chile",
+    "china", "chinese", "colombia", "cuba", "cuban", "czech", "danish",
+    "denmark", "dutch", "egypt", "england", "english", "estonian", "ethiopia",
+    "ethiopian", "finland", "finnish", "france", "french", "german", "germany",
+    "greece", "greek", "hungarian", "iceland", "icelandic", "india", "indian",
+    "indonesia", "iran", "iranian", "ireland", "irish", "israel", "israeli",
+    "italian", "italy", "jamaica", "jamaican", "japan", "japanese", "korea",
+    "korean", "latvian", "lebanon", "lithuanian", "mali", "mexican", "mexico",
+    "morocco", "netherlands", "new zealand", "niger", "nigeria", "nigerian",
+    "norway", "norwegian", "oslo", "peru", "poland", "polish", "portugal",
+    "portuguese", "romania", "russia", "russian", "scotland", "scottish",
+    "senegal", "serbia", "slovenia", "south africa", "spain", "spanish",
+    "sweden", "swedish", "swiss", "switzerland", "taiwan", "thailand",
+    "trondheim", "tunisia", "turkey", "turkish", "uk", "ukraine", "usa",
+    "venezuela", "vietnam", "wales", "welsh",
+}
+
+_STOPLIST = _JUNK | _DESCRIPTORS | _PLACES
+
+
+def _weight(item: dict) -> int:
+    try:
+        return int(item.get("count", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def clean_tags(
+    raw: list[dict], artist_name: str, floor: int = 10, keep: int = 8
+) -> list[tuple[str, int]]:
+    """Filter Last.fm's raw top tags down to usable genre signal.
+
+    Applied in order: drop below `floor`, drop the stoplist, drop tags that
+    overlap the artist's own name (catches self-tags and label names), keep
+    the top `keep` by weight.
+
+    `raw` is Last.fm's own shape — `[{"name": ..., "count": ...}, ...]` — which
+    is what `enrich` stores verbatim. This runs at split time, not fetch time,
+    so `floor`, `keep` and the stoplist can all be retuned for free.
+
+    The name filter only drops a tag that *is* the artist name, or that
+    *contains* it ("Shimshai Live"). The reverse direction — tag contained in
+    the artist name — was measured against the 720 real artists in
+    `data/cache.json` and cost 20 of them their primary genre: Jaga Jazzist
+    lost `jazz`, Funkadelic lost `funk`, The Moody Blues lost `blues`.
+    """
+    name_l = (artist_name or "").strip().lower()
+    out: list[tuple[str, int]] = []
+    for item in raw:
+        tag = (item.get("name") or "").strip()
+        if not tag:
+            continue
+        w = _weight(item)
+        if w < floor:
+            continue
+        low = tag.lower()
+        if low in _STOPLIST:
+            continue
+        if name_l and (low == name_l or (len(name_l) >= 4 and name_l in low)):
+            continue
+        out.append((tag, w))
+    out.sort(key=lambda tw: (-tw[1], tw[0].lower()))
+    return out[:keep]
+
+
+class LastFmError(Exception):
+    """Raised when Last.fm returns an error (other than artist not found).
+
+    `partial` carries whatever `enrich` had already verified when it aborted,
+    so a transient failure 600 artists into a 700-artist run does not throw
+    those 600 answers away. It is None for errors raised outside `enrich`.
+    """
+
+    def __init__(self, message: str, partial: dict | None = None):
+        super().__init__(message)
+        self.partial = partial
+
+
+API = "https://ws.audioscrobbler.com/2.0/"
+KEY_PATH = Path.home() / "state" / "sortify" / "lastfm.json"
+
+# Last.fm's stated ceiling is 5 requests/second. Sit below it: this is a
+# courtesy limit on someone else's free service, not a budget to spend.
+MIN_INTERVAL = 0.25
+
+# Last.fm code 6 is documented as "Invalid parameters - your request is
+# missing a required parameter"; artist.getTopTags also reuses it for an
+# unknown artist, and the two are told apart only by the message text. Treat
+# it as a miss ONLY when the message says so — a malformed request (e.g. an
+# empty api_key) otherwise writes `miss: true` for every artist in the
+# library, permanently. Every other code (10: invalid key, 26: suspended,
+# 29: rate limit, 8/11/16: service) raises for the same reason.
+NOT_FOUND_CODE = 6
+_NOT_FOUND_PHRASES = ("not be found", "not found")
+
+
+def _looks_like_not_found(message: str) -> bool:
+    low = (message or "").lower()
+    return any(p in low for p in _NOT_FOUND_PHRASES)
+
+
+def load_key(path: Path | None = None) -> str | None:
+    """Read the API key from ~/state/sortify/lastfm.json.
+
+    Deliberately outside the repo: data/config.json sits next to
+    version-controlled files.
+    """
+    p = Path(path or KEY_PATH)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    # Only accept a dict with a non-empty string api_key.
+    if not isinstance(data, dict):
+        return None
+    key = data.get("api_key")
+    if isinstance(key, str) and key:
+        return key
+    return None
+
+
+@dataclass(frozen=True)
+class ArtistTags:
+    """One artist's answer from Last.fm.
+
+    `matched_name` is what Last.fm says it actually matched
+    (`toptags.@attr.artist`), which `autocorrect=1` may quietly change — this
+    library has 13 artists of three characters or fewer (`Air`, `C2C`, `OM`),
+    prime collision targets. None when the response did not say.
+    """
+
+    matched_name: str | None
+    tags: list[dict] = field(default_factory=list)
+
+
+class LastFm:
+    """Minimal Last.fm client with its own rate limiter.
+
+    `sleep` and `client` are injectable so tests run without network or delay.
+    """
+
+    def __init__(self, key: str, sleep=time.sleep, client=None):
+        # A blank key is not a runtime hiccup, it is a misconfiguration:
+        # load_key() returns None when the state file is missing or renamed,
+        # and httpx renders that as an empty api_key, which Last.fm rejects
+        # with code 6 — the same code as "artist not found".
+        if not isinstance(key, str) or not key.strip():
+            raise LastFmError(
+                "Last.fm API key is missing or blank "
+                f"(expected a non-empty string, got {key!r}); see {KEY_PATH}"
+            )
+        self.key = key
+        self._sleep = sleep
+        self._client = client or httpx.Client(
+            headers={"User-Agent": "sortify/0.1 (+https://github.com/local/sortify)"}
+        )
+
+    def top_tags(self, artist_name: str) -> ArtistTags | None:
+        """Raw top tags for an artist, or None if Last.fm has no such artist.
+
+        Tags come back exactly as Last.fm sent them, unfiltered — see the
+        module docstring. Raises on anything other than a genuine "artist not
+        found", so that service errors, rate limits, malformed requests or
+        auth failures abort the batch loudly rather than writing false
+        permanent misses to a cache that is never re-fetched.
+        """
+        if not isinstance(artist_name, str) or not artist_name.strip():
+            raise LastFmError(f"artist name must be a non-empty string, got {artist_name!r}")
+        self._sleep(MIN_INTERVAL)
+        resp = self._client.get(
+            API,
+            params={
+                "method": "artist.getTopTags",
+                "artist": artist_name,
+                "api_key": self.key,
+                "format": "json",
+                "autocorrect": "1",
+            },
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise LastFmError(f"Last.fm returned a non-object body: {type(data).__name__}")
+        if "error" in data:
+            error_code = data.get("error")
+            error_msg = data.get("message", "")
+            try:
+                code = int(error_code)  # Last.fm has been seen stringifying it
+            except (TypeError, ValueError):
+                code = None
+            if code == NOT_FOUND_CODE and _looks_like_not_found(error_msg):
+                return None
+            raise LastFmError(f"Last.fm error {error_code}: {error_msg}")
+        # A 200 with no `toptags` at all is a broken response (a CDN
+        # maintenance page, say), not an artist without tags. Treating the two
+        # alike would record every artist after that point as tagless forever.
+        toptags = data.get("toptags")
+        if not isinstance(toptags, dict):
+            raise LastFmError(
+                f"Last.fm response for {artist_name!r} has no usable 'toptags' object"
+            )
+        tags = toptags.get("tag", [])
+        # Last.fm collapses a single tag into an object rather than a list.
+        if isinstance(tags, dict):
+            tags = [tags]
+        if not isinstance(tags, list):
+            raise LastFmError(f"Last.fm returned a non-list 'tag' for {artist_name!r}")
+        attr = toptags.get("@attr")
+        matched = attr.get("artist") if isinstance(attr, dict) else None
+        return ArtistTags(matched_name=matched if isinstance(matched, str) else None,
+                          tags=[t for t in tags if isinstance(t, dict)])
+
+
+def _store_tags(raw: list[dict]) -> list[dict]:
+    """Normalise Last.fm's tag list to name+count. Nothing is dropped."""
+    return [{"name": (item.get("name") or "").strip(), "count": _weight(item)}
+            for item in raw]
+
+
+def enrich(artist_names: dict[str, str], cached: dict, fm: LastFm, now: str) -> dict:
+    """Fetch tags for artists not already in `cached`. Returns the merged map.
+
+    `cached` is the **inner** artists map from `data/tags.json`
+    (`Store.tag_artists()`), not the versioned envelope — passing the envelope
+    would match no artist ids and silently re-fetch the whole library.
+
+    Tags are stored raw and unfiltered; `split.split_tracks` applies
+    `clean_tags`. Misses are recorded as `miss: true` so they are never asked
+    about again — at ~3% of artists, re-asking every split would be pure waste.
+
+    On failure the exception carries `.partial`: the map as it stood, holding
+    only verified-good entries plus whatever was already cached. Callers should
+    persist it rather than discard several hundred answered requests.
+    """
+    out = dict(cached)
+    for aid, name in artist_names.items():
+        if aid in out:
+            continue
+        try:
+            got = fm.top_tags(name)
+        except LastFmError as exc:
+            exc.partial = out
+            raise
+        except Exception as exc:  # transport errors, bad JSON, anything
+            raise LastFmError(f"tag fetch failed for {name!r}: {exc}", partial=out) from exc
+        if got is None:
+            out[aid] = {"name": name, "lastfm_name": None, "tags": [],
+                        "fetched_at": now, "miss": True}
+        else:
+            out[aid] = {"name": name, "lastfm_name": got.matched_name,
+                        "tags": _store_tags(got.tags),
+                        "fetched_at": now, "miss": False}
+    return out
