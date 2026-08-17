@@ -38,10 +38,17 @@ import tempfile
 import threading
 import time
 
-os.environ.setdefault("SORTIFY_DATA_DIR", tempfile.mkdtemp(prefix="sortify-fuzz-"))
-os.environ.setdefault(
-    "SPOTIFY_ACCOUNT_LEDGER",
-    os.path.join(tempfile.mkdtemp(prefix="sortify-fuzz-ledger-"), "account-ledger.json"),
+# Assigned, never setdefault. This file is not pytest-collected (no `test_`
+# prefix), so tests/conftest.py never runs for it and these two lines are the
+# only thing standing between the fuzzer and the live data directory. With
+# SORTIFY_DATA_DIR already exported — which it is in any shell used to run the
+# real app — setdefault would honour it, and `_seed_state` would overwrite the
+# user's actual splits.json and cache.json: the real split, and every keep/
+# reject decision recorded in it, gone. A throwaway directory is the only
+# correct value here regardless of the environment, so it is not negotiable.
+os.environ["SORTIFY_DATA_DIR"] = tempfile.mkdtemp(prefix="sortify-fuzz-")
+os.environ["SPOTIFY_ACCOUNT_LEDGER"] = os.path.join(
+    tempfile.mkdtemp(prefix="sortify-fuzz-ledger-"), "account-ledger.json"
 )
 
 from fastapi.testclient import TestClient  # noqa: E402

@@ -164,6 +164,43 @@ def test_get_split_404s_when_absent(client):
     assert client.get("/api/split/NOPE").status_code == 404
 
 
+def test_get_split_spends_no_api_calls(client, monkeypatch):
+    """GET /api/split is documented as costing 0 Spotify calls, and the whole
+    UI leans on that: the split view re-reads it on every open, startSitting
+    re-reads it after a failure, and finishSitting re-reads it on the
+    cleared:false path. Nothing pinned the claim — adding a
+    `sp.my_playlists(refresh=True)` to the endpoint left the suite green,
+    and that is ~21 paginated calls (a ~60s WINDOW_CAP stall) on every one of
+    those paths.
+
+    Guarded at Spotify.request(), the single chokepoint every call funnels
+    through, rather than at the handful of methods this endpoint happens not
+    to call today — see test_recluster_spends_no_api_calls for the same
+    reasoning, including why the fixture's pure-stand-in fakes have to be
+    removed first for the guard to be reachable at all.
+    """
+    client.post("/api/split/PL1")
+    before = dict(client.calls)
+
+    monkeypatch.delattr(appmod.sp, "playlist_tracks", raising=False)
+    monkeypatch.delattr(appmod.sp, "my_playlists", raising=False)
+
+    def fail(*a, **kw):
+        raise AssertionError("GET /api/split must not touch the Spotify API")
+
+    monkeypatch.setattr(appmod.sp, "request", fail)
+
+    r = client.get("/api/split/PL1")
+    assert r.status_code == 200
+    assert len(r.json()["piles"]) == 2
+    assert client.calls == before
+
+    # The 404 path is free too — it is what the split view hits before a
+    # playlist has ever been split, i.e. the most frequent call of all.
+    assert client.get("/api/split/NOPE").status_code == 404
+    assert client.calls == before
+
+
 def test_split_rejects_an_unknown_playlist_without_spending_a_call(client):
     r = client.post("/api/split/NOT-IN-LISTING")
     assert r.status_code == 404

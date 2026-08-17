@@ -141,6 +141,41 @@ def test_api_playlists_reports_when_the_list_was_last_read(monkeypatch):
     assert appmod.playlists()["fetched_at"] == 1_700_000_000.0
 
 
+def test_api_playlists_spends_no_api_calls_when_the_list_is_cached(monkeypatch):
+    """The Playlists view is opened constantly — nav-lists, ‹ Back from
+    triage, ‹ Back from a split, and once more after every Refresh — so
+    /api/playlists costing 0 Spotify calls is load-bearing, not incidental.
+    Nothing pinned it: adding `refresh=True` to the `sp.my_playlists()` call
+    in the endpoint left the whole suite green, and that is ~21 paginated
+    calls (a ~60s WINDOW_CAP stall) on every single one of those opens.
+
+    Unlike the other tests here, this one runs the REAL my_playlists so the
+    cache-hit path is what is under test, and guards Spotify.request() — the
+    chokepoint every upstream call funnels through — so any call at all, by
+    any method, current or future, fails the test rather than only the ones
+    this endpoint happens to make today.
+    """
+    from sortify import app as appmod
+
+    cache = appmod.store.cache()
+    cache["playlist_list"] = {
+        "fetched_at": 1_700_000_000.0,
+        "items": [{"id": "PLX", "name": "PLX", "owner": "me", "editable": True,
+                   "total": 3, "snapshot_id": "snap-x", "image": None}],
+    }
+    appmod.store.save_cache(cache)
+
+    def fail(*a, **kw):
+        raise AssertionError("GET /api/playlists must not touch the Spotify API")
+
+    monkeypatch.setattr(appmod.sp, "request", fail)
+
+    out = appmod.playlists()
+
+    assert [p["id"] for p in out["playlists"]] == ["liked", "PLX"]
+    assert out["fetched_at"] == 1_700_000_000.0
+
+
 def test_api_refresh_reports_what_it_spent(monkeypatch):
     """Refresh is the one user action that can burst — the listing plus a
     re-read of every home whose snapshot moved. CLAUDE.md's rule is that the
