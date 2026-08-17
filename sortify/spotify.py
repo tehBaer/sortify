@@ -559,3 +559,20 @@ class Spotify:
 
     def save_to_liked(self, uri: str) -> None:
         self.request("PUT", "/me/library", json={"uris": [uri]})
+
+    def create_playlist(self, name: str, description: str = "") -> str:
+        """Create a playlist and return its id. One call."""
+        resp = self.request(
+            "POST", "/me/playlists",
+            json={"name": name, "description": description, "public": False},
+        )
+        return (resp or {}).get("id")
+
+    def unfollow_playlist(self, playlist_id: str) -> None:
+        """Discard a whole playlist in one call.
+
+        This is why a sitting is disposable: clearing a 22-track playlist
+        track-by-track would cost 22 calls, since the Feb-2026 API has no
+        batch delete.
+        """
+        self.request("DELETE", f"/playlists/{playlist_id}/followers")

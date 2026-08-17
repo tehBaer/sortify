@@ -183,3 +183,25 @@ def split_tracks(tracks: list[dict], tags: dict, params: dict | None = None) -> 
     if untagged_uris:
         piles.append({"id": UNTAGGED, "name": "untagged", "tags": [], "uris": untagged_uris})
     return piles
+
+
+def pick_sitting(
+    uris: list[str], durations: dict[str, int], decided: dict, target_ms: int
+) -> list[str]:
+    """The next undecided tracks from a pile, in playlist order, up to target.
+
+    Order is preserved rather than shuffled so an interrupted sitting resumes
+    identically. Always returns at least one track if any remain — a single
+    track longer than the target must still be servable.
+    """
+    picked: list[str] = []
+    total = 0
+    for u in uris:
+        if u in decided:
+            continue
+        d = durations.get(u, 0)
+        if picked and total + d > target_ms:
+            break
+        picked.append(u)
+        total += d
+    return picked
