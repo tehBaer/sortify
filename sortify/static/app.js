@@ -336,6 +336,14 @@ $("nav-lists").onclick = () => { stopNowPolling(); triage = null; loadLists(); }
 // ---- now playing -----------------------------------------------------------
 
 let nowState = null;   // last /api/now payload + client flags
+// True exactly when the card on screen is an error/cooldown message rather
+// than a live track. `nowState` is deliberately NOT cleared on a failed poll
+// (the sitting bar and the toasts still want the last known truth), so it
+// alone cannot answer "is what the user is looking at current?" — and the
+// keyboard must not fire an irreversible keep against a track the screen
+// stopped showing. A keep spends a call and removes the track from every
+// future sitting; unlike /api/act there is no undo.
+let nowProblem = false;
 let nowTimer = null;
 let nowActions = 0;    // enables Undo
 let filedUris = {};    // uri -> home name we filed it to this session
@@ -384,14 +392,20 @@ function paintSittingBar() {
     ? { pileName: live.pile_name, uris: live.uris, decided: live.decided }
     : sitting;
   if (!s) { bar.hidden = true; return; }
-  const left = s.uris.filter((u) => !s.decided[u]).length;
-  $("now-sitting-status").textContent =
-    `sitting: ${s.pileName} — ${left} of ${s.uris.length} left`;
+  const uris = s.uris || [];
+  const left = uris.filter((u) => !s.decided[u]).length;
+  // A reservation whose create_playlist failed carries no tracks at all —
+  // "0 of 0 left" would read as "done", so say what it actually is. Either
+  // way the Finish button beside this text is the escape.
+  $("now-sitting-status").textContent = uris.length
+    ? `sitting: ${s.pileName} — ${left} of ${uris.length} left`
+    : `sitting: ${s.pileName} — reserved, no tracks added (finish it to release the split)`;
   bar.hidden = false;
 }
 $("btn-now-finish-sitting").onclick = () => finishSitting(nowState?.sitting?.split_id || sitting?.splitId);
 
 function renderNowProblem(msg) {
+  nowProblem = true;
   paintSittingBar();
   $("now-context").textContent = "";
   $("now-controls").hidden = true;
@@ -466,6 +480,15 @@ function syncSittingFromNow(d) {
 
 function renderNow() {
   const d = nowState;
+  // Callers that are not the poll — finishSitting's success and 404 paths,
+  // most of all — can reach this before any poll has ever succeeded, because
+  // paintSittingBar falls back to the `sitting` global and so a Finish
+  // button exists with nowState still null. Dereferencing d below then threw
+  // a TypeError that ate the success toast on one path and escaped as an
+  // unhandled rejection (from inside the catch, with nothing shown at all)
+  // on the other. The bar is the part that must still update here: the
+  // sitting it described is exactly what just went away.
+  if (!d) { paintSittingBar(); return; }
   // The server is authoritative here (see /api/now's `sitting` field): if it
   // says this poll's context is a sitting, it is one, regardless of what
   // this client remembers from before a reload. `/api/undo` knows nothing
@@ -477,6 +500,7 @@ function renderNow() {
   syncSittingFromNow(d);
   paintSittingBar();
   if (d.needs_reauth) {
+    nowProblem = true;
     $("now-context").textContent = "";
     $("now-card").innerHTML =
       `<p class="done-msg">Spotify needs one more permission (currently playing).<br>
@@ -485,6 +509,7 @@ function renderNow() {
   }
   if (d.cooldown) { renderNowProblem(d.cooldown); return; }
   if (!d.playing) {
+    nowProblem = false;
     $("now-context").textContent = "";
     $("now-card").innerHTML =
       '<p class="done-msg">Nothing playing.<br>Put something on in Spotify and it shows up here.</p>';
@@ -505,6 +530,7 @@ function renderNow() {
 
   const body = inSitting ? sittingCardBody(tr, d.sitting) : ordinaryCardBody(d, tr, ctx);
 
+  nowProblem = false;  // a real card for a real track is about to go up
   $("now-card").innerHTML = `<div class="track-card">
     ${img}
     <div class="t-name">${esc(tr.name)}</div>
@@ -676,12 +702,32 @@ async function openSplit(id, name) {
        calls if nothing's changed since the last read, otherwise about
        ${warm} — tagging them via Last.fm afterwards costs no Spotify calls
        at all.</p>
+       <p class="hint">Splitting works from the playlist listing as of the last
+       <b>Refresh</b> on the Playlists view. If you edited or created this
+       playlist in the Spotify client since then, Refresh first — otherwise
+       this reads the old track list, or says it doesn't know the playlist.</p>
        <button id="btn-do-split" class="primary">Split it (0–${warm} calls)</button>`;
     $("btn-do-split").onclick = doSplit;
   }
 }
 
+// `#split-loading` is an in-flow spinner, not an overlay, and the paid offer
+// above it is only cleared once the POST resolves — so without this the
+// button stays live for the whole ~15-call read and every extra click buys
+// another one (3 clicks measured at 42 Spotify calls against a button
+// labelled "0–15"). Same disable-and-relabel pattern as btn-refresh-lists.
+// `create_split` is the one split-family endpoint with no server-side
+// in-flight guard of its own (start_sitting reserves under _split_lock,
+// decide uses _pending_keeps), so this is the only thing standing between a
+// double-click and a doubled spend.
+let splitInFlight = false;
+
 async function doSplit() {
+  if (splitInFlight) return;
+  splitInFlight = true;
+  const btn = $("btn-do-split");
+  const label = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "Splitting… (already spending)"; }
   $("split-loading").hidden = false;
   $("split-msg").textContent = "Reading tracks, then tagging artists via Last.fm…";
   try {
@@ -711,9 +757,21 @@ async function doSplit() {
       $("btn-retry-split-load").onclick = () => openSplit(split.id, split.name);
     }
   } catch (e) {
-    toast(e.message);
+    // 404 here is not "no split yet" (that's the GET) — create_split
+    // validates the id against the cached listing, so it means the playlist
+    // isn't in the listing sortify last read. The fix is a Refresh, which
+    // is not something the raw "unknown playlist" detail says.
+    toast(e.status === 404
+      ? "Spotify's listing here doesn't have this playlist — go back and press " +
+        "Refresh on the Playlists view (it re-reads the listing), then try again"
+      : e.message, e.status === 404 ? 6000 : 2600);
   } finally {
+    splitInFlight = false;
     $("split-loading").hidden = true;
+    // Gone from the DOM on the success path (split-empty was cleared above);
+    // still there after a failure, where re-offering the spend is correct.
+    const again = $("btn-do-split");
+    if (again) { again.disabled = false; again.textContent = label; }
   }
 }
 
@@ -747,8 +805,19 @@ function applySplitData(data) {
 // free resync path (GET /api/split, local read) the design relies on — did
 // nothing for the sitting it already recognised, and two tabs on one
 // sitting would drift permanently.
+//
+// Gated on the reservation merely EXISTING, exactly like the backend
+// (start_sitting/recluster/create_split all refuse on `active_sitting`
+// truthiness alone). A reservation is written with `playlist_id: None`
+// BEFORE the first Spotify call, so a 429 landing on create_playlist —
+// this project's documented failure mode — leaves one standing with no id.
+// Also requiring an id here used to hide that reservation from every
+// surface: no bar, no Finish button, Start buttons still enabled, and every
+// one of them 409ing with "finish it first" against a Finish button that
+// existed nowhere. The server-side escape is free; it just needs a click to
+// reach it.
 function syncSitting(splitId, piles, decided, activeSitting) {
-  if (!activeSitting || !activeSitting.playlist_id) {
+  if (!activeSitting) {
     if (sitting && sitting.splitId === splitId) sitting = null;
     return;
   }
@@ -774,7 +843,12 @@ function renderPiles() {
   // live, active_sitting (which GET /api/split refreshes every time this
   // view opens, independent of whatever else the global currently points
   // at).
-  const sittingActive = !!(split.active_sitting && split.active_sitting.playlist_id);
+  //
+  // Existence alone, no playlist_id requirement — same gate the backend
+  // uses (see syncSitting). A reservation with no id still 409s every Start
+  // here, so leaving these buttons enabled only promises a spend the server
+  // will refuse.
+  const sittingActive = !!split.active_sitting;
   for (const p of split.piles) {
     const left = p.total - p.decided;
     const row = document.createElement("div");
@@ -792,28 +866,70 @@ function renderPiles() {
   renderSplitSittingBar();
 }
 
+// Shown whenever a reservation exists at all — `playlist_id` only decides
+// the wording, never whether the Finish button is reachable. A reservation
+// with no id (create_playlist failed, e.g. a 429 on the sitting's very first
+// call) is precisely the state that needs this bar most: nothing else in the
+// UI can release it, and finishing it costs 0 Spotify calls.
 function renderSplitSittingBar() {
   const bar = $("split-sitting-bar");
   const a = split.active_sitting;
-  if (!a || !a.playlist_id) { bar.hidden = true; return; }
+  if (!a) { bar.hidden = true; return; }
   const pile = split.piles.find((p) => p.id === a.pile_id);
+  const pileName = pile ? pile.name : a.pile_id;
   const uris = a.uris || [];
   const left = uris.filter((u) => !split.decided[u]).length;
-  $("split-sitting-status").textContent =
-    `Listening: ${pile ? pile.name : a.pile_id} — ${left} of ${uris.length} left. ` +
-    `Open Spotify and the Now view to keep/reject, or finish here.`;
+  $("split-sitting-status").textContent = a.playlist_id
+    ? `Listening: ${pileName} — ${left} of ${uris.length} left. ` +
+      `Open Spotify and the Now view to keep/reject, or finish here.`
+    : `A sitting on ${pileName} is reserved but its Spotify playlist was never ` +
+      `created — the call failed. Nothing was spent and nothing else can start ` +
+      `until it's cleared. Finish it here (0 Spotify calls).`;
   bar.hidden = false;
 }
 
 async function startSitting(pileId, pileName) {
+  const splitId = split.id;
   try {
-    const data = await api(`/api/split/${split.id}/sitting`, { pile_id: pileId, target_minutes: 120 });
+    const data = await api(`/api/split/${splitId}/sitting`, { pile_id: pileId, target_minutes: 120 });
     split.active_sitting = { playlist_id: data.sitting_id, pile_id: pileId, uris: data.uris };
     syncSitting(split.id, split.piles, split.decided, split.active_sitting);
     toast(`${data.uris.length} tracks (~${data.minutes} min) — open it in Spotify, ` +
           `then switch to Now to keep or reject as you go`, 4500);
     renderPiles();
-  } catch (e) { toast(e.message); }
+  } catch (e) {
+    toast(e.message);
+    // A failure here does NOT mean nothing happened. start_sitting reserves
+    // the slot under the lock before spending anything and fills in the
+    // playlist id as soon as create_playlist returns, so a 429 on add #5 of
+    // 22 leaves a live reservation AND a real ▶ playlist in the account.
+    // Toasting and leaving `split.active_sitting` null would show no sitting
+    // and enabled Start buttons over both. Re-read the split — a local,
+    // 0-call read — and let the server's answer stand.
+    try {
+      const fresh = await api(`/api/split/${splitId}`);
+      if (split && split.id === splitId) applySplitData(fresh);
+    } catch (_) {
+      // Leave the original failure on screen; a resync that fails too has
+      // nothing better to say.
+    }
+  }
+}
+
+// Finishing is a real Spotify call (one unfollow) and it is not idempotent
+// from the user's side: a second click while the first is in flight spends a
+// second unfollow, loses the compare-and-swap in finish_sitting, and comes
+// back cleared:false. Both Finish buttons are static in the DOM, so
+// disabling them by id here is enough — nothing re-renders them away.
+let finishInFlight = false;
+
+function setFinishBusy(busy) {
+  for (const id of ["btn-now-finish-sitting", "btn-split-finish-sitting"]) {
+    const b = $(id);
+    if (!b) continue;
+    b.disabled = busy;
+    b.textContent = busy ? "Finishing…" : "Finish sitting";
+  }
 }
 
 // `targetSplitId` lets a caller finish a SPECIFIC split's sitting (the Split
@@ -824,6 +940,9 @@ async function startSitting(pileId, pileName) {
 async function finishSitting(targetSplitId) {
   const finishedSplitId = targetSplitId || sitting?.splitId;
   if (!finishedSplitId) return;
+  if (finishInFlight) return;
+  finishInFlight = true;
+  setFinishBusy(true);
   try {
     const data = await api(`/api/split/${finishedSplitId}/sitting/finish`, {});
     if (data.cleared) {
@@ -837,7 +956,6 @@ async function finishSitting(targetSplitId) {
       // as "already finished" and wiping local state would make a real,
       // live sitting invisible to every surface with no pointer left
       // anywhere. Re-sync from the server (free, local) instead of guessing.
-      toast("another sitting is active on this split — finish it again");
       const fresh = await api(`/api/split/${finishedSplitId}`);
       syncSitting(finishedSplitId, fresh.piles, fresh.decided || {}, fresh.active_sitting || null);
       if (split && split.id === finishedSplitId) {
@@ -846,6 +964,14 @@ async function finishSitting(targetSplitId) {
         split.active_sitting = fresh.active_sitting || null;
         renderPiles();
       }
+      // Said only after the resync, and from what the resync found. The old
+      // wording ("finish it again") was unconditional, so the overwhelmingly
+      // common cause — a double-click, where the first click already
+      // finished everything — told the user to go spend a third unfollow on
+      // a split with nothing active on it at all.
+      toast(fresh.active_sitting
+        ? "a newer sitting is active on this split — press Finish again to end that one"
+        : "that sitting was already finished — nothing left to clear");
     }
     if (!$("view-now").hidden) renderNow();
   } catch (e) {
@@ -861,6 +987,9 @@ async function finishSitting(targetSplitId) {
     } else {
       toast(e.message);
     }
+  } finally {
+    finishInFlight = false;
+    setFinishBusy(false);
   }
 }
 
@@ -1049,7 +1178,12 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 
-  if (!$("view-now").hidden && nowState?.playing) {
+  // `nowProblem` and not just `nowState?.playing`: a failed poll leaves
+  // nowState untouched on purpose, so after e.g. a 500 from /api/now the
+  // screen shows an error card while `playing` still reads true — and `1`
+  // would fire a keep, which is final and costs a call. The card has to be
+  // showing the track a keystroke is about to decide on.
+  if (!$("view-now").hidden && !nowProblem && nowState?.playing) {
     if (nowState.sitting) {
       const dec = nowState.sitting.decided[nowState.track.uri];
       if (dec?.action === "keep") return;  // final — nothing left to press
