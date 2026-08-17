@@ -825,6 +825,93 @@ def finish_sitting(playlist_id: str):
     return {"ok": True, "cleared": cleared}
 
 
+class DecideIn(BaseModel):
+    uri: str
+    action: str  # "keep" | "reject"
+    to_id: str | None = None
+
+
+@app.post("/api/split/{playlist_id}/decide")
+def decide(playlist_id: str, body: DecideIn):
+    """Record a decision on one track from a split.
+
+    Keep costs one Spotify call (added to a home playlist, or Liked Songs);
+    reject costs none — it is recorded locally and the source playlist is
+    never touched. That asymmetry is the whole saving over the input-playlist
+    flow, which drains its source at 2 calls per decision: over 1372 tracks
+    that is ~1372 calls saved, and the original playlist survives intact as
+    an archive.
+
+    A decision is final through this endpoint once it is a *keep* —
+    correcting one means moving or removing an ordinary playlist track,
+    which is exactly what `/api/act` + `/api/undo` already do; duplicating
+    that here would be a second, hidden way to spend a call. A *reject* is
+    different: since it never touched Spotify, changing your mind about one
+    costs nothing more than deciding fresh, so a later "keep" on a
+    previously-rejected uri is honoured rather than treated as a no-op.
+    Deciding the same uri the same way twice, or trying to un-keep a keep,
+    is a no-op — the repeat call didn't cost anything to make either.
+    """
+    if body.action not in ("keep", "reject"):
+        raise HTTPException(400, f"unknown action {body.action!r}")
+    if body.action == "keep" and not body.to_id:
+        raise HTTPException(400, "keep needs to_id")
+
+    with _split_lock:
+        payload = store.splits()
+        split = payload["splits"].get(playlist_id)
+        if not split:
+            raise HTTPException(404, "no split for that playlist")
+        if not any(body.uri in p["uris"] for p in split["piles"]):
+            # Guards the remaining-count math below as much as the request
+            # itself: an out-of-pile uri would inflate `decided` without
+            # inflating `total`, corrupting "remaining" for every decision
+            # after it.
+            raise HTTPException(404, "that track is not in this split")
+
+        previous = split["decided"].get(body.uri)
+        settle = previous is None or (previous["action"] == "reject" and body.action == "keep")
+        if not settle:
+            total = sum(len(p["uris"]) for p in split["piles"])
+            return {"ok": True, "remaining": total - len(split["decided"])}
+
+        split["decided"][body.uri] = {
+            "action": body.action, "to_id": body.to_id, "at": _now_iso(),
+        }
+        store.save_splits(payload)
+        total = sum(len(p["uris"]) for p in split["piles"])
+        remaining = total - len(split["decided"])
+
+    # The Spotify call (if any) happens outside the lock — see the module
+    # note on `_split_lock`: nothing blocking may run while it is held.
+    if body.action == "keep":
+        try:
+            if body.to_id == LIKED_ID:
+                sp.save_to_liked(body.uri)
+            else:
+                _apply_snapshot(body.to_id, sp.add_to_playlist(body.to_id, body.uri))
+        except Exception:
+            # The call never landed, so the track was never actually kept.
+            # Roll the reservation back to whatever it was before (nothing,
+            # or the reject we just tried to override) so a retry finds it
+            # undecided instead of permanently, wrongly, "kept". Nothing else
+            # could have settled this uri in between (see the docstring: a
+            # "keep" entry is final to every other caller), so restoring
+            # exactly `previous` is safe.
+            with _split_lock:
+                payload = store.splits()
+                split = payload["splits"].get(playlist_id)
+                if split is not None:
+                    if previous is None:
+                        split["decided"].pop(body.uri, None)
+                    else:
+                        split["decided"][body.uri] = previous
+                    store.save_splits(payload)
+            raise
+
+    return {"ok": True, "remaining": remaining}
+
+
 # ---- now playing -----------------------------------------------------------
 
 # All tabs share one upstream currently-playing call, and the cached answer
