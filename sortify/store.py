@@ -87,3 +87,11 @@ class Store:
 
     def save_cache(self, cache: dict) -> None:
         self._save("cache.json", cache)
+
+    # tags.json: {artist_id: {name, lastfm_name, tags, fetched_at, miss}}
+    # Last.fm data, not Spotify's — kept separate from cache.json on purpose.
+    def tags(self) -> dict:
+        return self._load("tags.json", {"version": 1, "artists": {}})
+
+    def save_tags(self, payload: dict) -> None:
+        self._save("tags.json", payload)
