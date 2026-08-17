@@ -58,6 +58,15 @@ def main() -> None:
             # on a 400, and the day's dev allowance is small.
             print(f"refused: body is not valid JSON ({e})")
             sys.exit(2)
+        if not isinstance(body, dict):
+            # Every Spotify write body is a JSON object. json.loads happily
+            # accepts '5', '"x"' or 'null' as valid JSON too — none of those
+            # are a usable request body, and 'null' in particular would
+            # silently degrade into sending no body at all (the same as
+            # omitting the argument), which is not what a caller who
+            # bothered to pass one asked for.
+            print(f"refused: body must be a JSON object, got {type(body).__name__}")
+            sys.exit(2)
 
     spent = sp.budget_spent()
     if not dev_call_allowed(spent):

@@ -194,3 +194,147 @@ def test_finish_still_raises_on_a_real_spotify_error(client, monkeypatch):
     r = client.post("/api/split/PL1/sitting/finish")
     assert r.status_code == 502
     assert Store().splits()["splits"]["PL1"]["active_sitting"] is not None
+
+
+# ---- Fix Round 1 -------------------------------------------------------
+
+
+# Critical: active_sitting must be recorded before the add loop, not after,
+# so a failure partway through (a 429 landing mid-burst is the likely real
+# trigger; a process restart mid-add has the same shape) still leaves a
+# findable, finishable record instead of a real Spotify playlist sortify has
+# never heard of.
+
+
+def test_partial_add_failure_leaves_a_recoverable_record(client, monkeypatch):
+    seen = []
+
+    def flaky_add(pid, uri):
+        seen.append(uri)
+        if len(seen) == 4:
+            raise SpotifyError(429, "cooldown landed mid-burst")
+        return "snap"
+
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", flaky_add)
+    r = client.post("/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30})
+    assert r.status_code == 502
+    assert len(seen) == 4  # 3 succeeded, the 4th is what failed
+
+    # The record exists and already carries the real playlist id — recorded
+    # right after create_playlist returned, before any add was attempted.
+    active = Store().splits()["splits"]["PL1"]["active_sitting"]
+    assert active is not None
+    assert active["playlist_id"] == "NEW1"
+
+    # And it is recoverable with a single finish, exactly like any other
+    # active sitting — no special-case cleanup needed.
+    client.calls.clear()
+    r = client.post("/api/split/PL1/sitting/finish")
+    assert r.status_code == 200
+    assert client.calls == [("unfollow", "NEW1")]
+    assert Store().splits()["splits"]["PL1"]["active_sitting"] is None
+
+
+def test_finish_handles_a_reservation_whose_playlist_was_never_created(client, monkeypatch):
+    """create_playlist itself can fail (e.g. a cooldown on the very first
+    call of the sitting) after the slot is reserved but before any playlist
+    exists at all. finish must clear that reservation without trying to
+    unfollow a playlist id that was never assigned."""
+    def failing_create(name, description=""):
+        raise SpotifyError(429, "cooldown before the first call landed")
+
+    monkeypatch.setattr(appmod.sp, "create_playlist", failing_create)
+    r = client.post("/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30})
+    assert r.status_code == 502
+
+    active = Store().splits()["splits"]["PL1"]["active_sitting"]
+    assert active is not None
+    assert active["playlist_id"] is None
+
+    def unfollow_must_not_be_called(pid):
+        raise AssertionError("nothing was ever created — finish must not call unfollow")
+
+    monkeypatch.setattr(appmod.sp, "unfollow_playlist", unfollow_must_not_be_called)
+    r = client.post("/api/split/PL1/sitting/finish")
+    assert r.status_code == 200
+    assert Store().splits()["splits"]["PL1"]["active_sitting"] is None
+
+
+# Important 1: create_split/recluster must not silently wipe or race an
+# active_sitting that starts during their (Last.fm-enrichment-shaped, or —
+# for recluster — merely non-zero) window between the entry guard and the
+# final write. Covered indirectly by the entry-guard tests above; the
+# atomic recheck at the write itself has no network-timing hook to attach a
+# test to without mocking internals, so it is verified by inspection here:
+# both create_split and recluster re-read store.splits() and re-check
+# active_sitting under _split_lock immediately before writing, matching the
+# reviewer's suggested fix. The concurrency test below exercises the same
+# lock via the sitting endpoints, where a real race is easy to construct.
+
+
+# Important 2: an active_sitting request against a playlist with no cached
+# tracks must 400, not silently treat every duration as 0.
+
+
+def test_sitting_400s_with_no_cached_tracks(client):
+    s = Store()
+    cache = s.cache()
+    cache["playlists"].pop("PL1", None)
+    s.save_cache(cache)
+    r = client.post("/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30})
+    assert r.status_code == 400
+
+
+# Important 3: target_minutes has an upper bound (422), and the track count
+# is hard-capped regardless of computed target — chosen values and rationale
+# are in app.py next to SITTING_MAX_MINUTES / SITTING_MAX_TRACKS.
+
+
+def test_target_minutes_above_the_cap_is_rejected(client):
+    r = client.post(
+        "/api/split/PL1/sitting",
+        json={"pile_id": "p1", "target_minutes": appmod.SITTING_MAX_MINUTES + 1},
+    )
+    assert r.status_code == 422
+
+
+def test_sitting_hard_caps_track_count_even_when_durations_never_trip_the_target(client):
+    """A pile whose tracks have no duration data at all (e.g. a partially
+    populated cache) would otherwise never trip pick_sitting's running-total
+    check — every remaining track would come back as "the sitting". The
+    ceiling here is what keeps that from becoming a 300+ call burst."""
+    s = Store()
+    payload = s.splits()
+    payload["splits"]["PL1"]["piles"].append({
+        "id": "p2", "name": "no duration data", "tags": [],
+        "uris": [f"spotify:track:z{i}" for i in range(appmod.SITTING_MAX_TRACKS + 10)],
+    })
+    s.save_splits(payload)
+    r = client.post("/api/split/PL1/sitting", json={"pile_id": "p2", "target_minutes": 30})
+    assert r.status_code == 200
+    assert len(r.json()["uris"]) == appmod.SITTING_MAX_TRACKS
+
+
+# Important 4: two concurrent start_sitting calls (two tabs, a double-click)
+# must not both win — exactly one playlist gets created regardless of how
+# the threads interleave, because the check-and-reserve is atomic under
+# _split_lock.
+
+
+def test_concurrent_sitting_starts_yield_exactly_one_winner(client):
+    import threading
+
+    results = []
+
+    def worker():
+        r = client.post("/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30})
+        results.append(r.status_code)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert sorted(results) == [200, 409]
+    assert sum(1 for c in client.calls if c[0] == "create") == 1

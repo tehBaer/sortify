@@ -356,10 +356,18 @@ and no new proactive job is introduced.
 1. ~~**Unverified endpoints.**~~ **RESOLVED 2026-08-17 by probe — both exist.**
    A single-shot two-call probe created a playlist via `POST /me/playlists` and
    removed it via `DELETE /playlists/{id}/followers`. Both succeeded in the
-   Feb-2026 dev-mode shape. The delete returns an empty body, which `request()`
-   tolerates since `906c5ad` — before that commit this probe would have raised
-   `JSONDecodeError` on success. The throwaway playlist was removed by the probe
-   itself, so nothing was left in the account.
+   Feb-2026 dev-mode shape, and `request()` accepted the delete's response as
+   success without raising. (Correction: an earlier draft of this note claimed
+   that response was a genuinely empty body and that `request()` would have
+   raised `JSONDecodeError` on it before `906c5ad`. That's not accurate — the
+   pre-`906c5ad` code was `resp.json() if resp.content else None`, which
+   already returned `None` for a truly empty body with no exception.
+   `906c5ad`'s actual fix was for a *non-empty* body that isn't valid JSON,
+   which some Spotify acknowledge-only endpoints are known to send. Which of
+   those two shapes this particular delete returned was not distinguished by
+   the probe; either way, `request()` on this branch treats it as success.)
+   The throwaway playlist was removed by the probe itself, so nothing was
+   left in the account.
 
    The disposable-sitting design in Section 4 therefore stands at ~24 calls per
    2 h sitting, and the fallback it would otherwise have needed — one long-lived

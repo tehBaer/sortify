@@ -410,6 +410,18 @@ def _pile_progress(split: dict) -> list[dict]:
     return out
 
 
+# Guards every read-modify-write of splits.json for a single playlist. Two
+# concurrent requests (two tabs, a double-click) can otherwise both read the
+# same "no active sitting" state and both pass a check-then-act guard before
+# either has written anything — the lock makes each check-and-write atomic
+# instead. Held only around local dict/disk work, never across a Spotify or
+# Last.fm network call, so a slow Last.fm enrichment run cannot block a
+# concurrent finish. One process, in-memory lock: sortify is a single-user
+# LAN service with one server process, so this is sufficient without a
+# file-level lock.
+_split_lock = threading.Lock()
+
+
 @app.post("/api/split/{playlist_id}")
 def create_split(playlist_id: str, params: SplitParams = SplitParams()):
     """Read a playlist, tag its artists via Last.fm, cluster into piles.
@@ -472,17 +484,25 @@ def create_split(playlist_id: str, params: SplitParams = SplitParams()):
     store.save_tag_artists(artists)
 
     piles = split_tracks(tracks, artists, params.model_dump())
-    payload = store.splits()
-    prev = payload["splits"].get(playlist_id, {})
-    payload["splits"][playlist_id] = {
-        "created_at": _now_iso(),
-        "snapshot_id": snapshot_id,
-        "params": params.model_dump(),
-        "piles": piles,
-        "decided": prev.get("decided", {}),
-        "active_sitting": None,
-    }
-    store.save_splits(payload)
+    with _split_lock:
+        payload = store.splits()
+        prev = payload["splits"].get(playlist_id, {})
+        if prev.get("active_sitting"):
+            # A sitting can only have started here if the entry guard's
+            # negative answer went stale during the Last.fm walk above — the
+            # tags this run fetched are already persisted, so a retry
+            # resumes rather than re-tagging from scratch.
+            raise HTTPException(
+                409, "a sitting became active while splitting — finish it, then re-run the split")
+        payload["splits"][playlist_id] = {
+            "created_at": _now_iso(),
+            "snapshot_id": snapshot_id,
+            "params": params.model_dump(),
+            "piles": piles,
+            "decided": prev.get("decided", {}),
+            "active_sitting": None,
+        }
+        store.save_splits(payload)
     untagged = sum(len(p["uris"]) for p in piles if p["id"] == UNTAGGED)
     return {"piles": piles, "tagged": len(tracks) - untagged, "untagged": untagged}
 
@@ -505,74 +525,151 @@ def recluster(playlist_id: str, params: SplitParams = SplitParams()):
     if split.get("active_sitting"):
         # Same reasoning as create_split: new piles would leave the active
         # sitting's pile_id pointing at a partition that no longer exists.
+        # Cheap fail-fast for the common case; the real guarantee is the
+        # atomic recheck at the write below.
         raise HTTPException(409, "a sitting is active — finish it before reclustering")
     tracks = store.cache()["playlists"].get(playlist_id, {}).get("tracks", [])
     if not tracks:
         raise HTTPException(400, "no cached tracks — run the split again")
     artists = _tag_artists_checked()
-    split["piles"] = split_tracks(tracks, artists, params.model_dump())
-    split["params"] = params.model_dump()
-    store.save_splits(payload)
+    new_piles = split_tracks(tracks, artists, params.model_dump())
+
+    with _split_lock:
+        payload = store.splits()
+        split = payload["splits"].get(playlist_id)
+        if not split:
+            raise HTTPException(404, "no split for that playlist")
+        if split.get("active_sitting"):
+            # A sitting started in the window between the guard above and
+            # this write (narrow — no network call sits in between it, only
+            # local clustering — but not zero).
+            raise HTTPException(
+                409, "a sitting became active while reclustering — finish it, then try again")
+        split["piles"] = new_piles
+        split["params"] = params.model_dump()
+        store.save_splits(payload)
     return {"piles": _pile_progress(split)}
+
+
+# Structural ceilings on a sitting, independent of each other:
+#   - SITTING_MAX_MINUTES bounds the *requested* duration, so a caller can't
+#     ask for an absurd target (100000 minutes) and get an absurd burst back.
+#   - SITTING_MAX_TRACKS bounds the *actual* track count no matter what
+#     target_minutes says or what the cached durations look like. A pile
+#     whose tracks are all missing duration_ms (no cache entry ever
+#     populates a genuine 0, but a stale/partial one could) would otherwise
+#     never trip pick_sitting's duration check at all — every remaining
+#     track in a 300-track pile would come back as "the sitting", i.e. 301
+#     calls in one burst. 40 is roughly double the ~22-track 2h default, so
+#     it does not constrain a normal sitting; it exists purely as the floor
+#     under which "per sitting" stops being a documented property of this
+#     code and starts being a property of nothing.
+SITTING_MAX_MINUTES = 360  # 6 h
+SITTING_MAX_TRACKS = 40    # calls per sitting <= 1 create + 40 add + 1 finish = 42
 
 
 class SittingIn(BaseModel):
     pile_id: str
-    target_minutes: int = Field(120, gt=0)
+    target_minutes: int = Field(120, gt=0, le=SITTING_MAX_MINUTES)
 
 
 @app.post("/api/split/{playlist_id}/sitting")
 def start_sitting(playlist_id: str, body: SittingIn):
-    """Materialise one sitting as a disposable playlist. ~24 calls at 2 h."""
-    payload = store.splits()
-    split = payload["splits"].get(playlist_id)
-    if not split:
-        raise HTTPException(404, "no split for that playlist")
-    if split.get("active_sitting"):
-        raise HTTPException(409, "a sitting is already active — finish it first")
+    """Materialise one sitting as a disposable playlist. ~24 calls at 2 h,
+    structurally capped at 1 + SITTING_MAX_TRACKS + 1 regardless of input.
 
-    pile = next((p for p in split["piles"] if p["id"] == body.pile_id), None)
-    if not pile:
-        raise HTTPException(404, "no such pile")
+    The sitting is recorded (with the playlist id, as soon as it exists) in
+    two short, lock-protected writes around the actual API calls rather than
+    one write at the very end: a failure partway through the add loop — a
+    429 cooldown landing on track 5 of 22 is the likely real case, but a
+    process restart mid-add has the same shape — must still leave a
+    findable, finishable record. Recording only at the end would instead
+    leave a real playlist in the account that sortify has never heard of and
+    can never unfollow.
+    """
+    with _split_lock:
+        payload = store.splits()
+        split = payload["splits"].get(playlist_id)
+        if not split:
+            raise HTTPException(404, "no split for that playlist")
+        if split.get("active_sitting"):
+            raise HTTPException(409, "a sitting is already active — finish it first")
 
-    tracks = store.cache()["playlists"].get(playlist_id, {}).get("tracks", [])
-    durations = {t["uri"]: t.get("duration_ms") or 0 for t in tracks}
-    uris = pick_sitting(pile["uris"], durations, split.get("decided", {}),
-                        body.target_minutes * 60 * 1000)
-    if not uris:
-        raise HTTPException(400, "that pile is finished")
+        pile = next((p for p in split["piles"] if p["id"] == body.pile_id), None)
+        if not pile:
+            raise HTTPException(404, "no such pile")
+
+        tracks = store.cache()["playlists"].get(playlist_id, {}).get("tracks", [])
+        if not tracks:
+            raise HTTPException(400, "no cached tracks — run the split again")
+        durations = {t["uri"]: t.get("duration_ms") or 0 for t in tracks}
+        uris = pick_sitting(pile["uris"], durations, split.get("decided", {}),
+                            body.target_minutes * 60 * 1000)
+        if not uris:
+            raise HTTPException(400, "that pile is finished")
+        uris = uris[:SITTING_MAX_TRACKS]
+
+        # Reserve the slot before spending anything, atomically with the
+        # checks above: a second request that reaches this lock next sees a
+        # sitting already claimed, even though no Spotify call has happened
+        # yet. playlist_id is filled in below once create_playlist returns.
+        split["active_sitting"] = {"playlist_id": None, "pile_id": pile["id"],
+                                   "uris": [], "started_at": _now_iso()}
+        store.save_splits(payload)
 
     new_id = sp.create_playlist(f"▶ {pile['name']}", "sortify sitting — safe to delete")
+
+    with _split_lock:
+        payload = store.splits()
+        payload["splits"][playlist_id]["active_sitting"]["playlist_id"] = new_id
+        store.save_splits(payload)
+
     for uri in uris:
         sp.add_to_playlist(new_id, uri)
 
-    split["active_sitting"] = {"playlist_id": new_id, "pile_id": pile["id"],
-                               "uris": uris, "started_at": _now_iso()}
-    store.save_splits(payload)
+    with _split_lock:
+        payload = store.splits()
+        payload["splits"][playlist_id]["active_sitting"]["uris"] = uris
+        store.save_splits(payload)
+
     minutes = sum(durations.get(u, 0) for u in uris) // 60000
     return {"sitting_id": new_id, "uris": uris, "minutes": minutes}
 
 
 @app.post("/api/split/{playlist_id}/sitting/finish")
 def finish_sitting(playlist_id: str):
-    payload = store.splits()
-    split = payload["splits"].get(playlist_id)
-    if not split or not split.get("active_sitting"):
-        raise HTTPException(404, "no active sitting")
-    try:
-        sp.unfollow_playlist(split["active_sitting"]["playlist_id"])
-    except SpotifyError as e:
-        # Already gone — deleted or unfollowed from the Spotify app directly,
-        # bypassing sortify — is not a failure worth blocking on. Re-raising
-        # here would leave active_sitting stuck forever: finish would always
-        # 404 on the same missing playlist, and start_sitting would always
-        # 409 on the record finish could never clear. Clearing our own
-        # bookkeeping is the correct outcome either way; the playlist itself
-        # is already gone from the account, so there is nothing left to undo.
-        if e.status != 404:
-            raise
-    split["active_sitting"] = None
-    store.save_splits(payload)
+    with _split_lock:
+        payload = store.splits()
+        split = payload["splits"].get(playlist_id)
+        if not split or not split.get("active_sitting"):
+            raise HTTPException(404, "no active sitting")
+        sitting = split["active_sitting"]
+
+    playlist_ref = sitting.get("playlist_id")
+    if playlist_ref is not None:
+        try:
+            sp.unfollow_playlist(playlist_ref)
+        except SpotifyError as e:
+            # Already gone — deleted or unfollowed from the Spotify app
+            # directly, bypassing sortify — is not a failure worth blocking
+            # on. Re-raising here would leave active_sitting stuck forever:
+            # finish would always 404 on the same missing playlist, and
+            # start_sitting would always 409 on a record finish could never
+            # clear. Clearing our own bookkeeping is correct either way; the
+            # playlist itself is already gone from the account.
+            if e.status != 404:
+                raise
+    # playlist_ref is None when create_playlist itself never returned (e.g.
+    # a cooldown hit before the sitting's single call landed) — the
+    # reservation exists, but nothing was ever created in the account, so
+    # there is nothing to unfollow. Clearing the record is still correct.
+
+    with _split_lock:
+        payload = store.splits()
+        split = payload["splits"].get(playlist_id)
+        if split:
+            split["active_sitting"] = None
+            store.save_splits(payload)
     return {"ok": True}
 
 

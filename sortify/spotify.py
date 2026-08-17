@@ -566,7 +566,14 @@ class Spotify:
             "POST", "/me/playlists",
             json={"name": name, "description": description, "public": False},
         )
-        return (resp or {}).get("id")
+        playlist_id = (resp or {}).get("id")
+        if not playlist_id:
+            # A 200/201 with no id would otherwise flow straight into
+            # add_to_playlist as f"/playlists/{None}/items" — a confusing
+            # 404 far from the actual problem. The call already happened and
+            # spent budget either way; fail loudly at the source instead.
+            raise SpotifyError(502, "playlist creation returned no id")
+        return playlist_id
 
     def unfollow_playlist(self, playlist_id: str) -> None:
         """Discard a whole playlist in one call.
