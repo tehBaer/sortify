@@ -411,6 +411,28 @@ def _pile_progress(split: dict) -> list[dict]:
     return out
 
 
+def _remaining(split: dict) -> int:
+    """How many track *occurrences* across every pile are still undecided.
+
+    Deliberately per-pile-occurrence, like `_pile_progress` above, rather
+    than `sum(len(p["uris"])) - len(decided)`: `decided` is keyed by uri, so
+    a uri that occurs twice in the source (the same track added to the
+    playlist twice — `split_tracks` does not deduplicate) would inflate the
+    naive total by one occurrence that no single `decided` entry can ever
+    account for, and a stale `decided` entry left behind by a re-split that
+    dropped its uri from every current pile would deflate it — either way
+    driving the count negative and never reaching 0. Counting per pile, per
+    occurrence, self-corrects both: a decided uri counts as decided exactly
+    as many times as it actually appears in the current piles, no more, no
+    less.
+    """
+    decided = split.get("decided", {})
+    return sum(
+        len(p["uris"]) - sum(1 for u in p["uris"] if u in decided)
+        for p in split["piles"]
+    )
+
+
 # Guards every read-modify-write of splits.json for a single playlist. Two
 # concurrent requests (two tabs, a double-click) can otherwise both read the
 # same "no active sitting" state and both pass a check-then-act guard before
@@ -421,6 +443,18 @@ def _pile_progress(split: dict) -> list[dict]:
 # LAN service with one server process, so this is sufficient without a
 # file-level lock.
 _split_lock = threading.Lock()
+
+# uris (as (playlist_id, uri) pairs) with a keep currently being spent by
+# THIS process — i.e. between the reservation write in `decide` and the
+# Spotify call it's waiting on returning. Only ever read/mutated while
+# holding `_split_lock`, so it needs no lock of its own. Its purpose is
+# narrow: telling a genuinely-concurrent request in this same process
+# ("still in flight, don't touch it") apart from a `"pending": True` entry
+# left behind by a process that died mid-call ("nothing here anymore, this
+# is retryable") — see `decide`'s docstring. A fresh process starts with
+# this empty, which is exactly what makes every pre-existing pending entry
+# correctly read as abandoned after a restart.
+_pending_keeps: set[tuple[str, str]] = set()
 
 
 @app.post("/api/split/{playlist_id}")
@@ -827,7 +861,7 @@ def finish_sitting(playlist_id: str):
 
 class DecideIn(BaseModel):
     uri: str
-    action: str  # "keep" | "reject"
+    action: str  # "keep" | "reject" | "undecide"
     to_id: str | None = None
 
 
@@ -848,11 +882,37 @@ def decide(playlist_id: str, body: DecideIn):
     that here would be a second, hidden way to spend a call. A *reject* is
     different: since it never touched Spotify, changing your mind about one
     costs nothing more than deciding fresh, so a later "keep" on a
-    previously-rejected uri is honoured rather than treated as a no-op.
-    Deciding the same uri the same way twice, or trying to un-keep a keep,
-    is a no-op — the repeat call didn't cost anything to make either.
+    previously-rejected uri is honoured as a correction rather than a no-op —
+    and `action="undecide"` on a *rejected* uri (only) clears it back to
+    undecided for free, so an accidental reject doesn't permanently drop a
+    track out of every future sitting (`pick_sitting` skips anything in
+    `decided`). `undecide` on anything else — a keep, or a uri with no
+    decision at all — is a no-op for the same immutable-keep reason above.
+    Every no-op response says so explicitly via `"changed": false` and
+    `"decision"`, rather than looking identical to a real change.
+
+    A keep is recorded as `"pending": true` at the same moment it is
+    reserved, *before* the Spotify call — the call itself cannot happen
+    under `_split_lock` (nothing blocking may run while it's held), so the
+    reservation has to exist first or two concurrent requests for the same
+    uri could both pass the "not yet decided" check and both spend a call.
+    That ordering has its own gap: if this process dies between writing the
+    reservation and the call finishing (a systemd restart mid-cooldown is
+    this app's own history), the entry is left permanently `"pending": true`
+    with nothing to ever clear it — a `pending` marker is only trustworthy
+    to a request running in the SAME process, tracked by `_pending_keeps` in
+    memory. A later request in the same process sees the uri is genuinely
+    still in flight and correctly no-ops; a request after a restart sees an
+    empty `_pending_keeps` (this process never started that call) and
+    correctly treats the leftover `pending` entry as abandoned and retries
+    it. The tradeoff this accepts: a retry after a genuine crash may
+    double-add if the original call had actually landed just before the
+    process died — unprovable without spending a call to check, and strictly
+    better than the alternative (a keep silently recorded forever for a
+    track that was never added, un-retryable, because a plain `"action":
+    "keep"` entry is otherwise final).
     """
-    if body.action not in ("keep", "reject"):
+    if body.action not in ("keep", "reject", "undecide"):
         raise HTTPException(400, f"unknown action {body.action!r}")
     if body.action == "keep" and not body.to_id:
         raise HTTPException(400, "keep needs to_id")
@@ -863,24 +923,52 @@ def decide(playlist_id: str, body: DecideIn):
         if not split:
             raise HTTPException(404, "no split for that playlist")
         if not any(body.uri in p["uris"] for p in split["piles"]):
-            # Guards the remaining-count math below as much as the request
-            # itself: an out-of-pile uri would inflate `decided` without
-            # inflating `total`, corrupting "remaining" for every decision
-            # after it.
+            # Guards `_remaining` as much as the request itself: an
+            # out-of-pile uri would add a `decided` entry no pile's
+            # occurrence count could ever account for.
             raise HTTPException(404, "that track is not in this split")
 
-        previous = split["decided"].get(body.uri)
-        settle = previous is None or (previous["action"] == "reject" and body.action == "keep")
-        if not settle:
-            total = sum(len(p["uris"]) for p in split["piles"])
-            return {"ok": True, "remaining": total - len(split["decided"])}
+        decided = split["decided"]
+        previous = decided.get(body.uri)
 
-        split["decided"][body.uri] = {
-            "action": body.action, "to_id": body.to_id, "at": _now_iso(),
-        }
+        if body.action == "undecide":
+            changed = previous is not None and previous["action"] == "reject"
+            if changed:
+                del decided[body.uri]
+                store.save_splits(payload)
+            return {
+                "ok": True, "remaining": _remaining(split), "changed": changed,
+                "decision": None,
+            }
+
+        in_flight = (playlist_id, body.uri) in _pending_keeps
+        settle = (
+            previous is None
+            or (previous["action"] == "reject" and body.action == "keep")
+            or (previous.get("pending") and not in_flight)
+        )
+        if not settle:
+            # A snapshot, not a guarantee: if `previous` is still `pending`
+            # (the winner is genuinely in flight right now), that winner's
+            # own call can still fail and roll back after this response is
+            # sent, making the `remaining`/`decision` reported here stale.
+            # Accepted rather than fixed — closing it would mean blocking
+            # this request on the winner's outcome, which is exactly the
+            # coupling `_split_lock` exists to avoid. It is safe in the
+            # direction that matters: nothing here mis-reports a call as
+            # spent when it was not, only occasionally the reverse.
+            return {
+                "ok": True, "remaining": _remaining(split), "changed": False,
+                "decision": {"action": previous["action"], "to_id": previous.get("to_id")},
+            }
+
+        entry = {"action": body.action, "to_id": body.to_id, "at": _now_iso()}
+        if body.action == "keep":
+            entry["pending"] = True
+            _pending_keeps.add((playlist_id, body.uri))
+        decided[body.uri] = entry
         store.save_splits(payload)
-        total = sum(len(p["uris"]) for p in split["piles"])
-        remaining = total - len(split["decided"])
+        remaining = _remaining(split)
 
     # The Spotify call (if any) happens outside the lock — see the module
     # note on `_split_lock`: nothing blocking may run while it is held.
@@ -889,16 +977,18 @@ def decide(playlist_id: str, body: DecideIn):
             if body.to_id == LIKED_ID:
                 sp.save_to_liked(body.uri)
             else:
-                _apply_snapshot(body.to_id, sp.add_to_playlist(body.to_id, body.uri))
+                snapshot_id = sp.add_to_playlist(body.to_id, body.uri)
         except Exception:
             # The call never landed, so the track was never actually kept.
             # Roll the reservation back to whatever it was before (nothing,
             # or the reject we just tried to override) so a retry finds it
             # undecided instead of permanently, wrongly, "kept". Nothing else
-            # could have settled this uri in between (see the docstring: a
-            # "keep" entry is final to every other caller), so restoring
-            # exactly `previous` is safe.
+            # in this process could have settled this uri in the meantime
+            # (`_pending_keeps` made every concurrent request in this process
+            # see it as in-flight and no-op), so restoring exactly `previous`
+            # is safe.
             with _split_lock:
+                _pending_keeps.discard((playlist_id, body.uri))
                 payload = store.splits()
                 split = payload["splits"].get(playlist_id)
                 if split is not None:
@@ -909,7 +999,39 @@ def decide(playlist_id: str, body: DecideIn):
                     store.save_splits(payload)
             raise
 
-    return {"ok": True, "remaining": remaining}
+        # The add itself is done — never roll the decided entry back again
+        # past this point, even if the local bookkeeping below fails; that
+        # would undo a Spotify call that already succeeded, and a retry
+        # would double-add. The `finally` still has to clear `_pending_keeps`
+        # and the on-disk "pending" flag no matter what, though — otherwise
+        # a bug in `_apply_snapshot`/`_cache_move` would leave this uri
+        # permanently "in flight" in this process (every future decide()
+        # would see `in_flight=True` from `_pending_keeps` forever) and
+        # permanently `"pending": true` on disk, neither of which is true
+        # any more: the add landed.
+        try:
+            if body.to_id != LIKED_ID:
+                _apply_snapshot(body.to_id, snapshot_id)
+            # Mirrors the destination's cache the same way `act`'s move
+            # branch does: without this, `_cached_tracks` still has the
+            # pre-keep snapshot_id stamped fresh but missing the track, so
+            # it looks up-to-date forever, and both a later `/api/act`
+            # re-add and the suggestion engine's home profiles never learn
+            # the track landed.
+            _cache_move(body.uri, None, body.to_id)
+        finally:
+            with _split_lock:
+                _pending_keeps.discard((playlist_id, body.uri))
+                payload = store.splits()
+                split = payload["splits"].get(playlist_id)
+                if split is not None and body.uri in split["decided"]:
+                    split["decided"][body.uri].pop("pending", None)
+                    store.save_splits(payload)
+
+    return {
+        "ok": True, "remaining": remaining, "changed": True,
+        "decision": {"action": body.action, "to_id": body.to_id},
+    }
 
 
 # ---- now playing -----------------------------------------------------------
