@@ -91,12 +91,22 @@ def clean_tags(
     return out[:keep]
 
 
+class LastFmError(Exception):
+    """Raised when Last.fm returns an error (other than artist not found)."""
+    pass
+
+
 API = "https://ws.audioscrobbler.com/2.0/"
 KEY_PATH = Path.home() / "state" / "sortify" / "lastfm.json"
 
 # Last.fm's stated ceiling is 5 requests/second. Sit below it: this is a
 # courtesy limit on someone else's free service, not a budget to spend.
 MIN_INTERVAL = 0.25
+
+# Last.fm error codes: only 6 means "artist not found".
+# Other codes (10: invalid key, 26: suspended, 29: rate limit, 8/11/16: service)
+# must raise to prevent false permanent misses in the cache.
+NOT_FOUND_CODE = 6
 
 
 def load_key(path: Path | None = None) -> str | None:
@@ -109,9 +119,16 @@ def load_key(path: Path | None = None) -> str | None:
     if not p.exists():
         return None
     try:
-        return json.loads(p.read_text()).get("api_key") or None
+        data = json.loads(p.read_text())
     except (json.JSONDecodeError, OSError):
         return None
+    # Only accept a dict with a non-empty string api_key.
+    if not isinstance(data, dict):
+        return None
+    key = data.get("api_key")
+    if isinstance(key, str) and key:
+        return key
+    return None
 
 
 class LastFm:
@@ -128,7 +145,12 @@ class LastFm:
         )
 
     def top_tags(self, artist_name: str) -> list[dict] | None:
-        """Raw top tags for an artist, or None if Last.fm has no such artist."""
+        """Raw top tags for an artist, or None if Last.fm has no such artist.
+
+        Raises on any error other than "artist not found" (code 6), so that
+        service errors, rate limits, or auth failures abort the batch loudly
+        rather than writing false permanent misses to cache.
+        """
         self._sleep(MIN_INTERVAL)
         resp = self._client.get(
             API,
@@ -144,7 +166,11 @@ class LastFm:
         resp.raise_for_status()
         data = resp.json()
         if "error" in data:
-            return None
+            error_code = data.get("error")
+            error_msg = data.get("message", "")
+            if error_code == NOT_FOUND_CODE:
+                return None
+            raise LastFmError(f"Last.fm error {error_code}: {error_msg}")
         tags = data.get("toptags", {}).get("tag", [])
         # Last.fm collapses a single tag into an object rather than a list.
         if isinstance(tags, dict):

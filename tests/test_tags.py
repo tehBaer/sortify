@@ -116,3 +116,87 @@ def test_store_round_trips_tags():
     assert s.tags() == {"version": 1, "artists": {}}
     s.save_tags({"version": 1, "artists": {"a1": {"name": "A", "tags": [], "miss": True}}})
     assert s.tags()["artists"]["a1"]["name"] == "A"
+
+
+def test_error_6_returns_none():
+    """Error code 6 (artist not found) returns None — the normal miss path."""
+    fm = LastFm("k", sleep=lambda s: None,
+                client=FakeClient({}))
+    assert fm.top_tags("Unknown") is None
+
+
+def test_error_10_raises():
+    """Error code 10 (invalid API key) raises so batch aborts loudly."""
+    from sortify.tags import LastFmError
+    client = FakeClient({})
+    client.get = lambda url, params=None, timeout=None: FakeResponse(
+        {"error": 10, "message": "Invalid API key"})
+    fm = LastFm("bad_key", sleep=lambda s: None, client=client)
+    with pytest.raises(LastFmError, match="error 10"):
+        fm.top_tags("A")
+
+
+def test_error_29_raises():
+    """Error code 29 (rate limit) raises so batch aborts loudly."""
+    from sortify.tags import LastFmError
+    client = FakeClient({})
+    client.get = lambda url, params=None, timeout=None: FakeResponse(
+        {"error": 29, "message": "Rate limit exceeded"})
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    with pytest.raises(LastFmError, match="error 29"):
+        fm.top_tags("A")
+
+
+def test_enrich_aborts_on_error_not_miss():
+    """If top_tags raises partway through, enrich aborts and does not write miss."""
+    from sortify.tags import LastFmError
+    client = FakeClient({})
+    client.get = lambda url, params=None, timeout=None: FakeResponse(
+        {"error": 10, "message": "Invalid API key"})
+    fm = LastFm("bad_key", sleep=lambda s: None, client=client)
+    with pytest.raises(LastFmError):
+        enrich({"a1": "A", "a2": "B"}, {}, fm, now="2026-08-17T16:00:00Z")
+
+
+def test_load_key_rejects_null():
+    """load_key returns None if the file contains null."""
+    from sortify.tags import load_key
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        f.write("null")
+        f.flush()
+        result = load_key(Path(f.name))
+        assert result is None
+
+
+def test_load_key_rejects_list():
+    """load_key returns None if the file contains a list."""
+    from sortify.tags import load_key
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        f.write('[1, 2, 3]')
+        f.flush()
+        result = load_key(Path(f.name))
+        assert result is None
+
+
+def test_load_key_rejects_string():
+    """load_key returns None if the file contains a bare string."""
+    from sortify.tags import load_key
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        f.write('"just a string"')
+        f.flush()
+        result = load_key(Path(f.name))
+        assert result is None
+
+
+def test_load_key_rejects_empty_key():
+    """load_key returns None if api_key is empty string."""
+    from sortify.tags import load_key
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        f.write('{"api_key": ""}')
+        f.flush()
+        result = load_key(Path(f.name))
+        assert result is None
