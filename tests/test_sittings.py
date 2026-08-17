@@ -298,6 +298,24 @@ def test_target_minutes_above_the_cap_is_rejected(client):
     assert r.status_code == 422
 
 
+def test_the_sitting_ceilings_are_pinned_to_their_literals():
+    """These two numbers ARE the structural bound on one sitting's burst:
+    1 create + SITTING_MAX_TRACKS adds + 1 finish = 42 calls, worst case,
+    whatever the caller asks for and whatever the cached durations look like.
+
+    Pinned to literals rather than only compared against themselves. The
+    truncation test below asserts `len(uris) == SITTING_MAX_TRACKS` against a
+    pile of `SITTING_MAX_TRACKS + 10`, which stays true for any value of the
+    constant — raising it 40 -> 400 leaves that test green while turning one
+    sitting into a 400-call burst against a 12-per-60s window cap. Same
+    treatment BACKGROUND_DAILY_CAP == 40 gets in test_no_proactive_work.py,
+    and for the same reason: CLAUDE.md sets these numbers from three
+    multi-hour lockouts, so moving one has to be a deliberate act with
+    evidence behind it rather than something a refactor can do quietly."""
+    assert appmod.SITTING_MAX_TRACKS == 40
+    assert appmod.SITTING_MAX_MINUTES == 360
+
+
 def test_sitting_hard_caps_track_count_even_when_durations_never_trip_the_target(client):
     """A pile whose tracks have no duration data at all (e.g. a partially
     populated cache) would otherwise never trip pick_sitting's running-total
@@ -313,6 +331,12 @@ def test_sitting_hard_caps_track_count_even_when_durations_never_trip_the_target
     r = client.post("/api/split/PL1/sitting", json={"pile_id": "p2", "target_minutes": 30})
     assert r.status_code == 200
     assert len(r.json()["uris"]) == appmod.SITTING_MAX_TRACKS
+
+    # What the truncation is for in the first place: the Spotify spend. The
+    # ceiling here is a literal (1 create + at most 40 adds), so unlike the
+    # count above it does not follow SITTING_MAX_TRACKS upward.
+    assert sum(1 for c in client.calls if c[0] == "add") == len(r.json()["uris"])
+    assert len(client.calls) <= 41
 
 
 # Important 4: two concurrent start_sitting calls (two tabs, a double-click)
@@ -418,6 +442,102 @@ def test_finish_racing_the_add_loop_stops_early_and_unfollows(client, monkeypatc
     assert len(added) < 6
     assert ("unfollow", "NEW1") in client.calls
     assert Store().splits()["splits"]["PL1"]["active_sitting"] is None
+
+
+def test_the_add_loop_stops_when_a_DIFFERENT_sitting_owns_the_slot(client, monkeypatch):
+    """The other half of the mid-add check, and the half nothing pinned: the
+    question is not "is some sitting active" but "is MY reservation still the
+    one on disk".
+
+    The interleaving: a finish clears this sitting's slot while its add loop
+    is still running, and a fresh start_sitting immediately claims the empty
+    slot — entirely legal, and it takes no more than a double-click to
+    produce. A check that only asked whether *a* sitting exists would see the
+    newcomer's record, conclude everything is fine, and keep adding to a
+    playlist nothing points at any more: up to SITTING_MAX_TRACKS Spotify
+    calls into an orphan, at WINDOW_CAP pacing, while the user waits. The
+    claim token is what tells the two reservations apart, exactly as it does
+    in `_claim_reservation`.
+
+    The existing race tests all clear the slot to None, which `bool(active)`
+    alone already catches — this one leaves a live reservation behind, so it
+    fails if and only if the token is actually compared."""
+    added = []
+
+    def add_then_a_new_sitting_claims_the_slot(pid, uri):
+        added.append(uri)
+        if len(added) == 2:
+            s = Store()
+            payload = s.splits()
+            payload["splits"]["PL1"]["active_sitting"] = {
+                "playlist_id": "NEW2", "pile_id": "p1", "uris": [],
+                "started_at": "2026-08-17T12:00:00Z", "claim": "a-different-claim"}
+            s.save_splits(payload)
+        return "snap"
+
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", add_then_a_new_sitting_claims_the_slot)
+    r = client.post("/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30})
+
+    assert r.status_code == 409
+    # 6 tracks were picked for this sitting; the loop must have stopped at the
+    # first checkpoint after the slot changed hands, not run to the end.
+    assert len(added) == 2
+    assert ("unfollow", "NEW1") in client.calls  # its own playlist cleaned up
+
+    # And the loser must leave the winner's record exactly as it found it.
+    active = Store().splits()["splits"]["PL1"]["active_sitting"]
+    assert active["playlist_id"] == "NEW2"
+    assert active["claim"] == "a-different-claim"
+    assert active["uris"] == []
+
+
+def test_no_spotify_call_is_made_while_the_split_lock_is_held(client, monkeypatch):
+    """`_split_lock` guards short local read-modify-writes of splits.json and
+    nothing else. Holding it across a network call would serialise every
+    decide, start, finish and recluster in the app behind one Spotify request
+    — and a 429 cooldown inside that span parks the lot for as long as the
+    retry takes.
+
+    Worth an explicit test because the failure is invisible from the outside:
+    the mutation that motivated it (holding `_split_lock` across
+    `sp.create_playlist`) deadlocks rather than fails, so the suite hangs and
+    reports nothing at all. `_split_lock` is a plain, non-reentrant Lock, so
+    a same-thread `acquire(blocking=False)` from inside the fake network call
+    answers the question directly — no timeout, no second thread, no hang.
+    """
+    observed = {"create": None, "adds": []}
+
+    def create_checking_the_lock(name, description=""):
+        observed["create"] = appmod._split_lock.acquire(blocking=False)
+        if observed["create"]:
+            appmod._split_lock.release()
+        client.calls.append(("create", name))
+        return "NEW1"
+
+    def add_checking_the_lock(pid, uri):
+        got = appmod._split_lock.acquire(blocking=False)
+        observed["adds"].append(got)
+        if got:
+            appmod._split_lock.release()
+        return "snap"
+
+    def unfollow_checking_the_lock(pid):
+        observed["unfollow"] = appmod._split_lock.acquire(blocking=False)
+        if observed["unfollow"]:
+            appmod._split_lock.release()
+
+    monkeypatch.setattr(appmod.sp, "create_playlist", create_checking_the_lock)
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", add_checking_the_lock)
+    monkeypatch.setattr(appmod.sp, "unfollow_playlist", unfollow_checking_the_lock)
+
+    assert client.post(
+        "/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30}
+    ).status_code == 200
+    assert client.post("/api/split/PL1/sitting/finish").status_code == 200
+
+    assert observed["create"] is True, "create_playlist ran with _split_lock held"
+    assert observed["adds"] and all(observed["adds"]), "an add ran with _split_lock held"
+    assert observed["unfollow"] is True, "unfollow_playlist ran with _split_lock held"
 
 
 def test_uninterrupted_sitting_still_completes_normally(client):

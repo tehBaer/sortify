@@ -255,6 +255,41 @@ def test_recluster_preserves_decisions(client):
         Store().save_splits(original)
 
 
+def test_a_re_split_preserves_decisions(client):
+    """The same carry-forward as test_recluster_preserves_decisions above, on
+    the other path that rewrites a split — and the one nothing pinned.
+    Recluster mutates the existing record in place; create_split rebuilds the
+    whole entry from scratch and reaches back for `prev.get("decided", {})`,
+    so dropping that single expression empties the record with the suite
+    still green.
+
+    Re-splitting is routine — the input playlist grew, or the params changed
+    — and a silent wipe costs money, not just data: every track the user
+    already filed becomes undecided, so `pick_sitting` serves it again and
+    each re-keep spends another Spotify call. On a 40-track pile that is up
+    to 40 calls to redo work already done, plus the sitting that carries it.
+    """
+    original = Store().splits()
+    try:
+        client.post("/api/split/PL1")
+        s = Store()
+        payload = s.splits()
+        payload["splits"]["PL1"]["decided"] = {
+            "spotify:track:bh0": {"action": "keep", "to_id": "H1", "at": "2026-08-17T10:00:00Z"},
+            "spotify:track:kv0": {"action": "reject", "to_id": None, "at": "2026-08-17T10:01:00Z"},
+        }
+        s.save_splits(payload)
+
+        assert client.post("/api/split/PL1").status_code == 200
+
+        decided = Store().splits()["splits"]["PL1"]["decided"]
+        assert decided["spotify:track:bh0"] == {
+            "action": "keep", "to_id": "H1", "at": "2026-08-17T10:00:00Z"}
+        assert decided["spotify:track:kv0"]["action"] == "reject"
+    finally:
+        Store().save_splits(original)
+
+
 def test_split_reports_progress(client):
     # Same leak risk as test_recluster_preserves_decisions above: restore
     # splits.json so the injected "decided" entry doesn't survive this test.

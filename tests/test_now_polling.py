@@ -4,11 +4,19 @@ The shipped bug: a 5s server cache paired with a 6s client poll, so every poll
 missed and an open tab burned ~600 calls/hour just watching one track play.
 The fix makes the cache last until the track ends and lets the server hand the
 client its next poll time, so the two can no longer disagree.
+
+Everything above the "the endpoint itself" divider tests the helper
+(`_currently_playing_shared`) in isolation. That is not enough on its own:
+the helper is not what the client polls, and a second `sp.currently_playing()`
+added anywhere in `now_playing()` doubles the cost of every poll while every
+helper-level assertion here still passes. The route-level tests at the bottom
+count calls at `Spotify.request()` for that reason.
 """
 
 import time
 
 import pytest
+from fastapi.testclient import TestClient
 
 from sortify import app as appmod
 from sortify.app import (
@@ -20,6 +28,7 @@ from sortify.app import (
     _now_ttl,
     _poll_after_ms,
 )
+from sortify.store import Store
 
 TRACK_MS = 210_000  # a 3.5-minute track
 
@@ -143,3 +152,139 @@ def test_force_still_reports_the_automatic_pace(clock, monkeypatch):
     clock[0] += 1
     _, stale_in = _currently_playing_shared(force=True)
     assert stale_in > NOW_FORCE_MIN_INTERVAL
+
+
+# ---- the endpoint itself ----------------------------------------------------
+#
+# Every test above drives `_currently_playing_shared()` directly, so all of
+# them pin the helper and none of them pin GET /api/now — the thing an open
+# tab actually calls, and the thing this branch grew a `_sitting_for_context`
+# read in. Inserting a second `sp.currently_playing()` into `now_playing()`
+# doubled the cost of every poll with the whole suite still green. That is the
+# shape of the original ~600-calls/hour bug, so it gets a test at the level
+# where it happens.
+#
+# Counted at `Spotify.request()` — the single chokepoint currently_playing,
+# my_playlists, playlist_tracks and everything else funnels through — rather
+# than at the methods this endpoint happens to call today, so ANY call the
+# handler grows shows up here rather than being absorbed by a stand-in fake.
+# Same reasoning as test_get_split_spends_no_api_calls in test_split_api.py.
+
+RAW_CURRENTLY_PLAYING = {
+    "item": {
+        "uri": "spotify:track:x", "id": "x", "name": "X", "type": "track",
+        "is_local": False, "duration_ms": TRACK_MS,
+        "artists": [{"id": "a1", "name": "A"}],
+        "album": {"name": "Alb", "images": [{"url": "http://img/1"}]},
+    },
+    "is_playing": True,
+    "progress_ms": 1_000,
+    "context": {"type": "playlist", "uri": "spotify:playlist:CTX1"},
+}
+
+NOW_LISTING = [{"id": "CTX1", "name": "Some playlist", "owner": "me", "editable": False,
+                "total": 3, "snapshot_id": "snap-ctx1", "image": None}]
+
+
+@pytest.fixture
+def route_client(monkeypatch):
+    """GET /api/now with every Spotify call trapped and counted.
+
+    cache.json / config.json / splits.json are one set of files for the whole
+    test session (see conftest.py), so this captures and restores them —
+    otherwise the injected playlist listing would follow other test files
+    around depending on run order.
+
+    The listing it primes is deliberately non-editable and not input-named, so
+    `_ensure_profiles` resolves zero homes and zero inputs: the route's own
+    cost is then exactly the currently-playing call, with nothing else to hide
+    a regression behind.
+    """
+    s = Store()
+    original_cache, original_config, original_splits = s.cache(), s.config(), s.splits()
+
+    cache = s.cache()
+    cache["playlist_list"] = {"fetched_at": 0.0, "items": NOW_LISTING}
+    s.save_cache(cache)
+    s.save_config({**original_config, "input_ids": [], "home_ids": [],
+                   "input_name_pattern": r"^\[.+\]$"})
+    appmod._profile_state.clear()
+    appmod._profile_state["built_at"] = 0.0
+
+    calls = []
+
+    def trap(method, path, background=False, **kwargs):
+        calls.append((method, path))
+        return RAW_CURRENTLY_PLAYING
+
+    # Any method-level stand-in sitting on the client instance would swallow
+    # the call before it reached the trap, and `sp` is a module-level
+    # singleton: monkeypatch.setattr(sp, "currently_playing", ...) in an
+    # earlier test leaves a real instance attribute behind even after undo
+    # (undo re-sets the bound method it read off the class). Strip anything
+    # shadowing the real methods so the trap is genuinely reachable — the
+    # same reason test_split_api.py delattrs before trapping request().
+    for name in ("currently_playing", "my_playlists", "playlist_tracks"):
+        if name in vars(appmod.sp):
+            monkeypatch.delattr(appmod.sp, name)
+    monkeypatch.setattr(appmod.sp, "request", trap)
+
+    c = TestClient(appmod.app)
+    c.spotify_calls = calls
+    try:
+        yield c
+    finally:
+        s = Store()
+        s.save_cache(original_cache)
+        s.save_config(original_config)
+        s.save_splits(original_splits)
+        appmod._profile_state.clear()
+        appmod._profile_state["built_at"] = 0.0
+
+
+def test_one_poll_of_the_endpoint_costs_one_call(route_client):
+    r = route_client.get("/api/now")
+    assert r.status_code == 200
+    assert r.json()["playing"] is True
+    assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]
+
+
+def test_polling_the_endpoint_inside_the_ttl_costs_nothing(route_client):
+    """The regression that shipped once: an open tab polling on its own clock
+    against a shorter cache, every poll a miss."""
+    assert route_client.get("/api/now").status_code == 200
+    for _ in range(10):
+        assert route_client.get("/api/now").status_code == 200
+    assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]
+
+
+def test_forced_refreshes_of_the_endpoint_obey_the_floor(route_client):
+    """`?force=1` is explicit user action (opening the view, refocusing the
+    tab), so it skips the TTL — but never NOW_FORCE_MIN_INTERVAL. Ten forced
+    polls land well inside that 10s floor, so nine of them must be free; a
+    force that bypassed the floor would make refocusing a tab a paid event."""
+    for _ in range(10):
+        assert route_client.get("/api/now?force=1").status_code == 200
+    assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]
+
+
+def test_the_sitting_lookup_on_the_poll_path_is_free(route_client):
+    """`_sitting_for_context` is this branch's addition to the hottest path in
+    the app. It answers from splits.json on purpose; resolving the context
+    playlist against Spotify instead would put a call on every poll of every
+    open tab."""
+    Store().save_splits({"version": 1, "splits": {"PL_NOW": {
+        "created_at": "2026-08-17T10:00:00Z", "snapshot_id": None, "params": {},
+        "piles": [{"id": "p1", "name": "dream pop", "tags": [], "uris": ["spotify:track:x"]}],
+        "decided": {"spotify:track:x": {"action": "keep", "to_id": "H1", "at": "t"}},
+        "active_sitting": {"playlist_id": "CTX1", "pile_id": "p1",
+                           "uris": ["spotify:track:x"],
+                           "started_at": "2026-08-17T10:05:00Z", "claim": "c1"},
+    }}})
+
+    body = route_client.get("/api/now").json()
+
+    assert body["sitting"]["split_id"] == "PL_NOW"
+    assert body["sitting"]["decided"] == {
+        "spotify:track:x": {"action": "keep", "to_id": "H1", "at": "t"}}
+    assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]

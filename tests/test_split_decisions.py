@@ -110,6 +110,35 @@ def test_successful_decision_reports_changed_true_and_the_decision(client):
     assert body["decision"] == {"action": "keep", "to_id": "HOME1"}
 
 
+def test_the_keep_call_runs_outside_the_split_lock(client, monkeypatch):
+    """`decide` documents it explicitly — "the Spotify call (if any) happens
+    outside the lock ... nothing blocking may run while it is held" — and
+    nothing checked it. Holding `_split_lock` across the add would serialise
+    every decide, sitting start, finish and recluster in the app behind one
+    network request, and a 429 cooldown landing inside that span would park
+    all of them for as long as its retry takes.
+
+    Left untested, that regression is not merely unnoticed but unreportable:
+    moving the call under the lock deadlocks, so the suite hangs instead of
+    failing. `_split_lock` is a plain, non-reentrant Lock, so asking for it
+    without blocking from inside the fake add answers the question on the
+    spot — no second thread, no timeout, no hang."""
+    held = {}
+
+    def add_checking_the_lock(pid, uri):
+        held["free"] = appmod._split_lock.acquire(blocking=False)
+        if held["free"]:
+            appmod._split_lock.release()
+        client.calls.append(("add", pid, uri))
+        return "snap"
+
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", add_checking_the_lock)
+    r = client.post("/api/split/PL1/decide",
+                    json={"uri": "spotify:track:a", "action": "keep", "to_id": "HOME1"})
+    assert r.status_code == 200
+    assert held["free"] is True, "the keep's Spotify call ran with _split_lock held"
+
+
 # ---- Important 1: the destination cache mirror ------------------------------
 
 

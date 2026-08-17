@@ -14,7 +14,28 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+# pytest-timeout is test infrastructure, not a runtime dependency — the
+# runtime dependency list above stays as it is. Two known regressions in this
+# code HANG the suite instead of failing it (an unbounded retry in `decide`'s
+# settle logic; `_split_lock` held across a network call, which deadlocks).
+# Untimed, both look like a stalled run: nothing is reported, and the failure
+# is invisible rather than red.
+dev = ["pytest>=8", "pytest-timeout>=2.4"]
+
+[tool.pytest.ini_options]
+# Per test, not per run. Generous on purpose: the slowest real test here is a
+# two-thread finish/start race that waits on events with its own 10s bounds,
+# and the whole suite runs in ~3s — so 60s cannot be reached by anything
+# except genuinely stuck code, and a hang becomes an ordinary red test.
+timeout = 60
+# "thread", not the default "signal": both hangs this exists for park a
+# request thread (a deadlocked lock, a runaway retry) while the main thread
+# waits on it, and unwinding that through a signal took over four minutes in
+# one measured case and never finished in another. The thread method dumps
+# every thread's stack and ends the run at the deadline, which is the whole
+# point — a hang should read as a failure with a traceback, not as a run
+# that is still going.
+timeout_method = "thread"
 
 [project.scripts]
 sortify = "sortify.app:main"
