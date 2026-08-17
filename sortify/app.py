@@ -12,7 +12,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -614,9 +614,27 @@ STATIC = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
+_ASSET_REF = re.compile(r"/static/(app\.js|style\.css)")
+
+
 @app.get("/")
 def index():
-    return FileResponse(STATIC / "index.html")
+    """index.html with each asset URL stamped by that file's mtime.
+
+    An unversioned /static/app.js meant a tab opened before a deploy kept
+    running the old script against the new server — which shows up as a
+    feature simply not being there, while the server serves it happily. The
+    stamp comes from the file rather than a hand-bumped constant, because the
+    deploy where I forget to bump is the one that matters.
+
+    The document itself must never be cached: versioned assets are safe to
+    keep forever, but only if the page naming them is always re-fetched.
+    """
+    html = _ASSET_REF.sub(
+        lambda m: f"/static/{m.group(1)}?v={int((STATIC / m.group(1)).stat().st_mtime)}",
+        (STATIC / "index.html").read_text(),
+    )
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 def main():
