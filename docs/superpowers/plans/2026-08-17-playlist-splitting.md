@@ -26,7 +26,7 @@
 
 ### Task 1: Delete the dead genre enricher
 
-Spotify returns `genres: []` for every artist (717/717 measured). The enricher has been spending 40 background calls/day writing empty arrays. Removing it frees that allowance and deletes a proactive job of the exact kind that caused the bans.
+Spotify omits the `genres` key from `/artists/{id}` entirely (confirmed by live probe); the `genres: []` on all 717 cached artists is our own `a.get("genres", [])` default. Either way the enricher spends 40 background calls/day fetching a field that no longer exists. Removing it frees that allowance and deletes a proactive job of the exact kind that caused the bans.
 
 **Files:**
 - Modify: `sortify/app.py` (delete lines 546–619, the enricher block; delete the targeted fetch at lines 405–418)

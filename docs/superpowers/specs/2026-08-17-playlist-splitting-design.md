@@ -25,12 +25,17 @@ decides where a session *stops*; a tag-derived grouping decides what goes
 
 ### Spotify supplies no genre data
 
-`/artists/{id}` still returns a `genres` array, but it is empty for this app.
-Measured, not assumed: all **717 artists** in `data/cache.json` have
-`genres: []`, and all 717 have a populated `name`, so those calls succeeded —
-a failed fetch stores `name: null`. This is the Nov-2024 deprecation that also
-removed audio-features, audio-analysis, recommendations, and related-artists
-for development-mode apps.
+`/artists/{id}` omits the `genres` key entirely — it is absent from the
+response, not present-and-empty. A live single-shot probe of Alice Cooper
+(`3EhbVgyfGd7HkpsagwL9GS`) confirmed the key is missing; the `genres: []` seen
+throughout `data/cache.json` is our own client defaulting via
+`a.get("genres", [])`, not data from Spotify.
+
+Measured, not assumed: all **717 artists** in the cache have `genres: []`, and
+all 717 have a populated `name`, so those calls succeeded — a failed fetch
+stores `name: null`. This is the Nov-2024 deprecation that also removed
+audio-features, audio-analysis, recommendations, and related-artists for
+development-mode apps.
 
 Consequences:
 
@@ -315,8 +320,18 @@ and no new proactive job is introduced.
    come out mushy, fall back to dominant-tag bucketing — assign each artist
    its single most distinctive tag and merge undersized buckets — which is
    coarser but fully explainable.
-3. **Eclectic artists.** Every track by one artist lands in one pile. Accepted:
-   usually correct, and the alternative (per-track tags) is not available.
+3. **Eclectic artists.** Every track by one artist lands in one pile — a
+   ballad and a banger by the same artist are inseparable here. Per-track tags
+   (`track.getTopTags`) do exist and were the obvious fix, but they were
+   probed and rejected on evidence: **8% coverage (2/26 sampled tracks)**
+   against 97% at artist level. The tagged two were both hits
+   (Alice Cooper's "Poison", Edward Maya's "Stereo Love"); everything obscure
+   returned nothing. Notably "I Never Cry" — the exact ballad-vs-banger case
+   this risk describes — has **no track tags at all**, so the per-track route
+   would not have fixed even its motivating example. Last.fm's track tagging
+   follows chart popularity, and this library is mostly obscure electronic,
+   world, and ambient. Accepted as an artist-level limitation.
+   **Re-probe before revisiting**: the trade-off flips only if coverage rises.
 4. **Last.fm name matching.** Matching is by name, not id, so distinct artists
    sharing a name can collide. Accepted at ~3% miss rate; misses are explicit
    and land in the untagged pile.
