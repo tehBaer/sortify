@@ -612,7 +612,7 @@ def _reservation_alive(split_playlist_id: str, claim: str) -> bool:
 
 
 def _abandon_orphaned_playlist(
-    split_playlist_id: str, pile_id: str, new_id: str, detail: str, needs_unfollow: bool
+    split_playlist_id: str, pile_id: str, new_id: str, detail: str
 ) -> None:
     """A concurrent finish discarded the reservation for this sitting while
     it was still being materialised. The playlist itself is real, though —
@@ -620,20 +620,27 @@ def _abandon_orphaned_playlist(
     the recording-before-adds fix exists to prevent) and report a clean
     error instead of crashing on a vanished record.
 
-    `needs_unfollow` is False once playlist_id has already been written into
-    the reservation by an earlier successful `_claim_reservation` call in
-    this same request. `finish_sitting` is the only thing that ever clears a
-    reservation, and it only calls unfollow when it finds a non-None
-    playlist_id — so if we got far enough to record one before losing the
-    reservation, finish necessarily saw it and already unfollowed it for us;
-    calling unfollow again here would just spend a call to get a 404 back.
+    Every checkpoint unfollows, unconditionally. A previous round skipped it
+    at the two later ones, reasoning that once playlist_id is recorded, the
+    only thing that can clear the reservation is a `finish` that saw that id
+    and already unfollowed it. That premise was false: `finish_sitting` reads
+    the reservation under one acquisition of _split_lock and clears it under
+    a later one, so a finish that read it while playlist_id was still None
+    makes no unfollow call at all and then clears a record that has since
+    gained an id it never saw — leaving a live playlist in the user's account
+    that nothing points at. `finish_sitting`'s clear is now a compare-and-swap
+    on exactly that pair, which closes it from the other side too, but the
+    unfollow here stays: being wrong this way costs one call that comes back
+    404 in a rare race, and being wrong the other way costs a playlist the
+    user has to find and delete by hand. Unfollowing `new_id` can never harm
+    another sitting either — it is this request's own playlist and no other
+    reservation can name it.
     """
-    if needs_unfollow:
-        try:
-            sp.unfollow_playlist(new_id)
-        except SpotifyError as e:
-            if e.status != 404:
-                _recover_orphan(split_playlist_id, pile_id, new_id, e)
+    try:
+        sp.unfollow_playlist(new_id)
+    except SpotifyError as e:
+        if e.status != 404:
+            _recover_orphan(split_playlist_id, pile_id, new_id, e)
     raise HTTPException(409, detail)
 
 
@@ -734,22 +741,19 @@ def start_sitting(playlist_id: str, body: SittingIn):
     if not _claim_reservation(playlist_id, claim, playlist_id=new_id):
         _abandon_orphaned_playlist(
             playlist_id, pile["id"], new_id,
-            "the sitting was finished by another request while it was starting",
-            needs_unfollow=True)
+            "the sitting was finished by another request while it was starting")
 
     for uri in uris:
         if not _reservation_alive(playlist_id, claim):
             _abandon_orphaned_playlist(
                 playlist_id, pile["id"], new_id,
-                "the sitting was finished by another request while tracks were still being added",
-                needs_unfollow=False)
+                "the sitting was finished by another request while tracks were still being added")
         sp.add_to_playlist(new_id, uri)
 
     if not _claim_reservation(playlist_id, claim, uris=uris):
         _abandon_orphaned_playlist(
             playlist_id, pile["id"], new_id,
-            "the sitting was finished by another request just as it finished starting",
-            needs_unfollow=False)
+            "the sitting was finished by another request just as it finished starting")
 
     minutes = sum(durations.get(u, 0) for u in uris) // 60000
     return {"sitting_id": new_id, "uris": uris, "minutes": minutes}
@@ -757,13 +761,37 @@ def start_sitting(playlist_id: str, body: SittingIn):
 
 @app.post("/api/split/{playlist_id}/sitting/finish")
 def finish_sitting(playlist_id: str):
+    """Unfollow the sitting playlist in one call and clear the reservation —
+    but only the exact reservation this call observed.
+
+    The read below and the clear at the end are two separate acquisitions of
+    _split_lock with a network call between them, so the slot can change
+    underneath: a start still in flight can fill in a playlist_id we read as
+    None, another finish can clear it, and a whole new sitting can then claim
+    it. Clearing unconditionally is what made that a data-loss bug — a
+    double-clicked finish is enough. The slower of the two reads sitting A,
+    its unfollow goes out, the faster one completes and clears, sitting B
+    starts and populates a real playlist, and then the slower one's clear
+    lands and wipes B's record: B's playlist is live, full, playing, and
+    nothing in splits.json points at it, so `finish` can never reach it
+    again. It also erased _recover_orphan's re-stamp the same way.
+
+    So the clear is a compare-and-swap on what we actually observed — same
+    claim, same playlist_id — and otherwise the slot is left exactly as
+    found. Leaving it alone is always safe: whatever occupies it now is
+    either a sitting still starting (its own checkpoints resolve it) or one
+    newer than ours (its own finish resolves it). The response says which
+    happened, so a caller that meant to end the *current* sitting can just
+    ask again.
+    """
     with _split_lock:
         payload = store.splits()
         split = payload["splits"].get(playlist_id)
         if not split or not split.get("active_sitting"):
             raise HTTPException(404, "no active sitting")
-        sitting = split["active_sitting"]
+        sitting = dict(split["active_sitting"])
 
+    claim = sitting.get("claim")
     playlist_ref = sitting.get("playlist_id")
     if playlist_ref is not None:
         try:
@@ -783,13 +811,18 @@ def finish_sitting(playlist_id: str):
     # reservation exists, but nothing was ever created in the account, so
     # there is nothing to unfollow. Clearing the record is still correct.
 
+    cleared = False
     with _split_lock:
         payload = store.splits()
         split = payload["splits"].get(playlist_id)
-        if split:
+        active = split.get("active_sitting") if split else None
+        if (active is not None
+                and active.get("claim") == claim
+                and active.get("playlist_id") == playlist_ref):
             split["active_sitting"] = None
             store.save_splits(payload)
-    return {"ok": True}
+            cleared = True
+    return {"ok": True, "cleared": cleared}
 
 
 # ---- now playing -----------------------------------------------------------

@@ -382,17 +382,22 @@ def test_finish_racing_the_in_flight_create_playlist_leaves_no_litter(client, mo
     assert Store().splits()["splits"]["PL1"]["active_sitting"] is None
 
 
-def test_finish_racing_the_add_loop_stops_early_without_a_redundant_unfollow(client, monkeypatch):
+def test_finish_racing_the_add_loop_stops_early_and_unfollows(client, monkeypatch):
     """A concurrent finish clears active_sitting partway through the add
     loop. The remaining adds must not run — burning ~24 calls into a
-    playlist nobody can reach anymore — and the record must stay clear.
+    playlist nobody can reach anymore — and the playlist that was already
+    created must be unfollowed before the 409 goes out.
 
-    Unlike the create_playlist race above, this one must NOT call unfollow
-    again: by this point playlist_id was already successfully recorded into
-    the reservation, and finish_sitting only ever clears a reservation after
-    unfollowing whatever non-None playlist_id it found — so the concurrent
-    finish that cleared this one already unfollowed NEW1 itself. A second
-    unfollow call here would just spend a call to get a 404 back."""
+    Fix round 3 asserted the opposite here (no unfollow), on the premise that
+    a reservation carrying a playlist_id can only be cleared by a finish that
+    already unfollowed that id. finish_sitting is not atomic, so that premise
+    is false: it reads the reservation under one acquisition of _split_lock
+    and clears it under a later one, and a finish that read it while
+    playlist_id was still None spends no unfollow call at all. That is the
+    interleaving simulated here — the reservation vanishes mid-add with the
+    playlist still live — and the only thing standing between it and a real
+    playlist stranded in the user's account is this unfollow. Being wrong the
+    other way costs one call that comes back 404 in a rare race."""
     added = []
 
     def flaky_add(pid, uri):
@@ -411,7 +416,7 @@ def test_finish_racing_the_add_loop_stops_early_without_a_redundant_unfollow(cli
     # 6 tracks total for this pile/target; the loop must have stopped well
     # short of all of them once the reservation vanished after the 3rd.
     assert len(added) < 6
-    assert not any(c[0] == "unfollow" for c in client.calls)
+    assert ("unfollow", "NEW1") in client.calls
     assert Store().splits()["splits"]["PL1"]["active_sitting"] is None
 
 
@@ -531,3 +536,114 @@ def test_abandon_unfollow_failure_restamps_a_findable_reservation(client, monkey
     assert r2.status_code == 200
     assert client.calls == [("unfollow", "NEW1")]
     assert Store().splits()["splits"]["PL1"]["active_sitting"] is None
+
+
+# ---- Fix Round 4 -------------------------------------------------------
+#
+# finish_sitting was the one writer of active_sitting that did not tie its
+# write to the state it had observed: it read the reservation under one
+# acquisition of _split_lock and then cleared the slot under a later one,
+# unconditionally, with a network call in between. Anything that changed the
+# slot in that window was silently destroyed — including a fully materialised
+# sitting whose playlist was live and playing, and _recover_orphan's
+# re-stamped reservation. The clear is now a compare-and-swap on the
+# (claim, playlist_id) pair the call actually saw.
+
+
+def _incrementing_creates(client, monkeypatch):
+    """create_playlist returning a distinct id per call, so two sittings in
+    one test are actually distinguishable (the fixture's fake always returns
+    "NEW1")."""
+    made = []
+
+    def create(name, description=""):
+        made.append(name)
+        pid = f"P{len(made)}"
+        client.calls.append(("create", pid))
+        return pid
+
+    monkeypatch.setattr(appmod.sp, "create_playlist", create)
+    return made
+
+
+def test_a_slow_finish_does_not_clear_a_reservation_it_never_saw(client, monkeypatch):
+    """The single-threaded twin of the double-click race below: while THIS
+    finish's unfollow is in flight, the reservation it read is replaced by a
+    different one (a second finish cleared it, then a new sitting claimed the
+    slot). Clearing at that point would wipe a live sitting's only record."""
+    _incrementing_creates(client, monkeypatch)
+    client.post("/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30})
+
+    def unfollow_then_someone_else_starts(pid):
+        client.calls.append(("unfollow", pid))
+        s = Store()
+        payload = s.splits()
+        payload["splits"]["PL1"]["active_sitting"] = {
+            "playlist_id": "P2", "pile_id": "p1", "uris": [],
+            "started_at": "2026-08-17T12:00:00Z", "claim": "a-different-claim"}
+        s.save_splits(payload)
+
+    monkeypatch.setattr(appmod.sp, "unfollow_playlist", unfollow_then_someone_else_starts)
+    r = client.post("/api/split/PL1/sitting/finish")
+    assert r.status_code == 200
+    assert r.json()["cleared"] is False
+
+    active = Store().splits()["splits"]["PL1"]["active_sitting"]
+    assert active is not None and active["playlist_id"] == "P2"
+
+
+def test_double_clicked_finish_does_not_wipe_the_next_sitting(client, monkeypatch):
+    """Two real threads, the worst case no earlier round closed: finish #1
+    reads sitting A and its unfollow goes out; finish #2 completes and clears;
+    sitting B then starts, creates a playlist, adds every track and returns
+    200; finish #1's unfollow finally lands (404, tolerated) and it clears the
+    slot. Every request returned 200 and B's playlist was live, fully
+    populated, being listened to — with nothing in splits.json pointing at
+    it."""
+    import threading
+
+    _incrementing_creates(client, monkeypatch)
+    lock = threading.Lock()
+    entered, release = threading.Event(), threading.Event()
+    seen = []
+
+    def blocking_unfollow(pid):
+        with lock:
+            seen.append(pid)
+            first = len(seen) == 1
+        client.calls.append(("unfollow", pid))
+        if first:
+            entered.set()
+            assert release.wait(timeout=10)
+        else:
+            raise SpotifyError(404, "already gone")
+
+    monkeypatch.setattr(appmod.sp, "unfollow_playlist", blocking_unfollow)
+    client.post("/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30})
+
+    slow = {}
+
+    def slow_finish():
+        slow["r"] = client.post("/api/split/PL1/sitting/finish")
+
+    t = threading.Thread(target=slow_finish)
+    t.start()
+    assert entered.wait(timeout=10)  # finish #1 is now inside its unfollow
+
+    assert client.post("/api/split/PL1/sitting/finish").status_code == 200
+    started = client.post("/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30})
+    assert started.status_code == 200
+    release.set()
+    t.join(timeout=10)
+
+    assert slow["r"].status_code == 200
+    assert slow["r"].json()["cleared"] is False
+    active = Store().splits()["splits"]["PL1"]["active_sitting"]
+    assert active is not None
+    assert active["playlist_id"] == started.json()["sitting_id"]
+
+
+def test_finish_reports_whether_it_cleared(client):
+    r = client.post("/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30})
+    assert r.status_code == 200
+    assert client.post("/api/split/PL1/sitting/finish").json() == {"ok": True, "cleared": True}
