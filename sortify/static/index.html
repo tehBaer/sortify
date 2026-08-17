@@ -28,6 +28,10 @@
       <select id="now-input-switch" title="Play a different input playlist"></select>
       <button id="btn-now-next" title="Skip to the next track">Next ›</button>
     </div>
+    <div id="now-sitting-bar" class="row" hidden>
+      <span id="now-sitting-status" class="hint"></span>
+      <button id="btn-now-finish-sitting">Finish sitting</button>
+    </div>
     <div id="now-card"><p class="done-msg">Checking what's playing…</p></div>
   </section>
 
@@ -80,6 +84,25 @@
     </div>
     <div id="triage-loading" hidden><div class="spinner"></div><p id="loading-msg"></p></div>
     <div id="card"></div>
+  </section>
+
+  <section id="view-split" hidden>
+    <div class="triage-top">
+      <button id="btn-split-back">‹ Back</button>
+      <span id="split-title"></span>
+    </div>
+    <div id="split-loading" hidden><div class="spinner"></div><p id="split-msg"></p></div>
+    <div id="split-sitting-bar" class="row" hidden>
+      <span id="split-sitting-status" class="hint"></span>
+      <button id="btn-split-finish-sitting">Finish sitting</button>
+    </div>
+    <div id="split-empty"></div>
+    <div id="piles"></div>
+    <div id="split-params" class="row" hidden>
+      <label>Resolution <input id="split-resolution" type="number" min="0.1" max="5" step="0.1" value="1"></label>
+      <label>Pile size <input id="split-minpile" type="number" min="2" max="200" value="15"></label>
+      <button id="btn-recluster">Re-cluster (0 calls)</button>
+    </div>
   </section>
 </main>
 

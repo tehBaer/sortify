@@ -141,3 +141,21 @@ kbd {
 
 /* Now-view playback controls: the switcher takes the space, Next stays snug. */
 #now-controls select { flex: 1; min-width: 0; }
+
+/* splitting */
+.pl-split { font-size: 1.1rem; padding: .3rem .6rem; }
+#split-params label { display: flex; align-items: center; gap: .35rem; font-size: .85rem; color: var(--muted); }
+#split-params input { width: 4.5rem; }
+#split-params button { margin-left: auto; }
+.pile-row {
+  display: flex; align-items: center; gap: .65rem;
+  padding: .5rem .6rem; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--card); margin-bottom: .5rem;
+}
+.pile-row .pl-meta { flex: 1; min-width: 0; }
+.pile-row .name { font-weight: 600; }
+.pile-row .sub { color: var(--muted); font-size: .8rem; }
+.pile-row button { flex-shrink: 0; }
+#split-loading p { text-align: center; color: var(--muted); }
+#split-sitting-bar, #now-sitting-bar { align-items: center; }
+#split-sitting-status, #now-sitting-status { flex: 1; }
