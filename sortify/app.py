@@ -143,6 +143,8 @@ def playlists():
             else "home" if p["id"] in cfg.get("home_ids", [])
             else None
         )
+        # Local read, zero Spotify calls — see `_split_summary` below.
+        p["split"] = _split_summary(p["id"])
     entry = store.cache().get("playlist_list") or {}
     return {"playlists": out, "fetched_at": entry.get("fetched_at")}
 
@@ -400,6 +402,18 @@ def _tag_artists_checked() -> dict:
             "split time). Move the old file aside and re-run the split.",
         )
     return store.tag_artists()
+
+
+def _split_summary(playlist_id: str) -> dict | None:
+    """Local read only, for the Playlists picker: pile count and how much of
+    a previous split is still undecided, so a playlist someone already split
+    doesn't look untouched. Zero Spotify calls — the picker is not the place
+    to spend any.
+    """
+    split = store.splits()["splits"].get(playlist_id)
+    if not split:
+        return None
+    return {"piles": len(split["piles"]), "remaining": _remaining(split)}
 
 
 def _pile_progress(split: dict) -> list[dict]:
@@ -1129,6 +1143,43 @@ def _poll_after_ms(stale_in: float) -> int:
     return max(1000, int(stale_in * 1000) + 500)
 
 
+def _sitting_for_context(ctx_id: str | None) -> dict | None:
+    """If the currently-playing context is a sitting's disposable playlist,
+    say so — and hand back that split's `decided` map for it, restricted to
+    this sitting's own uris.
+
+    This is the fix for a real gap: without it, a reloaded tab has no way to
+    know a sitting is active (the client-side pointer to it lives only in
+    memory), so filing a track goes through the ordinary /api/act path
+    instead of /api/split/.../decide — 1 Spotify call spent, nothing written
+    to `decided`, and `pick_sitting` serves the exact same track again in a
+    later sitting. A local `store.splits()` read on every /api/now poll (the
+    poll that already exists) closes it for free and survives reload by
+    construction: there's no client state to lose.
+
+    Local read only, no Spotify call — matches every other helper in this
+    section. Scans every split's `active_sitting`, since nothing here is
+    keyed by split id the way the /api/split/{id} routes are; in practice
+    there are at most a couple of splits on disk at once.
+    """
+    if not ctx_id:
+        return None
+    for split_id, split in store.splits()["splits"].items():
+        active = split.get("active_sitting")
+        if active and active.get("playlist_id") == ctx_id:
+            pile = next((p for p in split["piles"] if p["id"] == active["pile_id"]), None)
+            uris = active.get("uris") or []
+            decided = split.get("decided", {})
+            return {
+                "split_id": split_id,
+                "pile_id": active["pile_id"],
+                "pile_name": pile["name"] if pile else active["pile_id"],
+                "uris": uris,
+                "decided": {u: decided[u] for u in uris if u in decided},
+            }
+    return None
+
+
 @app.get("/api/now")
 def now_playing(force: bool = False):
     try:
@@ -1163,6 +1214,7 @@ def now_playing(force: bool = False):
              "is_input": ctx_id in state["input_ids"]}
             if ctx_id else None
         ),
+        "sitting": _sitting_for_context(ctx_id),
         "suggestions": sugg.suggest(track, state["profiles"], state["artist_info"]) if sortable else [],
         "homes": _homes_payload(state),
         "inputs": [

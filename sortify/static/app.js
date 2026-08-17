@@ -8,9 +8,16 @@ let playlistData = [];   // lists view
 let roles = {};          // id -> "input" | "home" | null
 let triage = null;       // {id, name, homes:Map, tracks, idx, sorted, skipped, history}
 let split = null;        // {id, name, piles, decided, active_sitting} — the open split view
-let sitting = null;      // {splitId, sittingId, pileId, pileName, uris, decided} — the last
-                          // sitting this session has seen active, from either starting one
-                          // or opening a split whose stored active_sitting is still live.
+// {splitId, sittingId, pileId, pileName, uris, decided} — a UI convenience,
+// NOT the source of truth. The Split view's own display reads split.active_sitting
+// directly (fresh on every open); the Now view's decide card reads
+// nowState.sitting (fresh on every poll, from the server). This global only
+// drives the persistent "a sitting is active" bar when neither of those is
+// in view, and remembers which split/pile to finish from that bar. Because
+// the backend allows one active sitting *per split*, this single pointer can
+// only ever reflect one of them at a time if more than one is live — see the
+// report.
+let sitting = null;
 
 // ---- plumbing --------------------------------------------------------------
 
@@ -22,7 +29,13 @@ async function api(path, body) {
   let data = {};
   try { data = await resp.json(); } catch (_) {}
   if (resp.status === 401 && data.needs_auth) { show("setup"); throw new Error("auth needed"); }
-  if (!resp.ok) throw new Error(data.detail || `${resp.status} error`);
+  if (!resp.ok) {
+    // .status lets a caller tell "not split yet" (404) apart from a
+    // transient failure worth retrying instead of re-offering a paid action.
+    const err = new Error(data.detail || `${resp.status} error`);
+    err.status = resp.status;
+    throw err;
+  }
   return data;
 }
 
@@ -119,7 +132,8 @@ function renderLists() {
     const img = p.image
       ? `<img src="${esc(p.image)}" alt="" loading="lazy">`
       : '<div class="noimg"></div>';
-    const sub = [p.folder, p.total != null ? `${p.total} tracks` : null, p.editable ? null : p.id === "liked" ? "library" : "not yours"]
+    const splitNote = p.split ? `split into ${p.split.piles} pile${p.split.piles === 1 ? "" : "s"}, ${p.split.remaining} left` : null;
+    const sub = [p.folder, p.total != null ? `${p.total} tracks` : null, p.editable ? null : p.id === "liked" ? "library" : "not yours", splitNote]
       .filter(Boolean).join(" · ");
     row.innerHTML = `${img}
       <div class="pl-meta"><div class="name">${esc(p.name)}</div><div class="sub">${esc(sub)}</div></div>
@@ -359,16 +373,23 @@ async function pollNow(force = false) {
 
 // A sitting stays visible here no matter what's playing or whether Spotify
 // itself is in a cooldown — it costs a real Spotify call to finish, so its
-// status must never depend on the currently-playing poll succeeding.
+// status must never depend on the currently-playing poll succeeding. Prefers
+// the server's own answer (nowState.sitting, fresh every poll) when there is
+// one; falls back to the last-known client copy otherwise — e.g. while the
+// user is listening to something else and the poll no longer reports it.
 function paintSittingBar() {
   const bar = $("now-sitting-bar");
-  if (!sitting) { bar.hidden = true; return; }
-  const left = sitting.uris.filter((u) => !sitting.decided[u]).length;
+  const live = nowState?.sitting;
+  const s = live
+    ? { pileName: live.pile_name, uris: live.uris, decided: live.decided }
+    : sitting;
+  if (!s) { bar.hidden = true; return; }
+  const left = s.uris.filter((u) => !s.decided[u]).length;
   $("now-sitting-status").textContent =
-    `sitting: ${sitting.pileName} — ${left} of ${sitting.uris.length} left`;
+    `sitting: ${s.pileName} — ${left} of ${s.uris.length} left`;
   bar.hidden = false;
 }
-$("btn-now-finish-sitting").onclick = () => finishSitting();
+$("btn-now-finish-sitting").onclick = () => finishSitting(nowState?.sitting?.split_id || sitting?.splitId);
 
 function renderNowProblem(msg) {
   paintSittingBar();
@@ -430,10 +451,30 @@ $("now-input-switch").onchange = async (e) => {
   }
 };
 
+// Keeps the client-side `sitting` convenience global roughly in step with
+// what the server just confirmed, so the persistent bar/Finish button have
+// something recent to show even after the user tabs away from the sitting's
+// track. Not load-bearing for correctness — decide() calls always go through
+// nowState.sitting directly while it's available (see decideKeep etc.).
+function syncSittingFromNow(d) {
+  if (!d.sitting) return;
+  sitting = {
+    splitId: d.sitting.split_id, sittingId: d.context?.id, pileId: d.sitting.pile_id,
+    pileName: d.sitting.pile_name, uris: d.sitting.uris, decided: { ...d.sitting.decided },
+  };
+}
+
 function renderNow() {
   const d = nowState;
-  $("btn-undo-now").disabled = nowActions === 0;
+  // The server is authoritative here (see /api/now's `sitting` field): if it
+  // says this poll's context is a sitting, it is one, regardless of what
+  // this client remembers from before a reload. `/api/undo` knows nothing
+  // about split decisions, so it must not stay live just because an earlier,
+  // unrelated ordinary filing left nowActions > 0.
+  const inSitting = !!d.sitting;
+  $("btn-undo-now").disabled = nowActions === 0 || inSitting;
   paintNowControls(d);
+  syncSittingFromNow(d);
   paintSittingBar();
   if (d.needs_reauth) {
     $("now-context").textContent = "";
@@ -452,13 +493,9 @@ function renderNow() {
 
   const tr = d.track;
   const ctx = d.context;
-  // A sitting is just another disposable playlist as far as Spotify is
-  // concerned — this is the one place that recognises it's actually a split
-  // in progress and switches the card from "file this" to "keep or reject".
-  const inSitting = !!(sitting && ctx?.id === sitting.sittingId);
 
   $("now-context").textContent = inSitting
-    ? `sitting: ${sitting.pileName}`
+    ? `sitting: ${d.sitting.pile_name}`
     : ctx?.name
       ? (ctx.is_input ? `playing from ${ctx.name}` : `playing from ${ctx.name} (not an input)`)
       : "not playing from a playlist";
@@ -466,7 +503,7 @@ function renderNow() {
   const img = tr.image ? `<img src="${esc(tr.image)}" alt="">` : '<div class="noimg"></div>';
   const artists = tr.artists.map((a) => a.name).join(", ");
 
-  const body = inSitting ? sittingCardBody(tr) : ordinaryCardBody(d, tr, ctx);
+  const body = inSitting ? sittingCardBody(tr, d.sitting) : ordinaryCardBody(d, tr, ctx);
 
   $("now-card").innerHTML = `<div class="track-card">
     ${img}
@@ -617,18 +654,29 @@ async function openSplit(id, name) {
     applySplitData(data);
   } catch (e) {
     if (e.message === "auth needed") return;
-    // 404 (not split yet) is the expected case here — everything else is a
-    // real error, but either way there's nothing to show but the offer.
+    if (e.status !== 404) {
+      // 404 ("no split for that playlist") is the one expected failure here
+      // and means genuinely "offer to split it". Anything else — a
+      // transient 5xx, a network hiccup — must NOT fall into that same
+      // branch: this playlist may already be split, and the offer below
+      // spends ~15-35 real Spotify calls if clicked.
+      $("split-empty").innerHTML =
+        `<p class="hint">Couldn't load this split: ${esc(e.message)}</p>
+         <button id="btn-retry-split">Retry</button>`;
+      $("btn-retry-split").onclick = () => openSplit(id, name);
+      return;
+    }
     // Estimate follows the same pagination math as the read itself (~100
-    // tracks/call); a cold artist/track cache can cost noticeably more, so
-    // say so rather than promise a number the server can't guarantee.
+    // tracks/call). A snapshot that hasn't moved since the last read costs
+    // 0 — only a cold or changed cache pays the full amount.
     const total = playlistData.find((p) => p.id === id)?.total ?? 0;
     const warm = Math.ceil(total / 100) + 1;
     $("split-empty").innerHTML =
-      `<p class="hint">Not split yet. Reading ${total} tracks costs about
-       ${warm} Spotify calls if it's already cached, more if not — tagging
-       them via Last.fm afterwards costs no Spotify calls at all.</p>
-       <button id="btn-do-split" class="primary">Split it (~${warm}+ calls)</button>`;
+      `<p class="hint">Not split yet. Reading ${total} tracks costs 0 Spotify
+       calls if nothing's changed since the last read, otherwise about
+       ${warm} — tagging them via Last.fm afterwards costs no Spotify calls
+       at all.</p>
+       <button id="btn-do-split" class="primary">Split it (0–${warm} calls)</button>`;
     $("btn-do-split").onclick = doSplit;
   }
 }
@@ -639,13 +687,15 @@ async function doSplit() {
   try {
     const data = await api(`/api/split/${split.id}`, splitParams());
     toast(`${data.tagged} tagged, ${data.untagged} untagged`);
-    // A fresh split starts undecided — no need to round-trip for progress
-    // the server would only hand back as zeroes anyway.
-    split.piles = data.piles.map((p) => ({ ...p, decided: 0, total: p.uris.length }));
-    split.decided = {};
-    split.active_sitting = null;
+    // The POST response is raw piles with no progress fields at all — and
+    // create_split PRESERVES any decisions from a previous split of this
+    // same playlist, so synthesising decided:0 here would show every pile
+    // as fully undecided even when it isn't. GET is a free, local read;
+    // it's also what seeds the resolution/pile-size inputs from what the
+    // server actually used.
+    const fresh = await api(`/api/split/${split.id}`);
     $("split-empty").innerHTML = "";
-    renderPiles();
+    applySplitData(fresh);
   } catch (e) {
     toast(e.message);
   } finally {
@@ -664,40 +714,53 @@ function applySplitData(data) {
   split.piles = data.piles;
   split.decided = data.decided || {};
   split.active_sitting = data.active_sitting || null;
-  syncSittingFromSplit();
+  // Seed the tuning inputs from what the server actually used — otherwise a
+  // split made at resolution 1.4 displays 1.0, and pressing Re-cluster to
+  // "keep the same shape" silently reshapes every pile.
+  if (data.params) {
+    $("split-resolution").value = data.params.resolution ?? 1;
+    $("split-minpile").value = data.params.min_pile ?? 15;
+  }
+  syncSitting(split.id, split.piles, split.decided, split.active_sitting);
   renderPiles();
 }
 
-// Recovers `sitting` when the split view is (re)opened and its stored
-// active_sitting is still live — e.g. after a page reload. This is the only
-// path that can rediscover a sitting after the tab forgets it; there's no
-// endpoint to list active sittings across every split, so until the user
-// revisits this split's view, the Now view has no way to know a sitting
-// belongs to it (see the report for this limitation).
-function syncSittingFromSplit() {
-  const a = split.active_sitting;
-  if (!a || !a.playlist_id) {
-    if (sitting && sitting.splitId === split.id) sitting = null;
+// Rebuilds the `sitting` convenience global from a split's own (piles,
+// decided, active_sitting) — used both when the split view is (re)opened
+// (recovering `sitting` after e.g. a page reload) and by finishSitting's
+// cleared:false path below. Always refreshes `decided` even for a sitting
+// already known: without that, revisiting this same split's view — the one
+// free resync path (GET /api/split, local read) the design relies on — did
+// nothing for the sitting it already recognised, and two tabs on one
+// sitting would drift permanently.
+function syncSitting(splitId, piles, decided, activeSitting) {
+  if (!activeSitting || !activeSitting.playlist_id) {
+    if (sitting && sitting.splitId === splitId) sitting = null;
     return;
   }
-  if (!sitting || sitting.sittingId !== a.playlist_id) {
-    const pile = split.piles.find((p) => p.id === a.pile_id);
-    const decided = {};
-    for (const u of a.uris || []) {
-      if (split.decided[u]) decided[u] = split.decided[u];
-    }
-    sitting = {
-      splitId: split.id, sittingId: a.playlist_id, pileId: a.pile_id,
-      pileName: pile ? pile.name : a.pile_id, uris: a.uris || [], decided,
-    };
+  const uris = activeSitting.uris || [];
+  const decidedHere = {};
+  for (const u of uris) {
+    if (decided[u]) decidedHere[u] = decided[u];
   }
+  const pile = piles.find((p) => p.id === activeSitting.pile_id);
+  sitting = {
+    splitId, sittingId: activeSitting.playlist_id, pileId: activeSitting.pile_id,
+    pileName: pile ? pile.name : activeSitting.pile_id, uris, decided: decidedHere,
+  };
 }
 
 function renderPiles() {
   $("split-params").hidden = false;
   const wrap = $("piles");
   wrap.innerHTML = "";
-  const sittingActive = sitting && sitting.splitId === split.id;
+  // Reads split.active_sitting directly, not the `sitting` global — the
+  // backend allows one active sitting PER split, so a sitting started on a
+  // different split must not disable or hide this one's own, correctly
+  // live, active_sitting (which GET /api/split refreshes every time this
+  // view opens, independent of whatever else the global currently points
+  // at).
+  const sittingActive = !!(split.active_sitting && split.active_sitting.playlist_id);
   for (const p of split.piles) {
     const left = p.total - p.decided;
     const row = document.createElement("div");
@@ -717,10 +780,13 @@ function renderPiles() {
 
 function renderSplitSittingBar() {
   const bar = $("split-sitting-bar");
-  if (!sitting || sitting.splitId !== split.id) { bar.hidden = true; return; }
-  const left = sitting.uris.filter((u) => !sitting.decided[u]).length;
+  const a = split.active_sitting;
+  if (!a || !a.playlist_id) { bar.hidden = true; return; }
+  const pile = split.piles.find((p) => p.id === a.pile_id);
+  const uris = a.uris || [];
+  const left = uris.filter((u) => !split.decided[u]).length;
   $("split-sitting-status").textContent =
-    `Listening: ${sitting.pileName} — ${left} of ${sitting.uris.length} left. ` +
+    `Listening: ${pile ? pile.name : a.pile_id} — ${left} of ${uris.length} left. ` +
     `Open Spotify and the Now view to keep/reject, or finish here.`;
   bar.hidden = false;
 }
@@ -728,30 +794,64 @@ function renderSplitSittingBar() {
 async function startSitting(pileId, pileName) {
   try {
     const data = await api(`/api/split/${split.id}/sitting`, { pile_id: pileId, target_minutes: 120 });
-    sitting = { splitId: split.id, sittingId: data.sitting_id, pileId, pileName,
-                uris: data.uris, decided: {} };
     split.active_sitting = { playlist_id: data.sitting_id, pile_id: pileId, uris: data.uris };
+    syncSitting(split.id, split.piles, split.decided, split.active_sitting);
     toast(`${data.uris.length} tracks (~${data.minutes} min) — open it in Spotify, ` +
           `then switch to Now to keep or reject as you go`, 4500);
     renderPiles();
   } catch (e) { toast(e.message); }
 }
 
-async function finishSitting() {
-  if (!sitting) return;
-  const finishedSplitId = sitting.splitId;
+// `targetSplitId` lets a caller finish a SPECIFIC split's sitting (the Split
+// view's own Finish button always means "this split", regardless of what the
+// `sitting` global last pointed at — see the note by its declaration). Falls
+// back to the global for the Now view's bar, which has no "current split" of
+// its own to hand over explicitly.
+async function finishSitting(targetSplitId) {
+  const finishedSplitId = targetSplitId || sitting?.splitId;
+  if (!finishedSplitId) return;
   try {
     const data = await api(`/api/split/${finishedSplitId}/sitting/finish`, {});
-    toast(data.cleared ? "sitting finished — disposable playlist removed"
-                        : "already finished (from another tab)");
-    sitting = null;
-    if (split && split.id === finishedSplitId) { split.active_sitting = null; renderPiles(); }
+    if (data.cleared) {
+      toast("sitting finished — disposable playlist removed");
+      if (sitting && sitting.splitId === finishedSplitId) sitting = null;
+      if (split && split.id === finishedSplitId) { split.active_sitting = null; renderPiles(); }
+    } else {
+      // cleared:false means the reservation this call observed was NOT the
+      // one it cleared — most likely a newer sitting now occupies the slot.
+      // finish_sitting still unfollowed whatever it read, but treating this
+      // as "already finished" and wiping local state would make a real,
+      // live sitting invisible to every surface with no pointer left
+      // anywhere. Re-sync from the server (free, local) instead of guessing.
+      toast("another sitting is active on this split — finish it again");
+      const fresh = await api(`/api/split/${finishedSplitId}`);
+      syncSitting(finishedSplitId, fresh.piles, fresh.decided || {}, fresh.active_sitting || null);
+      if (split && split.id === finishedSplitId) {
+        split.piles = fresh.piles;
+        split.decided = fresh.decided || {};
+        split.active_sitting = fresh.active_sitting || null;
+        renderPiles();
+      }
+    }
     if (!$("view-now").hidden) renderNow();
-  } catch (e) { toast(e.message); }
+  } catch (e) {
+    if (e.status === 404) {
+      // No active sitting for this split at all — this client's pointer to
+      // one is stale (finished elsewhere, or left over from a session that
+      // never synced). Clearing it here is what stops every further Finish
+      // click from 404ing on the same stale pointer forever.
+      toast("no active sitting to finish — clearing it here too");
+      if (sitting && sitting.splitId === finishedSplitId) sitting = null;
+      if (split && split.id === finishedSplitId) { split.active_sitting = null; renderPiles(); }
+      if (!$("view-now").hidden) renderNow();
+    } else {
+      toast(e.message);
+    }
+  }
 }
 
 $("btn-split-back").onclick = () => { split = null; loadLists(); };
-$("btn-split-finish-sitting").onclick = () => finishSitting();
+$("btn-split-finish-sitting").onclick = () => finishSitting(split?.id);
 $("btn-recluster").onclick = async () => {
   try {
     const data = await api(`/api/split/${split.id}/recluster`, splitParams());
@@ -783,8 +883,14 @@ $("btn-recluster").onclick = async () => {
 // Keeping them as separate code paths, gated on whether the currently-playing
 // context is the active sitting's playlist, is what makes that impossible.
 
-function sittingCardBody(tr) {
-  const dec = sitting.decided[tr.uri];
+// `srvSitting` is always d.sitting from the most recent /api/now poll — the
+// server's own answer for "is the currently-playing context a sitting, and
+// what's already decided in it." Never the client-side `sitting` global:
+// that one only mirrors this for the cross-view convenience bar, and reading
+// it here would let a stale local guess override a fresh server answer (the
+// two-tab-drift and reload-gap bugs a review round caught).
+function sittingCardBody(tr, srvSitting) {
+  const dec = srvSitting.decided[tr.uri];
   if (dec?.action === "keep") {
     const homeName = dec.to_id === "liked" ? "Liked Songs" : (nowState.homes.get(dec.to_id)?.name || dec.to_id);
     return `<p class="done-msg">✓ kept to <b>${esc(homeName)}</b><br>
@@ -828,52 +934,71 @@ function wireSittingCard() {
   if (un) un.onclick = decideUndecide;
 }
 
-function recordSittingDecision(uri, entry) {
-  sitting.decided[uri] = entry;
+// Applies whatever the server says actually stands for `uri` — `decision` is
+// res.decision from a decide() response: {action, to_id} if something is
+// decided, or null if not (a successful undecide, or nothing ever landed).
+// NEVER the action this client just attempted: decide() reports
+// `changed: false` exactly when a different outcome already won (a
+// throttled add still in flight when a second click landed, for instance),
+// and recording the attempt instead of the true outcome is how a card ends
+// up reading "kept to Jazz" for a track that is actually in Rock.
+function applyDecision(uri, decision) {
+  if (nowState?.sitting) {
+    if (decision) nowState.sitting.decided[uri] = decision;
+    else delete nowState.sitting.decided[uri];
+  }
+  if (sitting) {
+    if (decision) sitting.decided[uri] = decision;
+    else delete sitting.decided[uri];
+  }
+}
+
+function homeNameFor(id) {
+  if (id === "liked") return "Liked Songs";
+  return nowState.homes.get(id)?.name || id;
 }
 
 async function decideKeep(homeId) {
-  if (!sitting || nowState?.context?.id !== sitting.sittingId) return;
+  if (!nowState?.sitting) return;
+  const splitId = nowState.sitting.split_id;
   const tr = nowState.track;
   try {
-    const res = await api(`/api/split/${sitting.splitId}/decide`,
+    const res = await api(`/api/split/${splitId}/decide`,
                           { uri: tr.uri, action: "keep", to_id: homeId });
-    recordSittingDecision(tr.uri, { action: "keep", to_id: homeId });
-    const homeName = homeId === "liked" ? "Liked Songs" : (nowState.homes.get(homeId)?.name || homeId);
+    applyDecision(tr.uri, res.decision);
     // decide() reports `changed: false` for a no-op (e.g. re-keeping an
-    // already-kept track) — that must read as "already handled", never as a
-    // fresh success, or the user is told something happened that didn't.
+    // already-kept track, or losing a race to another click) — that must
+    // read as "already handled", never as a fresh success.
     toast(res.changed
-      ? `kept → ${homeName} (${res.remaining} left in the split)`
-      : `already decided (kept) — nothing new spent`);
+      ? `kept → ${homeNameFor(homeId)} (${res.remaining} left in the split)`
+      : `already decided — ${res.decision ? res.decision.action : "no change"}` +
+        (res.decision?.action === "keep" ? ` to ${homeNameFor(res.decision.to_id)}` : ""));
     renderNow();
   } catch (e) { toast(e.message); }
 }
 
 async function decideReject() {
-  if (!sitting || nowState?.context?.id !== sitting.sittingId) return;
+  if (!nowState?.sitting) return;
+  const splitId = nowState.sitting.split_id;
   const tr = nowState.track;
   try {
-    const res = await api(`/api/split/${sitting.splitId}/decide`,
+    const res = await api(`/api/split/${splitId}/decide`,
                           { uri: tr.uri, action: "reject" });
-    recordSittingDecision(tr.uri, { action: "reject" });
+    applyDecision(tr.uri, res.decision);
     toast(res.changed ? `rejected — free (${res.remaining} left in the split)` : "already rejected");
     renderNow();
   } catch (e) { toast(e.message); }
 }
 
 async function decideUndecide() {
-  if (!sitting || nowState?.context?.id !== sitting.sittingId) return;
+  if (!nowState?.sitting) return;
+  const splitId = nowState.sitting.split_id;
   const tr = nowState.track;
   try {
-    const res = await api(`/api/split/${sitting.splitId}/decide`,
+    const res = await api(`/api/split/${splitId}/decide`,
                           { uri: tr.uri, action: "undecide" });
-    if (res.changed) {
-      delete sitting.decided[tr.uri];
-      toast(`un-rejected — free (${res.remaining} left in the split)`);
-    } else {
-      toast("nothing to undo");
-    }
+    applyDecision(tr.uri, res.decision);  // null on success — clears it
+    toast(res.changed ? `un-rejected — free (${res.remaining} left in the split)` : "nothing to undo");
     renderNow();
   } catch (e) { toast(e.message); }
 }
@@ -898,9 +1023,8 @@ document.addEventListener("keydown", (e) => {
   }
 
   if (!$("view-now").hidden && nowState?.playing) {
-    const inSitting = sitting && nowState.context?.id === sitting.sittingId;
-    if (inSitting) {
-      const dec = sitting.decided[nowState.track.uri];
+    if (nowState.sitting) {
+      const dec = nowState.sitting.decided[nowState.track.uri];
       if (dec?.action === "keep") return;  // final — nothing left to press
       if (dec?.action === "reject") { if (e.key === "u") decideUndecide(); return; }
       if (["1", "2", "3"].includes(e.key)) {
