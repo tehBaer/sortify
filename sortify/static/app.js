@@ -70,6 +70,14 @@ $("btn-auth-finish").onclick = async () => {
 
 // ---- playlist roles --------------------------------------------------------
 
+function ageText(fetchedAt) {
+  if (!fetchedAt) return "";
+  const mins = Math.max(0, Math.round((Date.now() / 1000 - fetchedAt) / 60));
+  if (mins < 60) return `list read ${mins} min ago`;
+  const hrs = Math.round(mins / 60);
+  return hrs < 48 ? `list read ${hrs}h ago` : `list read ${Math.round(hrs / 24)} days ago`;
+}
+
 async function loadLists() {
   show("lists");
   $("playlists").innerHTML = '<p class="hint">Loading playlists…</p>';
@@ -77,6 +85,9 @@ async function loadLists() {
     const data = await api("/api/playlists");
     playlistData = data.playlists;
     roles = Object.fromEntries(playlistData.map((p) => [p.id, p.role]));
+    // The list is cached until refreshed by hand, so say how old it is rather
+    // than present a stale list as current.
+    $("pl-age").textContent = ageText(data.fetched_at);
     renderLists();
   } catch (e) {
     if (e.message === "auth needed") return;
@@ -134,6 +145,27 @@ function renderLists() {
 }
 
 $("pl-filter").oninput = renderLists;
+
+// The only thing that re-reads the listing from Spotify. It is slow on
+// purpose — ~21 paginated calls paced by the rolling-window throttle — so the
+// button says so and stays disabled until it lands.
+$("btn-refresh-lists").onclick = async () => {
+  const btn = $("btn-refresh-lists");
+  btn.disabled = true;
+  btn.textContent = "Refreshing…";
+  $("pl-age").textContent = "re-reading from Spotify — this takes about a minute";
+  try {
+    const res = await api("/api/refresh", {});
+    await loadLists();
+    toast(`refreshed — ${res.calls_spent} Spotify calls spent`, 4000);
+  } catch (e) {
+    toast(e.message);
+    $("pl-age").textContent = "";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Refresh";
+  }
+};
 
 async function saveConfig() {
   const input_ids = Object.keys(roles).filter((k) => roles[k] === "input");

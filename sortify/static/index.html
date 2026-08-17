@@ -53,7 +53,11 @@
     <h2>Playlists</h2>
     <p class="hint">Mark your <b>inputs</b> (where new songs land) and the <b>homes</b> you sort
     into. Marked playlists stay pinned on top.</p>
-    <input id="pl-filter" placeholder="Filter playlists…" autocomplete="off">
+    <div class="row">
+      <input id="pl-filter" placeholder="Filter playlists…" autocomplete="off">
+      <button id="btn-refresh-lists" title="Re-read the playlist list from Spotify">Refresh</button>
+    </div>
+    <p id="pl-age" class="hint"></p>
     <div id="playlists"></div>
     <div class="actionbar">
       <button id="btn-save-config" class="primary">Save roles</button>

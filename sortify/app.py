@@ -128,7 +128,8 @@ def playlists():
             else "home" if p["id"] in cfg.get("home_ids", [])
             else None
         )
-    return {"playlists": out}
+    entry = store.cache().get("playlist_list") or {}
+    return {"playlists": out, "fetched_at": entry.get("fetched_at")}
 
 
 @app.post("/api/folders")
@@ -292,8 +293,22 @@ def _homes_payload(state: dict, exclude: str = "") -> list[dict]:
 
 @app.post("/api/refresh")
 def refresh_profiles():
+    """The Refresh button: the one place the playlist listing is re-read.
+
+    Everything else runs off the cached list, so this has to invalidate it
+    before rebuilding — otherwise the button would spin and change nothing.
+    """
+    before = sp.budget_spent()
+    sp.my_playlists(refresh=True)
     state = _ensure_profiles(force=True)
-    return {"ok": True, "homes": len(state["homes"])}
+    # This is the one user action that can burst: the listing itself, plus a
+    # re-read of every home whose snapshot_id moved while the list sat frozen.
+    # Report the cost rather than let it disappear into the ledger.
+    return {
+        "ok": True,
+        "homes": len(state["homes"]),
+        "calls_spent": sp.budget_spent() - before,
+    }
 
 
 # ---- triage ----------------------------------------------------------------

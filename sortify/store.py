@@ -76,9 +76,14 @@ class Store:
     def save_usage(self, usage: dict) -> None:
         self._save("usage.json", usage)
 
-    # cache.json: playlist snapshots and artist genres
+    # cache.json: playlist snapshots and artist genres.
+    # "playlists" is per-playlist track data keyed by id; "playlist_list" is the
+    # user's playlist *listing* — different things, hence the separate key.
     def cache(self) -> dict:
-        return self._load("cache.json", {"playlists": {}, "artists": {}, "me": None})
+        return self._load(
+            "cache.json",
+            {"playlists": {}, "artists": {}, "me": None, "playlist_list": None},
+        )
 
     def save_cache(self, cache: dict) -> None:
         self._save("cache.json", cache)

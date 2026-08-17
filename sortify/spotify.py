@@ -406,7 +406,28 @@ class Spotify:
 
     # ---- playlists --------------------------------------------------------
 
-    def my_playlists(self) -> list[dict]:
+    def my_playlists(self, refresh: bool = False) -> list[dict]:
+        """The user's playlist listing, served from disk unless asked to reload.
+
+        A thousand playlists is ~21 paginated calls, and WINDOW_CAP turns that
+        into a ~60s stall — far too expensive to repay on every Playlists view
+        and every 10-minute profile rebuild for a list that changes rarely.
+        Refreshing is therefore an explicit act (the Refresh button), which
+        also means playlists edited in the Spotify client stay invisible here
+        until then: snapshot_id comes from this listing, so the track caches
+        keyed off it stay put too.
+        """
+        if not refresh:
+            entry = self.store.cache().get("playlist_list")
+            if entry and entry.get("items") is not None:
+                return entry["items"]
+        items = self._fetch_my_playlists()
+        cache = self.store.cache()
+        cache["playlist_list"] = {"fetched_at": time.time(), "items": items}
+        self.store.save_cache(cache)
+        return items
+
+    def _fetch_my_playlists(self) -> list[dict]:
         me = (self.store.cache().get("me") or {}).get("id")
         out = []
         for p in self._paginate("/me/playlists", {"limit": 50}):
