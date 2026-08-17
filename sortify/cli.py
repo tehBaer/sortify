@@ -8,6 +8,11 @@ usage — the rest of the day's budget belongs to the user.
 
   spx budget            show today's spend, caps, cooldown
   spx GET /me           one budgeted API call (method optional, GET default)
+  spx POST /me/playlists '{"name":"x"}'   same, with a JSON body
+
+The body argument is what makes writes reachable by hand at all. Without it
+this tool could only issue reads, so anyone probing a POST or DELETE was
+pushed toward curl and a raw token — the exact thing it exists to prevent.
 """
 
 from __future__ import annotations
@@ -44,13 +49,23 @@ def main() -> None:
         return
 
     method, path = (args[0].upper(), args[1]) if len(args) >= 2 else ("GET", args[0])
+    body = None
+    if len(args) >= 3:
+        try:
+            body = json.loads(args[2])
+        except json.JSONDecodeError as e:
+            # Refuse before spending: a malformed body would burn a real call
+            # on a 400, and the day's dev allowance is small.
+            print(f"refused: body is not valid JSON ({e})")
+            sys.exit(2)
+
     spent = sp.budget_spent()
     if not dev_call_allowed(spent):
         print(f"refused: {spent} calls already spent today ≥ dev ceiling {DEV_CAP}.")
         print("Development traffic stops here — the rest belongs to real usage.")
         sys.exit(2)
     try:
-        data = sp.request(method, path)
+        data = sp.request(method, path, **({"json": body} if body is not None else {}))
     except SpotifyError as e:
         print("error:", e)
         sys.exit(1)

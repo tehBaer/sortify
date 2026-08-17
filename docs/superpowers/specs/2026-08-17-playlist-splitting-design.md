@@ -353,12 +353,23 @@ and no new proactive job is introduced.
 
 ## Risks and open questions
 
-1. **Unverified endpoints.** `POST /me/playlists` and
-   `DELETE /playlists/{id}/followers` are not in the client today and are not
-   confirmed present in the Feb-2026 API shape. **Mitigation:** one
-   single-shot probe before implementing Section 4. **Fallback if absent:**
-   reuse one long-lived sitting playlist and clear it per track — roughly
-   double the calls per sitting (~44), still viable.
+1. ~~**Unverified endpoints.**~~ **RESOLVED 2026-08-17 by probe — both exist.**
+   A single-shot two-call probe created a playlist via `POST /me/playlists` and
+   removed it via `DELETE /playlists/{id}/followers`. Both succeeded in the
+   Feb-2026 dev-mode shape. The delete returns an empty body, which `request()`
+   tolerates since `906c5ad` — before that commit this probe would have raised
+   `JSONDecodeError` on success. The throwaway playlist was removed by the probe
+   itself, so nothing was left in the account.
+
+   The disposable-sitting design in Section 4 therefore stands at ~24 calls per
+   2 h sitting, and the fallback it would otherwise have needed — one long-lived
+   playlist cleared track by track, ~44 calls per sitting — is dropped.
+
+   The probe also exposed a gap in the tooling. `spx` could not send a request
+   body, so the only sanctioned path to the API could issue reads but not
+   writes, pushing anyone probing a POST toward curl and a raw token — exactly
+   what `spx` exists to prevent. It now takes an optional JSON body argument and
+   refuses malformed JSON *before* spending a call.
 2. **Clustering quality is unproven on this data.** 97% tag coverage makes
    Louvain viable but does not guarantee coherent piles. **Mitigation:**
    clustering is free to re-run, and the plan sequences tag enrichment before
