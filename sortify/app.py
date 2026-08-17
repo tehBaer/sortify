@@ -15,7 +15,7 @@ import uvicorn
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import suggest as sugg
 from .folders import extract_folder_map, home_name_excluded, select_home_ids
@@ -27,7 +27,7 @@ from .spotify import (
     Spotify,
     SpotifyError,
 )
-from .split import split_tracks
+from .split import UNTAGGED, split_tracks
 from .store import TAGS_VERSION, Store
 from .tags import LastFm, LastFmError, enrich, load_key
 
@@ -366,10 +366,10 @@ def triage(playlist_id: str):
 
 
 class SplitParams(BaseModel):
-    resolution: float = 1.0
-    min_pile: int = 15
-    tag_floor: int = 10
-    max_tags_per_artist: int = 8
+    resolution: float = Field(1.0, gt=0)
+    min_pile: int = Field(15, ge=1)
+    tag_floor: int = Field(10, ge=0)
+    max_tags_per_artist: int = Field(8, ge=1)
 
 
 def _now_iso() -> str:
@@ -414,20 +414,29 @@ def _pile_progress(split: dict) -> list[dict]:
 def create_split(playlist_id: str, params: SplitParams = SplitParams()):
     """Read a playlist, tag its artists via Last.fm, cluster into piles.
 
-    The only Spotify spend is the track read (~15 calls for 1372). Tagging is
-    Last.fm, one request per not-yet-cached artist; clustering is local and
-    free. A Last.fm failure partway through does not lose what was already
-    verified — see `_tag_artists_checked` and the `LastFmError` handling below.
+    The only Spotify spend is the track read (~15 calls for 1372, and zero if
+    the snapshot hasn't moved since the last read — see `_cached_tracks`, the
+    same cache `triage` uses). Tagging is Last.fm, one request per
+    not-yet-cached artist; clustering is local and free. A Last.fm failure
+    partway through does not lose what was already verified — see
+    `_tag_artists_checked` and the `LastFmError` handling below.
     """
     fm = _lastfm_client()
     if fm is None:
         raise HTTPException(400, "No Last.fm API key — expected ~/state/sortify/lastfm.json")
 
-    # Checked before the Spotify read: a stale tags.json is a local problem
-    # that should fail for free, not after spending the ~15-call track fetch.
+    # Checked before any Spotify read: a stale tags.json is a local problem
+    # that should fail for free, not after spending a track fetch.
     cached_artists = _tag_artists_checked()
 
-    tracks = sp.playlist_tracks(playlist_id)
+    # Validated against the cached listing, like triage — an unknown id must
+    # not cost a call just to find that out.
+    by_id = {p["id"]: p for p in sp.my_playlists()}
+    if playlist_id != LIKED_ID and playlist_id not in by_id:
+        raise HTTPException(404, "unknown playlist")
+
+    snapshot_id = by_id.get(playlist_id, {}).get("snapshot_id")
+    tracks = _cached_tracks(playlist_id, snapshot_id)
     if not tracks:
         raise HTTPException(400, "playlist has no tracks")
 
@@ -442,31 +451,30 @@ def create_split(playlist_id: str, params: SplitParams = SplitParams()):
     except LastFmError as exc:
         saved = exc.partial if exc.partial is not None else cached_artists
         store.save_tag_artists(saved)
+        # How many of *this playlist's* artists made it, not the size of the
+        # whole cross-playlist cache `saved` carries forward.
+        tagged_here = len(set(names) & set(saved))
         raise HTTPException(
             502,
-            f"Last.fm tagging stopped after {len(saved)} of {len(names)} "
+            f"Last.fm tagging stopped after {tagged_here} of {len(names)} "
             f"artists in this playlist ({exc}); progress was saved — "
             "re-running the split will resume instead of starting over.",
         ) from exc
     store.save_tag_artists(artists)
-
-    cache = store.cache()
-    cache["playlists"].setdefault(playlist_id, {})["tracks"] = tracks
-    store.save_cache(cache)
 
     piles = split_tracks(tracks, artists, params.model_dump())
     payload = store.splits()
     prev = payload["splits"].get(playlist_id, {})
     payload["splits"][playlist_id] = {
         "created_at": _now_iso(),
-        "snapshot_id": cache["playlists"][playlist_id].get("snapshot_id"),
+        "snapshot_id": snapshot_id,
         "params": params.model_dump(),
         "piles": piles,
         "decided": prev.get("decided", {}),
         "active_sitting": None,
     }
     store.save_splits(payload)
-    untagged = sum(len(p["uris"]) for p in piles if p["id"] == "untagged")
+    untagged = sum(len(p["uris"]) for p in piles if p["id"] == UNTAGGED)
     return {"piles": piles, "tagged": len(tracks) - untagged, "untagged": untagged}
 
 
