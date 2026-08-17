@@ -36,6 +36,16 @@ def test_drops_self_tags_and_substring_matches():
     assert out == [("trip-hop", 100)]
 
 
+def test_keeps_a_genre_that_is_part_of_the_artist_name():
+    """Measured on the live library: dropping tags *contained in* the artist
+    name cost 20 of 720 artists their primary genre."""
+    assert clean_tags(raw(("jazz", 100), ("nu jazz", 80)), "Jaga Jazzist") == [
+        ("jazz", 100), ("nu jazz", 80)]
+    assert clean_tags(raw(("funk", 100)), "Funkadelic") == [("funk", 100)]
+    assert clean_tags(raw(("blues", 100)), "The Moody Blues") == [("blues", 100)]
+    assert clean_tags(raw(("house", 100)), "Green-House") == [("house", 100)]
+
+
 def test_short_artist_names_do_not_strip_everything():
     """An artist named "A" must not lose every tag containing the letter a."""
     out = clean_tags(raw(("ambient", 100), ("trance", 80), ("a", 50)), "A")

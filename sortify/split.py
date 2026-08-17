@@ -11,13 +11,29 @@ from __future__ import annotations
 import math
 
 from .community import louvain
+from .tags import clean_tags
 
-DEFAULTS = {"resolution": 1.0, "min_pile": 15, "top_name_tags": 3}
+DEFAULTS = {
+    "resolution": 1.0,       # Louvain resolution; higher = more, smaller piles
+    "min_pile": 15,          # tracks; smaller piles merge into their neighbour
+    "tag_floor": 10,         # drop tags Last.fm counts below this
+    "max_tags_per_artist": 8,  # keep this many tags per artist, by weight
+    "top_name_tags": 3,      # tags used to name a pile
+}
 UNTAGGED = "untagged"
 
 
-def _vec(entry: dict) -> dict[str, float]:
-    return {t: float(w) for t, w in entry.get("tags", [])}
+def _vec(entry: dict, floor: int, keep: int) -> dict[str, float]:
+    """Tag-weight vector for one cached artist, after hygiene.
+
+    `data/tags.json` holds Last.fm's raw tags, so the stoplist, the count
+    floor and the keep limit are applied here, per split — re-tuning any of
+    them is free, where filtering at fetch time would have frozen them behind
+    a ~700-request re-fetch.
+    """
+    cleaned = clean_tags(entry.get("tags", []), entry.get("name") or "",
+                         floor=floor, keep=keep)
+    return {t: float(w) for t, w in cleaned}
 
 
 def _cosine(a: dict[str, float], b: dict[str, float]) -> float:
@@ -114,6 +130,10 @@ def _merge_small(groups: list[list[str]], vecs: dict, tracks: list[dict], min_pi
 
 
 def split_tracks(tracks: list[dict], tags: dict, params: dict | None = None) -> list[dict]:
+    """Group `tracks` into piles. `tags` is the **inner** artists map from
+    `data/tags.json` (`Store.tag_artists()`), keyed by Spotify artist id — not
+    the versioned envelope, which would leave every track untagged.
+    """
     p = {**DEFAULTS, **(params or {})}
     if not tracks:
         return []
@@ -123,7 +143,7 @@ def split_tracks(tracks: list[dict], tags: dict, params: dict | None = None) -> 
     for t in tracks:
         aid = _primary_artist(t)
         if aid and aid not in vecs:
-            v = _vec(tags.get(aid, {}))
+            v = _vec(tags.get(aid, {}), p["tag_floor"], p["max_tags_per_artist"])
             if v:
                 vecs[aid] = v
 
@@ -151,11 +171,14 @@ def split_tracks(tracks: list[dict], tags: dict, params: dict | None = None) -> 
         if idx is not None:
             buckets[idx].append(t["uri"])
 
+    # Every group holds at least one artist that came from a track, so every
+    # bucket is non-empty; skipping empties here would only produce
+    # non-contiguous pile ids.
+    assert all(buckets), "a pile came out with no tracks"
     piles = [
         {"id": f"p{i + 1}", "name": " · ".join(names[i]) or f"pile {i + 1}",
          "tags": names[i], "uris": buckets[i]}
         for i in range(len(groups))
-        if buckets[i]
     ]
     if untagged_uris:
         piles.append({"id": UNTAGGED, "name": "untagged", "tags": [], "uris": untagged_uris})

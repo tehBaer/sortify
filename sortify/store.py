@@ -14,6 +14,9 @@ from typing import Any
 
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
+# tags.json shape version. 2: raw Last.fm tags, hygiene applied at split time.
+TAGS_VERSION = 2
+
 
 def _atomic_write(path: Path, payload: Any) -> None:
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=".tmp")
@@ -88,10 +91,31 @@ class Store:
     def save_cache(self, cache: dict) -> None:
         self._save("cache.json", cache)
 
-    # tags.json: {artist_id: {name, lastfm_name, tags, fetched_at, miss}}
+    # tags.json is an *envelope*:
+    #   {"version": 2, "artists": {artist_id: {name, lastfm_name, tags,
+    #                                          fetched_at, miss}}}
     # Last.fm data, not Spotify's — kept separate from cache.json on purpose.
+    # Version 2 stores Last.fm's raw tags; version 1 stored them pre-filtered.
     def tags(self) -> dict:
-        return self._load("tags.json", {"version": 1, "artists": {}})
+        """The whole envelope. Consumers almost always want `tag_artists()`."""
+        return self._load("tags.json", {"version": TAGS_VERSION, "artists": {}})
+
+    def tag_artists(self) -> dict:
+        """The inner `{artist_id: record}` map.
+
+        This is what `tags.enrich(cached=...)` and `split.split_tracks(tags=...)`
+        take. Handing either of them the envelope fails silently: enrich finds
+        no artist ids and re-fetches the whole library, split finds no tags and
+        calls every track untagged.
+        """
+        artists = self.tags().get("artists")
+        return artists if isinstance(artists, dict) else {}
 
     def save_tags(self, payload: dict) -> None:
+        """Write the envelope. To write just the artists map use
+        `save_tag_artists()`, which wraps it for you."""
         self._save("tags.json", payload)
+
+    def save_tag_artists(self, artists: dict) -> None:
+        """Wrap an inner artists map in the current envelope and store it."""
+        self._save("tags.json", {"version": TAGS_VERSION, "artists": artists})

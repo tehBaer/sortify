@@ -79,7 +79,8 @@ geography (`niger`, `icelandic`, `Trondheim`, `netherlands`), listener
 descriptors (`female vocalists`, `oldies`), label names
 (`dusted wax kingdom`), and junk (`All`, `misc`, `x`). Left unfiltered these
 produce cross-genre piles such as "Norwegian". Tag hygiene is a required
-stage, not a refinement.
+stage, not a refinement — it runs in the splitter (Section 2), over raw tags
+kept in the cache, so it can be retuned without re-fetching.
 
 ## Non-goals
 
@@ -130,29 +131,46 @@ through the Spotify budget, or Spotify traffic through the Last.fm limiter.
 - **Rate limit.** 4 requests/second, below Last.fm's stated ceiling of 5.
   Independent of `WINDOW_CAP`.
 - **Request.** `artist.getTopTags`, `autocorrect=1`, matched by artist name.
-- **Hygiene**, applied in order:
-  1. drop tags with `count < 10`;
-  2. drop tags on the stoplist — countries, nationalities, cities, and the
-     known junk set (`seen live`, `favorites`, `All`, `misc`, `x`);
-  3. drop tags that case-insensitively match the artist's own name or a
-     substring of it (catches self-tags and label names);
-  4. keep the top 8 surviving tags with their weights.
+  Because `autocorrect=1` may silently match a *different* artist, the name
+  Last.fm says it matched (`toptags.@attr.artist`) is stored as `lastfm_name`,
+  so a mismatch against the Spotify `name` is visible in the record rather
+  than invisible forever. It is `null` when the response did not say.
+- **The cache stores raw tags.** `enrich` writes Last.fm's tag list verbatim
+  (name + count, nothing dropped). Hygiene runs at **split** time — Section 2 —
+  not here. The cache is permanent and never re-fetched, so anything filtered
+  on the way in would be unrecoverable without ~700 fresh requests, and the
+  stoplist, the count floor and the keep limit are all certain to need tuning
+  once the whole library is visible instead of a 30-artist probe.
+- **Errors never become data.** Only a genuine "artist not found" (code 6 *and*
+  a not-found message; code 6 is also Last.fm's "invalid parameters") is
+  recorded as a miss. A missing/blank API key is rejected at construction, a
+  200 response without a `toptags` object raises, and any other error aborts
+  the run — each of these would otherwise write a permanent lie for every
+  remaining artist. On abort the exception carries the partial map
+  (`LastFmError.partial`), holding only verified-good entries, so a failure
+  late in the run does not throw away the requests already answered.
 - **Cache.** `data/tags.json`, keyed by **Spotify artist id** so it joins
   directly against cached tracks. Permanent — never re-fetched.
 - **Misses.** The ~3% Last.fm cannot match are recorded explicitly as
   `"miss": true` so they are never re-asked, and their tracks are routed to a
   dedicated "untagged" pile rather than silently dropped.
 
-`data/tags.json`:
+`data/tags.json` is an **envelope** — `{"version", "artists"}` — around the map
+that both `enrich` and `split_tracks` actually consume. `Store.tags()` returns
+the envelope; `Store.tag_artists()` returns the inner map, and that is what the
+two consumers take. Handing either of them the envelope fails silently.
+Version 2 holds raw tags; version 1 held them pre-filtered.
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "artists": {
     "5PbpKlxQE0Ktl5lcNABoFI": {
       "name": "Altin Gün",
       "lastfm_name": "Altın Gün",
-      "tags": [["psychedelic rock", 100], ["anatolian rock", 85]],
+      "tags": [{"name": "psychedelic rock", "count": 100},
+               {"name": "turkish", "count": 51},
+               {"name": "anatolian rock", "count": 85}],
       "fetched_at": "2026-08-17T16:00:00Z",
       "miss": false
     }
@@ -170,6 +188,21 @@ This matters for two reasons: it is fully testable offline, and re-clustering
 with different parameters is free once tags are cached — which the user will
 want, because the first clustering is unlikely to be the last.
 
+0. **Tag hygiene**, applied to each artist's stored raw tags, in order:
+   1. drop tags with `count < tag_floor` (default 10);
+   2. drop tags on the stoplist — countries, nationalities, cities, and the
+      known junk set (`seen live`, `favorites`, `All`, `misc`, `x`);
+   3. drop a tag that *is* the artist's name, or that *contains* it (catches
+      self-tags and "Shimshai Live"). The reverse direction — dropping a tag
+      contained *in* the artist name — was measured against the 720 artists in
+      `data/cache.json` and cost 20 of them their primary genre (Jaga Jazzist
+      lost `jazz`, Funkadelic `funk`, The Moody Blues `blues`), so it is not
+      applied;
+   4. keep the top `max_tags_per_artist` survivors (default 8) with weights.
+
+   This runs here, per split, rather than at fetch time, which is what makes
+   re-clustering genuinely free: the stoplist and both thresholds can be
+   retuned against the same cache with zero requests.
 1. Build a weighted graph over artists; edge weight is shared-tag weight
    (cosine over tag-weight vectors).
 2. Run Louvain community detection. Community count falls out of the data
@@ -189,9 +222,11 @@ want, because the first clustering is unlikely to be the last.
    until every pile meets `min_pile` or only one pile remains. Untagged tracks
    form their own pile and are exempt from merging in both directions.
 
-Parameters, all persisted with the result so a split is reproducible:
-`resolution` (Louvain, default 1.0), `min_pile` (default 15 tracks),
-`tag_floor` (default 10), `max_tags_per_artist` (default 8).
+Parameters (`split.DEFAULTS`), all persisted with the result so a split is
+reproducible: `resolution` (Louvain, default 1.0), `min_pile` (default 15
+tracks), `tag_floor` (default 10), `max_tags_per_artist` (default 8),
+`top_name_tags` (tags used to name a pile, default 3). All five are split-time
+parameters and cost nothing to change.
 
 `data/splits.json`:
 
@@ -202,8 +237,8 @@ Parameters, all persisted with the result so a split is reproducible:
     "<playlist_id>": {
       "created_at": "2026-08-17T16:00:00Z",
       "snapshot_id": "<spotify snapshot at read time>",
-      "params": {"resolution": 1.0, "min_pile": 15,
-                 "tag_floor": 10, "max_tags_per_artist": 8},
+      "params": {"resolution": 1.0, "min_pile": 15, "tag_floor": 10,
+                 "max_tags_per_artist": 8, "top_name_tags": 3},
       "piles": [
         {"id": "p1",
          "name": "desert blues · tuareg",
@@ -298,9 +333,12 @@ and no new proactive job is introduced.
   tags after hygiene.
 - Tag hygiene tests assert the specific observed junk is removed —
   `All`, `misc`, `x`, `Trondheim`, `icelandic`, `female vocalists` — and that
-  a legitimate compound genre like `anatolian rock` survives.
-- `tags.py` tests run against a fake HTTP client, with an explicit assertion
-  that no Spotify budget function is called.
+  a legitimate compound genre like `anatolian rock` survives, as does a genre
+  that happens to sit inside the artist's name (`jazz` for Jaga Jazzist).
+- `tags.py` tests run against a fake HTTP client and a fake sleep. The
+  no-Spotify invariant is checked at runtime, not by grepping the source: a
+  fresh interpreter imports `sortify.tags` and asserts no loaded module name
+  contains `spotify`, so a transitive import is caught too.
 - Sitting sizing tests confirm the duration target is met without exceeding it
   and that undecided tracks are never served twice.
 - The existing suite stays green. No test makes a network call.
@@ -333,8 +371,12 @@ and no new proactive job is introduced.
    world, and ambient. Accepted as an artist-level limitation.
    **Re-probe before revisiting**: the trade-off flips only if coverage rises.
 4. **Last.fm name matching.** Matching is by name, not id, so distinct artists
-   sharing a name can collide. Accepted at ~3% miss rate; misses are explicit
-   and land in the untagged pile.
+   sharing a name can collide — this library has 13 artists of three characters
+   or fewer (`Air`, `C2C`, `GUM`, `Nu`, `OM`, `Tor`, `III`), and `autocorrect=1`
+   can quietly redirect any of them. Accepted at ~3% miss rate; misses are
+   explicit and land in the untagged pile, and every hit records the name
+   Last.fm actually matched as `lastfm_name`, so a collision is auditable
+   against `name` instead of being invisible.
 5. **Key in transcript.** The Last.fm API key was pasted into a chat
    transcript and should be rotated at the user's convenience. It is stored
    outside the repo regardless.
