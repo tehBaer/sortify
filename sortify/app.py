@@ -136,6 +136,14 @@ def playlists():
              "total": None, "image": None}
     out = [liked] + items
     inputs = _effective_input_ids(cfg, items)
+    # One disk read + JSON parse for the whole listing, not one per playlist.
+    # Against a real ~1000-playlist account with a splits.json that has grown
+    # to hundreds of KB, calling `_split_summary` inside this loop (each call
+    # doing its own `store.splits()`) turned every /api/playlists response
+    # into a ~1.4s stall — felt on every Playlists-view open (nav-lists,
+    # btn-back, btn-split-back, post-refresh). Zero Spotify calls either way;
+    # this was a purely local-disk cost the user was still paying constantly.
+    splits = store.splits()["splits"]
     for p in out:
         p["folder"] = (folders.get(p["id"]) or {}).get("path")
         p["role"] = (
@@ -143,8 +151,7 @@ def playlists():
             else "home" if p["id"] in cfg.get("home_ids", [])
             else None
         )
-        # Local read, zero Spotify calls — see `_split_summary` below.
-        p["split"] = _split_summary(p["id"])
+        p["split"] = _split_summary(p["id"], splits)
     entry = store.cache().get("playlist_list") or {}
     return {"playlists": out, "fetched_at": entry.get("fetched_at")}
 
@@ -404,13 +411,23 @@ def _tag_artists_checked() -> dict:
     return store.tag_artists()
 
 
-def _split_summary(playlist_id: str) -> dict | None:
+def _split_summary(playlist_id: str, splits: dict | None = None) -> dict | None:
     """Local read only, for the Playlists picker: pile count and how much of
     a previous split is still undecided, so a playlist someone already split
     doesn't look untouched. Zero Spotify calls — the picker is not the place
     to spend any.
+
+    `splits` is `store.splits()["splits"]`, pre-fetched by the caller. Every
+    caller iterating a whole playlist listing MUST pass it — calling
+    `store.splits()` fresh per playlist re-reads and re-parses the same
+    (potentially hundreds-of-KB) file once per playlist, which is exactly the
+    /api/playlists regression a review round caught (~1.4s added on a real
+    ~1000-playlist account). Defaults to a fresh read only for the rare
+    single-playlist caller.
     """
-    split = store.splits()["splits"].get(playlist_id)
+    if splits is None:
+        splits = store.splits()["splits"]
+    split = splits.get(playlist_id)
     if not split:
         return None
     return {"piles": len(split["piles"]), "remaining": _remaining(split)}
@@ -962,9 +979,21 @@ def decide(playlist_id: str, body: DecideIn):
             if changed:
                 del decided[body.uri]
                 store.save_splits(payload)
+            # What actually stands now: nothing, if this cleared a reject
+            # (changed=True) or there was never anything here — otherwise
+            # whatever this no-op left untouched, most commonly a keep,
+            # which undecide can never touch (see the docstring). Reporting
+            # unconditional None here was a real regression: a client that
+            # trusts "the server tells you what actually stands" (the whole
+            # point of `decision`) would render a settled keep as cleared,
+            # even though disk still holds it and no Spotify call happened.
+            decision = (
+                None if changed or previous is None
+                else {"action": previous["action"], "to_id": previous.get("to_id")}
+            )
             return {
                 "ok": True, "remaining": _remaining(split), "changed": changed,
-                "decision": None,
+                "decision": decision,
             }
 
         in_flight = (playlist_id, body.uri) in _pending_keeps

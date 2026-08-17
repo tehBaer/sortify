@@ -275,12 +275,19 @@ def test_undecided_track_is_eligible_for_a_sitting_again(client):
 
 
 def test_undecide_on_a_keep_is_a_noop(client):
+    """Regression pin: `decision` used to be unconditional None on every
+    undecide response, including this no-op — a client that trusts "the
+    server tells you what actually stands" would render a settled, paid-for
+    keep as cleared, even though disk (asserted below) never changed and no
+    Spotify call happened."""
     client.post("/api/split/PL1/decide",
                 json={"uri": "spotify:track:a", "action": "keep", "to_id": "HOME1"})
     client.calls.clear()
     r = client.post("/api/split/PL1/decide", json={"uri": "spotify:track:a", "action": "undecide"})
     assert r.status_code == 200
-    assert r.json()["changed"] is False
+    body = r.json()
+    assert body["changed"] is False
+    assert body["decision"] == {"action": "keep", "to_id": "HOME1"}
     assert client.calls == []
     d = Store().splits()["splits"]["PL1"]["decided"]["spotify:track:a"]
     assert d["action"] == "keep"

@@ -687,15 +687,29 @@ async function doSplit() {
   try {
     const data = await api(`/api/split/${split.id}`, splitParams());
     toast(`${data.tagged} tagged, ${data.untagged} untagged`);
-    // The POST response is raw piles with no progress fields at all — and
-    // create_split PRESERVES any decisions from a previous split of this
-    // same playlist, so synthesising decided:0 here would show every pile
-    // as fully undecided even when it isn't. GET is a free, local read;
-    // it's also what seeds the resolution/pile-size inputs from what the
-    // server actually used.
-    const fresh = await api(`/api/split/${split.id}`);
+    // The split now exists — clear the paid "Split it" offer immediately,
+    // before risking a second request, so a failure below can never leave
+    // stale UI still inviting a spend that already happened.
     $("split-empty").innerHTML = "";
-    applySplitData(fresh);
+    try {
+      // The POST response is raw piles with no progress fields at all — and
+      // create_split PRESERVES any decisions from a previous split of this
+      // same playlist, so synthesising decided:0 here would show every pile
+      // as fully undecided even when it isn't. GET is a free, local read;
+      // it's also what seeds the resolution/pile-size inputs from what the
+      // server actually used.
+      const fresh = await api(`/api/split/${split.id}`);
+      applySplitData(fresh);
+    } catch (e2) {
+      // The split happened; only the follow-up read failed. Offering
+      // "Split it" again here would be confusing (it already exists) even
+      // though it'd actually be free and safe (create_split resumes rather
+      // than re-tagging) — so offer a plain retry of the read instead.
+      $("split-empty").innerHTML =
+        `<p class="hint">Split, but couldn't load the piles: ${esc(e2.message)}</p>
+         <button id="btn-retry-split-load">Retry</button>`;
+      $("btn-retry-split-load").onclick = () => openSplit(split.id, split.name);
+    }
   } catch (e) {
     toast(e.message);
   } finally {
@@ -958,6 +972,16 @@ function homeNameFor(id) {
   return nowState.homes.get(id)?.name || id;
 }
 
+// Describes res.decision — the standing decision a no-op left untouched —
+// for a toast. Shared so a hardcoded "already rejected"/"nothing to undo"
+// can never say something the card itself contradicts (e.g. the card
+// correctly showing "kept to Jazz" while a hardcoded toast said "already
+// rejected").
+function describeStanding(decision) {
+  if (!decision) return "no change";
+  return decision.action === "keep" ? `kept to ${homeNameFor(decision.to_id)}` : decision.action;
+}
+
 async function decideKeep(homeId) {
   if (!nowState?.sitting) return;
   const splitId = nowState.sitting.split_id;
@@ -971,8 +995,7 @@ async function decideKeep(homeId) {
     // read as "already handled", never as a fresh success.
     toast(res.changed
       ? `kept → ${homeNameFor(homeId)} (${res.remaining} left in the split)`
-      : `already decided — ${res.decision ? res.decision.action : "no change"}` +
-        (res.decision?.action === "keep" ? ` to ${homeNameFor(res.decision.to_id)}` : ""));
+      : `already decided — ${describeStanding(res.decision)}`);
     renderNow();
   } catch (e) { toast(e.message); }
 }
@@ -985,7 +1008,9 @@ async function decideReject() {
     const res = await api(`/api/split/${splitId}/decide`,
                           { uri: tr.uri, action: "reject" });
     applyDecision(tr.uri, res.decision);
-    toast(res.changed ? `rejected — free (${res.remaining} left in the split)` : "already rejected");
+    toast(res.changed
+      ? `rejected — free (${res.remaining} left in the split)`
+      : `already decided — ${describeStanding(res.decision)}`);
     renderNow();
   } catch (e) { toast(e.message); }
 }
@@ -998,7 +1023,9 @@ async function decideUndecide() {
     const res = await api(`/api/split/${splitId}/decide`,
                           { uri: tr.uri, action: "undecide" });
     applyDecision(tr.uri, res.decision);  // null on success — clears it
-    toast(res.changed ? `un-rejected — free (${res.remaining} left in the split)` : "nothing to undo");
+    toast(res.changed
+      ? `un-rejected — free (${res.remaining} left in the split)`
+      : res.decision ? `already decided — ${describeStanding(res.decision)}` : "nothing to undo");
     renderNow();
   } catch (e) { toast(e.message); }
 }

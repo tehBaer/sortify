@@ -167,3 +167,35 @@ def test_playlists_endpoint_carries_the_split_summary(splits_store, monkeypatch)
 
     assert out["PL_NOW"]["split"] == {"piles": 1, "remaining": 2}
     assert out[appmod.LIKED_ID]["split"] is None
+
+
+def test_playlists_reads_splits_json_once_not_per_playlist(splits_store, monkeypatch):
+    """Regression pin: `_split_summary` was originally called inside the
+    per-playlist loop, each call doing its own `store.splits()` — a full
+    disk read + JSON parse per playlist. Against a real ~1000-playlist
+    account with a splits.json grown to hundreds of KB, that turned every
+    /api/playlists response (nav-lists, btn-back, btn-split-back, and every
+    post-refresh reload) into a ~1.4s stall. `playlists()` must read
+    splits.json at most once for the whole listing, however many playlists
+    it returns."""
+    Store().save_splits(_splits_payload())
+    many_playlists = [
+        {"id": f"PLX{i}", "name": f"list {i}", "owner": "me", "editable": True,
+         "total": 3, "snapshot_id": f"s{i}", "image": None}
+        for i in range(50)
+    ]
+    monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: many_playlists)
+
+    calls = []
+    real_splits = Store.splits
+
+    def counting_splits(self):
+        calls.append(1)
+        return real_splits(self)
+
+    monkeypatch.setattr(Store, "splits", counting_splits)
+
+    out = appmod.playlists()
+
+    assert len(out["playlists"]) == 51  # 50 + Liked Songs
+    assert len(calls) == 1, f"store.splits() called {len(calls)} times for 51 playlists"
