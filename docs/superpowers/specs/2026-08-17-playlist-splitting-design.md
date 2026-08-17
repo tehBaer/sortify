@@ -51,6 +51,14 @@ batch adds. So:
 
 - Reading all 1372 tracks costs **~15 calls** (`limit=100`, 14 pages plus
   metadata).
+- That ~15-call figure assumes the playlist listing (`my_playlists()`) is
+  already warm. On a genuinely cold `cache.json` — the very first split of a
+  session, or after `data/cache.json` is cleared — splitting also pays for
+  that listing walk once: **~21 calls** at this user's ~977 playlists, so the
+  first split of a session costs **~35 calls total**, not ~15. That cost is
+  one-time and persisted (`playlist_list` in `cache.json`), and it is shared
+  with every other view that needs the listing (Playlists, triage, the home
+  Refresh button) — it is not paid again per split.
 - Materialising every pile as a real Spotify playlist would cost **~1384
   calls**: three days of `DAILY_CAP` (600), sustained at a rate matching the
   traffic that earned the ~23 h ban on 2026-08-13. **Rejected.**

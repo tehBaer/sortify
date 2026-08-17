@@ -102,7 +102,7 @@ def test_split_persists(client):
     assert stored["decided"] == {}
 
 
-def test_split_records_the_real_snapshot_id_and_reuses_the_track_cache(client):
+def test_split_records_the_real_snapshot_id_and_reuses_the_track_cache(client, monkeypatch):
     """The cache write create_split does (via _cached_tracks, the same helper
     triage uses) must be the real shape — snapshot_id + fetched_at — or the
     ~15-call read it just paid for can never be served again, and the split's
@@ -115,17 +115,29 @@ def test_split_records_the_real_snapshot_id_and_reuses_the_track_cache(client):
     cache["playlists"].pop("PL1", None)
     Store().save_cache(cache)
 
+    # Count my_playlists() too, not just playlist_tracks — the fixture's
+    # default fake never increments client.calls, so this test would not
+    # notice a regression that made my_playlists() start spending on every
+    # split. It runs on every call (the cheap listing/validation step); the
+    # cache win under test is that playlist_tracks does not.
+    def counted_my_playlists(refresh=False):
+        client.calls["spotify"] += 1
+        return PLAYLIST_LIST
+
+    monkeypatch.setattr(appmod.sp, "my_playlists", counted_my_playlists)
+
     r = client.post("/api/split/PL1")
     assert r.status_code == 200
-    assert client.calls["spotify"] == 1
+    assert client.calls["spotify"] == 2  # 1 listing lookup + 1 track read
 
     stored = Store().splits()["splits"]["PL1"]
     assert stored["snapshot_id"] == "snap-pl1"  # from the fake playlist listing
 
-    # Splitting again with the same snapshot must be a cache hit, not a
-    # second ~15-call read.
+    # Splitting again with the same snapshot must skip the track read — the
+    # listing lookup itself still runs (it's the cheap step); the whole
+    # point of the cache is skipping the ~15-call read, not the validation.
     client.post("/api/split/PL1")
-    assert client.calls["spotify"] == 1
+    assert client.calls["spotify"] == 3  # +1 listing lookup, +0 track reads
 
 
 def test_split_stores_the_inner_tag_map_not_the_envelope(client):
@@ -162,15 +174,24 @@ def test_recluster_spends_no_api_calls(client, monkeypatch):
     client.post("/api/split/PL1")
     before = dict(client.calls)
 
-    # Tighter than counting through one method: fail loudly if recluster
-    # touches EITHER Spotify entry point this feature uses, not just the one
-    # a prior test happened to instrument. Zero-cost reclustering is the
-    # feature's headline contract.
+    # Fail loudly at the one chokepoint every Spotify call funnels through —
+    # Spotify.request() (playlist_tracks, my_playlists, currently_playing,
+    # everything goes through it) — rather than enumerating the methods
+    # split currently happens to use. That way ANY current or future
+    # Spotify call is caught by the assertion itself, not just the two this
+    # feature calls today.
+    #
+    # The fixture's own fakes for playlist_tracks/my_playlists never reach
+    # request() at all (they're pure stand-ins), so they're removed first —
+    # restoring the real methods means a stray call actually gets to
+    # request() where the guard below can see it.
+    monkeypatch.delattr(appmod.sp, "playlist_tracks", raising=False)
+    monkeypatch.delattr(appmod.sp, "my_playlists", raising=False)
+
     def fail(*a, **kw):
         raise AssertionError("recluster must not touch the Spotify API")
 
-    monkeypatch.setattr(appmod.sp, "playlist_tracks", fail)
-    monkeypatch.setattr(appmod.sp, "my_playlists", fail)
+    monkeypatch.setattr(appmod.sp, "request", fail)
 
     r = client.post("/api/split/PL1/recluster", json={"min_pile": 5, "resolution": 1.0})
     assert r.status_code == 200
@@ -178,27 +199,41 @@ def test_recluster_spends_no_api_calls(client, monkeypatch):
 
 
 def test_recluster_preserves_decisions(client):
-    client.post("/api/split/PL1")
-    s = Store()
-    payload = s.splits()
-    payload["splits"]["PL1"]["decided"] = {
-        "spotify:track:bh0": {"action": "keep", "to_id": "H1", "at": "2026-08-17T10:00:00Z"}
-    }
-    s.save_splits(payload)
-    client.post("/api/split/PL1/recluster", json={"min_pile": 5})
-    assert "spotify:track:bh0" in Store().splits()["splits"]["PL1"]["decided"]
+    # data/splits.json is shared for the whole test session (see
+    # conftest.py) — the "decided" entry this test injects for PL1 must not
+    # survive it, or test_split_persists's `stored["decided"] == {}` fails
+    # whenever it runs afterward.
+    original = Store().splits()
+    try:
+        client.post("/api/split/PL1")
+        s = Store()
+        payload = s.splits()
+        payload["splits"]["PL1"]["decided"] = {
+            "spotify:track:bh0": {"action": "keep", "to_id": "H1", "at": "2026-08-17T10:00:00Z"}
+        }
+        s.save_splits(payload)
+        client.post("/api/split/PL1/recluster", json={"min_pile": 5})
+        assert "spotify:track:bh0" in Store().splits()["splits"]["PL1"]["decided"]
+    finally:
+        Store().save_splits(original)
 
 
 def test_split_reports_progress(client):
-    client.post("/api/split/PL1")
-    s = Store()
-    payload = s.splits()
-    payload["splits"]["PL1"]["decided"] = {
-        "spotify:track:bh0": {"action": "reject", "to_id": None, "at": "2026-08-17T10:00:00Z"}
-    }
-    s.save_splits(payload)
-    body = client.get("/api/split/PL1").json()
-    assert sum(p["decided"] for p in body["piles"]) == 1
+    # Same leak risk as test_recluster_preserves_decisions above: restore
+    # splits.json so the injected "decided" entry doesn't survive this test.
+    original = Store().splits()
+    try:
+        client.post("/api/split/PL1")
+        s = Store()
+        payload = s.splits()
+        payload["splits"]["PL1"]["decided"] = {
+            "spotify:track:bh0": {"action": "reject", "to_id": None, "at": "2026-08-17T10:00:00Z"}
+        }
+        s.save_splits(payload)
+        body = client.get("/api/split/PL1").json()
+        assert sum(p["decided"] for p in body["piles"]) == 1
+    finally:
+        Store().save_splits(original)
 
 
 def test_split_without_lastfm_key_errors_clearly(client, monkeypatch):
@@ -255,6 +290,12 @@ def test_split_on_lastfm_failure_persists_the_partial_and_reports_clearly(client
     # (0 of 0 coincide) but go nonsensical the moment the cache has history —
     # which, for a real user who has split more than one playlist, is every
     # time.
+    # data/tags.json is shared for the whole test session too — restore
+    # whatever this test found once it's done, exactly like the version-guard
+    # tests above, so seeding "other1"/"other2" here can't leak into
+    # test_split_stores_the_inner_tag_map_not_the_envelope's exact-set
+    # assertion when tests run in a different order.
+    original_tags = Store().tag_artists()
     warm_cache = {
         "other1": {"name": "Other One", "tags": [], "miss": False},
         "other2": {"name": "Other Two", "tags": [], "miss": False},
@@ -264,27 +305,30 @@ def test_split_on_lastfm_failure_persists_the_partial_and_reports_clearly(client
     splits_payload["splits"].pop("PL1", None)
     Store().save_splits(splits_payload)
 
-    def failing_enrich(artist_names, cached, fm, now):
-        partial = {**cached, "bh": TAGS["bh"]}
-        raise LastFmError("Last.fm error 29: rate limited", partial=partial)
+    try:
+        def failing_enrich(artist_names, cached, fm, now):
+            partial = {**cached, "bh": TAGS["bh"]}
+            raise LastFmError("Last.fm error 29: rate limited", partial=partial)
 
-    monkeypatch.setattr(appmod, "enrich", failing_enrich)
-    r = client.post("/api/split/PL1")
-    assert r.status_code == 502
-    detail = r.json()["detail"].lower()
-    # 1 of this playlist's 2 artists ("bh", "kv") got through — NOT
-    # 3 of 2 (the 2 warm cross-playlist entries plus "bh"), which is what a
-    # bare len(saved) would report.
-    assert "1 of 2" in detail
-    assert "3 of" not in detail
-    assert "resum" in detail  # "resume"/"resuming" — retrying will pick up where it left off
+        monkeypatch.setattr(appmod, "enrich", failing_enrich)
+        r = client.post("/api/split/PL1")
+        assert r.status_code == 502
+        detail = r.json()["detail"].lower()
+        # 1 of this playlist's 2 artists ("bh", "kv") got through — NOT
+        # 3 of 2 (the 2 warm cross-playlist entries plus "bh"), which is what
+        # a bare len(saved) would report.
+        assert "1 of 2" in detail
+        assert "3 of" not in detail
+        assert "resum" in detail  # "resume"/"resuming" — retry will pick up where it left off
 
-    # The 689-of-700 promise: verified-good entries are not discarded, and
-    # neither is the pre-existing cross-playlist cache.
-    saved = Store().tag_artists()
-    assert saved == {**warm_cache, "bh": TAGS["bh"]}
-    # And no split was persisted from the failed attempt.
-    assert "PL1" not in Store().splits()["splits"]
+        # The 689-of-700 promise: verified-good entries are not discarded,
+        # and neither is the pre-existing cross-playlist cache.
+        saved = Store().tag_artists()
+        assert saved == {**warm_cache, "bh": TAGS["bh"]}
+        # And no split was persisted from the failed attempt.
+        assert "PL1" not in Store().splits()["splits"]
+    finally:
+        Store().save_tag_artists(original_tags)
 
 
 # ---- Correction 4: tag_floor / max_tags_per_artist are split parameters ----
@@ -305,6 +349,13 @@ def faint_tracks():
 
 
 def test_recluster_tag_floor_changes_the_result_with_zero_api_calls(client, monkeypatch):
+    # "faint" (and this test's own copy of "bh") land in the shared
+    # data/tags.json the same way "other1"/"other2" did above — restore
+    # what was there so this test can run in any order relative to
+    # test_split_stores_the_inner_tag_map_not_the_envelope's exact-set
+    # assertion.
+    original_tags = Store().tag_artists()
+
     def fake_playlist_tracks(pid):
         client.calls["spotify"] += 1
         return faint_tracks()
@@ -316,25 +367,28 @@ def test_recluster_tag_floor_changes_the_result_with_zero_api_calls(client, monk
     monkeypatch.setattr(appmod.sp, "playlist_tracks", fake_playlist_tracks)
     monkeypatch.setattr(appmod, "enrich", fake_enrich)
 
-    client.post("/api/split/PL4")
-    before = dict(client.calls)
+    try:
+        client.post("/api/split/PL4")
+        before = dict(client.calls)
 
-    def pile_of(piles, uri):
-        return next(p["id"] for p in piles if uri in p["uris"])
+        def pile_of(piles, uri):
+            return next(p["id"] for p in piles if uri in p["uris"])
 
-    low = client.post(
-        "/api/split/PL4/recluster",
-        json={"min_pile": 1, "resolution": 1.0, "tag_floor": 10},
-    ).json()
-    high = client.post(
-        "/api/split/PL4/recluster",
-        json={"min_pile": 1, "resolution": 1.0, "tag_floor": 20},
-    ).json()
+        low = client.post(
+            "/api/split/PL4/recluster",
+            json={"min_pile": 1, "resolution": 1.0, "tag_floor": 10},
+        ).json()
+        high = client.post(
+            "/api/split/PL4/recluster",
+            json={"min_pile": 1, "resolution": 1.0, "tag_floor": 20},
+        ).json()
 
-    assert client.calls == before  # zero Spotify or Last.fm calls for either recluster
+        assert client.calls == before  # zero Spotify or Last.fm calls for either recluster
 
-    assert pile_of(low["piles"], "spotify:track:faint0") != "untagged"
-    assert pile_of(high["piles"], "spotify:track:faint0") == "untagged"
+        assert pile_of(low["piles"], "spotify:track:faint0") != "untagged"
+        assert pile_of(high["piles"], "spotify:track:faint0") == "untagged"
+    finally:
+        Store().save_tag_artists(original_tags)
 
 
 @pytest.mark.parametrize("bad_params", [
