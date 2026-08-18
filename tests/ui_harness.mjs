@@ -508,11 +508,17 @@ run("stopNowPolling()");
   check("save-all posts the summed price it displayed",
         bodies("/api/split/PL8/queue")[0]?.expected_calls === 5,
         JSON.stringify(bodies("/api/split/PL8/queue")[0]));
+  // The check above is deliberately synchronous (pins that the body is
+  // logged before any await, per the misclick contract) — but queuePiles'
+  // own trailing re-read + queue-poll are still pending after it. Drain
+  // them here so they can't land, unattributed, inside a later test's tick().
+  await tick();
 
   resetLog();
   run(`queuePiles(["p1"], 3)`);        // single pile goes through the same gate
   check("single-pile save is a one-pile queue",
         JSON.stringify(bodies("/api/split/PL8/queue")[0]?.pile_ids) === '["p1"]');
+  await tick();
 
   // Finding I2: every displayed price is a floor, not a ceiling — request()
   // retries a transient 429 up to 3x and each attempt is charged.
@@ -526,12 +532,91 @@ run("stopNowPolling()");
   run(`pauseQueue()`);
   check("pause posts exactly once and nowhere else",
         posts("/api/split/PL8/queue/pause") === 1 && log.length === 1);
+  await tick();
+
+  // Review fix (Important 1): a 409 here means the on-screen state was
+  // already stale — a poll must reconcile it immediately rather than
+  // leaving a dead Pause button until the next scheduled tick (or none, if
+  // polling had already stopped).
+  routes["POST /api/split/PL8/queue/pause"] = {
+    status: 409, body: { detail: "queue is stopped, not running — nothing to pause" } };
+  resetLog();
+  run(`pauseQueue()`);
+  await tick();
+  check("a refused pause polls the queue so the UI reconciles immediately",
+        gets("/api/split/PL8/queue") === 1, `${gets("/api/split/PL8/queue")} GET(s)`);
+
+  // Review fix (Minor 2): the same in-flight guard the spend buttons use,
+  // now covering Pause/Resume/Cancel too.
+  {
+    let release;
+    const pending = new Promise((r) => (release = r));
+    routes["POST /api/split/PL8/queue/pause"] = () => pending;
+    resetLog();
+    run(`pauseQueue()`);
+    run(`pauseQueue()`);   // second click, first still in flight
+    await tick();
+    check("two clicks on Pause post exactly once",
+          posts("/api/split/PL8/queue/pause") === 1,
+          `${posts("/api/split/PL8/queue/pause")} POST(s)`);
+    release({ status: 200, body: { ok: true } });
+    await tick();
+  }
 
   const restartPanel = run(`renderQueuePanel({ queue: { state: "paused", stop_reason: null,
+    pending: ["p2", "p3"], current: null,
     progress: { pile_index: 1, pile_count: 8, track: 40, track_total: 309 } },
     pacing: { rate_per_min: 2.5, ceiling: 7.0, max_clean_rate: 2.1 } })`);
   check("a restart's leftover running state renders as paused with Resume",
         restartPanel.includes("Resume"));
+
+  // Review fix (Important 2): Resume must not render enabled when there's
+  // nothing left to resume — cancel leaves exactly this shape (stopped,
+  // pending: [], current: null) and resume() 409s "nothing queued" against
+  // it, so a state-only gate left Resume a permanent dead end after Cancel.
+  const resumeTag = (html) => (html.match(/<button id="btn-queue-resume"[^>]*>/) || [""])[0];
+  const cancelledPanel = run(`renderQueuePanel({ queue: { state: "stopped", stop_reason: "cancelled",
+    pending: [], current: null, progress: {} }, pacing: {} })`);
+  check("a cancelled, empty queue renders Resume disabled",
+        /disabled/.test(resumeTag(cancelledPanel)), cancelledPanel);
+  const pausedWithWorkPanel = run(`renderQueuePanel({ queue: { state: "paused", stop_reason: null,
+    pending: ["p2"], current: null,
+    progress: { pile_index: 1, pile_count: 8, track: 40, track_total: 309 } },
+    pacing: { rate_per_min: 2.5, ceiling: 7.0, max_clean_rate: 2.1 } })`);
+  check("a paused queue with pending work renders Resume enabled",
+        !/disabled/.test(resumeTag(pausedWithWorkPanel)), pausedWithWorkPanel);
+
+  // Review fix (Minor 1): a quota trip is the severe case (Development
+  // Mode's daily allowance, gone until the window resets — see CLAUDE.md)
+  // and must not look like a routine 429 note.
+  const quotaPanel = run(`renderQueuePanel({ queue: { state: "stopped", stop_reason: "quota",
+    pending: [], current: null, progress: {} }, pacing: {} })`);
+  check("a quota trip renders its own distinct, prominent marker",
+        /queue-stop-quota/.test(quotaPanel) && /quota tripped/i.test(quotaPanel) &&
+        /resume is manual/i.test(quotaPanel),
+        quotaPanel);
+  const rateLimitPanel = run(`renderQueuePanel({ queue: { state: "sleeping", stop_reason: "rate limited",
+    pending: ["p2"], current: "p1", progress: {} }, pacing: {} })`);
+  check("an ordinary rate-limit note does NOT get the quota marker",
+        !/queue-stop-quota/.test(rateLimitPanel), rateLimitPanel);
+
+  // Review fix (Minor 3): pins the disclosed-but-untested claim — a
+  // single-pile save in flight must not block save-all's guard key, and
+  // vice versa, since the two are different (split, pile-set) signatures.
+  {
+    let release;
+    const pending = new Promise((r) => (release = r));
+    routes["POST /api/split/PL8/queue"] = () => pending;
+    resetLog();
+    run(`queuePiles(["p1"], 3)`);
+    run(`queuePiles(null, 5)`);
+    await tick();
+    check("a single-pile save in flight doesn't block save-all's guard key (and vice versa)",
+          posts("/api/split/PL8/queue") === 2,
+          `${posts("/api/split/PL8/queue")} POST(s)`);
+    release({ status: 200, body: { ok: true, queued: ["p1", "p2"], total_calls: 5 } });
+    await tick();
+  }
 
   // A server that sends no cost must not be guessed at.
   routes["GET /api/split/PL9"] = {

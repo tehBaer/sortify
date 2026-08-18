@@ -1121,11 +1121,22 @@ function renderQueuePanel(status) {
   // stop_reason carries both permanent quota trips and the last 429's
   // reason string (see app.py's classify_429/note_429) — surfaced verbatim
   // rather than re-worded, since the exact reason is what tells a user
-  // whether Resume is worth clicking yet.
-  const stopLine = q.stop_reason
-    ? `<p class="hint">last stop: ${esc(q.stop_reason)}</p>` : "";
+  // whether Resume is worth clicking yet. A quota trip is the severe case
+  // (Development Mode's daily allowance, gone until the window resets — see
+  // CLAUDE.md's lockout history) and must not read like a routine 429 note,
+  // so it gets its own class and explicit wording rather than the raw
+  // "quota" string.
+  const stopLine = q.stop_reason === "quota"
+    ? `<p class="hint queue-stop-quota">daily quota tripped — resume is manual</p>`
+    : q.stop_reason
+      ? `<p class="hint">last stop: ${esc(q.stop_reason)}</p>` : "";
   const canPause = QUEUE_ACTIVE_STATES.has(state);
-  const canResume = state === "paused" || state === "stopped";
+  // Resume 409s ("nothing queued") whenever pending/current are both empty
+  // — cancel leaves the queue in exactly that state (stopped, pending: [],
+  // current: null), so gating on state alone left Resume permanently
+  // enabled-but-dead after a cancel. Both fields ride along in the same GET.
+  const hasWork = (Array.isArray(q.pending) && q.pending.length > 0) || !!q.current;
+  const canResume = (state === "paused" || state === "stopped") && hasWork;
   const canCancel = state !== "done" && state !== "stopped";
   return `${summary}${stopLine}
     <div class="queue-controls">
@@ -1176,34 +1187,62 @@ async function pollQueueStatus() {
   }
 }
 
-// Deliberately makes exactly one call and nothing else: pausing doesn't need
-// a fresh read to be trustworthy (the click itself is the truth), so this
-// updates the on-screen state from the response it already has instead of
-// spending a second round trip.
+// Same in-flight guard queuePiles uses (cheap consistency): the queue
+// control buttons are static ids, re-rendered whenever the panel repaints,
+// so a raw boolean would survive a repaint fine but a per-action key on the
+// same Set costs nothing extra and keeps every "is this already in flight"
+// question answered the same way in one place.
+function queueControlKey(action) {
+  return split ? split.id + " control:" + action : null;
+}
+
+// On success, the response IS the truth — no need to spend a second round
+// trip to confirm it. On failure (most commonly a 409 from a panel that was
+// already stale — the queue finished, or someone else cancelled it) the
+// on-screen state was never true to begin with, so re-polling is what
+// reconciles the UI immediately instead of leaving a dead Pause button
+// enabled until the next scheduled poll (or none, if polling had already
+// stopped). Same behaviour resumeQueue/cancelQueue already have below.
 async function pauseQueue() {
   if (!split) return;
+  const key = queueControlKey("pause");
+  if (queueActionInFlight.has(key)) return;
+  queueActionInFlight.add(key);
   try {
     await api(`/api/split/${split.id}/queue/pause`, {});
     if (queueStatus && queueStatus.queue) queueStatus.queue.state = "paused";
     stopQueuePolling();
     paintQueuePanel();
-  } catch (e) { toast(e.message); }
+  } catch (e) {
+    toast(e.message);
+    pollQueueStatus();
+  } finally {
+    queueActionInFlight.delete(key);
+  }
 }
 
 async function resumeQueue() {
   if (!split) return;
+  const key = queueControlKey("resume");
+  if (queueActionInFlight.has(key)) return;
+  queueActionInFlight.add(key);
   try {
     await api(`/api/split/${split.id}/queue/resume`, {});
   } catch (e) { toast(e.message); }
+  queueActionInFlight.delete(key);
   pollQueueStatus();
 }
 
 async function cancelQueue() {
   if (!split) return;
+  const key = queueControlKey("cancel");
+  if (queueActionInFlight.has(key)) return;
+  queueActionInFlight.add(key);
   try {
     await api(`/api/split/${split.id}/queue`, undefined, "DELETE");
     toast("queue cancelled");
   } catch (e) { toast(e.message); }
+  queueActionInFlight.delete(key);
   pollQueueStatus();
 }
 

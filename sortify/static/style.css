@@ -177,4 +177,11 @@ kbd {
 }
 .queue-controls { display: flex; gap: .5rem; }
 .queue-controls button { flex-shrink: 0; }
+/* A quota trip is the severe case — Development Mode's daily allowance is
+   gone until the window resets and resuming is a human decision, not a
+   routine 429 that clears itself. Must not blend in with .hint. */
+.queue-stop-quota {
+  color: var(--danger); font-weight: 600; border: 1px solid var(--danger);
+  border-radius: 8px; padding: .3rem .5rem;
+}
 #split-sitting-status, #now-sitting-status { flex: 1; }
