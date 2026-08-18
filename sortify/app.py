@@ -21,8 +21,10 @@ from pydantic import BaseModel, Field
 
 from . import suggest as sugg
 from .folders import extract_folder_map, home_name_excluded, select_home_ids
+from .pacing import Governor
 from .spotify import (
     BACKGROUND_DAILY_CAP,
+    BULK_RESERVE,
     DAILY_CAP,
     LIKED_ID,
     AuthNeeded,
@@ -1300,6 +1302,142 @@ def _readopt_materialisation(
     raise HTTPException(
         409, "this pile's saved-playlist record was replaced while tracks were being added — "
              "the playlist itself is fine and was re-recorded; open the split again to see it")
+
+
+# ---- the queued materialiser: one paced call per tick ----------------------
+#
+# The worker thread is created ONLY by the enqueue/resume endpoints (Task 9);
+# there is no code path from boot to Spotify traffic, and
+# tests/test_no_proactive_work.py pins that. Pacing belongs to the Governor
+# (sortify/pacing.py); stopping belongs to _queue_next_action; the single
+# Spotify call per tick belongs to _materialise_tick. queue.json and
+# pacing.json are read directly by boxdash, so both are rewritten (atomic,
+# versioned) after every state change, not just at exit.
+
+_queue_lock = threading.Lock()
+_queue_wake = threading.Event()          # set() = "wake now and re-decide"
+_queue_worker: threading.Thread | None = None
+
+
+def _set_queue_state(state: str, stop_reason: str | None = None) -> None:
+    with _queue_lock:
+        q = store.queue()
+        q["state"] = state
+        q["stop_reason"] = stop_reason
+        q["updated_at"] = _now_iso()
+        store.save_queue(q)
+
+
+def _queue_progress(q: dict) -> dict:
+    """The boxdash snapshot: everything the card shows, in one read."""
+    split = store.splits()["splits"].get(q.get("playlist_id") or "", {})
+    piles = {p["id"]: p for p in split.get("piles", [])}
+    cur = piles.get(q.get("current") or "")
+    rec = (split.get("materialised") or {}).get(q.get("current") or "", {})
+    total = len(q.get("pending", [])) + (1 if q.get("current") else 0)
+    done = (q.get("pile_count_at_enqueue") or total) - total
+    return {"pile_id": q.get("current"), "pile_index": done + (1 if cur else 0),
+            "pile_count": q.get("pile_count_at_enqueue") or total,
+            "track": len(rec.get("added", [])),
+            "track_total": len(_unique(cur["uris"])) if cur else 0,
+            "spent_today": sp.budget_spent(), "bulk_today": sp.bulk_spent(),
+            "daily_cap": DAILY_CAP, "reserve": BULK_RESERVE}
+
+
+def _queue_next_action(now: float) -> tuple:
+    """Decide, without doing: ("stop", reason) | ("sleep", secs, state) |
+    ("tick", playlist_id, pile_id). Mutates queue.json only to advance
+    current/pending as piles finish (free, local)."""
+    with _queue_lock:
+        q = store.queue()
+        if q["state"] in ("paused", "stopped", "done"):
+            return ("stop", q["state"])
+        block = sp.bulk_block_reason()
+        if block:
+            reason, until = block
+            state = "quiet" if reason == "quiet" else "sleeping"
+            return ("sleep", max(until - now, 1.0), state)
+        while True:
+            pid = q.get("current")
+            if not pid:
+                if not q["pending"]:
+                    q.update(state="done", updated_at=_now_iso())
+                    q["progress"] = _queue_progress(q)
+                    store.save_queue(q)
+                    return ("stop", "done")
+                q["current"] = q["pending"].pop(0)
+                store.save_queue(q)
+                continue
+            split = store.splits()["splits"].get(q["playlist_id"], {})
+            pile = next((p for p in split.get("piles", []) if p["id"] == pid), None)
+            if pile is None or _materialise_plan(split, pile)["calls"] == 0:
+                q["current"] = None          # vanished or finished: next pile
+                store.save_queue(q)
+                continue
+            return ("tick", q["playlist_id"], pid)
+
+
+def _drain_queue() -> None:
+    gov = Governor(store.pacing())
+    gov.note_interruption()                  # every (re)start re-climbs from 1.8
+    store.save_pacing(gov.to_state())
+    with _queue_lock:
+        q = store.queue()
+        if not q.get("pile_count_at_enqueue"):
+            # Fixed at the run's start so `_queue_progress`'s pile_count is a
+            # stable denominator for boxdash, not one that drops to 0 as
+            # `pending` and `current` drain to empty at the very end.
+            q["pile_count_at_enqueue"] = len(q.get("pending", [])) + (1 if q.get("current") else 0)
+            store.save_queue(q)
+    _set_queue_state("running")
+    while True:
+        action = _queue_next_action(time.time())
+        if action[0] == "stop":
+            return
+        if action[0] == "sleep":
+            _set_queue_state(action[2])
+            gov.note_interruption()
+            store.save_pacing(gov.to_state())
+            # Wake early on pause/cancel/resume; re-check at most every 60s so
+            # a cooldown shortened by another process is noticed.
+            _queue_wake.wait(min(action[1], 60))
+            if store.queue()["state"] in ("paused", "stopped"):
+                return
+            _set_queue_state("running")
+            continue
+        _, playlist_id, pile_id = action
+        tick_started = time.time()
+        try:
+            _materialise_tick(playlist_id, pile_id)
+        except SpotifyError as e:
+            info = sp.last_429 or {}
+            if e.status == 429 and info.get("ts", 0) >= tick_started:
+                gov.note_429(info["kind"], info.get("retry_after", 60), time.time())
+                store.save_pacing(gov.to_state())
+                if info["kind"] == "quota":
+                    # Permanent: request() already published note_cooldown to
+                    # the account ledger; resuming is a human's call (spec §2).
+                    _set_queue_state("stopped", stop_reason="quota")
+                    return
+                continue                     # rate: cooldown sleep happens above
+            # Auth failures, 5xx, local budget refusals: stop spending and
+            # surface the reason rather than grind a broken loop.
+            log.error("queue worker paused by error: %s", e)
+            _set_queue_state("paused", stop_reason=str(e))
+            return
+        info = sp.last_429 or {}
+        if info.get("ts", 0) >= tick_started:
+            gov.note_429(info["kind"], info.get("retry_after", 60), time.time())
+        else:
+            gov.note_success(time.time())
+        store.save_pacing(gov.to_state())
+        with _queue_lock:
+            q = store.queue()
+            q["progress"] = _queue_progress(q)
+            q["updated_at"] = _now_iso()
+            store.save_queue(q)
+        if _queue_wake.wait(gov.interval()):
+            _queue_wake.clear()              # pause/cancel: next loop decides
 
 
 class DecideIn(BaseModel):
