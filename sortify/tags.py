@@ -274,7 +274,7 @@ class LastFm:
     `sleep` and `client` are injectable so tests run without network or delay.
     """
 
-    def __init__(self, key: str, sleep=time.sleep, client=None):
+    def __init__(self, key: str, sleep=time.sleep, client=None, timeout: float = 15.0):
         # A blank key is not a runtime hiccup, it is a misconfiguration:
         # load_key() returns None when the state file is missing or renamed,
         # and httpx renders that as an empty api_key, which Last.fm rejects
@@ -289,6 +289,12 @@ class LastFm:
         self._client = client or httpx.Client(
             headers={"User-Agent": "sortify/0.1 (+https://github.com/local/sortify)"}
         )
+        # Per-request timeout `top_tags` passes to `self._client.get(...)`.
+        # Defaults to the splitter's long-standing 15s; `/api/now`'s
+        # force-path fetch (app.py's `_fetch_missing_now_tags`) overrides
+        # this on its own instance to 5s so a slow Last.fm can't turn a
+        # user-triggered request into a ~45s hang — see NOW_FETCH_TIMEOUT.
+        self._timeout = timeout
 
     def top_tags(self, artist_name: str) -> ArtistTags | None:
         """Raw top tags for an artist, or None if Last.fm has no such artist.
@@ -311,7 +317,7 @@ class LastFm:
                 "format": "json",
                 "autocorrect": "1",
             },
-            timeout=15.0,
+            timeout=self._timeout,
         )
         resp.raise_for_status()
         data = resp.json()

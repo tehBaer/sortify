@@ -2191,11 +2191,15 @@ def _fetch_missing_now_tags(track: dict, *, clock=time.monotonic) -> int:
     Two bounds on top of that reuse: the `LastFm` instance this path gets
     back from `_lastfm_client()` has its transport swapped for one built with
     `timeout=NOW_FETCH_TIMEOUT` — a fresh `httpx.Client`, only on this
-    instance, never touching the splitter's own (which keeps the 15s
-    `top_tags` uses) — and `NOW_FETCH_MIN_INTERVAL` floors how often an
-    attempt happens at all, checked (and skipped on) before any client is
-    even touched. `clock` is injectable so tests can move time without
-    sleeping.
+    instance, never touching the splitter's own — *and* `fm._timeout` is set
+    to the same value, since `LastFm.top_tags` passes `timeout=self._timeout`
+    on every request, which in httpx overrides whatever the client itself was
+    constructed with. Setting only the client would leave every actual
+    request still bounded by the splitter's 15s default; both need setting
+    for this path to actually be bounded at 5s. `NOW_FETCH_MIN_INTERVAL`
+    floors how often an attempt happens at all, checked (and skipped on)
+    before any client is even touched. `clock` is injectable so tests can
+    move time without sleeping.
 
     Write-once: an artist already in tags.json — a hit or a recorded
     `miss: true` alike — is never handed to `enrich` again. `enrich` raises
@@ -2219,7 +2223,11 @@ def _fetch_missing_now_tags(track: dict, *, clock=time.monotonic) -> int:
             return 0
         if isinstance(fm, LastFm):
             # This path's own bounded transport — see NOW_FETCH_TIMEOUT above.
+            # Both the client AND `_timeout` must be set: `top_tags` passes
+            # `timeout=self._timeout` explicitly on every request, which
+            # overrides the client's own configured default in httpx.
             fm._client = httpx.Client(timeout=NOW_FETCH_TIMEOUT)
+            fm._timeout = NOW_FETCH_TIMEOUT
         names: dict[str, str] = {}
         for a in track.get("artists") or []:
             aid = a.get("id")

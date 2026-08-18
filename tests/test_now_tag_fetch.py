@@ -336,32 +336,50 @@ def test_a_fetch_after_the_floor_elapses_does_retry(monkeypatch):
     assert fm.calls == ["Artist a1", "Artist a1"]
 
 
-def test_the_fetch_client_gets_a_bounded_timeout(monkeypatch):
-    """A real `LastFm` instance (not a test double) must have its transport
-    swapped for one built with NOW_FETCH_TIMEOUT, so a slow Last.fm can't
-    turn this into a ~46s hang inside a request the user is waiting on. The
-    splitter's own `_lastfm_client()` calls are untouched by this — this
-    swap only ever happens on the instance handed to this fetch."""
+def test_the_fetch_client_and_timeout_reach_the_request_call(monkeypatch):
+    """A real `LastFm` instance (not a test double) must have both its
+    transport AND its per-request `_timeout` bounded to NOW_FETCH_TIMEOUT,
+    so a slow Last.fm can't turn this into a ~46s hang inside a request the
+    user is waiting on. Asserting only that `httpx.Client(timeout=...)` gets
+    constructed isn't enough: `LastFm.top_tags` passes `timeout=self._timeout`
+    explicitly on every `.get(...)` call, which in httpx overrides whatever
+    the client itself was built with — so this drives the real (unmocked)
+    `enrich()` -> `top_tags()` path and checks the timeout actually reaches
+    that `.get(...)` call, not just the client constructor. The splitter's
+    own `_lastfm_client()` calls are untouched by this — the swap only ever
+    happens on the instance handed to this fetch."""
     Store().save_tag_artists({})
     real_fm = LastFm("fake-key", client=object())  # object(): truthy, no real httpx.Client built
     monkeypatch.setattr(appmod, "_lastfm_client", lambda: real_fm)
-    monkeypatch.setattr(appmod, "enrich", lambda names, cached, fm, now: cached)
 
-    captured = {}
+    captured_client_kwargs = {}
+    captured_get_kwargs = {}
 
-    class DummyClient:
-        pass
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"toptags": {"tag": [], "@attr": {"artist": "Artist a1"}}}
+
+    class FakeHttpxClient:
+        def get(self, url, params=None, timeout=None):
+            captured_get_kwargs["timeout"] = timeout
+            return FakeResponse()
 
     def fake_client(*, timeout=None, **kwargs):
-        captured["timeout"] = timeout
-        return DummyClient()
+        captured_client_kwargs["timeout"] = timeout
+        return FakeHttpxClient()
 
     monkeypatch.setattr(appmod.httpx, "Client", fake_client)
 
-    _fetch_missing_now_tags(track_with_artists(["a1"]))
+    n = _fetch_missing_now_tags(track_with_artists(["a1"]))  # real enrich()/top_tags(), no mock
 
-    assert captured["timeout"] == NOW_FETCH_TIMEOUT == 5.0
-    assert isinstance(real_fm._client, DummyClient)
+    assert captured_client_kwargs["timeout"] == NOW_FETCH_TIMEOUT == 5.0
+    assert captured_get_kwargs["timeout"] == NOW_FETCH_TIMEOUT == 5.0
+    assert isinstance(real_fm._client, FakeHttpxClient)
+    assert real_fm._timeout == NOW_FETCH_TIMEOUT == 5.0
+    assert n == 1  # the real round trip actually completed and got recorded
 
 
 # ---- concurrency: fix round 1, Important 1 ---------------------------------
