@@ -1318,27 +1318,33 @@ _queue_lock = threading.Lock()
 _queue_wake = threading.Event()          # set() = "wake now and re-decide"
 _queue_worker: threading.Thread | None = None
 
-# A pause/cancel already recorded in queue.json is never allowed to be
-# clobbered back to a running-ish state by a worker that hasn't noticed it
-# yet (ruling R-T8a) — only these three targets are ever refused, and only
-# when the CURRENT state is one of the terminal-from-the-worker's-view ones.
-_QUEUE_TERMINAL = ("paused", "stopped")
+# A pause/cancel/done already recorded in queue.json is never allowed to be
+# clobbered back to something actionable by a worker (or a stray pause) that
+# hasn't noticed it yet (ruling R-T8a, extended by I3 review round 1): once a
+# queue is terminal, the ONLY way out is "stopped" (cancel always remains
+# reachable, or the resume endpoint's `force=True` escape hatch below).
+_QUEUE_TERMINAL = ("paused", "stopped", "done")
 _QUEUE_RESUMABLE = ("running", "sleeping", "quiet")
 
 
-def _set_queue_state(state: str, stop_reason: str | None = None, force: bool = False) -> bool:
-    """Check-and-set queue.json's state under one lock acquisition.
+def _apply_queue_state(
+    q: dict, state: str, stop_reason: str | None, force: bool = False,
+    keep_stop_reason: bool = False,
+) -> bool:
+    """The guarded write itself, given a queue dict already read under
+    `_queue_lock`. Split out from `_set_queue_state` (review round 1, M1) so
+    the resume endpoint can check `pending`/`current` and apply the state
+    change in the SAME lock acquisition, instead of racing a separate
+    `_set_queue_state` call against a concurrent cancel that empties them.
 
-    Returns False (refusing the write) when:
-    - the queue is already paused or stopped and this call is trying to
-      move it back to running/sleeping/quiet — the worker racing its own
-      "resume" write against a pause it hasn't read yet (C2/R-T8a); or
-    - the queue is already "stopped" (a cancel) and this call is trying to
-      downgrade it to "paused" — a non-429 error noticed after a user
-      already cancelled must not turn that cancel back into something
-      resumable (fix round 2, minor 1).
-    Every caller MUST treat a False return as its own stop signal and exit
-    the loop; the worker exits either way, so tolerating a refusal here
+    Returns False (refusing the write) when the queue is already terminal
+    (paused/stopped/done) and this call isn't targeting "stopped" — the
+    worker racing its own "resume" write against a pause it hasn't read yet
+    (C2/R-T8a), a stray pause/resume landing on an already-finished run
+    (I3), or a non-429 error noticed after a user already cancelled (fix
+    round 2, minor 1). Cancel ("stopped") is always reachable, matching the
+    Task 9 binding note. Every caller MUST treat a False return as its own
+    stop signal; the worker exits either way, so tolerating a refusal here
     needs no extra branching at the call site.
 
     `force=True` is the one deliberate override, for the human-only resume
@@ -1347,19 +1353,33 @@ def _set_queue_state(state: str, stop_reason: str | None = None, force: bool = F
     job is crossing it (Task 9 binding note — an explicit escape hatch
     rather than weakening the check-and-set itself, which everything else
     still relies on to keep a pause/cancel from being clobbered).
+
+    `keep_stop_reason=True` (review round 1, M1) leaves the stored
+    `stop_reason` untouched instead of overwriting it with the `stop_reason`
+    argument — resume uses this so a quota/error reason a user is still
+    looking at doesn't flicker to None the instant the click lands; the
+    worker's own unconditional "running" transition at the top of
+    `_drain_queue_body` is what actually clears it, once a run is genuinely
+    under way again rather than just requested.
     """
+    if not force and q["state"] in _QUEUE_TERMINAL and state != "stopped":
+        return False
+    q["state"] = state
+    if not keep_stop_reason:
+        q["stop_reason"] = stop_reason
+    q["updated_at"] = _now_iso()
+    store.save_queue(q)
+    return True
+
+
+def _set_queue_state(state: str, stop_reason: str | None = None, force: bool = False) -> bool:
+    """Check-and-set queue.json's state under one lock acquisition. See
+    `_apply_queue_state` for the guard's rules; this is the plain entry
+    point used everywhere except resume (which needs the lock held across
+    its own extra check — see `_apply_queue_state`'s docstring)."""
     with _queue_lock:
         q = store.queue()
-        if not force:
-            if q["state"] in _QUEUE_TERMINAL and state in _QUEUE_RESUMABLE:
-                return False
-            if q["state"] == "stopped" and state == "paused":
-                return False
-        q["state"] = state
-        q["stop_reason"] = stop_reason
-        q["updated_at"] = _now_iso()
-        store.save_queue(q)
-        return True
+        return _apply_queue_state(q, state, stop_reason, force=force)
 
 
 def _queue_progress(q: dict) -> dict:
@@ -1411,7 +1431,64 @@ def _queue_next_action(now: float) -> tuple:
             return ("tick", q["playlist_id"], pid)
 
 
+def _worker_may_stop() -> bool:
+    """The atomic version of "am I still supposed to exit?", checked right
+    before every planned exit from `_drain_queue_body`'s loop (I4 fix round
+    2 — the round-1 fix of clearing `_queue_worker` in a `finally` closed
+    the case where resume runs AFTER a worker has fully exited, but not
+    this one: a worker can READ a terminal state, decide to stop, and then
+    a resume's forced write can land in the gap before that decision's
+    `return` actually executes. `_start_queue_worker`'s `is_alive()` check
+    then sees the (still technically alive) old worker and skips spawning a
+    new one, trusting it to notice the resume — but it already committed to
+    stopping based on stale data, so nothing ever picks the run back up.
+    Reproduced directly: a plain pause-then-immediate-resume round trip
+    over HTTP hit this roughly 1 time in 5 in a tight loop, so this is not
+    the vanishingly rare window the round-1 fix left as accepted risk — it
+    needed closing, not just documenting.
+
+    Re-reads queue.json fresh, under `_queue_lock`. If the state has
+    already flipped back to something resumable (a resume raced in first),
+    returns False WITHOUT touching `_queue_worker` — the caller must
+    `continue` its loop rather than exit, since it is now the (only, still
+    current) worker for this resumed run. Otherwise it is safe to commit:
+    clears `_queue_worker` (this thread's own bookkeeping, matching the
+    `finally` wrapper's own guard against clobbering a newer thread) and
+    returns True so the caller can `return`.
+    """
+    global _queue_worker
+    with _queue_lock:
+        if store.queue()["state"] in _QUEUE_RESUMABLE:
+            return False
+        if _queue_worker is threading.current_thread():
+            _queue_worker = None
+        return True
+
+
 def _drain_queue() -> None:
+    """Thread entry point. Delegates the actual walk to `_drain_queue_body`;
+    this wrapper's only job is guaranteeing `_queue_worker` is cleared under
+    `_queue_lock` as the worker's LAST act (review round 1, I4) — so
+    `_start_queue_worker`'s "is a worker already running" check has an
+    explicit, lock-synchronized signal to consult instead of leaning only on
+    `Thread.is_alive()`, which can still read True for a thread that has
+    already decided to return but hasn't finished unwinding. `_worker_may_stop`
+    (fix round 2) closes the more common half of this same race — a resume
+    landing between a stop DECISION and this cleanup, which turned out to be
+    reproducible about 1 time in 5 rather than a negligible edge case — so
+    this `finally` now mainly guards paths `_worker_may_stop` doesn't cover
+    (e.g. an unhandled exception) and remains defense in depth either way.
+    """
+    global _queue_worker
+    try:
+        _drain_queue_body()
+    finally:
+        with _queue_lock:
+            if _queue_worker is threading.current_thread():
+                _queue_worker = None
+
+
+def _drain_queue_body() -> None:
     gov = Governor(store.pacing())
     gov.note_interruption()                  # every (re)start re-climbs from 1.8
     store.save_pacing(gov.to_state())
@@ -1424,14 +1501,21 @@ def _drain_queue() -> None:
             q["pile_count_at_enqueue"] = len(q.get("pending", [])) + (1 if q.get("current") else 0)
             store.save_queue(q)
     if not _set_queue_state("running"):
-        return                                # paused/cancelled before this thread even ran
+        if _worker_may_stop():
+            return                            # paused/cancelled before this thread even ran
+        # else: a resume raced in first (I4) — state is running again, fall
+        # through into the loop below exactly as if this check had passed.
     while True:
         action = _queue_next_action(time.time())
         if action[0] == "stop":
-            return
+            if _worker_may_stop():
+                return
+            continue                          # a resume raced in first (I4) — re-decide, don't exit
         if action[0] == "sleep":
             if not _set_queue_state(action[2]):
-                return                         # a pause/cancel beat us to the write (R-T8a)
+                if _worker_may_stop():
+                    return                     # a pause/cancel beat us to the write (R-T8a)
+                continue                       # ...or a resume beat THAT (I4) — re-decide
             # note_interruption() only ever pulls the rate DOWN to at most
             # START_RATE (ruling R-T8f, sortify/pacing.py) — so calling it
             # unconditionally here is safe even when this sleep is the
@@ -1454,7 +1538,9 @@ def _drain_queue() -> None:
             _queue_wake.wait(min(action[1], 60))
             _queue_wake.clear()
             if not _set_queue_state("running"):
-                return                         # paused/cancelled during the sleep
+                if _worker_may_stop():
+                    return                     # paused/cancelled during the sleep
+                # else: a resume raced in first (I4) — keep going
             continue
         _, playlist_id, pile_id = action
         tick_started = time.monotonic()
@@ -1554,7 +1640,12 @@ def enqueue_piles(playlist_id: str, body: QueueIn):
         split = payload["splits"].get(playlist_id)
         if not split:
             raise HTTPException(404, "no split for that playlist")
-        wanted = body.pile_ids or [p["id"] for p in split["piles"]]
+        # M3 (review round 1): `[]` is an explicit "nothing selected", not
+        # the same thing as `None`'s "everything" — `body.pile_ids or [...]`
+        # used to treat them the same because `[]` is falsy.
+        if body.pile_ids is not None and not body.pile_ids:
+            raise HTTPException(409, "no piles selected")
+        wanted = body.pile_ids if body.pile_ids is not None else [p["id"] for p in split["piles"]]
         piles = [p for p in split["piles"] if p["id"] in wanted]
         if len(piles) != len(set(wanted)):
             raise HTTPException(404, "unknown pile id in the request")
@@ -1572,9 +1663,17 @@ def enqueue_piles(playlist_id: str, body: QueueIn):
     if total == 0:
         return {"ok": True, "queued": [], "total_calls": 0, "complete": True}
     with _queue_lock:
-        q = _effective_queue()
-        if q["state"] in ("running", "sleeping", "quiet"):
-            raise HTTPException(409, "a queue is already draining — pause or cancel it first")
+        q = store.queue()
+        # R-T9a (review round 1, I2): refuse whenever anything is pending or
+        # in progress, regardless of `state` — a PAUSED, resumable run is
+        # still user work sitting there; replacing it needs an explicit
+        # cancel first, not a second enqueue that overwrites its plan. The
+        # old check only looked at "running"/"sleeping"/"quiet" and let a
+        # second enqueue silently clobber a paused run's `pending`.
+        if q.get("pending") or q.get("current"):
+            raise HTTPException(
+                409, "a queue already has piles pending or in progress — "
+                     "pause or cancel it first")
         store.save_queue({"version": 1, "playlist_id": playlist_id,
                           "pending": order, "current": None, "state": "running",
                           "stop_reason": None, "progress": {},
@@ -1586,24 +1685,56 @@ def enqueue_piles(playlist_id: str, body: QueueIn):
 
 @app.get("/api/split/{playlist_id}/queue")
 def queue_status(playlist_id: str):
+    # M4 (review round 1): GET stays global on purpose — it's the read path
+    # boxdash and every split page poll, and a playlist_id mismatch here
+    # should show "nothing queued for you", not 409. pause/resume/cancel are
+    # the ones that mutate, so those are the ones that check ownership.
     return {"queue": _effective_queue(), "pacing": store.pacing()}
+
+
+def _require_owned_queue(playlist_id: str, q: dict) -> None:
+    """R-T9c (review round 1, M4): pause/resume/cancel act on the one
+    queue.json in the whole app, so a stale tab still pointed at a playlist
+    whose run already finished (or that never owned the current run) must
+    not be able to touch someone else's queue."""
+    if q.get("playlist_id") != playlist_id:
+        raise HTTPException(409, "no active queue for this playlist")
 
 
 @app.post("/api/split/{playlist_id}/queue/pause")
 def pause_queue(playlist_id: str):
-    _set_queue_state("paused")
+    with _queue_lock:
+        q = store.queue()
+        _require_owned_queue(playlist_id, q)
+        # I3 (review round 1): honour the guard's refusal instead of always
+        # answering {"ok": true} — pausing a queue that already finished or
+        # was already stopped must not resurrect it into "paused", and the
+        # caller needs to know the click didn't do what it asked.
+        if not _apply_queue_state(q, "paused", None):
+            raise HTTPException(
+                409, f"queue is {q['state']}, not running — nothing to pause")
     _queue_wake.set()
     return {"ok": True}
 
 
 @app.post("/api/split/{playlist_id}/queue/resume")
 def resume_queue(playlist_id: str):
-    q = store.queue()
-    if not q.get("pending") and not q.get("current"):
-        raise HTTPException(409, "nothing queued")
-    # force=True: resume's whole job is leaving "paused"/"stopped" — the
-    # check-and-set guard exists to stop everyone ELSE from doing that.
-    _set_queue_state("running", force=True)
+    # M1 (review round 1): the emptiness check and the state write happen
+    # under the SAME _queue_lock acquisition now, so a concurrent cancel
+    # can't empty `pending`/`current` between this check and the write.
+    with _queue_lock:
+        q = store.queue()
+        _require_owned_queue(playlist_id, q)
+        if not q.get("pending") and not q.get("current"):
+            raise HTTPException(409, "nothing queued")
+        # force=True: resume's whole job is leaving "paused"/"stopped" — the
+        # check-and-set guard exists to stop everyone ELSE from doing that.
+        # keep_stop_reason=True: a quota/error reason the user is still
+        # looking at should not flicker to None the instant this click
+        # lands — the worker's own unconditional "running" transition (top
+        # of `_drain_queue_body`) is what actually clears it once the run
+        # is genuinely under way again.
+        _apply_queue_state(q, "running", None, force=True, keep_stop_reason=True)
     _start_queue_worker()
     return {"ok": True}
 
@@ -1612,6 +1743,7 @@ def resume_queue(playlist_id: str):
 def cancel_queue(playlist_id: str):
     with _queue_lock:
         q = store.queue()
+        _require_owned_queue(playlist_id, q)
         q.update(pending=[], current=None, state="stopped",
                  stop_reason="cancelled", updated_at=_now_iso())
         store.save_queue(q)

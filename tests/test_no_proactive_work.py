@@ -57,3 +57,12 @@ def test_the_queue_worker_cannot_self_start():
         f"_start_queue_worker is invoked {calls - defs} times — enqueue and "
         "resume are the only two launch sites allowed; a third is a "
         "self-start waiting to happen")
+    # I1 (review round 1): the count above only pins call SITES of
+    # `_start_queue_worker()` — it says nothing about a second thread
+    # construction added elsewhere (e.g. a stray `threading.Thread(target=
+    # _drain_queue, ...)` outside `_start_queue_worker`), which is
+    # mutation-verified to slip past the check above untouched. Pin the
+    # single construction site directly.
+    assert src.count("target=_drain_queue") == 1, (
+        "queue-materialiser threads must be constructed in exactly one "
+        "place, inside _start_queue_worker")

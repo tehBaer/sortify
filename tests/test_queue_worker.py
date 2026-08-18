@@ -73,8 +73,15 @@ def wait_done(s, timeout=5.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
         if s.queue()["state"] in ("done", "stopped", "paused"):
-            appmod._queue_worker.join(timeout=2)
-            assert not appmod._queue_worker.is_alive(), "worker thread did not exit after settling"
+            # Task 9 fix round 1 (I4): the worker now clears appmod._queue_worker
+            # to None, under _queue_lock, as its own last act — by the time this
+            # poll notices a settled state the clearing may already have
+            # happened, so read the reference once and tolerate None instead of
+            # assuming the global still points at the (already-exited) thread.
+            worker = appmod._queue_worker
+            if worker:
+                worker.join(timeout=2)
+                assert not worker.is_alive(), "worker thread did not exit after settling"
             return s.queue()
         time.sleep(0.01)
     raise AssertionError(f"queue never settled: {s.queue()}")
@@ -108,6 +115,12 @@ def test_pause_is_instant_and_the_thread_exits(worker_env, monkeypatch):
     calls, s = worker_env
     monkeypatch.setattr(pacing.Governor, "interval", lambda self: 30.0)
     start_queue(s, pending=("p1",))
+    # Task 9 fix round 1 (I4): grab the thread object now, while it is
+    # definitely still running — the worker clears appmod._queue_worker to
+    # None as its own last act, and this test's whole point is racing the
+    # pause against a thread that's about to exit, so the global itself is
+    # not a safe thing to keep re-reading below.
+    worker = appmod._queue_worker
     deadline = time.time() + 5
     while time.time() < deadline and not calls:
         time.sleep(0.01)
@@ -116,8 +129,8 @@ def test_pause_is_instant_and_the_thread_exits(worker_env, monkeypatch):
     q = s.queue(); q["state"] = "paused"; s.save_queue(q)
     appmod._queue_wake.set()                             # what the endpoint does
     t0 = time.time()
-    appmod._queue_worker.join(timeout=5)
-    assert not appmod._queue_worker.is_alive() and time.time() - t0 < 5
+    worker.join(timeout=5)
+    assert not worker.is_alive() and time.time() - t0 < 5
     assert s.queue()["state"] == "paused"                # resumable at the price of what's left
     # M2: at most the one call already in flight (if any) is allowed to
     # land after the pause is flipped — no NEW tick may start.
