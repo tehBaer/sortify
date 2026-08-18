@@ -22,24 +22,20 @@ from collections import Counter
 
 from .tags import clean_tags
 
-# PROVISIONAL, not a settled measurement (fix round 1, ruling R3b). Measured
-# by scripts/eval_suggest.py, corrected for the fix-round C3 label-leak bug
-# (hold-out now applies to every home a track sits in, not just the sampled
-# pair's home) — task-3-report.md has the full corrected grid:
+# Measured 2026-08-18 by scripts/eval_suggest.py AFTER the home-artist
+# backfill (scripts/backfill_tags.py: 1427/1427 home artists attempted,
+# 1417 tagged, 10 real misses):
 #   .venv/bin/python scripts/eval_suggest.py --n 500 --seed 7 --search
 #   artist-only baseline (TAG_WEIGHT=0): top1 0.268 top3 0.424
-#   winner TAG_WEIGHT=3.0: top1 0.274 top3 0.430
-# Home-artist tag coverage was 7.1% (102/1427 distinct artists across home
-# playlists have any Last.fm tag record) at measurement time, so this ~0.006
-# lift is close to what 7% coverage can even produce, not a settled read on
-# whether tags help — re-run the command above once coverage has grown and
-# replace this constant with a real measurement.
-# On the spec's original target case — tracks whose artist has NO overlap
-# in any home, where artist_overlap contributes nothing and only tags could
-# rescue the ranking — the harness reports separately: at TAG_WEIGHT=3.0,
-# top1 0.000 and top3 0.013 on that subset (n=158/500). Tags are not yet
-# doing the job the spec asked for; low coverage is the diagnosis, not
-# that artist-level tags are inherently too weak a signal.
+#   TAG_WEIGHT=3.0:                      top1 0.290 top3 0.534
+# On the spec's target case — tracks whose artist has no overlap in any
+# home, where only tags can rescue the ranking — top3 went 0.000 -> 0.253
+# (n=158/500). Higher weights (4.0/6.0) buy top3 0.540 but lose top1 and
+# would let a perfect tag cosine outrank a single artist match (the
+# artist-overlap-primacy pin caps the weight below ARTIST_BASE +
+# ARTIST_PER_TRACK = 3.4), so 3.0 is the committed ceiling. Earlier
+# pre-backfill numbers (7.1% coverage, ~0.006 lift) are in
+# task-3-report.md for the record.
 ARTIST_BASE = 3.0
 ARTIST_PER_TRACK = 0.4
 TAG_WEIGHT = 3.0
