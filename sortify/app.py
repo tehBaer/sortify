@@ -635,18 +635,29 @@ def create_split(playlist_id: str, params: SplitParams = SplitParams()):
             "params": params.model_dump(),
             "piles": piles,
             "decided": prev.get("decided", {}),
-            # Carried forward for the same reason `decided` is: re-running a
-            # split is the ordinary way to resume an interrupted Last.fm walk,
-            # and it usually produces the very same piles. Dropping the
-            # materialisation records would make a pile that already has a
-            # permanent playlist look untouched — and its button would then
-            # offer to spend 310 calls building a second copy of it. Piles
-            # that really did change are caught by the fingerprint in
-            # `_materialise_plan`, not by throwing the records away.
-            "materialised": prev.get("materialised", {}),
-            "materialised_history": prev.get("materialised_history", []),
             "active_sitting": None,
         }
+        # Carried forward for the same reason `decided` is (see above): a
+        # re-run usually produces the very same piles, and dropping the
+        # materialisation records would make a pile that already has a
+        # permanent playlist look untouched — offering to spend 310 calls on
+        # a second copy of it. Piles that really did change under the same
+        # id are caught by the fingerprint in `_materialise_plan`, not by
+        # throwing the records away here.
+        #
+        # But a record whose pile id no longer exists after this re-cluster
+        # would never be shown or priced again — swept to history instead,
+        # so a playlist sortify made never stops being traceable to the pile
+        # it came from (review finding I3).
+        new_ids = {p["id"] for p in piles}
+        carried, history = {}, list(prev.get("materialised_history", []))
+        for pid, rec in (prev.get("materialised") or {}).items():
+            if pid in new_ids:
+                carried[pid] = rec
+            else:
+                history.append({**rec, "swept": "recluster"})
+        payload["splits"][playlist_id]["materialised"] = carried
+        payload["splits"][playlist_id]["materialised_history"] = history
         store.save_splits(payload)
     untagged = sum(len(p["uris"]) for p in piles if p["id"] == UNTAGGED)
     return {"piles": piles, "tagged": len(tracks) - untagged, "untagged": untagged}

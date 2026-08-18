@@ -474,3 +474,51 @@ def test_a_half_filled_playlist_whose_record_vanished_is_re_recorded(client, mon
     # And the re-recorded state is resumable at the price of what is left.
     pile = next(p for p in client.get("/api/split/PLM").json()["piles"] if p["id"] == "p1")
     assert pile["materialise_calls"] == 3
+
+
+def test_recluster_sweeps_records_for_vanished_pile_ids_to_history(client, monkeypatch):
+    """9 piles → 8 must not orphan p9's record (finding I3): the playlist is
+    real, and history is the only place it stays traceable. p1's record, kept
+    because p1 still exists after the re-cluster, pins the other half: a
+    sweep-everything implementation would also make this test pass."""
+    s = Store()
+    payload = s.splits()
+    payload["splits"]["PLM"]["materialised"] = {
+        "p1": {"playlist_id": "STILL1", "pile_id": "p1", "name": "cumbia · latin · salsa",
+               "fingerprint": "whatever", "track_count": 5,
+               "added": ["spotify:track:m0"], "claim": "c",
+               "created_at": "t", "updated_at": "t"},
+        "p9": {"playlist_id": "OLD9", "pile_id": "p9", "name": "gone pile",
+               "fingerprint": "beef", "track_count": 3,
+               "added": ["spotify:track:x"], "claim": "c",
+               "created_at": "t", "updated_at": "t"}}
+    s.save_splits(payload)
+
+    # Same re-cluster pattern as
+    # test_a_resplit_that_rebuilds_the_same_piles_keeps_the_record: force the
+    # split back to its original p1/p2 piles (no p9) with every network
+    # source faked out, so this is a free local re-cluster, not a live one.
+    piles = Store().splits()["splits"]["PLM"]["piles"]
+    monkeypatch.setattr(appmod, "split_tracks", lambda tracks, artists, params: piles)
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: object())
+    monkeypatch.setattr(appmod, "enrich", lambda names, cached, fm, now: cached)
+    monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: [
+        {"id": "PLM", "name": "PLM", "owner": "me", "editable": True,
+         "total": 65, "snapshot_id": None, "image": None}])
+    monkeypatch.setattr(appmod.sp, "playlist_tracks",
+                        lambda pid: Store().cache()["playlists"]["PLM"]["tracks"])
+
+    original_tags = Store().tags()
+    try:
+        Store().save_tags({"version": TAGS_VERSION, "artists": {}})
+        r = client.post("/api/split/PLM", json={})     # re-cluster, 0 calls
+        assert r.status_code == 200
+    finally:
+        Store().save_tags(original_tags)
+
+    split = Store().splits()["splits"]["PLM"]
+    assert split["materialised"]["p1"]["playlist_id"] == "STILL1"  # still-existing id: kept
+    assert "p9" not in split.get("materialised", {})
+    hist = split["materialised_history"]
+    assert hist and hist[-1]["playlist_id"] == "OLD9" and hist[-1]["swept"] == "recluster"
+    assert client.calls == []                       # free, like every re-cluster
