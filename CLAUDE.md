@@ -15,6 +15,11 @@ escalating penalties. Therefore:
   12/60s across all sources; `BACKGROUND_DAILY_CAP` 40/day for anything proactive.
   These are set from observed damage, not from the docs — raising one needs
   evidence, not optimism. The 2026-08-13 ban came from 678 calls in ~70 minutes.
+  The queued materialiser adds two more: `BULK_RESERVE` 150 means it never
+  spends the day's last 150 calls and sleeps to local midnight instead; its
+  governor holds a 7.0/min ceiling and only escalates after 15 clean minutes.
+  `data/pacing.json` carries the measured `max_clean_rate` — the number that
+  replaces the guess band once the rate has actually been observed clean.
 - **It is the rate, not the day's total.** spotify-autoqueuer ran 1208 calls on
   2026-08-14 (~1.8/min) with no penalty, against sortify's 678 at ~9.7/min that
   earned ~23h. So `WINDOW_CAP` and the pacing are the real protection; the daily
