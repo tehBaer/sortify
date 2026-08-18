@@ -21,9 +21,13 @@ let sitting = null;
 
 // ---- plumbing --------------------------------------------------------------
 
-async function api(path, body) {
-  const opts = body
-    ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+async function api(path, body, method) {
+  // `method` is the escape hatch for verbs that carry no body — DELETE
+  // (cancelQueue) — everything else still just says "POST if there's a
+  // body, GET otherwise" the way every existing call site already relies on.
+  const opts = (body || method)
+    ? { method: method || "POST", headers: { "Content-Type": "application/json" },
+        ...(body ? { body: JSON.stringify(body) } : {}) }
     : {};
   const resp = await fetch(path, opts);
   let data = {};
@@ -688,6 +692,10 @@ $("picker").onclick = (e) => { if (e.target.id === "picker") closePicker(); };
 // for why.
 
 async function openSplit(id, name) {
+  stopQueuePolling();
+  queueStatus = null;
+  $("queue-panel").hidden = true;
+  $("queue-panel").innerHTML = "";
   split = { id, name, piles: [], decided: {}, active_sitting: null };
   show("split");
   $("split-title").textContent = name;
@@ -697,6 +705,7 @@ async function openSplit(id, name) {
   try {
     const data = await api(`/api/split/${id}`);
     applySplitData(data);
+    pollQueueStatus();
   } catch (e) {
     if (e.message === "auth needed") return;
     if (e.status !== 404) {
@@ -854,6 +863,7 @@ function syncSitting(splitId, piles, decided, activeSitting) {
 
 function renderPiles() {
   $("split-params").hidden = false;
+  renderSaveAll();
   const wrap = $("piles");
   wrap.innerHTML = "";
   // Reads split.active_sitting directly, not the `sitting` global — the
@@ -874,33 +884,78 @@ function renderPiles() {
     row.className = "pile-row";
     const tags = p.tags && p.tags.length ? p.tags.join(" · ") : "";
     const save = saveOffer(p);
+    const busy = saveAllBusy || pileSaveBusy.has(p.id);
     row.innerHTML = `
       <div class="pl-meta">
         <div class="name">${esc(p.name)}</div>
         <div class="sub">${left} of ${p.total} left${tags ? " · " + esc(tags) : ""}${
           save.note ? " · " + esc(save.note) : ""}</div>
       </div>
-      <button class="pile-save" ${save.disabled ? "disabled" : ""} title="${esc(save.title)}">${
-        esc(save.label)}</button>
+      <button class="pile-save" ${save.disabled || busy ? "disabled" : ""} title="${esc(save.title)}">${
+        busy ? "Queuing… (already spending)" : esc(save.label)}</button>
       <button class="pile-sitting primary" ${left === 0 || sittingActive ? "disabled" : ""}>Start ~2h sitting (~24 calls)</button>`;
     row.querySelector(".pile-sitting").onclick = () => startSitting(p.id, p.name);
     const saveBtn = row.querySelector(".pile-save");
-    saveBtn.onclick = () => materialisePile(p.id, save.calls, saveBtn);
+    saveBtn.onclick = () => queuePiles([p.id], save.calls);
     wrap.appendChild(row);
   }
   renderSplitSittingBar();
 }
 
+// One header button that queues every pile with something left to save in
+// one go (`queuePiles(null, …)` — null is the server's "everything" sigil,
+// same contract as a single pile). The total is computed here, once, and
+// baked into the closure the button's click reads — never recomputed at
+// click time — so what gets echoed back to the server is guaranteed to be
+// the number that was actually on screen, the same misclick contract every
+// other priced button in this file keeps.
+let saveAllTotal = 0;
+
+function renderSaveAll() {
+  const wrap = $("split-save-all");
+  const btn = $("btn-save-all");
+  saveAllTotal = split.piles.reduce(
+    (sum, p) => sum + (Number.isInteger(p.materialise_calls) ? p.materialise_calls : 0), 0);
+  if (saveAllTotal <= 0) { wrap.hidden = true; return; }
+  btn.textContent = saveAllBusy ? "Queuing… (already spending)" : `Save all piles (${floorPrice(saveAllTotal)})`;
+  btn.title = renderSaveAllLabel(saveAllTotal);
+  btn.disabled = saveAllBusy;
+  wrap.hidden = false;
+}
+
+// Finding I2: every price this app shows is a FLOOR, not a ceiling —
+// request() retries a transient 429 up to 3x, and each attempt is a real
+// Spotify call the retry pays for, so the true spend can run over what was
+// quoted. Every displayed price says so: `≥ N calls` on the button itself,
+// and the disclosure spelled out in its title tooltip. One shared pair of
+// helpers so the wording can't drift between the per-pile buttons and the
+// save-all header button.
+function floorPrice(calls) {
+  return `≥ ${calls} call${calls === 1 ? "" : "s"}`;
+}
+
+function floorDisclosure(calls) {
+  return `at least ${calls} Spotify call${calls === 1 ? "" : "s"} — a retried ` +
+         `429 is charged per attempt.`;
+}
+
+// The save-all header button's price-floor disclosure — also unit-tested
+// directly (ui_harness.mjs) since a wrong number here is exactly the kind of
+// thing that would otherwise only surface after a misclick.
+function renderSaveAllLabel(calls) {
+  return `Save all piles (${floorPrice(calls)}) — ${floorDisclosure(calls)}`;
+}
+
 // What the "save this pile" button says, and what it will hand back as
 // `expected_calls`. The cost is NEVER computed here: the server sends
 // `materialise_calls` with every pile (a free, local read) and refuses the
-// POST unless the number comes back exactly, so a figure invented on this
+// enqueue unless the number comes back exactly, so a figure invented on this
 // side could only ever buy a refusal. A pile row from a server that didn't
 // send one is therefore offered as un-clickable rather than guessed at.
 //
 // One call per track — the Feb-2026 API has no batch add — which is ~26
-// minutes of paced requests for the 309-track pile, so the tooltip says both
-// the price and the wait before anything is spent.
+// minutes of paced requests for the 309-track pile, so the tooltip says the
+// price, the floor disclosure, and the wait before anything is spent.
 function saveOffer(p) {
   const calls = p.materialise_calls;
   const m = p.materialised;
@@ -909,8 +964,8 @@ function saveOffer(p) {
              note: "", title: "Reopen this split to see what saving it would cost." };
   }
   const mins = Math.max(1, Math.ceil(calls / 12));
-  const price = `${calls} Spotify call${calls === 1 ? "" : "s"} — one per track, ` +
-    `about ${mins} min at sortify's pacing. Leave this tab open; if it stops partway ` +
+  const price = `${floorPrice(calls)} — one per track, about ${mins} min at sortify's ` +
+    `pacing (${floorDisclosure(calls)}). Leave this tab open; if it stops partway ` +
     `(a rate-limit cooldown, say) nothing is lost — pressing it again adds only the ` +
     `tracks that are still missing.`;
   if (calls === 0) {
@@ -920,59 +975,81 @@ function saveOffer(p) {
                     "sortify never deletes it — remove it there if you don't want it." };
   }
   if (m && m.stale) {
-    return { calls, disabled: false, label: `Save as a new playlist (${calls} calls)`,
+    return { calls, disabled: false, label: `Save as a new playlist (${floorPrice(calls)})`,
              note: "saved earlier, but the pile has changed since",
              title: "This pile was saved before, but re-clustering has changed which " +
                     "tracks are in it, so the old playlist is no longer this pile. " +
                     "Saving now makes a separate one. " + price };
   }
   if (m && m.playlist_id) {
-    return { calls, disabled: false, label: `Resume saving (${calls} calls)`,
+    return { calls, disabled: false, label: `Resume saving (${floorPrice(calls)})`,
              note: `${m.added} of ${p.total} saved so far`,
              title: "Adds only the tracks still missing from the playlist this pile " +
                     "already has. " + price };
   }
-  return { calls, disabled: false, label: `Save as playlist (${calls} calls)`,
+  return { calls, disabled: false, label: `Save as playlist (${floorPrice(calls)})`,
            note: "", title: "Makes a permanent Spotify playlist named after this pile " +
                             "and adds every track in it. " + price };
 }
 
-// One entry per (split, pile) currently being saved by this tab. A save can
-// run for half an hour, so "disable the button" alone is not enough — the
-// button is re-rendered on every free re-read of the split, and a re-render
-// would hand a second click a fresh, enabled one. The server refuses the
-// duplicate too (`_pending_materialise`), but the whole point of the C2
-// lesson is not to promise a spend that has to be refused.
-const materialiseInFlight = new Set();
+// One entry per (split, pile-set) signature currently mid-`queuePiles()` in
+// this tab — "save all" and "save this one pile" are different signatures
+// on purpose, so a save-all in flight doesn't lock out a single-pile retry
+// (or vice versa) even though the server ultimately allows only one queue at
+// a time; that invariant is enforced server-side (409) and handled below
+// like any other refusal. A save can run for a long time, so "disable the
+// button" alone is not enough — the button is re-rendered on every free
+// re-read of the split, and a re-render would hand a second click a fresh,
+// enabled one.
+const queueActionInFlight = new Set();
+let saveAllBusy = false;
+const pileSaveBusy = new Set();
 
-async function materialisePile(pileId, expectedCalls, btn) {
+function queueActionKey(pileIds) {
+  return pileIds === null ? "*" : [...pileIds].sort().join(",");
+}
+
+// Replaces the old one-shot materialisePile (Task 7 removed its endpoint):
+// this posts to the queue instead of spending synchronously, so a save that
+// used to tie up the tab for up to ~26 minutes now returns almost instantly
+// and the worker drains it in the background — see renderQueuePanel below
+// for how that progress is shown. Same misclick contract as the one-shot
+// had: the POST echoes back exactly the number the button displayed
+// (`expectedCalls`), and `pileIds: null` is the server's "every pile" sigil
+// for the save-all button, never invented client-side.
+async function queuePiles(pileIds, expectedCalls) {
+  if (!split) return;
   const splitId = split.id;
-  const key = splitId + " " + pileId;
-  if (expectedCalls === null || materialiseInFlight.has(key)) return;
-  materialiseInFlight.add(key);
-  const label = btn ? btn.textContent : "";
-  if (btn) { btn.disabled = true; btn.textContent = "Saving… (already spending)"; }
+  if (expectedCalls === null) return;
+  const key = splitId + " " + queueActionKey(pileIds);
+  if (queueActionInFlight.has(key)) return;
+  queueActionInFlight.add(key);
+  const targetIds = pileIds === null ? split.piles.map((p) => p.id) : pileIds;
+  if (pileIds === null) saveAllBusy = true;
+  for (const id of targetIds) pileSaveBusy.add(id);
+  renderPiles();
   try {
-    const data = await api(`/api/split/${splitId}/materialise`,
-                           { pile_id: pileId, expected_calls: expectedCalls });
-    toast(data.calls_spent === 0
-      ? "already saved — nothing to spend"
-      : `saved: ${data.added} of ${data.total} tracks, ${data.calls_spent} Spotify calls spent`,
-      5000);
+    const data = await api(`/api/split/${splitId}/queue`,
+                           { pile_ids: pileIds, expected_calls: expectedCalls });
+    toast(data.total_calls === 0
+      ? "already saved — nothing queued"
+      : `queued ${data.queued.length} pile${data.queued.length === 1 ? "" : "s"} — ` +
+        `${data.total_calls} Spotify calls, running in the background`, 5000);
   } catch (e) {
     if (e.message === "auth needed") return;
-    // A 409 here is the cost guard, not a conflict to retry blindly: the row
-    // this click came from was stale, so the free re-read below is exactly
-    // the right next step and the new price will be on the button.
+    // A 409 here is either the cost guard (a stale row) or "a queue is
+    // already running" — neither is a conflict to retry blindly. The free
+    // re-read below puts the current truth back on screen either way.
     toast(e.message, 6000);
   } finally {
-    materialiseInFlight.delete(key);
-    if (btn) { btn.disabled = false; btn.textContent = label; }
+    queueActionInFlight.delete(key);
+    if (pileIds === null) saveAllBusy = false;
+    for (const id of targetIds) pileSaveBusy.delete(id);
   }
-  // Always re-read, on success and on failure alike: a save that stopped
-  // partway still added tracks, and the row must show what actually landed
-  // (and what resuming would now cost) rather than what it cost before. Free
-  // and local — GET /api/split spends nothing.
+  // Always re-read, on success and on failure alike — same behaviour the
+  // one-shot materialisePile had: a stale price or an already-landed queue
+  // needs the fresh row, not what was true before this click. Free and
+  // local — GET /api/split spends nothing.
   try {
     const fresh = await api(`/api/split/${splitId}`);
     if (split && split.id === splitId) applySplitData(fresh);
@@ -980,6 +1057,7 @@ async function materialisePile(pileId, expectedCalls, btn) {
     // Leave the original message on screen; a failed re-read has nothing
     // better to say than the failure that preceded it.
   }
+  pollQueueStatus();
 }
 
 // Shown whenever a reservation exists at all — `playlist_id` only decides
@@ -1002,6 +1080,131 @@ function renderSplitSittingBar() {
       `created — the call failed. Nothing was spent and nothing else can start ` +
       `until it's cleared. Finish it here (0 Spotify calls).`;
   bar.hidden = false;
+}
+
+// ---- the queued materialiser's status panel --------------------------------
+//
+// GET /api/split/{id}/queue never touches Spotify (it reads queue.json and
+// pacing.json, both local), so none of the /api/now call-budget rules apply
+// here — it's polled purely for UI freshness, gated on the panel actually
+// being on screen AND the queue actually being able to change on its own
+// (running/sleeping/quiet). A paused/stopped/done queue doesn't move without
+// a click, so polling it is pure waste.
+const QUEUE_ACTIVE_STATES = new Set(["running", "sleeping", "quiet"]);
+let queueStatus = null;     // last known {queue, pacing} for the open split
+let queuePanelTimer = null;
+
+function stopQueuePolling() { clearTimeout(queuePanelTimer); queuePanelTimer = null; }
+
+// Pure — takes the exact shape GET /api/split/{id}/queue returns and renders
+// it to a markup string, so it's testable without a DOM (ui_harness.mjs).
+function renderQueuePanel(status) {
+  const q = (status && status.queue) || {};
+  const p = (status && status.pacing) || {};
+  const prog = q.progress || {};
+  const state = q.state || "stopped";
+  const badge = `<span class="queue-state">${esc(state)}</span>`;
+  const bits = [];
+  if (prog.pile_count) {
+    bits.push(`pile ${prog.pile_index ?? 0}/${prog.pile_count} · ` +
+               `track ${prog.track ?? 0}/${prog.track_total ?? 0}`);
+  }
+  if (p.rate_per_min != null) {
+    bits.push(`rate ${p.rate_per_min}/min (ceiling ${p.ceiling ?? 7.0})`);
+  }
+  if (p.max_clean_rate != null) {
+    bits.push(`max clean rate ${p.max_clean_rate}/min`);
+  }
+  const summary = bits.length
+    ? `<div class="queue-summary">${badge}<span>${esc(bits.join(" · "))}</span></div>`
+    : `<div class="queue-summary">${badge}</div>`;
+  // stop_reason carries both permanent quota trips and the last 429's
+  // reason string (see app.py's classify_429/note_429) — surfaced verbatim
+  // rather than re-worded, since the exact reason is what tells a user
+  // whether Resume is worth clicking yet.
+  const stopLine = q.stop_reason
+    ? `<p class="hint">last stop: ${esc(q.stop_reason)}</p>` : "";
+  const canPause = QUEUE_ACTIVE_STATES.has(state);
+  const canResume = state === "paused" || state === "stopped";
+  const canCancel = state !== "done" && state !== "stopped";
+  return `${summary}${stopLine}
+    <div class="queue-controls">
+      <button id="btn-queue-pause" ${canPause ? "" : "disabled"}>Pause</button>
+      <button id="btn-queue-resume" ${canResume ? "" : "disabled"}>Resume</button>
+      <button id="btn-queue-cancel" ${canCancel ? "" : "disabled"}>Cancel</button>
+    </div>`;
+}
+
+function paintQueuePanel() {
+  const el = $("queue-panel");
+  // Only ever shown for the split that actually owns the current/last queue
+  // — GET stays global (M4, Task 9) so a split that never queued anything
+  // would otherwise render someone else's progress as its own.
+  if (!queueStatus || !queueStatus.queue || !split ||
+      queueStatus.queue.playlist_id !== split.id) {
+    el.hidden = true; el.innerHTML = "";
+    return;
+  }
+  el.innerHTML = renderQueuePanel(queueStatus);
+  el.hidden = false;
+  const pause = $("btn-queue-pause");
+  const resume = $("btn-queue-resume");
+  const cancel = $("btn-queue-cancel");
+  if (pause) pause.onclick = pauseQueue;
+  if (resume) resume.onclick = resumeQueue;
+  if (cancel) cancel.onclick = cancelQueue;
+}
+
+async function pollQueueStatus() {
+  if (!split) { stopQueuePolling(); return; }
+  const splitId = split.id;
+  try {
+    const status = await api(`/api/split/${splitId}/queue`);
+    if (!split || split.id !== splitId) return;   // navigated away mid-flight
+    queueStatus = status;
+  } catch (_) {
+    // Local and free — a failed poll leaves the last-known status on screen
+    // rather than erasing it.
+  }
+  paintQueuePanel();
+  const active = queueStatus && queueStatus.queue &&
+    queueStatus.queue.playlist_id === splitId &&
+    QUEUE_ACTIVE_STATES.has(queueStatus.queue.state);
+  stopQueuePolling();
+  if (!$("queue-panel").hidden && active) {
+    queuePanelTimer = setTimeout(pollQueueStatus, 10000);
+  }
+}
+
+// Deliberately makes exactly one call and nothing else: pausing doesn't need
+// a fresh read to be trustworthy (the click itself is the truth), so this
+// updates the on-screen state from the response it already has instead of
+// spending a second round trip.
+async function pauseQueue() {
+  if (!split) return;
+  try {
+    await api(`/api/split/${split.id}/queue/pause`, {});
+    if (queueStatus && queueStatus.queue) queueStatus.queue.state = "paused";
+    stopQueuePolling();
+    paintQueuePanel();
+  } catch (e) { toast(e.message); }
+}
+
+async function resumeQueue() {
+  if (!split) return;
+  try {
+    await api(`/api/split/${split.id}/queue/resume`, {});
+  } catch (e) { toast(e.message); }
+  pollQueueStatus();
+}
+
+async function cancelQueue() {
+  if (!split) return;
+  try {
+    await api(`/api/split/${split.id}/queue`, undefined, "DELETE");
+    toast("queue cancelled");
+  } catch (e) { toast(e.message); }
+  pollQueueStatus();
 }
 
 async function startSitting(pileId, pileName) {
@@ -1109,8 +1312,9 @@ async function finishSitting(targetSplitId) {
   }
 }
 
-$("btn-split-back").onclick = () => { split = null; loadLists(); };
+$("btn-split-back").onclick = () => { stopQueuePolling(); split = null; loadLists(); };
 $("btn-split-finish-sitting").onclick = () => finishSitting(split?.id);
+$("btn-save-all").onclick = () => queuePiles(null, saveAllTotal);
 $("btn-recluster").onclick = async () => {
   try {
     const data = await api(`/api/split/${split.id}/recluster`, splitParams());

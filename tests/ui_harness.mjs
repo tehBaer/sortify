@@ -87,6 +87,11 @@ async function fetchStub(path, opts) {
   if (typeof r === "function") r = r();
   r = await r;
   if (!r) r = { status: 200, body: {} };
+  // Shorthand for the common "just a success body" case: a route value with
+  // no `status` field is treated as an implicit 200 whose body IS the value
+  // itself, so a test can write `{ ok: true, queued: [...] }` directly
+  // instead of `{ status: 200, body: { ok: true, queued: [...] } }`.
+  if (r.status === undefined) r = { status: 200, body: r };
   return {
     status: r.status, ok: r.status >= 200 && r.status < 300,
     // Deep-cloned: app.js keeps `nowState.sitting` by reference and mutates
@@ -109,6 +114,9 @@ const run = (code) => vm.runInContext(code, ctx);
 const tick = () => new Promise((r) => setImmediate(() => setImmediate(() => setImmediate(r))));
 const posts = (p) => log.filter((c) => c.method === "POST" && c.path === p).length;
 const gets = (p) => log.filter((c) => c.method === "GET" && c.path === p).length;
+// Every logged body for a given path, parsed — the queue checks care about
+// *which* request carried a given field, not just how many fired.
+const bodies = (p) => log.filter((c) => c.path === p).map((c) => c.body ? JSON.parse(c.body) : undefined);
 
 const results = [];
 function check(name, pass, detail) {
@@ -420,10 +428,11 @@ run("stopNowPolling()");
 }
 
 // ============================================================================
-// M — saving a pile as a permanent playlist. The price must be on the button
-// before the click, and it must be the server's number, echoed back
-// unchanged: that echo is the only thing standing between a misclick on the
-// 309-track pile and 310 silent Spotify calls.
+// M — saving piles into permanent playlists via the queue. The price must be
+// on the button before the click, it must be the server's number echoed
+// back unchanged — that echo is the only thing standing between a misclick
+// on the 309-track pile and 310 silent Spotify calls — and every price is a
+// FLOOR (finding I2), not a promise of the final total.
 // ============================================================================
 {
   routes["GET /api/split/PL8"] = {
@@ -446,53 +455,83 @@ run("stopNowPolling()");
   await tick();
   const rows = $$("piles").children.map((c) => c.innerHTML);
 
-  check("M the price is on the button before the click",
-        /Save as playlist \(3 calls\)/.test(rows[0]), rows[0].slice(-120));
+  check("M the price is on the button before the click, as a floor",
+        /Save as playlist \(≥ 3 calls\)/.test(rows[0]), rows[0].slice(-120));
   check("M a partly-saved pile offers to resume at the price of what's left",
-        /Resume saving \(2 calls\)/.test(rows[1]) && /1 of 3 saved so far/.test(rows[1]),
+        /Resume saving \(≥ 2 calls\)/.test(rows[1]) && /1 of 3 saved so far/.test(rows[1]),
         rows[1].slice(-160));
   check("M a finished pile is not clickable and says so",
         /Saved as a playlist/.test(rows[2]) && /<button[^>]*disabled[^>]*>Saved as a playlist/.test(rows[2]),
         rows[2].slice(-140));
   check("M a re-clustered pile is offered as a NEW playlist, at full price",
-        /Save as a new playlist \(2 calls\)/.test(rows[3]) && /pile has changed/.test(rows[3]),
+        /Save as a new playlist \(≥ 2 calls\)/.test(rows[3]) && /pile has changed/.test(rows[3]),
         rows[3].slice(-180));
-  check("M the tooltip states the wait, not just the price",
-        /one per track/.test(rows[0]) && /min at sortify/.test(rows[0]), "");
+  check("M the tooltip states the wait and the floor disclosure, not just the price",
+        /one per track/.test(rows[0]) && /min at sortify/.test(rows[0]) && /at least/.test(rows[0]), "");
 
-  // The click: exactly one POST, carrying exactly the number that was shown.
-  let release;
-  const pending = new Promise((r) => (release = r));
-  routes["POST /api/split/PL8/materialise"] = () => pending;
+  // A double-click on the SAME pile (identical queue signature) must not
+  // double-queue — the same misclick guard materialisePile had, now scoped
+  // per (split, pile-set) so it doesn't block an unrelated save-all/other-pile
+  // click (see the next block).
+  {
+    let release;
+    const pending = new Promise((r) => (release = r));
+    routes["POST /api/split/PL8/queue"] = () => pending;
+    resetLog();
+    run(`queuePiles(["p1"], 3)`);
+    run(`queuePiles(["p1"], 3)`);   // second click, first in flight
+    await tick();
+    check("M two clicks on the same pile issue exactly one paid POST",
+          posts("/api/split/PL8/queue") === 1,
+          `${posts("/api/split/PL8/queue")} POST(s)`);
+    release({ status: 200, body: { ok: true, queued: ["p1"], total_calls: 3 } });
+    await tick();
+  }
+
+  // A refusal (the cost guard, or a queue already running) must re-read too
+  // — the row that produced the stale number is exactly what needs
+  // replacing.
+  routes["POST /api/split/PL8/queue"] = {
+    status: 409, body: { detail: "cost has changed: saving these piles now spends 2 Spotify calls" } };
   resetLog();
-  run(`materialisePile("p1", 3, null)`);
-  run(`materialisePile("p1", 3, null)`);      // second click, first in flight
+  run(`queuePiles(["p1"], 3)`);
   await tick();
-  check("M two clicks issue exactly one paid POST",
-        posts("/api/split/PL8/materialise") === 1,
-        `${posts("/api/split/PL8/materialise")} POST(s)`);
-  const sent = JSON.parse(log.find((c) => c.method === "POST").body);
-  check("M the POST echoes the displayed cost back to the server",
-        sent.expected_calls === 3 && sent.pile_id === "p1", JSON.stringify(sent));
-
-  release({ status: 200, body: { ok: true, playlist_id: "NEW8", added: 2, total: 2, calls_spent: 3, complete: true } });
-  await tick();
-  check("M the toast reports what was actually spent",
-        /3 Spotify calls spent/.test($$("toast").textContent),
-        JSON.stringify($$("toast").textContent.slice(0, 80)));
-  check("M success triggers the free re-read so the row shows what landed",
-        gets("/api/split/PL8") === 1, `${gets("/api/split/PL8")} GET(s)`);
-
-  // A refusal (the cost guard fired) must re-read too — the row that produced
-  // the stale number is exactly what needs replacing.
-  routes["POST /api/split/PL8/materialise"] = {
-    status: 409, body: { detail: "cost has changed: saving this pile now spends 2 Spotify calls" } };
-  resetLog();
-  run(`materialisePile("p1", 3, null)`);
-  await tick();
-  check("M a refused save says why and re-reads the split for free",
+  check("M a refused enqueue says why and re-reads the split for free",
         /cost has changed/.test($$("toast").textContent) && gets("/api/split/PL8") === 1,
         `${gets("/api/split/PL8")} GET(s)`);
+
+  // The queue replaces the one-shot save. Same misclick contract: the number
+  // POSTed is the number the button displayed, now summed across piles.
+  resetLog();
+  routes["POST /api/split/PL8/queue"] = { ok: true, queued: ["p2", "p1"], total_calls: 5 };
+  run(`queuePiles(null, 5)`);          // "Save all" — null means every pile
+  check("save-all posts the summed price it displayed",
+        bodies("/api/split/PL8/queue")[0]?.expected_calls === 5,
+        JSON.stringify(bodies("/api/split/PL8/queue")[0]));
+
+  resetLog();
+  run(`queuePiles(["p1"], 3)`);        // single pile goes through the same gate
+  check("single-pile save is a one-pile queue",
+        JSON.stringify(bodies("/api/split/PL8/queue")[0]?.pile_ids) === '["p1"]');
+
+  // Finding I2: every displayed price is a floor, not a ceiling — request()
+  // retries a transient 429 up to 3x and each attempt is charged.
+  const saveAllLabel5 = run(`renderSaveAllLabel(5)`);
+  check("the price label discloses it is a floor",
+        /at least|minst|floor/i.test(saveAllLabel5), saveAllLabel5);
+
+  // Pause is one click and free; the button reflects the effective state.
+  resetLog();
+  routes["POST /api/split/PL8/queue/pause"] = { ok: true };
+  run(`pauseQueue()`);
+  check("pause posts exactly once and nowhere else",
+        posts("/api/split/PL8/queue/pause") === 1 && log.length === 1);
+
+  const restartPanel = run(`renderQueuePanel({ queue: { state: "paused", stop_reason: null,
+    progress: { pile_index: 1, pile_count: 8, track: 40, track_total: 309 } },
+    pacing: { rate_per_min: 2.5, ceiling: 7.0, max_clean_rate: 2.1 } })`);
+  check("a restart's leftover running state renders as paused with Resume",
+        restartPanel.includes("Resume"));
 
   // A server that sends no cost must not be guessed at.
   routes["GET /api/split/PL9"] = {
@@ -505,11 +544,11 @@ run("stopNowPolling()");
   const row = $$("piles").children[0].innerHTML;
   check("M an unpriced pile is offered as un-clickable rather than guessed at",
         /<button[^>]*disabled[^>]*>Save as playlist</.test(row), row.slice(-120));
-  run(`materialisePile("p1", null, null)`);
+  run(`queuePiles(["p1"], null)`);
   await tick();
   check("M and calling it with no price spends nothing",
-        posts("/api/split/PL9/materialise") === 0,
-        `${posts("/api/split/PL9/materialise")} POST(s)`);
+        posts("/api/split/PL9/queue") === 0,
+        `${posts("/api/split/PL9/queue")} POST(s)`);
 }
 
 // ---- summary ---------------------------------------------------------------

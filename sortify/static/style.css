@@ -162,4 +162,19 @@ kbd {
 .pile-row button { flex-shrink: 0; }
 #split-loading p { text-align: center; color: var(--muted); }
 #split-sitting-bar, #now-sitting-bar { align-items: center; }
+#split-save-all { align-items: center; }
+#btn-save-all { margin-left: auto; }
+
+/* the queued materialiser's status panel */
+#queue-panel {
+  border: 1px solid var(--border); border-radius: 10px; background: var(--card);
+  padding: .6rem .7rem; margin-bottom: .6rem; font-size: .85rem;
+}
+.queue-summary { display: flex; flex-wrap: wrap; gap: .5rem .9rem; align-items: center; margin-bottom: .4rem; }
+.queue-state {
+  font-weight: 600; text-transform: uppercase; font-size: .75rem;
+  padding: .1rem .5rem; border-radius: 999px; border: 1px solid var(--border);
+}
+.queue-controls { display: flex; gap: .5rem; }
+.queue-controls button { flex-shrink: 0; }
 #split-sitting-status, #now-sitting-status { flex: 1; }
