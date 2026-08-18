@@ -14,9 +14,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from sortify import app as appmod
-from sortify.app import NOW_FETCH_MAX_ARTISTS, _fetch_missing_now_tags, _merge_save_tag_artists
+from sortify.app import (
+    NOW_FETCH_MAX_ARTISTS,
+    NOW_FETCH_MIN_INTERVAL,
+    NOW_FETCH_TIMEOUT,
+    _fetch_missing_now_tags,
+    _merge_save_tag_artists,
+)
 from sortify.store import Store
-from sortify.tags import ArtistTags, LastFmError
+from sortify.tags import ArtistTags, LastFm, LastFmError
 
 TRACK_MS = 210_000
 
@@ -55,6 +61,18 @@ def _isolate_tags_json():
     original = Store().tags()
     yield
     Store().save_tags(original)
+
+
+@pytest.fixture(autouse=True)
+def _reset_now_fetch_floor():
+    """`_now_fetch_last_attempt` is process-global state guarding
+    NOW_FETCH_MIN_INTERVAL. Without a reset, one test's real-clock fetch
+    would poison every other test that calls `_fetch_missing_now_tags`
+    within the next 60s of wall time — which, run back to back, is all of
+    them."""
+    appmod._now_fetch_last_attempt = 0.0
+    yield
+    appmod._now_fetch_last_attempt = 0.0
 
 
 class RaisingFm:
@@ -275,6 +293,75 @@ def test_a_fetched_artist_is_visible_to_the_very_next_request(isolated_now, monk
 
     assert r.status_code == 200
     assert Store().tag_artists()["a1"]["tags"] == [{"name": "rock", "count": 50}]
+
+
+# ---- latency + retry floor: fix round, Important 1 --------------------------
+#
+# `_fetch_missing_now_tags` runs inline inside `?force=1`, a request the user
+# is waiting on. Two separate bounds: a short per-request Last.fm timeout
+# (this path only — the splitter's own `top_tags` call keeps its 15s), and a
+# floor on how often an *attempt* happens at all, so a persistent Last.fm
+# failure can't turn every subsequent force into an unfloored retry.
+
+
+def test_a_failed_fetch_is_not_retried_within_the_floor(monkeypatch):
+    Store().save_tag_artists({})
+    fm = FakeFm(error_by_name={"Artist a1": LastFmError("Last.fm error 29: rate limited")})
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: fm)
+    clock = {"t": 1_000.0}
+
+    n1 = _fetch_missing_now_tags(track_with_artists(["a1"]), clock=lambda: clock["t"])
+    assert n1 == 0
+    assert fm.calls == ["Artist a1"]
+
+    clock["t"] += NOW_FETCH_MIN_INTERVAL - 1  # still inside the floor
+    n2 = _fetch_missing_now_tags(track_with_artists(["a1"]), clock=lambda: clock["t"])
+
+    assert n2 == 0
+    assert fm.calls == ["Artist a1"]  # not called again — the client was never touched
+
+
+def test_a_fetch_after_the_floor_elapses_does_retry(monkeypatch):
+    Store().save_tag_artists({})
+    fm = FakeFm(error_by_name={"Artist a1": LastFmError("Last.fm error 29: rate limited")})
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: fm)
+    clock = {"t": 1_000.0}
+
+    _fetch_missing_now_tags(track_with_artists(["a1"]), clock=lambda: clock["t"])
+    assert fm.calls == ["Artist a1"]
+
+    clock["t"] += NOW_FETCH_MIN_INTERVAL + 1  # past the floor
+    _fetch_missing_now_tags(track_with_artists(["a1"]), clock=lambda: clock["t"])
+
+    assert fm.calls == ["Artist a1", "Artist a1"]
+
+
+def test_the_fetch_client_gets_a_bounded_timeout(monkeypatch):
+    """A real `LastFm` instance (not a test double) must have its transport
+    swapped for one built with NOW_FETCH_TIMEOUT, so a slow Last.fm can't
+    turn this into a ~46s hang inside a request the user is waiting on. The
+    splitter's own `_lastfm_client()` calls are untouched by this — this
+    swap only ever happens on the instance handed to this fetch."""
+    Store().save_tag_artists({})
+    real_fm = LastFm("fake-key", client=object())  # object(): truthy, no real httpx.Client built
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: real_fm)
+    monkeypatch.setattr(appmod, "enrich", lambda names, cached, fm, now: cached)
+
+    captured = {}
+
+    class DummyClient:
+        pass
+
+    def fake_client(*, timeout=None, **kwargs):
+        captured["timeout"] = timeout
+        return DummyClient()
+
+    monkeypatch.setattr(appmod.httpx, "Client", fake_client)
+
+    _fetch_missing_now_tags(track_with_artists(["a1"]))
+
+    assert captured["timeout"] == NOW_FETCH_TIMEOUT == 5.0
+    assert isinstance(real_fm._client, DummyClient)
 
 
 # ---- concurrency: fix round 1, Important 1 ---------------------------------

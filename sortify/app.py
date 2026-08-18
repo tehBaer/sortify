@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
 import uvicorn
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -245,17 +246,6 @@ def _cached_tracks(pid: str, snapshot_id: str | None) -> list[dict]:
     return tracks
 
 
-def _known_artists() -> dict[str, dict]:
-    """Whatever Spotify artist data is already cached — never fetches.
-
-    Every entry has empty genres and always will: the Feb-2026 dev-mode API
-    dropped the `genres` field from /artists/{id}. suggest.py's tag signal
-    comes from Last.fm (`store.tag_artists()`) instead; this is kept for
-    other, non-scoring uses of the cached Spotify artist data.
-    """
-    return store.cache()["artists"]
-
-
 def _resolve_homes(cfg: dict, playlists: list[dict], exclude: str, input_ids: set[str]) -> list[dict]:
     home_ids = cfg.get("home_ids") or []
     if home_ids:
@@ -315,7 +305,7 @@ def _ensure_profiles_locked(force: bool) -> dict:
 
     _profile_state.update(
         built_at=now, profiles=profiles, homes=homes, inputs=inputs,
-        tag_artists=tag_artists, playlists=all_playlists, input_ids=input_ids,
+        playlists=all_playlists, input_ids=input_ids,
     )
     return _profile_state
 
@@ -364,7 +354,6 @@ def triage(playlist_id: str):
     # even with a stale/bad-version tags.json; the split flow is where that
     # fails loud.
     tag_artists = store.tag_artists()
-    state["tag_artists"] = tag_artists
 
     tracks_out = []
     for t in input_tracks:
@@ -2167,8 +2156,28 @@ NOW_FETCH_MAX_ARTISTS = 3  # per /api/now?force=1 call — an explicit user acti
 # request's Last.fm round trip.
 _now_fetch_lock = threading.Lock()
 
+# Fix round, Important 1: worst case this fetch is up to NOW_FETCH_MAX_ARTISTS
+# sequential Last.fm requests, each paced by tags.MIN_INTERVAL and (until this
+# change) able to hang for the splitter's full 15s timeout — ~46s inline in a
+# request the user is sitting on. NOW_FETCH_TIMEOUT bounds each request in
+# this path alone; the splitter's own `top_tags` call is untouched.
+NOW_FETCH_TIMEOUT = 5.0  # seconds per Last.fm request, this path only
 
-def _fetch_missing_now_tags(track: dict) -> int:
+# A non-code-6 Last.fm failure (rate limit, outage, bad key) used to be
+# retried on every single subsequent `?force=1` with no floor at all — the
+# same "retry into a rate limit" pattern CLAUDE.md forbids for Spotify,
+# aimed at Last.fm instead. NOW_FETCH_MIN_INTERVAL floors how often an
+# *attempt* happens at all, success or failure, independent of
+# NOW_FORCE_MIN_INTERVAL (which paces the whole /api/now response).
+NOW_FETCH_MIN_INTERVAL = 60  # seconds between fetch attempts, this path only
+
+# Monotonic timestamp of the last fetch *attempt* (i.e. the last time `enrich`
+# was actually called), guarded by `_now_fetch_lock` like everything else in
+# this function — never read or written outside it.
+_now_fetch_last_attempt = 0.0
+
+
+def _fetch_missing_now_tags(track: dict, *, clock=time.monotonic) -> int:
     """Fetch Last.fm tags for up to `NOW_FETCH_MAX_ARTISTS` unknown artists on
     the currently-playing track. Returns how many artists were fetched.
 
@@ -2179,22 +2188,38 @@ def _fetch_missing_now_tags(track: dict) -> int:
     split flow uses, rather than a second one; no key configured means
     `_lastfm_client()` returns None and this does nothing, silently.
 
+    Two bounds on top of that reuse: the `LastFm` instance this path gets
+    back from `_lastfm_client()` has its transport swapped for one built with
+    `timeout=NOW_FETCH_TIMEOUT` — a fresh `httpx.Client`, only on this
+    instance, never touching the splitter's own (which keeps the 15s
+    `top_tags` uses) — and `NOW_FETCH_MIN_INTERVAL` floors how often an
+    attempt happens at all, checked (and skipped on) before any client is
+    even touched. `clock` is injectable so tests can move time without
+    sleeping.
+
     Write-once: an artist already in tags.json — a hit or a recorded
     `miss: true` alike — is never handed to `enrich` again. `enrich` raises
     `LastFmError` on anything other than a genuine "not found" (code 6,
     folded into `miss: true` by `top_tags` returning None); that must not
     break this response, so it's caught here and only `.partial` — whatever
     was verified before the failure — is persisted. Every artist after the
-    failing one in this batch is simply left absent and retryable. Persisting
+    failing one in this batch is simply left absent and retryable, bounded by
+    the floor above rather than retried on the very next force. Persisting
     goes through `_merge_save_tag_artists`, so a concurrent `enrich()` walk
     from the split flow can't lose (or be lost by) this write.
     """
+    global _now_fetch_last_attempt
     if not _now_fetch_lock.acquire(blocking=False):
         return 0
     try:
+        if clock() - _now_fetch_last_attempt < NOW_FETCH_MIN_INTERVAL:
+            return 0
         fm = _lastfm_client()
         if fm is None:
             return 0
+        if isinstance(fm, LastFm):
+            # This path's own bounded transport — see NOW_FETCH_TIMEOUT above.
+            fm._client = httpx.Client(timeout=NOW_FETCH_TIMEOUT)
         names: dict[str, str] = {}
         for a in track.get("artists") or []:
             aid = a.get("id")
@@ -2217,6 +2242,10 @@ def _fetch_missing_now_tags(track: dict) -> int:
         except LastFmError as exc:
             log.warning("now-playing tag fetch stopped early: %s", exc)
             merged = exc.partial if exc.partial is not None else cached
+        finally:
+            # Recorded for success and failure alike — the floor above is
+            # about "was an attempt just made", not "did it work".
+            _now_fetch_last_attempt = clock()
         fetched = len(merged) - len(cached)
         if fetched > 0:
             _merge_save_tag_artists(merged)
@@ -2256,10 +2285,10 @@ def now_playing(force: bool = False):
             # bonus enrichment, not the payload the client actually needs.
             log.exception("now-playing tag fetch failed")
     # Guard-on-read, fresh on every request — same reasoning as `triage`'s own
-    # re-read below `_ensure_profiles`: `state["tag_artists"]` is a
-    # profile-build-time snapshot that can sit stale for up to PROFILE_TTL, so
-    # a fetch just above (or any other write to tags.json) would otherwise be
-    # invisible for up to 10 minutes. Deliberate freshness/cost trade-off: a
+    # re-read below `_ensure_profiles`: `_profile_state`'s cached profiles are
+    # a profile-build-time snapshot that can sit stale for up to PROFILE_TTL,
+    # so a fetch just above (or any other write to tags.json) would otherwise
+    # be invisible for up to 10 minutes. Deliberate freshness/cost trade-off: a
     # local JSON read on every poll (zero API cost) buys always-current tags
     # instead of leaning on the profile cache.
     tag_artists = store.tag_artists()

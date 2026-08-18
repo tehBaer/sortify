@@ -64,6 +64,14 @@ def load_home_tracks(data_dir: Path = DATA_DIR) -> dict[str, list[dict]]:
     Spotify calls that function makes when the cache is stale — this harness
     only ever sees what is already on disk. Home ids missing from the cache
     (never fetched) are silently skipped rather than treated as empty homes.
+
+    Unlike `_resolve_homes`, this mirrors `config.json`'s `home_ids` only —
+    an empty (or unset) `home_ids` yields zero homes here, not app.py's
+    live fallback to every editable playlist. That fallback exists so a
+    fresh install has *something* to build profiles from before the user
+    marks any Home; the harness has no such need (a config with no homes
+    named simply has nothing to evaluate) and duplicating the live-listing
+    fallback here would need a Spotify call this file is not allowed to make.
     """
     with open(data_dir / "config.json") as f:
         cfg = json.load(f)
@@ -92,7 +100,17 @@ def load_tag_artists(data_dir: Path = DATA_DIR) -> dict[str, dict]:
 
 def collect_pairs(home_tracks: dict[str, list[dict]]) -> list[tuple[str, dict]]:
     """One (home_id, track) pair per occurrence of a track in a home. A
-    track filed into two homes yields two pairs, one per home."""
+    track filed into two homes yields two pairs, one per home.
+
+    A track sitting in N homes is therefore sampled up to N times, each
+    hold-one-out eval run with an identical outcome (same track, same
+    artists, same tags — only which home is being held out differs, and
+    hold-one-out already applies to every home the track sits in, not just
+    the sampled pair's — see the module docstring's C3 note). Mild
+    over-weighting of multi-home tracks in the aggregate accuracy, accepted
+    rather than deduplicated: multi-home tracks are rare enough in practice
+    that this hasn't been worth the extra bookkeeping to fix.
+    """
     return [(hid, t) for hid, tracks in home_tracks.items() for t in tracks]
 
 

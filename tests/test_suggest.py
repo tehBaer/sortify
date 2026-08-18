@@ -174,3 +174,48 @@ def test_tag_weight_read_at_call_time(monkeypatch):
     doubled = suggest(new_track, {"H": prof}, ta)[0]["score"]
 
     assert doubled == round(single * 2, 2)
+
+
+def test_a_freshly_fetched_artists_tags_lag_in_the_home_profile():
+    """Pins a deliberate freshness asymmetry in how `/api/now` calls this
+    module, not a bug: `suggest()` takes `tag_artists` fresh on every call
+    (app.py re-reads tags.json guard-on-read on every request) but `profiles`
+    is `_ensure_profiles`'s cached build, refreshed at most every
+    PROFILE_TTL (10 min). So a Last.fm fetch that lands mid-poll (see
+    `_fetch_missing_now_tags`) is visible in `_track_tags` — the currently
+    playing track's own tags — on the very next request, but a *home*
+    playlist containing that same artist keeps scoring it as tagless in
+    `prof["tag_counts"]` until the profile is next rebuilt. Accepted trade:
+    rebuilding profiles on every poll would cost a full re-scan of every home
+    playlist's cached tracks for a benefit that only matters while an artist
+    is mid-fetch, a narrow and self-correcting window (PROFILE_TTL is 10
+    minutes, not indefinite).
+    """
+    # "shoegaze" not yet known when the home profile was last built...
+    stale_tag_artists = {"beach-house": tag_entry(name="Beach House")}  # no tags yet
+    home_tracks = [track("spotify:track:d1", ["beach-house"])]
+    stale_profile = build_profile(home_tracks, stale_tag_artists)
+    assert stale_profile["tag_counts"] == Counter()  # nothing to match against, yet
+
+    # ...but a fetch lands between then and this request: tags.json now has
+    # them, and `/api/now` reads that fresh copy for `tag_artists` while
+    # still handing `suggest()` the profile built before the fetch.
+    fresh_tag_artists = {"beach-house": tag_entry("dream pop", "shoegaze", name="Beach House")}
+
+    # Immediate: the currently playing track's own tags see the fetch right away.
+    playing = track("spotify:track:new", ["beach-house"])
+    track_tags = suggest_mod._track_tags(playing, fresh_tag_artists)
+    assert track_tags == Counter({"dream pop": 1, "shoegaze": 1})
+
+    # Lagging: the home's tag-similarity signal doesn't, because `suggest()`
+    # only ever reads whatever `prof["tag_counts"]` already holds — nothing
+    # about calling it with fresher `tag_artists` reaches back into a profile
+    # dict that was already computed.
+    res = suggest(playing, {"dreamy": stale_profile}, fresh_tag_artists)
+    assert res and res[0]["playlist_id"] == "dreamy"
+    assert "artist tags" not in " ".join(res[0]["reasons"])  # no tag-similarity reason yet
+
+    # Only a rebuilt profile (what actually happens after PROFILE_TTL) picks it up.
+    rebuilt_profile = build_profile(home_tracks, fresh_tag_artists)
+    res_after_rebuild = suggest(playing, {"dreamy": rebuilt_profile}, fresh_tag_artists)
+    assert any("artist tags" in r for r in res_after_rebuild[0]["reasons"])
