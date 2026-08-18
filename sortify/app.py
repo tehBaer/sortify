@@ -464,8 +464,8 @@ def _pile_progress(split: dict) -> list[dict]:
                     "total": len(p["uris"]),
                     # What materialising this pile would spend RIGHT NOW, and
                     # what (if anything) already exists for it. The client
-                    # displays this number and hands it straight back as
-                    # `expected_calls`; see `materialise_pile`.
+                    # displays this number; `_materialise_tick` is what
+                    # actually spends it, one call at a time.
                     "materialise_calls": plan["calls"],
                     "materialised": plan["record_view"]})
     return out
@@ -1151,137 +1151,75 @@ def _rerecord_materialisation(split_playlist_id: str, pile_id: str, record: dict
         return True
 
 
-class MaterialiseIn(BaseModel):
-    pile_id: str
-    # No default, and no upper bound: the caller must state the price it was
-    # shown. See `materialise_pile` for why this is a required echo rather
-    # than a confirmation flag.
-    expected_calls: int = Field(..., ge=0)
+def _materialise_tick(playlist_id: str, pile_id: str) -> dict:
+    """Advance one pile's materialisation by at most ONE Spotify call.
 
+    The one-shot endpoint this replaces spent a whole pile in a blocking
+    loop — measured at 12.4 calls/min for 25 minutes, above the rate that
+    earned the 2026-08-13 ban. Same machinery, same records, same claims;
+    the only change is that the loop now lives in the queue worker, which
+    owns the pacing between calls (delivery is the queue's job now, not a
+    request handler's). Returns {"spent", "done", "gone"}; SpotifyError
+    propagates to the caller, which classifies it.
 
-@app.post("/api/split/{playlist_id}/materialise")
-def materialise_pile(playlist_id: str, body: MaterialiseIn):
-    """Create a permanent playlist for one pile and add every track in it.
-
-    Cost is exactly `len(unique uris) + 1` on a fresh pile, and exactly the
-    number of tracks still missing on a resumed one. There is no cap: the
-    biggest pile in the real split is 309 tracks, so this is a ~310-call, ~26
-    minute paced request (WINDOW_CAP is 12/60s), and that is the point of the
-    confirmation below.
-
-    **The cost mechanism is an echo, not a flag.** `expected_calls` must equal
-    what this call is about to spend or it refuses, having spent nothing. A
-    boolean `confirm: true` would say only "the user clicked something"; the
-    echo says "the user clicked something that displayed THIS number". The
-    number comes from `_materialise_plan` via GET /api/split (free, local), so
-    a click on a stale pile row — one rendered before another tab re-clustered
-    the split, or before an earlier run added 40 of the 309 — cannot spend the
-    figure the user never saw. A misclick on the 309-track pile is refused
-    unless the button under the cursor genuinely said 310.
-
-    Idempotent and resumable. Every add is recorded as it lands, so a 429
-    partway through leaves a record whose retry adds only what is missing:
-    same playlist, no duplicates, no second create. Re-running a finished pile
-    costs 0 calls and is a no-op.
-
-    Permanent, and deliberately unlike a sitting: no `active_sitting`
-    reservation (so this neither blocks nor is blocked by one), no
-    SITTING_MAX_TRACKS cap, no auto-unfollow, and nothing written to
-    `decided` — materialising is "keep this to listen to", not a triage
-    decision about any track in it.
+    One subtlety: a fresh claim is minted only when a record must be
+    (re)stamped from scratch — a brand-new pile or one whose fingerprint went
+    stale. A resumed pile reuses its persisted claim, which is fine because
+    the worker is the only writer and `_claim_materialisation` still CASes
+    on it.
     """
     with _split_lock:
         payload = store.splits()
         split = payload["splits"].get(playlist_id)
-        if not split:
-            raise HTTPException(404, "no split for that playlist")
-        pile = next((p for p in split["piles"] if p["id"] == body.pile_id), None)
-        if not pile:
-            raise HTTPException(404, "no such pile")
-        if (playlist_id, body.pile_id) in _pending_materialise:
-            # Same-process concurrency (a double-click, two tabs): refuse
-            # rather than let a second attempt re-stamp the claim mid-run,
-            # which would leave the first one's playlist unrecorded — the
-            # exact litter class this design exists to avoid.
-            raise HTTPException(
-                409, "that pile is already being saved right now — let it finish")
-
+        pile = next((p for p in (split or {}).get("piles", []) if p["id"] == pile_id), None)
+        if not split or not pile:
+            return {"spent": 0, "done": True, "gone": True}
+        if (playlist_id, pile_id) in _pending_materialise:
+            return {"spent": 0, "done": False, "gone": False}
         plan = _materialise_plan(split, pile)
-        if body.expected_calls != plan["calls"]:
-            raise HTTPException(
-                409,
-                f"cost has changed: saving this pile now spends {plan['calls']} "
-                f"Spotify calls, not the {body.expected_calls} you confirmed. "
-                "Nothing was spent. Re-open the pile list and confirm the new "
-                "number.",
-            )
         if plan["calls"] == 0:
-            # Already complete: every uri is recorded as added and the
-            # playlist exists. Costs nothing to say so.
-            record = plan["record"]
-            return {"ok": True, "playlist_id": record["playlist_id"],
-                    "added": len(record["added"]), "total": len(_unique(pile["uris"])),
-                    "calls_spent": 0, "complete": True}
-
+            return {"spent": 0, "done": True, "gone": False}
         if plan["stale"]:
-            # The pile changed since the old playlist was made. Keep the old
-            # record — the playlist is real and the user asked for it — but
-            # move it out of the way so this pile can have its own. Nothing
-            # reads the history; it exists so a playlist sortify made never
-            # stops being traceable to the pile it came from.
-            old = split["materialised"].pop(body.pile_id, None)
+            old = split["materialised"].pop(pile_id, None)
             if old:
                 split.setdefault("materialised_history", []).append(old)
+        record = (split.get("materialised") or {}).get(pile_id)
+        if not record or plan["stale"] or not record.get("claim"):
+            existing = plan["record"] if not plan["stale"] else None
+            record = {
+                "playlist_id": existing.get("playlist_id") if existing else None,
+                "pile_id": pile_id, "name": pile["name"],
+                "fingerprint": _pile_fingerprint(pile),
+                "track_count": len(_unique(pile["uris"])),
+                "added": list(existing.get("added", [])) if existing else [],
+                "claim": uuid.uuid4().hex,
+                "created_at": existing.get("created_at") if existing else _now_iso(),
+                "updated_at": _now_iso(),
+            }
+            # Written BEFORE the create call — the create/record gap is where
+            # this project's stray playlists have come from.
+            split.setdefault("materialised", {})[pile_id] = record
+            store.save_splits(payload)
+        claim = record["claim"]
+        need_create = not record.get("playlist_id")
+        next_uri = None if need_create else plan["missing"][0]
+        _pending_materialise.add((playlist_id, pile_id))
 
-        claim = uuid.uuid4().hex
-        existing = plan["record"]
-        record = {
-            "playlist_id": existing.get("playlist_id") if existing else None,
-            "pile_id": pile["id"],
-            "name": pile["name"],
-            "fingerprint": _pile_fingerprint(pile),
-            "track_count": len(_unique(pile["uris"])),
-            "added": list(existing.get("added", [])) if existing else [],
-            "claim": claim,
-            "created_at": existing.get("created_at") if existing else _now_iso(),
-            "updated_at": _now_iso(),
-        }
-        # Written BEFORE the create call, like start_sitting's reservation and
-        # for the same reason: a create whose response is lost must still
-        # leave something on disk pointing at this pile.
-        split.setdefault("materialised", {})[pile["id"]] = record
-        store.save_splits(payload)
-        _pending_materialise.add((playlist_id, body.pile_id))
-
-    missing = plan["missing"]
-    added_here: list[str] = []
     try:
-        new_id = record["playlist_id"]
-        if plan["need_create"]:
-            new_id = sp.create_playlist(pile["name"], MATERIALISE_DESCRIPTION)
-            if not _claim_materialisation(playlist_id, pile["id"], claim, playlist_id=new_id):
-                # Nothing points at this playlist and it is still empty, so
-                # unfollowing it is both safe and the only way it doesn't
-                # become litter. (Unreachable in a single process — the
-                # in-flight guard above owns this pile for the whole run —
-                # but the create/record gap is precisely where this project's
-                # stray playlists have come from, so it is handled rather
-                # than assumed away.)
-                _abandon_unrecorded_playlist(playlist_id, pile["id"], new_id, record)
-        for uri in missing:
-            sp.add_to_playlist(new_id, uri)
-            added_here.append(uri)
-            if not _claim_materialisation(playlist_id, pile["id"], claim, added_uri=uri):
-                # The record vanished mid-run. The playlist holds real tracks
-                # the user paid for, so it is re-recorded, never unfollowed.
-                _readopt_materialisation(playlist_id, pile["id"], record, new_id, added_here)
+        if need_create:
+            new_id = sp.create_playlist(pile["name"], MATERIALISE_DESCRIPTION, bulk=True)
+            if not _claim_materialisation(playlist_id, pile_id, claim, playlist_id=new_id):
+                _abandon_unrecorded_playlist(playlist_id, pile_id, new_id, record)
+        else:
+            sp.add_to_playlist(record["playlist_id"], next_uri, bulk=True)
+            if not _claim_materialisation(playlist_id, pile_id, claim, added_uri=next_uri):
+                _readopt_materialisation(playlist_id, pile_id, record,
+                                         record["playlist_id"], [next_uri])
     finally:
         with _split_lock:
-            _pending_materialise.discard((playlist_id, body.pile_id))
-
-    total = len(_unique(pile["uris"]))
-    return {"ok": True, "playlist_id": new_id, "added": len(record["added"]) + len(added_here),
-            "total": total, "calls_spent": plan["calls"], "complete": True}
+            _pending_materialise.discard((playlist_id, pile_id))
+    remaining = len(plan["missing"]) - (0 if need_create else 1)
+    return {"spent": 1, "done": remaining == 0 and not need_create, "gone": False}
 
 
 def _abandon_unrecorded_playlist(
