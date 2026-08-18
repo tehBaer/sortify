@@ -407,7 +407,11 @@ class Spotify:
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", 2))
                 kind = classify_429(resp.text, retry_after)
-                self.last_429 = {"ts": time.time(), "kind": kind, "retry_after": retry_after}
+                # time.monotonic(): the queue worker compares this against a
+                # tick-start timestamp it also takes with monotonic() (ruling
+                # R-T8c) — a wall-clock jump between the two must not make a
+                # stale 429 look fresh, or a fresh one look stale.
+                self.last_429 = {"ts": time.monotonic(), "kind": kind, "retry_after": retry_after}
                 # Two different limiters with opposite remedies. A rate limit is
                 # a rolling 30s window and wants a few seconds of patience; a
                 # Development Mode quota trip wants the rest of the day, and

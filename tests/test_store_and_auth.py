@@ -42,6 +42,14 @@ def test_queue_and_pacing_round_trip_and_are_private(tmp_path):
     assert mode == 0o600  # boxdash reads these; nobody else should
 
 
+def test_default_queue_pending_list_is_not_shared_across_reads(tmp_path):
+    s = Store(tmp_path)
+    q1 = s.queue()
+    q1["pending"].append("poison")
+    q2 = s.queue()  # a fresh default read must not see the first read's mutation
+    assert q2["pending"] == []
+
+
 def test_wrong_version_reads_as_default(tmp_path):
     s = Store(tmp_path)
     (tmp_path / "pacing.json").write_text('{"version": 99, "rate_per_min": 40}')

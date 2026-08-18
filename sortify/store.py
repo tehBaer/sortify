@@ -6,6 +6,7 @@ single-user LAN service; readable files beat ceremony.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import tempfile
@@ -141,8 +142,12 @@ class Store:
                       "history_429": [], "updated_at": None}
 
     def _versioned(self, name: str, default: dict) -> dict:
-        data = self._load(name, dict(default))
-        return data if isinstance(data, dict) and data.get("version") == default["version"] else dict(default)
+        # dict(default) is a shallow copy: nested mutables like "pending": []
+        # would still be the SAME list object as QUEUE_DEFAULT's, so mutating
+        # a freshly-defaulted read (e.g. q["pending"].append(...)) silently
+        # poisons every later default read (ruling R-T8e) — deepcopy instead.
+        data = self._load(name, copy.deepcopy(default))
+        return data if isinstance(data, dict) and data.get("version") == default["version"] else copy.deepcopy(default)
 
     def queue(self) -> dict:
         return self._versioned("queue.json", self.QUEUE_DEFAULT)

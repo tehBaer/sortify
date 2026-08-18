@@ -1318,14 +1318,33 @@ _queue_lock = threading.Lock()
 _queue_wake = threading.Event()          # set() = "wake now and re-decide"
 _queue_worker: threading.Thread | None = None
 
+# A pause/cancel already recorded in queue.json is never allowed to be
+# clobbered back to a running-ish state by a worker that hasn't noticed it
+# yet (ruling R-T8a) — only these three targets are ever refused, and only
+# when the CURRENT state is one of the terminal-from-the-worker's-view ones.
+_QUEUE_TERMINAL = ("paused", "stopped")
+_QUEUE_RESUMABLE = ("running", "sleeping", "quiet")
 
-def _set_queue_state(state: str, stop_reason: str | None = None) -> None:
+
+def _set_queue_state(state: str, stop_reason: str | None = None) -> bool:
+    """Check-and-set queue.json's state under one lock acquisition.
+
+    Returns False (refusing the write) when the queue is already paused or
+    stopped and this call is trying to move it back to running/sleeping/
+    quiet — i.e. the worker racing its own "resume" write against a pause it
+    hasn't read yet. Every caller MUST treat a False return as its own stop
+    signal and exit the loop; only that makes a pause/cancel unlosable no
+    matter where in the loop the worker happens to be (C2/R-T8a).
+    """
     with _queue_lock:
         q = store.queue()
+        if q["state"] in _QUEUE_TERMINAL and state in _QUEUE_RESUMABLE:
+            return False
         q["state"] = state
         q["stop_reason"] = stop_reason
         q["updated_at"] = _now_iso()
         store.save_queue(q)
+        return True
 
 
 def _queue_progress(q: dict) -> dict:
@@ -1361,7 +1380,7 @@ def _queue_next_action(now: float) -> tuple:
             pid = q.get("current")
             if not pid:
                 if not q["pending"]:
-                    q.update(state="done", updated_at=_now_iso())
+                    q.update(state="done", stop_reason=None, updated_at=_now_iso())
                     q["progress"] = _queue_progress(q)
                     store.save_queue(q)
                     return ("stop", "done")
@@ -1389,26 +1408,50 @@ def _drain_queue() -> None:
             # `pending` and `current` drain to empty at the very end.
             q["pile_count_at_enqueue"] = len(q.get("pending", [])) + (1 if q.get("current") else 0)
             store.save_queue(q)
-    _set_queue_state("running")
+    if not _set_queue_state("running"):
+        return                                # paused/cancelled before this thread even ran
+    # Whether the loop's last significant event was a 429 whose halving
+    # `note_429` just applied. request() always sets a fresh cooldown before
+    # raising a worker-visible rate 429, so the very next `_queue_next_action`
+    # call is guaranteed to see `bulk_block_reason()` blocked and route
+    # straight into the sleep branch below — if that branch unconditionally
+    # called `gov.note_interruption()` (which resets rate to START_RATE) it
+    # would silently wipe the halving on every single rate 429 in
+    # production, not just in a contrived test. So the sleep branch skips
+    # the reset exactly once, only for the sleep that is that 429's own
+    # direct continuation; any other sleep (reserve cap, an externally-
+    # sourced cooldown, a quiet period) still gets the full reset, since
+    # `_clean_since` genuinely no longer reflects reality after those gaps.
+    just_noted_429 = False
     while True:
         action = _queue_next_action(time.time())
         if action[0] == "stop":
             return
         if action[0] == "sleep":
-            _set_queue_state(action[2])
-            gov.note_interruption()
-            store.save_pacing(gov.to_state())
+            if not _set_queue_state(action[2]):
+                return                         # a pause/cancel beat us to the write (R-T8a)
+            if not just_noted_429:
+                gov.note_interruption()
+                store.save_pacing(gov.to_state())
+            just_noted_429 = False
             # Wake early on pause/cancel/resume; re-check at most every 60s so
-            # a cooldown shortened by another process is noticed.
+            # a cooldown shortened by another process is noticed. The event
+            # is cleared unconditionally right after waiting — whether it
+            # fired or the wait simply timed out — so a set() landing mid-
+            # sleep is consumed exactly once and can never latch into a
+            # file-churning hot loop on the next sleep iteration (C1/I1).
+            # queue.json, written by whoever called set() and re-checked via
+            # _set_queue_state below, is the actual source of truth for what
+            # happens next — the event itself is only ever a wake-up nudge.
             _queue_wake.wait(min(action[1], 60))
-            if store.queue()["state"] in ("paused", "stopped"):
-                return
-            _set_queue_state("running")
+            _queue_wake.clear()
+            if not _set_queue_state("running"):
+                return                         # paused/cancelled during the sleep
             continue
         _, playlist_id, pile_id = action
-        tick_started = time.time()
+        tick_started = time.monotonic()
         try:
-            _materialise_tick(playlist_id, pile_id)
+            result = _materialise_tick(playlist_id, pile_id)
         except SpotifyError as e:
             info = sp.last_429 or {}
             if e.status == 429 and info.get("ts", 0) >= tick_started:
@@ -1419,25 +1462,53 @@ def _drain_queue() -> None:
                     # the account ledger; resuming is a human's call (spec §2).
                     _set_queue_state("stopped", stop_reason="quota")
                     return
+                just_noted_429 = True        # preserve this halving through the next sleep
                 continue                     # rate: cooldown sleep happens above
-            # Auth failures, 5xx, local budget refusals: stop spending and
-            # surface the reason rather than grind a broken loop.
+            # No fresh 429 to pin this on. Some raises never touch last_429
+            # at all — the pre-flight cooldown check and the bulk-reserve
+            # guard in spotify.py both raise SpotifyError(429, ...) without
+            # stamping it. Consult the real block reason before treating
+            # this as a hard stop (ruling R-T8b): a reserve-crossing race or
+            # a cooldown that started between calls must ride out as a
+            # sleep, not park a multi-day run on a transient race.
+            if sp.bulk_block_reason():
+                continue                     # next loop's sleep branch labels it correctly
+            # Auth failures, 5xx, and anything else unexplained: stop
+            # spending and surface the reason rather than grind a broken loop.
             log.error("queue worker paused by error: %s", e)
             _set_queue_state("paused", stop_reason=str(e))
             return
         info = sp.last_429 or {}
-        if info.get("ts", 0) >= tick_started:
+        fresh = info.get("ts", 0) >= tick_started
+        if fresh:
             gov.note_429(info["kind"], info.get("retry_after", 60), time.time())
+            just_noted_429 = True            # preserve this halving through the next sleep
         else:
-            gov.note_success(time.time())
+            just_noted_429 = False
+            if result.get("spent") == 1:
+                # Only a tick that actually spent a call earns clean-time
+                # credit (I3) — a vanished-split or in-flight-backoff tick
+                # spends nothing and must not count toward escalation.
+                gov.note_success(time.time())
         store.save_pacing(gov.to_state())
+        if fresh and info["kind"] == "quota":
+            # A quota trip can surface on the success path too: `sp` is a
+            # shared client, so another thread's concurrent call (e.g.
+            # /api/now) can trip quota while THIS tick's own call succeeds.
+            # Mirror the except-branch handling exactly (C3) — a quota trip
+            # must stop the worker no matter which path noticed it.
+            _set_queue_state("stopped", stop_reason="quota")
+            return
         with _queue_lock:
             q = store.queue()
             q["progress"] = _queue_progress(q)
             q["updated_at"] = _now_iso()
             store.save_queue(q)
-        if _queue_wake.wait(gov.interval()):
-            _queue_wake.clear()              # pause/cancel: next loop decides
+        # Governor-paced wait before the next tick; consumed exactly once,
+        # same reasoning as the sleep branch above (C1/I1) — the top of the
+        # loop re-decides from queue.json regardless of why we woke.
+        _queue_wake.wait(gov.interval())
+        _queue_wake.clear()
 
 
 class DecideIn(BaseModel):
