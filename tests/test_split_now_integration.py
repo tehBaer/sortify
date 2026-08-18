@@ -109,7 +109,7 @@ def test_split_summary_counts_piles_and_what_remains(splits_store):
 
 # ---- wired into the endpoints --------------------------------------------------
 
-MINIMAL_STATE = {"playlists": [], "input_ids": set(), "artist_info": {},
+MINIMAL_STATE = {"playlists": [], "input_ids": set(), "tag_artists": {},
                   "profiles": {}, "homes": [], "inputs": []}
 
 

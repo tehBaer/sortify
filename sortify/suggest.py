@@ -2,12 +2,15 @@
 
 Two signals, both explainable to the user:
   - artist overlap: the playlist already contains tracks by this artist
-  - genre similarity: cosine between the track's artist genres and the
-    playlist's genre profile
+  - artist-tag similarity: cosine between the track's artists' Last.fm tags
+    and the playlist's tag profile
 
-Spotify's audio-features endpoint is deprecated for new apps, and artist
-genres are sparse for small artists — artist overlap is the primary signal,
-genres the tiebreaker.
+Spotify's audio-features endpoint is deprecated for new apps, and Spotify no
+longer returns artist genres at all in development mode — tags come from
+Last.fm instead (see `sortify/tags.py`). They describe the *artist*, not the
+track, which is weaker evidence than a track-level tag would be, so the tag
+score is diluted before it competes with artist overlap, which stays the
+primary signal.
 """
 
 from __future__ import annotations
@@ -15,19 +18,37 @@ from __future__ import annotations
 import math
 from collections import Counter
 
-# A pure genre match can reach 4.0; a single artist match starts at 3.4,
-# so "right artist" beats "similar genre" unless the genre fit is perfect.
+from .tags import clean_tags
+
+# A pure tag match can reach TAG_WEIGHT * ARTIST_TAG_DILUTION = 2.0; a single
+# artist match starts at 3.4, so "right artist" beats "similar tags" unless
+# the tag fit is perfect. Placeholders until Task 3 measures real weights.
 ARTIST_BASE = 3.0
 ARTIST_PER_TRACK = 0.4
-GENRE_WEIGHT = 4.0
+TAG_WEIGHT = 4.0
+ARTIST_TAG_DILUTION = 0.5
 MIN_SCORE = 0.8
 TOP_N = 3
 
 
-def build_profile(tracks: list[dict], artist_info: dict[str, dict]) -> dict:
+def _cleaned_tags(entry: dict) -> list[str]:
+    """Hygiene-filtered tag names for one `tag_artists()` record.
+
+    Shared by the profile side and the track side so they can't drift.
+    Missing artists and recorded Last.fm misses both yield no tags. Last.fm's
+    weights are ignored here, same as today's genre counts — just presence
+    per artist.
+    """
+    if not entry or entry.get("miss"):
+        return []
+    cleaned = clean_tags(entry.get("tags", []), entry.get("name") or "")
+    return [t for t, _w in cleaned]
+
+
+def build_profile(tracks: list[dict], tag_artists: dict[str, dict]) -> dict:
     """Precompute what the suggester needs to know about one home playlist."""
     artist_counts: Counter = Counter()
-    genre_counts: Counter = Counter()
+    tag_counts: Counter = Counter()
     uris = set()
     for t in tracks:
         uris.add(t["uri"])
@@ -35,9 +56,9 @@ def build_profile(tracks: list[dict], artist_info: dict[str, dict]) -> dict:
             if not a.get("id"):
                 continue
             artist_counts[a["id"]] += 1
-            for g in artist_info.get(a["id"], {}).get("genres", []):
-                genre_counts[g] += 1
-    return {"artist_counts": artist_counts, "genre_counts": genre_counts, "uris": uris}
+            for tag in _cleaned_tags(tag_artists.get(a["id"], {})):
+                tag_counts[tag] += 1
+    return {"artist_counts": artist_counts, "tag_counts": tag_counts, "uris": uris}
 
 
 def _cosine(a: Counter, b: Counter) -> float:
@@ -49,17 +70,17 @@ def _cosine(a: Counter, b: Counter) -> float:
     return dot / (math.sqrt(sum(v * v for v in a.values())) * math.sqrt(sum(v * v for v in b.values())))
 
 
-def _track_genres(track: dict, artist_info: dict[str, dict]) -> Counter:
+def _track_tags(track: dict, tag_artists: dict[str, dict]) -> Counter:
     c: Counter = Counter()
     for a in track["artists"]:
-        for g in artist_info.get(a.get("id"), {}).get("genres", []):
-            c[g] += 1
+        for tag in _cleaned_tags(tag_artists.get(a.get("id"), {})):
+            c[tag] += 1
     return c
 
 
-def suggest(track: dict, profiles: dict[str, dict], artist_info: dict[str, dict]) -> list[dict]:
+def suggest(track: dict, profiles: dict[str, dict], tag_artists: dict[str, dict]) -> list[dict]:
     """Rank home playlists for one track. Returns [{playlist_id, score, already, reasons}]."""
-    track_genres = _track_genres(track, artist_info)
+    track_tags = _track_tags(track, tag_artists)
     results = []
     for pid, prof in profiles.items():
         reasons = []
@@ -71,16 +92,16 @@ def suggest(track: dict, profiles: dict[str, dict], artist_info: dict[str, dict]
                 score += ARTIST_BASE + ARTIST_PER_TRACK * min(n, 5)
                 reasons.append(f"{n} track{'s' if n > 1 else ''} by {a['name']} here")
 
-        sim = _cosine(track_genres, prof["genre_counts"])
+        sim = _cosine(track_tags, prof["tag_counts"])
         if sim > 0.05:
-            score += GENRE_WEIGHT * sim
+            score += TAG_WEIGHT * ARTIST_TAG_DILUTION * sim
             overlap = sorted(
-                (g for g in track_genres if g in prof["genre_counts"]),
-                key=lambda g: track_genres[g] * prof["genre_counts"][g],
+                (t for t in track_tags if t in prof["tag_counts"]),
+                key=lambda t: track_tags[t] * prof["tag_counts"][t],
                 reverse=True,
             )
             if overlap:
-                reasons.append("genre fit: " + ", ".join(overlap[:3]))
+                reasons.append("artist tags: " + ", ".join(overlap[:3]))
 
         already = track["uri"] in prof["uris"]
         if already or score >= MIN_SCORE:

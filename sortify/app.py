@@ -246,11 +246,12 @@ def _cached_tracks(pid: str, snapshot_id: str | None) -> list[dict]:
 
 
 def _known_artists() -> dict[str, dict]:
-    """Whatever artist data is already cached — never fetches.
+    """Whatever Spotify artist data is already cached — never fetches.
 
     Every entry has empty genres and always will: the Feb-2026 dev-mode API
-    dropped the `genres` field from /artists/{id}. Scoring is therefore pure
-    artist overlap, and suggest.py's genre cosine is a dead branch.
+    dropped the `genres` field from /artists/{id}. suggest.py's tag signal
+    comes from Last.fm (`_tag_artists_checked`) instead; this is kept for
+    other, non-scoring uses of the cached Spotify artist data.
     """
     return store.cache()["artists"]
 
@@ -294,8 +295,8 @@ def _ensure_profiles_locked(force: bool) -> dict:
     home_tracks = {}
     for h in homes:
         home_tracks[h["id"]] = _cached_tracks(h["id"], h["snapshot_id"])
-    artist_info = _known_artists()
-    profiles = {h["id"]: sugg.build_profile(home_tracks[h["id"]], artist_info) for h in homes}
+    tag_artists = _tag_artists_checked()
+    profiles = {h["id"]: sugg.build_profile(home_tracks[h["id"]], tag_artists) for h in homes}
 
     # Input contents too, so the capture chips can show membership.
     by_id = {p["id"]: p for p in all_playlists}
@@ -309,7 +310,7 @@ def _ensure_profiles_locked(force: bool) -> dict:
 
     _profile_state.update(
         built_at=now, profiles=profiles, homes=homes, inputs=inputs,
-        artist_info=artist_info, playlists=all_playlists, input_ids=input_ids,
+        tag_artists=tag_artists, playlists=all_playlists, input_ids=input_ids,
     )
     return _profile_state
 
@@ -354,8 +355,8 @@ def triage(playlist_id: str):
         raise HTTPException(404, "unknown playlist")
 
     input_tracks = _cached_tracks(playlist_id, by_id.get(playlist_id, {}).get("snapshot_id"))
-    artist_info = _known_artists()
-    state["artist_info"] = artist_info
+    tag_artists = _tag_artists_checked()
+    state["tag_artists"] = tag_artists
 
     tracks_out = []
     for t in input_tracks:
@@ -364,7 +365,7 @@ def triage(playlist_id: str):
             {
                 **t,
                 "sortable": bool(sortable),
-                "suggestions": sugg.suggest(t, state["profiles"], artist_info) if sortable else [],
+                "suggestions": sugg.suggest(t, state["profiles"], tag_artists) if sortable else [],
             }
         )
 
@@ -2150,7 +2151,7 @@ def now_playing(force: bool = False):
             if ctx_id else None
         ),
         "sitting": _sitting_for_context(ctx_id),
-        "suggestions": sugg.suggest(track, state["profiles"], state["artist_info"]) if sortable else [],
+        "suggestions": sugg.suggest(track, state["profiles"], state["tag_artists"]) if sortable else [],
         "homes": _homes_payload(state),
         "inputs": [
             {"id": l["id"], "name": l["name"], "has_track": track["uri"] in l["uris"]}
