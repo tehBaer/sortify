@@ -30,34 +30,114 @@ import httpx
 _JUNK = {
     "all", "misc", "x", "seen live", "favorites", "favourites", "my music",
     "albums i own", "under 2000 listeners", "spotify", "10s", "00s", "90s",
-    "80s", "70s", "60s",
+    "80s", "70s", "60s", "50s", "40s",
+    # Personal library bookkeeping that leaked into public tags. The two
+    # lidarr strings are verbatim from data/tags.json; they carry the word
+    # "funk", so left in they would quietly bind two unrelated artists
+    # together and can win a pile name outright (a tag on a single artist
+    # creates no clustering edge but is maximally distinctive to the TF-IDF
+    # namer — which is exactly how a city ended up naming a pile).
+    "funk_add_to_lidarr_batch_8", "funk_add_to_lidarr_batch_11",
+    "need to rate", "posted", "lesser known yet streamable artists",
+    "if this band doesnt get huge i will buy a hat and eat it",
+    "solo album", "new music", "favorit", "blandband",
+    # Artist, crew and collective names used as tags. The existing name
+    # filter below already drops a tag that is the artist's own name; these
+    # are the same thing one step removed (a Wu-Tang member tagged
+    # "wu-tang"), which that filter cannot see.
+    "wu-tang", "wu-fam", "boot camp clik", "black hippy", "ofwgkta",
+    "buena vista social club", "the black angels", "the black asap rocky",
+    "blank and the blanks", "real recognize real and this nigga the realest",
+    "lamarr sessions", "robertitus global", "rocky ram", "zomeki", "evislwa",
+    "ellias", "jecks", "dubabub", "withhouse", "mj-house bounce",
 }
 
 _DESCRIPTORS = {
     "female vocalists", "male vocalists", "female vocalist", "male vocalist",
     "female fronted", "singer-songwriter women", "oldies", "beautiful",
     "chill", "cool", "awesome", "love", "sexy", "catchy", "melancholic",
+    "groovy", "sad", "swag", "based", "vintage", "retro", "relaxing cafe",
+    # Note what is deliberately NOT here: "funky". It sits one letter from a
+    # genre this library is full of, and the risk of shaving real funk signal
+    # off an artist outweighs the little it adds as a mood word.
 }
 
-# Nationalities, countries and cities. Last.fm tags these heavily, and left in
-# they produce piles that cut across every genre ("Norwegian", "dutch").
+# Nationalities, countries, regions and cities. Last.fm tags these heavily,
+# and left in they produce piles that cut across every genre ("Norwegian",
+# "dutch"). Everything below was read out of the real `data/tags.json` (891
+# artists) unless it is the other half of an observed pair — a country whose
+# demonym is in the data, or vice versa — because Last.fm's vocabulary uses
+# both forms interchangeably and half a pair is a hole waiting to be found by
+# the next artist.
+#
+# The line drawn here, and the reason "bollywood" is NOT below: drop a tag
+# when everything it tells you is where the music (or the listener) is from;
+# keep it when it names a way of sounding, even one named after a place.
+# Bollywood is Indian film music — an arrangement style, an instrumentation, a
+# vocal tradition — so it stays, and so do highlife, cumbia, chicha, bossa
+# nova, fado, morna, calypso, soca, zouk, samba, candombe, tango, flamenco,
+# klezmer, krautrock, mpb, j-pop, city pop, enka, molam, ethio-jazz, anatolian
+# rock, chanson francaise, desert blues, delta/chicago/texas blues and
+# east/west coast rap. Only the bare place words go.
+#
+# `world`, `world music` and `ethnic` were tried here and deliberately left
+# out, against first instinct — they are marketing categories, not sounds,
+# and `world` alone sits on 75 artists spanning afrobeat, cumbia, bossa nova
+# and Tuvan throat singing. Measured on this library they are load-bearing
+# anyway: they are the ONLY surviving tag for Orchestra Baobab, Salif Keita,
+# Miriam Makeba, Oumou Sangaré, Cheikh Lô, Amadou & Mariam and four more,
+# whose every other tag is a country. Dropping them moved 21 tracks into
+# `untagged` and cut the cumbia/latin/salsa pile from 59 to 31, while fixing
+# nothing: the place-named pile is already gone without them. Re-tuning is
+# free (hygiene runs at split time), so this is a measurement, not a
+# principle — remeasure before changing it.
 _PLACES = {
-    "african", "american", "argentina", "australia", "australian", "austrian",
-    "belgian", "brazil", "brazilian", "british", "canada", "canadian", "chile",
-    "china", "chinese", "colombia", "cuba", "cuban", "czech", "danish",
-    "denmark", "dutch", "egypt", "england", "english", "estonian", "ethiopia",
-    "ethiopian", "finland", "finnish", "france", "french", "german", "germany",
-    "greece", "greek", "hungarian", "iceland", "icelandic", "india", "indian",
-    "indonesia", "iran", "iranian", "ireland", "irish", "israel", "israeli",
-    "italian", "italy", "jamaica", "jamaican", "japan", "japanese", "korea",
-    "korean", "latvian", "lebanon", "lithuanian", "mali", "mexican", "mexico",
+    # Continents and supra-national regions.
+    "africa", "afrika", "african", "east africa", "east african",
+    "north africa", "north african", "west africa", "west african",
+    "south africa", "south african", "asia", "asian", "europe", "european",
+    "scandinavia", "scandinavian", "balkan", "balkans",
+    # Countries, and the demonyms/language words that stand in for them.
+    "algeria", "algerian", "american", "argentina", "australia", "australian",
+    "austrian", "belgian", "benin", "brasil", "brazil", "brazilian",
+    "brazilian music", "british", "burkina faso", "burkinabe", "cabo verde",
+    "cambodia", "cambodian", "cameroon", "canada", "canadian", "cape verde",
+    "chile", "china", "chinese", "colombia", "colombian", "congo", "cuba",
+    "cuban", "czech", "danish", "dansk", "denmark", "dr congo", "dutch",
+    "egypt", "england", "english", "estonian", "ethiopia", "ethiopian",
+    "finland", "finnish", "france", "francais", "français", "french",
+    "gambia", "gambian", "german", "germany", "ghana", "ghanaian", "greece",
+    "greek", "guadeloupe", "guinea", "guinea bissau", "guinea-bissau",
+    "guinean", "haiti", "hebrew", "hungarian", "iceland", "icelandic",
+    "india", "indian", "indonesia", "iran", "iranian", "ireland", "irish",
+    "israel", "israeli", "italian", "italy", "ivory coast", "jamaica",
+    "jamaican", "japan", "japanese", "korea", "korean", "latvian", "lebanese",
+    "lebanon", "lithuanian", "mali", "martinique", "mexican", "mexico",
     "morocco", "netherlands", "new zealand", "niger", "nigeria", "nigerian",
-    "norway", "norwegian", "oslo", "peru", "poland", "polish", "portugal",
-    "portuguese", "romania", "russia", "russian", "scotland", "scottish",
-    "senegal", "serbia", "slovenia", "south africa", "spain", "spanish",
-    "sweden", "swedish", "swiss", "switzerland", "taiwan", "thailand",
-    "trondheim", "tunisia", "turkey", "turkish", "uk", "ukraine", "usa",
-    "venezuela", "vietnam", "wales", "welsh",
+    "norsk", "norway", "norwegian", "persian", "peru", "peruvian", "poland",
+    "polish", "portugal", "portuguese", "puerto rico", "romania", "russia",
+    "russian", "scotland", "scottish", "senegal", "senegalese", "serbia",
+    "sierra leone", "slovenia", "spain", "spanish", "sudan", "sudanese",
+    "svensk", "svenskt", "sweden", "swedish", "swiss", "switzerland", "syria",
+    "syrian", "taiwan", "thai", "thailand", "togo", "trinidad",
+    "trinidad and tobago", "trinidadian", "trini", "tunisia", "turkey",
+    "turkish", "uk", "ukraine", "united kingdom", "united states", "uruguay",
+    "uruguayan", "us", "usa", "venezuela", "vietnam", "vietnamese", "wales",
+    "welsh", "yemen", "zambia",
+    # Peoples and ethnonyms — the same claim as a demonym, and just as silent
+    # about how anything sounds. The music these sit on keeps its real style
+    # tags: tishoumaren for the Tuareg artists, throat singing for the Tuvan
+    # ones, cambodian rocks / psychedelic for the Khmer ones.
+    "chicano", "khmer", "tuareg", "tuva", "tuvan",
+    # Cities and city-regions. `chicago` alone binds Curtis Mayfield, Kanye
+    # West and Rotary Connection into one pile across soul and hip-hop;
+    # `new york` does the same for 24 artists. The compounds that name an
+    # actual sound (chicago blues, new orleans rhythm and blues) survive,
+    # since only exact matches are dropped.
+    "amsterdam", "atlanta", "austin", "bamako", "berlin", "brooklyn",
+    "chicago", "detroit", "east coast", "kingston", "lausanne", "lauzanne",
+    "london", "memphis", "new orleans", "new york", "oslo",
+    "rio de janeiro", "san francisco", "trondheim", "west coast",
 }
 
 _STOPLIST = _JUNK | _DESCRIPTORS | _PLACES
@@ -75,9 +155,15 @@ def clean_tags(
 ) -> list[tuple[str, int]]:
     """Filter Last.fm's raw top tags down to usable genre signal.
 
-    Applied in order: drop below `floor`, drop the stoplist, drop tags that
-    overlap the artist's own name (catches self-tags and label names), keep
-    the top `keep` by weight.
+    Applied in order: drop below `floor`, drop bare numbers, drop the
+    stoplist, drop tags that overlap the artist's own name (catches self-tags
+    and label names), keep the top `keep` by weight.
+
+    The bare-number rule is a rule rather than two more stoplist entries
+    because the data holds "11" and "13" — someone's private numbering — and
+    "12" would sail straight through a list. No genre in Last.fm's vocabulary
+    is a bare number; decade tags ("90s", "10s") keep their suffix and are
+    handled by `_JUNK`.
 
     `raw` is Last.fm's own shape — `[{"name": ..., "count": ...}, ...]` — which
     is what `enrich` stores verbatim. This runs at split time, not fetch time,
@@ -99,6 +185,8 @@ def clean_tags(
         if w < floor:
             continue
         low = tag.lower()
+        if low.isdigit():
+            continue
         if low in _STOPLIST:
             continue
         if name_l and (low == name_l or (len(name_l) >= 4 and name_l in low)):
