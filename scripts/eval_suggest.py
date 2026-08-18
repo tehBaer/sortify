@@ -7,14 +7,21 @@ use of that symlink (see task-3 brief).
 
 The user's own home playlists are labelled training data: every track that
 sits in a home is an example of a track the user decided belongs there. The
-harness samples (home, track) pairs and asks "if we rebuild that home's
-profile with this one track removed, does ranking still put it back?"
+harness samples (home, track) pairs and asks "if we rebuild the profile of
+EVERY home this track sits in, with this track removed, does ranking still
+put it back?"
 
-Hold-one-out is the whole validity of this file. If the held-out track were
-left in the profile used to rank it, `already` and the artist-overlap count
-would see it and every pair would score as a trivial, meaningless 100% — see
-`test_removing_track_from_profile_changes_its_score` in tests/test_suggest.py
-and the harness's own tests in tests/test_eval_suggest.py.
+Hold-one-out is the whole validity of this file, and it must be applied to
+every true home of the track, not just the one pair happens to name — a
+multi-home track whose sibling home is left untouched keeps `already=True`
+there and trivially wins the ranking regardless of any real signal (fix
+round 1, finding C3). See `test_removing_track_from_profile_changes_its_score`
+in tests/test_suggest.py and the harness's own tests in
+tests/test_eval_suggest.py, in particular
+`test_evaluate_pair_holds_track_out_before_ranking` (a fixture where holding
+out actually flips the outcome — a no-op hold-out fails it, mutation-verified)
+and `test_evaluate_pair_holds_track_out_of_every_home_it_appears_in` (the
+multi-home regression pin for C3).
 
 Usage:
     python scripts/eval_suggest.py [--n 500] [--seed 7] [--baseline] [--search]
@@ -24,12 +31,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import itertools
 import json
 import random
 import sys
 from pathlib import Path
-from typing import Iterable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -40,8 +45,13 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DEFAULT_N = 500
 DEFAULT_SEED = 7
 DEFAULT_TOP_K = 3
-SEARCH_TAG_WEIGHTS = (2.0, 3.0, 4.0, 6.0)
-SEARCH_DILUTIONS = (0.3, 0.5, 0.7, 1.0)
+# 1-D sweep over TAG_WEIGHT (fix round 1, ruling R3a: ARTIST_TAG_DILUTION was
+# removed because it and TAG_WEIGHT only ever appeared as a product — the
+# original 4x4 grid was this same 1-D search wearing a 2-D costume, with
+# duplicate cells wherever two (weight, dilution) pairs shared a product).
+# These values are the deduplicated products of that original grid, so the
+# rerun is comparable to the numbers task-3-report.md already recorded.
+SEARCH_TAG_WEIGHTS = (0.6, 0.9, 1.0, 1.2, 1.4, 1.5, 1.8, 2.0, 2.1, 2.8, 3.0, 4.0, 4.2, 6.0)
 
 
 # ---- loading (the only place that touches disk) -----------------------------
@@ -90,7 +100,16 @@ def sample_pairs(
     pairs: list[tuple[str, dict]], n: int, seed: int
 ) -> list[tuple[str, dict]]:
     """Seeded, repeatable sample of at most `n` pairs (order-stable input,
-    order-shuffled output) — same seed always yields the same sample."""
+    order-shuffled output) — same seed always yields the same sample.
+
+    Not nested across `n`: `sample_pairs(pairs, 100, 7)` is not a subset of
+    `sample_pairs(pairs, 500, 7)`. `random.Random(seed).sample` consumes the
+    RNG stream differently depending on how many items are drawn, so two
+    calls with the same seed but different `n` are independent draws, not
+    one growing out of the other. Comparing runs at different `n` is
+    therefore comparing two different samples, not a bigger vs. a smaller
+    look at the same one.
+    """
     rng = random.Random(seed)
     if n >= len(pairs):
         sampled = list(pairs)
@@ -101,7 +120,9 @@ def sample_pairs(
 
 def uri_home_index(home_tracks: dict[str, list[dict]]) -> dict[str, set[str]]:
     """track uri -> every home it currently sits in. Used to score
-    multi-home tracks as correct if ANY of their homes lands in top-k."""
+    multi-home tracks as correct if ANY of their homes lands in top-k, and to
+    know every home a held-out track must be removed from (not just the
+    pair's own home — see the module docstring, finding C3)."""
     idx: dict[str, set[str]] = {}
     for hid, tracks in home_tracks.items():
         for t in tracks:
@@ -115,6 +136,22 @@ def build_all_profiles(
     return {hid: build_profile(tracks, tag_artists) for hid, tracks in home_tracks.items()}
 
 
+def _artist_absent(track: dict, profiles_for_pair: dict[str, dict]) -> bool:
+    """True when none of the track's artists have any overlap in ANY home
+    profile (after hold-out). This is the spec's original target case — "a
+    sad ballad by an artist you own is offered playlists of sad, slow music,
+    not merely playlists containing that artist" — the subset where artist
+    overlap contributes nothing and only the tag signal (or nothing) can
+    produce a correct ranking. A track with no artist id at all counts as
+    artist-absent too, since overlap can never fire for it either way."""
+    artist_ids = {a.get("id") for a in track["artists"] if a.get("id")}
+    if not artist_ids:
+        return True
+    return not any(
+        prof["artist_counts"].get(aid, 0) for prof in profiles_for_pair.values() for aid in artist_ids
+    )
+
+
 def evaluate_pair(
     home_id: str,
     track: dict,
@@ -123,27 +160,34 @@ def evaluate_pair(
     tag_artists: dict[str, dict],
     uri_homes: dict[str, set[str]],
     top_k: int = DEFAULT_TOP_K,
-) -> tuple[bool, bool]:
-    """Rank `track` with `home_id`'s profile rebuilt minus `track` itself —
-    every other home's profile is passed through untouched. Returns
-    (top1_hit, top3_hit): whether any of the track's true homes (which may
-    be more than just `home_id`) lands in the top-1 / top-k ranking.
+) -> tuple[bool, bool, bool]:
+    """Rank `track` with EVERY true home's profile rebuilt minus `track`
+    itself — not just `home_id`. A multi-home track's sibling homes must
+    lose the track too, or `already=True` there trivially wins the ranking
+    no matter what the scorer does (fix round 1, finding C3: this used to
+    rebuild only `home_id`'s profile, which handed a multi-home track a free
+    top-1 via whichever sibling home was left untouched).
+
+    Returns (top1_hit, top3_hit, artist_absent). `artist_absent` flags the
+    spec's target case (see `_artist_absent`) so callers can report accuracy
+    on that subset separately.
 
     Does not mutate `profiles` — a fresh dict is built per call so later
     pairs in the same run never see a corrupted home profile.
     """
-    held_out_tracks = [t for t in home_tracks[home_id] if t["uri"] != track["uri"]]
-    rebuilt = build_profile(held_out_tracks, tag_artists)
+    true_homes = uri_homes.get(track["uri"], {home_id})
+
     profiles_for_pair = dict(profiles)
-    profiles_for_pair[home_id] = rebuilt
+    for hid in true_homes:
+        held_out_tracks = [t for t in home_tracks[hid] if t["uri"] != track["uri"]]
+        profiles_for_pair[hid] = build_profile(held_out_tracks, tag_artists)
 
     results = suggest(track, profiles_for_pair, tag_artists)
     ranked_ids = [r["playlist_id"] for r in results]
-    true_homes = uri_homes.get(track["uri"], {home_id})
 
     top1_hit = bool(true_homes & set(ranked_ids[:1]))
     top3_hit = bool(true_homes & set(ranked_ids[:top_k]))
-    return top1_hit, top3_hit
+    return top1_hit, top3_hit, _artist_absent(track, profiles_for_pair)
 
 
 def run_eval(
@@ -152,57 +196,67 @@ def run_eval(
     sampled_pairs: list[tuple[str, dict]],
     top_k: int = DEFAULT_TOP_K,
 ) -> dict:
-    """Evaluate a fixed, pre-sampled set of pairs under whatever weights
+    """Evaluate a fixed, pre-sampled set of pairs under whatever weight
     `sortify.suggest` currently holds. Takes the sample as an argument
     (rather than sampling itself) so a baseline run, a full grid search, and
-    the committed-weights run all score the identical pairs."""
+    the committed-weight run all score the identical pairs.
+
+    Reports both the overall top1/top3 and the artist-absent subset's
+    top1/top3 — the subset where artist overlap cannot fire at all and only
+    the tag signal could produce a correct ranking (the spec's target case).
+    """
     profiles = build_all_profiles(home_tracks, tag_artists)
     uri_homes = uri_home_index(home_tracks)
 
     top1 = top3 = 0
+    absent_n = absent_top1 = absent_top3 = 0
     for home_id, track in sampled_pairs:
-        hit1, hit3 = evaluate_pair(home_id, track, home_tracks, profiles, tag_artists, uri_homes, top_k)
+        hit1, hit3, absent = evaluate_pair(home_id, track, home_tracks, profiles, tag_artists, uri_homes, top_k)
         top1 += hit1
         top3 += hit3
+        if absent:
+            absent_n += 1
+            absent_top1 += hit1
+            absent_top3 += hit3
 
     total = len(sampled_pairs)
     return {
         "n": total,
         "top1": top1 / total if total else 0.0,
         "top3": top3 / total if total else 0.0,
+        "artist_absent_n": absent_n,
+        "artist_absent_top1": absent_top1 / absent_n if absent_n else 0.0,
+        "artist_absent_top3": absent_top3 / absent_n if absent_n else 0.0,
     }
 
 
 @contextlib.contextmanager
-def weights(tag_weight: float, dilution: float):
-    """Temporarily override sortify.suggest's module-level weight constants.
-    `suggest()` reads them at call time (not as bound defaults), so mutating
-    the module and restoring it afterwards is sufficient — no monkeypatch
-    fixture needed outside of pytest."""
+def weights(tag_weight: float):
+    """Temporarily override sortify.suggest's TAG_WEIGHT constant.
+    `suggest()` reads it as a module-level lookup at call time (not a bound
+    default), so mutating the module and restoring it afterwards is
+    sufficient — no monkeypatch fixture needed outside of pytest."""
     orig_weight = suggest_mod.TAG_WEIGHT
-    orig_dilution = suggest_mod.ARTIST_TAG_DILUTION
     suggest_mod.TAG_WEIGHT = tag_weight
-    suggest_mod.ARTIST_TAG_DILUTION = dilution
     try:
         yield
     finally:
         suggest_mod.TAG_WEIGHT = orig_weight
-        suggest_mod.ARTIST_TAG_DILUTION = orig_dilution
 
 
 def grid_search(
     home_tracks: dict[str, list[dict]],
     tag_artists: dict[str, dict],
     sampled_pairs: list[tuple[str, dict]],
-    grid: Iterable[tuple[float, float]],
+    tag_weights: list[float],
     top_k: int = DEFAULT_TOP_K,
-) -> dict[tuple[float, float], dict]:
-    """Run `run_eval` once per (tag_weight, dilution) cell, restoring the
-    module's weights to whatever they were before the search once done."""
+) -> dict[float, dict]:
+    """Run `run_eval` once per TAG_WEIGHT value, restoring the module's
+    weight to whatever it was before the search once done."""
     results = {}
-    for tag_weight, dilution in grid:
-        with weights(tag_weight, dilution):
-            results[(tag_weight, dilution)] = run_eval(home_tracks, tag_artists, sampled_pairs, top_k)
+    for tag_weight in tag_weights:
+        with weights(tag_weight):
+            results[tag_weight] = run_eval(home_tracks, tag_artists, sampled_pairs, top_k)
     return results
 
 
@@ -210,7 +264,11 @@ def grid_search(
 
 
 def _print_result(label: str, result: dict) -> None:
-    print(f"{label}: n={result['n']} top1={result['top1']:.3f} top3={result['top3']:.3f}")
+    print(
+        f"{label}: n={result['n']} top1={result['top1']:.3f} top3={result['top3']:.3f} | "
+        f"artist-absent n={result['artist_absent_n']} "
+        f"top1={result['artist_absent_top1']:.3f} top3={result['artist_absent_top3']:.3f}"
+    )
 
 
 def main() -> None:
@@ -219,8 +277,14 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="sampling seed, for repeatability")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--baseline", action="store_true", help="force TAG_WEIGHT=0 (artist-only)")
-    parser.add_argument("--search", action="store_true", help="coarse grid search over TAG_WEIGHT x ARTIST_TAG_DILUTION")
+    parser.add_argument("--search", action="store_true", help="1-D grid search over TAG_WEIGHT")
     args = parser.parse_args()
+
+    top_k = args.top_k
+    if top_k > suggest_mod.TOP_N:
+        print(f"note: --top-k {top_k} > suggest.TOP_N ({suggest_mod.TOP_N}); "
+              f"suggest() never returns more than TOP_N results, clamping to {suggest_mod.TOP_N}")
+        top_k = suggest_mod.TOP_N
 
     home_tracks = load_home_tracks()
     tag_artists = load_tag_artists()
@@ -230,27 +294,26 @@ def main() -> None:
     print(f"homes={len(home_tracks)} pairs_available={len(pairs)} sampled={len(sampled)} seed={args.seed}")
 
     if args.baseline:
-        with weights(0.0, suggest_mod.ARTIST_TAG_DILUTION):
-            _print_result("artist-only baseline (TAG_WEIGHT=0)", run_eval(home_tracks, tag_artists, sampled, args.top_k))
+        with weights(0.0):
+            _print_result("artist-only baseline (TAG_WEIGHT=0)", run_eval(home_tracks, tag_artists, sampled, top_k))
         return
 
     if args.search:
-        with weights(0.0, suggest_mod.ARTIST_TAG_DILUTION):
-            baseline = run_eval(home_tracks, tag_artists, sampled, args.top_k)
+        with weights(0.0):
+            baseline = run_eval(home_tracks, tag_artists, sampled, top_k)
         _print_result("artist-only baseline (TAG_WEIGHT=0)", baseline)
 
-        grid = list(itertools.product(SEARCH_TAG_WEIGHTS, SEARCH_DILUTIONS))
-        results = grid_search(home_tracks, tag_artists, sampled, grid, args.top_k)
-        for (tag_weight, dilution), result in results.items():
-            _print_result(f"TAG_WEIGHT={tag_weight} ARTIST_TAG_DILUTION={dilution}", result)
+        results = grid_search(home_tracks, tag_artists, sampled, list(SEARCH_TAG_WEIGHTS), top_k)
+        for tag_weight, result in results.items():
+            _print_result(f"TAG_WEIGHT={tag_weight}", result)
 
-        best_cell = max(results, key=lambda cell: (results[cell]["top3"], results[cell]["top1"]))
-        print(f"best: TAG_WEIGHT={best_cell[0]} ARTIST_TAG_DILUTION={best_cell[1]} -> {results[best_cell]}")
+        best_weight = max(results, key=lambda w: (results[w]["top3"], results[w]["top1"]))
+        print(f"best: TAG_WEIGHT={best_weight} -> {results[best_weight]}")
         return
 
     _print_result(
-        f"current weights (TAG_WEIGHT={suggest_mod.TAG_WEIGHT} ARTIST_TAG_DILUTION={suggest_mod.ARTIST_TAG_DILUTION})",
-        run_eval(home_tracks, tag_artists, sampled, args.top_k),
+        f"current weight (TAG_WEIGHT={suggest_mod.TAG_WEIGHT})",
+        run_eval(home_tracks, tag_artists, sampled, top_k),
     )
 
 

@@ -8,9 +8,11 @@ Two signals, both explainable to the user:
 Spotify's audio-features endpoint is deprecated for new apps, and Spotify no
 longer returns artist genres at all in development mode — tags come from
 Last.fm instead (see `sortify/tags.py`). They describe the *artist*, not the
-track, which is weaker evidence than a track-level tag would be, so the tag
-score is diluted before it competes with artist overlap, which stays the
-primary signal.
+track, which is weaker evidence than a track-level tag would be. TAG_WEIGHT
+is the single knob for how much that weaker evidence counts against artist
+overlap, which stays the primary signal (see the constant's comment: only
+~7% of this library's home artists have any Last.fm tags at all, so the
+weight is provisional until more artists are tagged).
 """
 
 from __future__ import annotations
@@ -20,21 +22,35 @@ from collections import Counter
 
 from .tags import clean_tags
 
-# Measured by scripts/eval_suggest.py (hold-one-out; task-3-report.md has the
-# full 16-cell grid): --n 500 --seed 7, 2026-08-18 ->
-#   artist-only baseline (TAG_WEIGHT=0): top1 0.320 top3 0.462
-#   winner TAG_WEIGHT=3.0 ARTIST_TAG_DILUTION=1.0: top1 0.326 top3 0.468
-# The grid's true optimum ties several cells at top3=0.468; 3.0/1.0 is the
-# smallest TAG_WEIGHT among the tied winners. Re-verified against
-# test_artist_overlap_still_outranks_a_perfect_tag_match with these values
-# (no cap needed, it still passes): a pure tag match now reaches
-# TAG_WEIGHT * ARTIST_TAG_DILUTION = 3.0, a single artist match still starts
-# at ARTIST_BASE + ARTIST_PER_TRACK = 3.4, so "right artist" still beats
-# "similar tags" unless the tag fit is perfect.
+# PROVISIONAL, not a settled measurement (fix round 1, ruling R3b). Measured
+# by scripts/eval_suggest.py, corrected for the fix-round C3 label-leak bug
+# (hold-out now applies to every home a track sits in, not just the sampled
+# pair's home) — task-3-report.md has the full corrected grid:
+#   .venv/bin/python scripts/eval_suggest.py --n 500 --seed 7 --search
+#   artist-only baseline (TAG_WEIGHT=0): top1 0.268 top3 0.424
+#   winner TAG_WEIGHT=3.0: top1 0.274 top3 0.430
+# Home-artist tag coverage was 7.1% (102/1427 distinct artists across home
+# playlists have any Last.fm tag record) at measurement time, so this ~0.006
+# lift is close to what 7% coverage can even produce, not a settled read on
+# whether tags help — re-run the command above once coverage has grown and
+# replace this constant with a real measurement.
+# On the spec's original target case — tracks whose artist has NO overlap
+# in any home, where artist_overlap contributes nothing and only tags could
+# rescue the ranking — the harness reports separately: at TAG_WEIGHT=3.0,
+# top1 0.000 and top3 0.013 on that subset (n=158/500). Tags are not yet
+# doing the job the spec asked for; low coverage is the diagnosis, not
+# that artist-level tags are inherently too weak a signal.
 ARTIST_BASE = 3.0
 ARTIST_PER_TRACK = 0.4
 TAG_WEIGHT = 3.0
-ARTIST_TAG_DILUTION = 1.0
+# ARTIST_TAG_DILUTION was removed (fix round 1, ruling R3a): it and
+# TAG_WEIGHT only ever appeared as a product (TAG_WEIGHT * ARTIST_TAG_DILUTION
+# * sim below), so the original 16-cell grid was a 1-D search over that
+# product wearing a 2-D costume — see the duplicate-valued cells in
+# task-3-report.md's fix-round section. A separate dilution factor is worth
+# reintroducing if/when track-level tags exist (spec phase 2: Last.fm
+# `track.getTopTags`), since a track-level tag is stronger evidence than an
+# artist-level one and the two should not compete at face value.
 MIN_SCORE = 0.8
 TOP_N = 3
 
@@ -113,7 +129,7 @@ def suggest(track: dict, profiles: dict[str, dict], tag_artists: dict[str, dict]
 
         sim = _cosine(track_tags, prof["tag_counts"])
         if sim > 0.05:
-            score += TAG_WEIGHT * ARTIST_TAG_DILUTION * sim
+            score += TAG_WEIGHT * sim
             overlap = sorted(
                 (t for t in track_tags if t in prof["tag_counts"]),
                 key=lambda t: track_tags[t] * prof["tag_counts"][t],

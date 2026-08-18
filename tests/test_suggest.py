@@ -152,7 +152,13 @@ def test_removing_track_from_profile_changes_its_score():
     assert without_results and without_results[0]["already"] is False
 
 
-def test_dilution_applied(monkeypatch):
+def test_tag_weight_read_at_call_time(monkeypatch):
+    # ARTIST_TAG_DILUTION was removed (fix round 1, ruling R3a): it and
+    # TAG_WEIGHT only ever appeared as a product, so TAG_WEIGHT alone is now
+    # the single knob. This pins that `suggest()` reads TAG_WEIGHT as a
+    # module-level lookup at call time (not a bound default) — the eval
+    # harness's `weights()` context manager depends on that to vary it
+    # between runs without re-importing the module.
     home_track = {"uri": "h1", "artists": [{"id": "h", "name": "H"}]}
     ta = {
         "h": tag_entry("cumbia", name="H"),
@@ -161,10 +167,10 @@ def test_dilution_applied(monkeypatch):
     prof = build_profile([home_track], ta)
     new_track = {"uri": "new", "artists": [{"id": "n", "name": "N"}]}
 
-    monkeypatch.setattr(suggest_mod, "ARTIST_TAG_DILUTION", 1.0)
-    full = suggest(new_track, {"H": prof}, ta)[0]["score"]
+    monkeypatch.setattr(suggest_mod, "TAG_WEIGHT", 1.0)
+    single = suggest(new_track, {"H": prof}, ta)[0]["score"]
 
-    monkeypatch.setattr(suggest_mod, "ARTIST_TAG_DILUTION", 0.5)
-    half = suggest(new_track, {"H": prof}, ta)[0]["score"]
+    monkeypatch.setattr(suggest_mod, "TAG_WEIGHT", 2.0)
+    doubled = suggest(new_track, {"H": prof}, ta)[0]["score"]
 
-    assert half == round(full / 2, 2)
+    assert doubled == round(single * 2, 2)
