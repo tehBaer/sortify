@@ -103,6 +103,7 @@ def status():
             "cap": DAILY_CAP,
             "background_spent": sp.background_spent(),
             "background_cap": BACKGROUND_DAILY_CAP,
+            "bulk": {"spent_today": sp.bulk_spent(), "reserve": BULK_RESERVE},
         },
         "cooldown_min_left": max(0, int((sp.effective_cooldown_until() - now) / 60)),
         # Cooldown is over but proactive work is still holding its breath.
@@ -1490,7 +1491,7 @@ def _drain_queue() -> None:
 
 def _drain_queue_body() -> None:
     gov = Governor(store.pacing())
-    gov.note_interruption()                  # every (re)start re-climbs from 1.8
+    gov.note_interruption()                  # every (re)start floors the rate at 1.8 (never raises it)
     store.save_pacing(gov.to_state())
     with _queue_lock:
         q = store.queue()
@@ -1535,17 +1536,36 @@ def _drain_queue_body() -> None:
             # cooldown) still gets its `_clean_since` correctly cleared.
             gov.note_interruption()
             store.save_pacing(gov.to_state())
-            # Wake early on pause/cancel/resume; re-check at most every 60s so
-            # a cooldown shortened by another process is noticed. The event
-            # is cleared unconditionally right after waiting — whether it
-            # fired or the wait simply timed out — so a set() landing mid-
-            # sleep is consumed exactly once and can never latch into a
-            # file-churning hot loop on the next sleep iteration (C1/I1).
-            # queue.json, written by whoever called set() and re-checked via
-            # _set_queue_state below, is the actual source of truth for what
-            # happens next — the event itself is only ever a wake-up nudge.
-            _queue_wake.wait(min(action[1], 60))
-            _queue_wake.clear()
+            # M-4: poll in ≤60s chunks WITHOUT bouncing queue.json through
+            # "running" and straight back to the same sleep label every
+            # chunk — a multi-hour bulk-reserve wait used to rewrite
+            # queue.json (and bump updated_at) twice a minute for the whole
+            # span with no actual transition behind either write. Instead,
+            # re-check the same block sp.bulk_block_reason() would recompute
+            # at the top of the outer loop; if it's still the SAME reason
+            # (same displayed state), just keep waiting in place — only a
+            # genuine change (block clears, or clears to a different
+            # labelled state) breaks out to do the real write.
+            while True:
+                _queue_wake.wait(min(action[1], 60))
+                # Cleared unconditionally right after waiting — whether it
+                # fired or the wait simply timed out — so a set() landing
+                # mid-sleep is consumed exactly once and can never latch
+                # into a file-churning hot loop on the next iteration
+                # (C1/I1).
+                _queue_wake.clear()
+                with _queue_lock:
+                    current_state = store.queue()["state"]
+                if current_state not in _QUEUE_RESUMABLE:
+                    break                      # paused/cancelled — let the write below report it
+                still_blocked = sp.bulk_block_reason()
+                if still_blocked:
+                    reason, until = still_blocked
+                    state_label = "quiet" if reason == "quiet" else "sleeping"
+                    if state_label == action[2]:
+                        action = (action[0], max(until - time.time(), 1.0), action[2])
+                        continue               # unchanged — no write, keep waiting
+                break                          # cleared, or changed to a different label
             if not _set_queue_state("running"):
                 if _worker_may_stop():
                     return                     # paused/cancelled during the sleep
