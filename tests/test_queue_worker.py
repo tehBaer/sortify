@@ -12,6 +12,21 @@ import sortify.pacing as pacing
 from sortify.spotify import QUIET_AFTER_COOLDOWN, Spotify, SpotifyError
 from sortify.store import Store
 
+
+class FakeResponse:
+    """Mirrors tests/test_budget.py's FakeResponse — a stand-in for the
+    httpx.Response object at the sp.http.request wire seam."""
+
+    def __init__(self, status_code=200, headers=None, text="", json_body=None):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = text
+        self._json_body = json_body
+        self.content = b"1" if json_body is not None else text.encode()
+
+    def json(self):
+        return self._json_body
+
 PILE_URIS = [f"spotify:track:m{i}" for i in range(3)]
 TINY = [f"spotify:track:t{i}" for i in range(1)]
 
@@ -235,6 +250,90 @@ def test_block_reason_sleeps_with_the_labelled_state(worker_env, monkeypatch):
     appmod._queue_wake.set(); appmod._queue_wake.clear()
     q = wait_done(s)
     assert q["state"] == "done" and len(calls) == 2
+
+
+def test_governor_halves_from_a_real_429_stamped_by_request_itself(worker_env, monkeypatch):
+    """I-3 / R-F2: the spec's acceptance sketch wants the wire seam exercised
+    — a real 429 that Spotify.request() itself classifies, stamps onto
+    sp.last_429, and retries through — not a hand-crafted last_429 dict
+    assigned by a fake create_playlist/add_to_playlist like the other tests
+    in this file use. So here create_playlist and add_to_playlist are left
+    as the REAL bound methods, and only sp.http.request is faked (the same
+    seam test_budget.py's test_request_records_the_last_429_... fakes),
+    with sp._access_token stubbed so no real auth/refresh happens and
+    time.sleep patched to a no-op so request()'s Retry-After wait doesn't
+    make this test slow.
+    """
+    calls, s = worker_env
+    monkeypatch.setattr(appmod.sp, "create_playlist",
+                        Spotify.create_playlist.__get__(appmod.sp))
+    monkeypatch.setattr(appmod.sp, "add_to_playlist",
+                        Spotify.add_to_playlist.__get__(appmod.sp))
+    monkeypatch.setattr(appmod.sp, "bulk_block_reason",
+                        Spotify.bulk_block_reason.__get__(appmod.sp))
+    monkeypatch.setattr(appmod.sp, "_access_token", lambda: "tok")
+    monkeypatch.setattr(time, "sleep", lambda secs: None)
+
+    responses = [
+        FakeResponse(200, json_body={"id": "NEW-tiny"}),               # create_playlist
+        FakeResponse(429, headers={"Retry-After": "1"},                # add, attempt 1: rate 429
+                     text='{"error": {"status": 429}}'),
+        FakeResponse(200, json_body={"snapshot_id": "snap1"}),         # add, attempt 2: retried OK
+    ]
+    monkeypatch.setattr(appmod.sp.http, "request", lambda *a, **k: responses.pop(0))
+
+    start_queue(s, pending=("p2",))     # the 1-track pile — one create, one add
+    q = wait_done(s)
+    assert q["state"] == "done"
+    # create_playlist/add_to_playlist are the REAL bound methods here (not
+    # the calls-list-recording fakes worker_env's fixture installs), so the
+    # record materialised into splits.json is what proves both API calls
+    # actually landed rather than `calls`.
+    record = s.splits()["splits"]["PLQ"]["materialised"]["p2"]
+    assert record["playlist_id"] == "NEW-tiny" and record["added"] == [TINY[0]]
+
+    # request() itself classified and stamped the 429 — this test never wrote
+    # to appmod.sp.last_429 directly, unlike test_rate_429_halves_and_keeps_going.
+    assert appmod.sp.last_429 and appmod.sp.last_429["kind"] == "rate"
+    # The governor's halving is driven by THAT stamp: START_RATE (1.8) halved
+    # and floored at MIN_RATE (0.9).
+    assert s.pacing()["rate_per_min"] == pacing.MIN_RATE
+
+
+def test_sleep_loop_does_not_rewrite_queue_json_for_an_unchanged_block(worker_env, monkeypatch):
+    """M-4: the sleep loop polls in <=60s chunks, but re-labelling the SAME
+    ongoing block (e.g. a multi-hour bulk-reserve wait) every chunk must not
+    rewrite queue.json — only entering the sleep and eventually leaving it
+    are real transitions worth a save."""
+    calls, s = worker_env
+    writes = []
+    real_save_queue = appmod.store.save_queue
+
+    def spy_save_queue(payload):
+        writes.append(payload.get("state"))
+        real_save_queue(payload)
+    monkeypatch.setattr(appmod.store, "save_queue", spy_save_queue)
+
+    unblock = {"on": False}
+
+    def block_reason():
+        return None if unblock["on"] else ("reserve", time.time() + 0.3)
+    monkeypatch.setattr(appmod.sp, "bulk_block_reason", block_reason)
+
+    start_queue(s, pending=("p2",))
+    time.sleep(2.5)      # several ~1s-floored polling chunks, still blocked
+    assert writes.count("sleeping") == 1, writes   # one entry write, not one per chunk
+
+    unblock["on"] = True
+    appmod._queue_wake.set(); appmod._queue_wake.clear()
+    q = wait_done(s)
+    assert q["state"] == "done"
+    assert calls == [("create", "tiny"), ("add", "NEW-tiny", TINY[0])]
+    # "running" also gets written by the two ticks' own progress saves
+    # (legitimate — progress actually changes each tick), so this only pins
+    # the thing M-4 is actually about: the block itself was one write in,
+    # one write out, not one pair per 60s polling chunk.
+    assert writes.count("sleeping") == 1, writes
 
 
 def test_progress_snapshot_is_written_for_boxdash(worker_env):
