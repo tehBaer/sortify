@@ -6,6 +6,16 @@
 <title>sortify</title>
 <link rel="stylesheet" href="/static/style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='80' font-size='80'>&#127925;</text></svg>">
+<!-- Add-to-home-screen: standalone launch, matching status bar, real icon.
+     Deliberately no service worker — the app is nothing without its server,
+     and stale cached JS is the exact failure ?v= stamping guards against. -->
+<link rel="manifest" href="/static/manifest.webmanifest">
+<meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#121212" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
 </head>
 <body>
 <header>

@@ -124,6 +124,12 @@ kbd {
   background: var(--bg); border: 1px solid var(--border); border-bottom-width: 2px;
   border-radius: 4px; padding: 0 .35em; font-size: .75em;
 }
+/* Finger-first devices have no keyboard to hint at — the boxed 1/m/r glyphs
+   are dead space there. (An iPad with a keyboard attached still counts as
+   coarse and loses the hints; the shortcuts themselves keep working.) */
+@media (pointer: coarse) {
+  kbd { display: none; }
+}
 
 /* picker overlay */
 #picker {
