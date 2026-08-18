@@ -151,8 +151,12 @@ kbd {
   display: flex; align-items: center; gap: .65rem;
   padding: .5rem .6rem; border: 1px solid var(--border); border-radius: 10px;
   background: var(--card); margin-bottom: .5rem;
+  /* Two buttons per row now (save the pile, start a sitting) and both labels
+     carry a call count, so on a phone they wrap under the pile name rather
+     than squeezing it to nothing. */
+  flex-wrap: wrap;
 }
-.pile-row .pl-meta { flex: 1; min-width: 0; }
+.pile-row .pl-meta { flex: 1 1 12rem; min-width: 0; }
 .pile-row .name { font-weight: 600; }
 .pile-row .sub { color: var(--muted); font-size: .8rem; }
 .pile-row button { flex-shrink: 0; }

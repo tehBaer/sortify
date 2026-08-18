@@ -62,6 +62,14 @@ batch adds. So:
 - Materialising every pile as a real Spotify playlist would cost **~1384
   calls**: three days of `DAILY_CAP` (600), sustained at a rate matching the
   traffic that earned the ~23 h ban on 2026-08-13. **Rejected.**
+  - *(Added 2026-08-18.)* What is rejected there is materialising **every**
+    pile, as a step of the split. Materialising **one** pile, on an explicit
+    click, at a price the user read on the button first, is a different
+    proposition and now exists: `POST /api/split/{id}/materialise` costs
+    `len(unique uris) + 1` (310 for the largest real pile), refuses unless the
+    caller echoes that exact number back, and records every add as it lands so
+    a retry adds only what is missing. Nothing is materialised automatically,
+    and nothing is materialised as a side effect of splitting.
 
 ### Sortify cannot control playback
 
@@ -322,6 +330,8 @@ Undo for keeps uses the existing undo stack. Undo for rejects is a local
 | Tag ~700 artists | **0** (Last.fm) |
 | Cluster, and every re-cluster | **0** |
 | Per ~2 h sitting | ~24 |
+| Save one pile as a permanent playlist (opt-in, confirmed) | len(uris) + 1 |
+| ...resuming an interrupted save | one per missing track |
 | Per keep | 1 |
 | Per reject | 0 |
 

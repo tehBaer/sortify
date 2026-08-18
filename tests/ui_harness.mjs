@@ -80,7 +80,9 @@ function key(path, opts) { return `${opts?.method || "GET"} ${path}`; }
 
 async function fetchStub(path, opts) {
   const k = key(path, opts);
-  log.push({ method: opts?.method || "GET", path });
+  // The body is logged too: the materialise checks are about *which number*
+  // the client sends back, which a method+path log cannot see.
+  log.push({ method: opts?.method || "GET", path, body: opts?.body });
   let r = routes[k];
   if (typeof r === "function") r = r();
   r = await r;
@@ -114,9 +116,15 @@ function check(name, pass, detail) {
   console.log(`${pass ? "PASS" : "FAIL"}  ${name}${detail ? "  — " + detail : ""}`);
 }
 
+// Shaped like what _pile_progress actually sends, materialise fields
+// included: the client never computes a call cost, so a pile row without
+// `materialise_calls` renders its Save button disabled — which would make the
+// "no disabled buttons" assertions below pass or fail for the wrong reason.
 const PILES = [
-  { id: "p1", name: "one", tags: ["a"], uris: ["u1", "u2"], decided: 0, total: 2 },
-  { id: "p2", name: "two", tags: ["b"], uris: ["u3"], decided: 0, total: 1 },
+  { id: "p1", name: "one", tags: ["a"], uris: ["u1", "u2"], decided: 0, total: 2,
+    materialise_calls: 3, materialised: null },
+  { id: "p2", name: "two", tags: ["b"], uris: ["u3"], decided: 0, total: 1,
+    materialise_calls: 2, materialised: null },
 ];
 const splitBody = (active) => ({
   piles: PILES, decided: {}, active_sitting: active,
@@ -409,6 +417,99 @@ run("stopNowPolling()");
   const owned = run(`splitDisabledReason({ editable: true })`);
   check("O1 an owned playlist gets no disabled reason",
         owned === null, JSON.stringify(owned));
+}
+
+// ============================================================================
+// M — saving a pile as a permanent playlist. The price must be on the button
+// before the click, and it must be the server's number, echoed back
+// unchanged: that echo is the only thing standing between a misclick on the
+// 309-track pile and 310 silent Spotify calls.
+// ============================================================================
+{
+  routes["GET /api/split/PL8"] = {
+    status: 200,
+    body: {
+      ...splitBody(null),
+      piles: [
+        { id: "p1", name: "fresh", tags: [], uris: ["u1", "u2"], decided: 0, total: 2,
+          materialise_calls: 3, materialised: null },
+        { id: "p2", name: "half done", tags: [], uris: ["u3", "u4", "u5"], decided: 0, total: 3,
+          materialise_calls: 2, materialised: { playlist_id: "SAVED2", added: 1, name: "half done", stale: false } },
+        { id: "p3", name: "complete", tags: [], uris: ["u6"], decided: 0, total: 1,
+          materialise_calls: 0, materialised: { playlist_id: "SAVED3", added: 1, name: "complete", stale: false } },
+        { id: "p4", name: "changed", tags: [], uris: ["u7"], decided: 0, total: 1,
+          materialise_calls: 2, materialised: { playlist_id: "SAVED4", added: 1, name: "old", stale: true } },
+      ],
+    },
+  };
+  run(`openSplit("PL8", "PL8")`);
+  await tick();
+  const rows = $$("piles").children.map((c) => c.innerHTML);
+
+  check("M the price is on the button before the click",
+        /Save as playlist \(3 calls\)/.test(rows[0]), rows[0].slice(-120));
+  check("M a partly-saved pile offers to resume at the price of what's left",
+        /Resume saving \(2 calls\)/.test(rows[1]) && /1 of 3 saved so far/.test(rows[1]),
+        rows[1].slice(-160));
+  check("M a finished pile is not clickable and says so",
+        /Saved as a playlist/.test(rows[2]) && /<button[^>]*disabled[^>]*>Saved as a playlist/.test(rows[2]),
+        rows[2].slice(-140));
+  check("M a re-clustered pile is offered as a NEW playlist, at full price",
+        /Save as a new playlist \(2 calls\)/.test(rows[3]) && /pile has changed/.test(rows[3]),
+        rows[3].slice(-180));
+  check("M the tooltip states the wait, not just the price",
+        /one per track/.test(rows[0]) && /min at sortify/.test(rows[0]), "");
+
+  // The click: exactly one POST, carrying exactly the number that was shown.
+  let release;
+  const pending = new Promise((r) => (release = r));
+  routes["POST /api/split/PL8/materialise"] = () => pending;
+  resetLog();
+  run(`materialisePile("p1", 3, null)`);
+  run(`materialisePile("p1", 3, null)`);      // second click, first in flight
+  await tick();
+  check("M two clicks issue exactly one paid POST",
+        posts("/api/split/PL8/materialise") === 1,
+        `${posts("/api/split/PL8/materialise")} POST(s)`);
+  const sent = JSON.parse(log.find((c) => c.method === "POST").body);
+  check("M the POST echoes the displayed cost back to the server",
+        sent.expected_calls === 3 && sent.pile_id === "p1", JSON.stringify(sent));
+
+  release({ status: 200, body: { ok: true, playlist_id: "NEW8", added: 2, total: 2, calls_spent: 3, complete: true } });
+  await tick();
+  check("M the toast reports what was actually spent",
+        /3 Spotify calls spent/.test($$("toast").textContent),
+        JSON.stringify($$("toast").textContent.slice(0, 80)));
+  check("M success triggers the free re-read so the row shows what landed",
+        gets("/api/split/PL8") === 1, `${gets("/api/split/PL8")} GET(s)`);
+
+  // A refusal (the cost guard fired) must re-read too — the row that produced
+  // the stale number is exactly what needs replacing.
+  routes["POST /api/split/PL8/materialise"] = {
+    status: 409, body: { detail: "cost has changed: saving this pile now spends 2 Spotify calls" } };
+  resetLog();
+  run(`materialisePile("p1", 3, null)`);
+  await tick();
+  check("M a refused save says why and re-reads the split for free",
+        /cost has changed/.test($$("toast").textContent) && gets("/api/split/PL8") === 1,
+        `${gets("/api/split/PL8")} GET(s)`);
+
+  // A server that sends no cost must not be guessed at.
+  routes["GET /api/split/PL9"] = {
+    status: 200,
+    body: { ...splitBody(null), piles: [{ id: "p1", name: "n", tags: [], uris: ["u1"], decided: 0, total: 1 }] },
+  };
+  run(`openSplit("PL9", "PL9")`);
+  await tick();
+  resetLog();
+  const row = $$("piles").children[0].innerHTML;
+  check("M an unpriced pile is offered as un-clickable rather than guessed at",
+        /<button[^>]*disabled[^>]*>Save as playlist</.test(row), row.slice(-120));
+  run(`materialisePile("p1", null, null)`);
+  await tick();
+  check("M and calling it with no price spends nothing",
+        posts("/api/split/PL9/materialise") === 0,
+        `${posts("/api/split/PL9/materialise")} POST(s)`);
 }
 
 // ---- summary ---------------------------------------------------------------
