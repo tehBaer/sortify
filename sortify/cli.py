@@ -21,7 +21,7 @@ import json
 import sys
 import time
 
-from .spotify import BACKGROUND_DAILY_CAP, DAILY_CAP, Spotify, SpotifyError
+from .spotify import BACKGROUND_DAILY_CAP, BULK_RESERVE, DAILY_CAP, Spotify, SpotifyError
 from .store import Store
 
 # Dev traffic stops here, leaving the rest of DAILY_CAP for real use. Scaled
@@ -43,6 +43,10 @@ def main() -> None:
         quiet = max(0.0, sp.quiet_until() - time.time())
         print(f"today: {spent}/{DAILY_CAP} calls spent · dev ceiling {DEV_CAP}")
         print(f"  of which background: {sp.background_spent()}/{BACKGROUND_DAILY_CAP}")
+        # Print-only (M-1): the queued materialiser's bulk bucket, for
+        # visibility while it's running. DEV_CAP gating above is untouched —
+        # spx's own dev traffic never counts as bulk.
+        print(f"  of which bulk: {sp.bulk_spent()} (interactive reserve: last {BULK_RESERVE}/day)")
         print("cooldown: none" if cd == 0 else f"cooldown: {int(cd / 60)} min left")
         if cd == 0 and quiet > 0:
             print(f"background quiet period: {int(quiet / 60)} min left")
