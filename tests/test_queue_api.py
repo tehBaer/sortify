@@ -16,8 +16,14 @@ exited worker starts a fresh thread), M1 (resume's check+write are atomic and
 preserve stop_reason), M2 (cancel doesn't erase what already landed), M3
 (pile_ids=[] is refused, not treated as "all"), M4/R-T9c (pause/resume/cancel
 require the matching playlist_id; GET stays global).
+
+Fix round 2 added: a deterministic regression test for `_worker_may_stop`
+itself (distilling round 1's stress repro), and made test_enqueue_is_free
+structural instead of timing-based by gating the worker's first action on an
+Event instead of racing a check against real thread scheduling.
 """
 
+import inspect
 import threading
 import time
 
@@ -102,26 +108,38 @@ def test_enqueue_orders_smallest_first_and_starts_the_worker(client):
 
 def test_enqueue_is_free(client, monkeypatch):
     """The click costs 0: pricing comes from _materialise_plan (local), and
-    the response returns before the worker's first tick can land.
+    the response returns before the worker can spend anything.
 
     C1 fix (review round 1): the original mock blocked WITHOUT recording, so
     the `client.calls == []` assertion below passed trivially even for a
     mutant where enqueue itself spent a call before returning — there was
-    nothing that a synchronous spend could have appended to. This version
-    records first, so a call landing before the response would show up.
+    nothing that a synchronous spend could have appended to. A later version
+    recorded before blocking inside `create_playlist`, which caught that
+    mutation but still relied on the worker thread not yet having reached
+    that call by the time this test checked — true in practice (GIL,
+    minimal work in between) but not structurally guaranteed.
+
+    Minor 3 (review round 2): remove the timing dependency entirely by
+    gating the worker's very first action inside `_drain_queue_body`
+    (`Governor.note_interruption()`, called immediately after construction,
+    before anything Spotify-related) on an Event this test holds closed.
+    The worker literally cannot get past that point until the gate opens,
+    so `client.calls == []` is deterministic, not merely likely — while
+    still catching the same C1 mutation (a synchronous spend inside
+    `enqueue_piles` itself happens before this gate is ever reached).
     """
-    hold = threading.Event()
+    gate = threading.Event()
+    original_note_interruption = pacing.Governor.note_interruption
 
-    def blocking_create(name, description="", bulk=False):
-        client.calls.append(("create", name))
-        hold.wait(5)
-        return "NEWP"
+    def gated_note_interruption(self):
+        gate.wait(5)
+        return original_note_interruption(self)
 
-    monkeypatch.setattr(appmod.sp, "create_playlist", blocking_create)
+    monkeypatch.setattr(pacing.Governor, "note_interruption", gated_note_interruption)
     r = client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 6})
     assert r.status_code == 200
     assert client.calls == []
-    hold.set()
+    gate.set()
 
 
 def test_second_enqueue_while_active_is_refused(client, monkeypatch):
@@ -280,10 +298,16 @@ def test_resume_after_a_full_exit_starts_a_fresh_worker(client, monkeypatch):
     """I4 (review round 1): once the old worker has genuinely, fully exited
     (joined), resume must start a NEW thread and drain to completion — this
     pins the structural half of the fix (the worker clears _queue_worker to
-    None, under _queue_lock, as its own last act). The narrower race — a
-    resume landing in the split second between the old worker's decision to
-    stop and that cleanup — is not deterministically reproducible in a test
-    and the review accepted that; this pins the guaranteed behaviour."""
+    None, under _queue_lock, as its own last act).
+
+    The narrower race this test doesn't cover — a resume landing in the
+    split second between the old worker's DECISION to stop and that
+    cleanup — turned out to be common rather than rare (measured ~1 run in
+    5 for a plain pause-then-resume) and was closed by `_worker_may_stop`
+    (review round 1's own follow-up); see
+    `test_worker_may_stop_keeps_the_same_worker_running_when_a_resume_races_in`
+    below for a deterministic test of THAT mechanism specifically.
+    """
     speed = {"v": 30.0}
     monkeypatch.setattr(pacing.Governor, "interval", lambda self: speed["v"])
     client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 6})
@@ -298,6 +322,93 @@ def test_resume_after_a_full_exit_starts_a_fresh_worker(client, monkeypatch):
     new_worker = appmod._queue_worker
     assert new_worker is not None and new_worker is not old_worker
     assert wait_done(Store())["state"] == "done"
+
+
+def test_worker_may_stop_keeps_the_same_worker_running_when_a_resume_races_in(client, monkeypatch):
+    """Review round 2, finding 2: `_worker_may_stop` is the load-bearing
+    single-writer invariant behind I4's fix, and had zero DETERMINISTIC
+    committed coverage — only the 150-iteration stress repro described in
+    the round-1 fix report, which wasn't itself committed. This distills
+    that repro's mechanism into a single deterministic run.
+
+    Forces the exact interleaving the fix protects: `_queue_next_action`
+    reads "paused" and decides to stop; before `_worker_may_stop`'s own,
+    LATER, separate read of queue.json, a resume's forced write lands —
+    performed here through the exact same `_apply_queue_state(..., force=
+    True, keep_stop_reason=True)` call `resume_queue` itself makes, so the
+    write is byte-for-byte what a real resume produces. No second thread is
+    ever started (`_start_queue_worker` is stubbed to record, not act) —
+    the SAME worker must simply keep going and drain the queue, exactly as
+    `_worker_may_stop` returning False (instead of exiting) makes it do.
+
+    Two timing pitfalls found (and fixed) while building this deterministic
+    version, both worth naming since they're easy to reintroduce:
+
+    1. Writing "paused" WITHOUT `_queue_lock` races the worker's own
+       lock-protected progress write and can be silently clobbered back to
+       "running" — production's `pause_queue` always writes under the lock;
+       this test now does too.
+    2. `inspect.stack()[1].function == "_worker_may_stop"` targets the
+       exact call site regardless of how many OTHER "paused" reads happen
+       first (the pile_count_at_enqueue check, `_queue_next_action`'s own
+       read) — a plain "Nth paused read" counter is fragile to reorderings
+       and was flaky in practice.
+    """
+    # Force the interval large first (ruling P1) — otherwise a 6-call drain
+    # with fake, non-blocking Spotify calls can finish before this test even
+    # gets to writing "paused" below. Dropped back to 0 only AFTER the race
+    # has actually landed (never based on a timing guess), so the resumed
+    # continuation still drains in milliseconds.
+    speed = {"v": 30.0}
+    monkeypatch.setattr(pacing.Governor, "interval", lambda self: speed["v"])
+    r = client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 6})
+    assert r.status_code == 200
+
+    # Let the first tick land for real (same pattern as
+    # test_cancel_clears_pending_but_keeps_records and test_queue_worker.py's
+    # test_pause_is_instant_and_the_thread_exits) so the worker is reliably
+    # parked in its post-tick governor wait, not mid-startup.
+    deadline = time.time() + 5
+    while time.time() < deadline and not client.calls:
+        time.sleep(0.01)
+    assert client.calls
+
+    # Pause "for real" — under _queue_lock, same as pause_queue itself —
+    # so the worker's next _queue_next_action() sees a terminal state and
+    # decides to stop.
+    s = Store()
+    with appmod._queue_lock:
+        q = s.queue(); q["state"] = "paused"; s.save_queue(q)
+
+    spawned = []
+    monkeypatch.setattr(appmod, "_start_queue_worker", lambda: spawned.append(1))
+
+    real_queue = appmod.store.queue
+    state = {"raced": False}
+
+    def racing_queue():
+        result = real_queue()
+        if (not state["raced"] and result.get("state") == "paused"
+                and inspect.stack()[1].function == "_worker_may_stop"):
+            state["raced"] = True
+            fresh = real_queue()
+            appmod._apply_queue_state(fresh, "running", None,
+                                      force=True, keep_stop_reason=True)
+            return real_queue()
+        return result
+
+    monkeypatch.setattr(appmod.store, "queue", racing_queue)
+    appmod._queue_wake.set()                # what the pause endpoint would do
+
+    deadline = time.time() + 5
+    while time.time() < deadline and not state["raced"]:
+        time.sleep(0.001)
+    assert state["raced"], "the race never actually happened — test isn't exercising anything"
+    speed["v"] = 0.0                        # now safe: the race has already landed
+
+    q_final = wait_done(Store())
+    assert q_final["state"] == "done"
+    assert spawned == [], "a second worker was started — _worker_may_stop lost the race"
 
 
 def test_restart_shows_a_running_file_as_paused_and_starts_nothing(client):

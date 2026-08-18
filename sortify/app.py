@@ -1404,7 +1404,7 @@ def _queue_next_action(now: float) -> tuple:
     current/pending as piles finish (free, local)."""
     with _queue_lock:
         q = store.queue()
-        if q["state"] in ("paused", "stopped", "done"):
+        if q["state"] in _QUEUE_TERMINAL:
             return ("stop", q["state"])
         block = sp.bulk_block_reason()
         if block:
@@ -1503,8 +1503,17 @@ def _drain_queue_body() -> None:
     if not _set_queue_state("running"):
         if _worker_may_stop():
             return                            # paused/cancelled before this thread even ran
-        # else: a resume raced in first (I4) — state is running again, fall
-        # through into the loop below exactly as if this check had passed.
+        # Minor 1 (review round 2): a resume raced in first (I4) — state is
+        # running again, but our OWN guarded write above never landed, so a
+        # stop_reason `keep_stop_reason=True` preserved (e.g. "quota") would
+        # otherwise linger under state "running" forever. The M1 docstring
+        # promise is that the worker's own unconditional "running"
+        # transition clears it — this IS that transition, it just needed a
+        # second attempt now that the guard is known to pass (state is
+        # already resumable, so this plain call cannot be refused by
+        # anything except a fresh pause/cancel landing in the next instant,
+        # which is exactly the state that call would then correctly record).
+        _set_queue_state("running")
     while True:
         action = _queue_next_action(time.time())
         if action[0] == "stop":
@@ -1555,7 +1564,15 @@ def _drain_queue_body() -> None:
                     # Permanent: request() already published note_cooldown to
                     # the account ledger; resuming is a human's call (spec §2).
                     _set_queue_state("stopped", stop_reason="quota")
-                    return
+                    if _worker_may_stop():
+                        return
+                    # A resume raced in first (I4/round 2) — that's a
+                    # legitimate human action even right after a quota trip
+                    # (binding note: resume IS the human-only unblock here).
+                    # Keep going: the very next _queue_next_action() call
+                    # hits bulk_block_reason() and sleeps through the still-
+                    # active cooldown, so nothing actually spends early.
+                    continue
                 continue                     # rate: cooldown sleep happens above
             # No fresh 429 to pin this on. Some raises never touch last_429
             # at all — the pre-flight cooldown check and the bulk-reserve
@@ -1570,7 +1587,9 @@ def _drain_queue_body() -> None:
             # spending and surface the reason rather than grind a broken loop.
             log.error("queue worker paused by error: %s", e)
             _set_queue_state("paused", stop_reason=str(e))
-            return
+            if _worker_may_stop():
+                return
+            continue                          # a resume raced in first (I4/round 2) — retry the tick
         info = sp.last_429 or {}
         fresh = info.get("ts", 0) >= tick_started
         if fresh:
@@ -1588,7 +1607,9 @@ def _drain_queue_body() -> None:
             # Mirror the except-branch handling exactly (C3) — a quota trip
             # must stop the worker no matter which path noticed it.
             _set_queue_state("stopped", stop_reason="quota")
-            return
+            if _worker_may_stop():
+                return
+            continue                          # a resume raced in first (I4/round 2) — see the except branch above
         with _queue_lock:
             q = store.queue()
             q["progress"] = _queue_progress(q)
@@ -1627,7 +1648,7 @@ def _effective_queue() -> dict:
     "running" while no worker thread is alive is a restart's leftover —
     paused, resumable, and starting nothing by itself."""
     q = store.queue()
-    if q["state"] in ("running", "sleeping", "quiet") and not (
+    if q["state"] in _QUEUE_RESUMABLE and not (
             _queue_worker and _queue_worker.is_alive()):
         q["state"] = "paused"
     return q
@@ -1671,9 +1692,13 @@ def enqueue_piles(playlist_id: str, body: QueueIn):
         # old check only looked at "running"/"sleeping"/"quiet" and let a
         # second enqueue silently clobber a paused run's `pending`.
         if q.get("pending") or q.get("current"):
+            # Minor 2 (review round 2): name the OWNING playlist — a user on
+            # playlist B's page hitting this needs to know where to go to
+            # cancel, not just that "a queue" exists somewhere.
             raise HTTPException(
-                409, "a queue already has piles pending or in progress — "
-                     "pause or cancel it first")
+                409, f"a queue for {q.get('playlist_id')!r} already has "
+                     "piles pending or in progress — pause or cancel it "
+                     "first")
         store.save_queue({"version": 1, "playlist_id": playlist_id,
                           "pending": order, "current": None, "state": "running",
                           "stop_reason": None, "progress": {},
