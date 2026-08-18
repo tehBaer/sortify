@@ -20,13 +20,21 @@ from collections import Counter
 
 from .tags import clean_tags
 
-# A pure tag match can reach TAG_WEIGHT * ARTIST_TAG_DILUTION = 2.0; a single
-# artist match starts at 3.4, so "right artist" beats "similar tags" unless
-# the tag fit is perfect. Placeholders until Task 3 measures real weights.
+# Measured by scripts/eval_suggest.py (hold-one-out; task-3-report.md has the
+# full 16-cell grid): --n 500 --seed 7, 2026-08-18 ->
+#   artist-only baseline (TAG_WEIGHT=0): top1 0.320 top3 0.462
+#   winner TAG_WEIGHT=3.0 ARTIST_TAG_DILUTION=1.0: top1 0.326 top3 0.468
+# The grid's true optimum ties several cells at top3=0.468; 3.0/1.0 is the
+# smallest TAG_WEIGHT among the tied winners. Re-verified against
+# test_artist_overlap_still_outranks_a_perfect_tag_match with these values
+# (no cap needed, it still passes): a pure tag match now reaches
+# TAG_WEIGHT * ARTIST_TAG_DILUTION = 3.0, a single artist match still starts
+# at ARTIST_BASE + ARTIST_PER_TRACK = 3.4, so "right artist" still beats
+# "similar tags" unless the tag fit is perfect.
 ARTIST_BASE = 3.0
 ARTIST_PER_TRACK = 0.4
-TAG_WEIGHT = 4.0
-ARTIST_TAG_DILUTION = 0.5
+TAG_WEIGHT = 3.0
+ARTIST_TAG_DILUTION = 1.0
 MIN_SCORE = 0.8
 TOP_N = 3
 

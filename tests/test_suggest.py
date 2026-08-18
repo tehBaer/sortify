@@ -128,6 +128,30 @@ def test_missing_or_miss_artists_contribute_nothing():
     assert tt == Counter()
 
 
+def test_removing_track_from_profile_changes_its_score():
+    # Regression pin for the eval harness (Task 3): if hold-one-out did
+    # nothing, a track's score against its own home would be identical
+    # whether or not it was left in the profile used to rank it, and the
+    # harness would silently report a trivially-perfect accuracy.
+    dreamy_tracks = [
+        track("spotify:track:d1", ["beach-house"]),
+        track("spotify:track:d2", ["beach-house"]),
+        track("spotify:track:d3", ["slowdive"]),
+    ]
+    held = track("spotify:track:d1", ["beach-house"])
+
+    with_held = build_profile(dreamy_tracks, ARTISTS)
+    without_held = build_profile([t for t in dreamy_tracks if t["uri"] != held["uri"]], ARTISTS)
+
+    score_with = suggest(held, {"dreamy": with_held}, ARTISTS)[0]["score"]
+    without_results = suggest(held, {"dreamy": without_held}, ARTISTS)
+    score_without = without_results[0]["score"] if without_results else 0.0
+
+    assert score_with != score_without
+    # And "already" must not fire once the held-out track is actually removed.
+    assert without_results and without_results[0]["already"] is False
+
+
 def test_dilution_applied(monkeypatch):
     home_track = {"uri": "h1", "artists": [{"id": "h", "name": "H"}]}
     ta = {
