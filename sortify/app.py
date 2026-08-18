@@ -250,7 +250,7 @@ def _known_artists() -> dict[str, dict]:
 
     Every entry has empty genres and always will: the Feb-2026 dev-mode API
     dropped the `genres` field from /artists/{id}. suggest.py's tag signal
-    comes from Last.fm (`_tag_artists_checked`) instead; this is kept for
+    comes from Last.fm (`store.tag_artists()`) instead; this is kept for
     other, non-scoring uses of the cached Spotify artist data.
     """
     return store.cache()["artists"]
@@ -295,7 +295,12 @@ def _ensure_profiles_locked(force: bool) -> dict:
     home_tracks = {}
     for h in homes:
         home_tracks[h["id"]] = _cached_tracks(h["id"], h["snapshot_id"])
-    tag_artists = _tag_artists_checked()
+    # Guard-on-read, not fail-hard: a bad tags.json shape must degrade
+    # suggestions to artist-overlap-only, not break profile building (and
+    # therefore /api/now, a polling endpoint) on every rebuild. The
+    # actionable 400 belongs only to the user-initiated split flow
+    # (`_tag_artists_checked`).
+    tag_artists = store.tag_artists()
     profiles = {h["id"]: sugg.build_profile(home_tracks[h["id"]], tag_artists) for h in homes}
 
     # Input contents too, so the capture chips can show membership.
@@ -355,7 +360,10 @@ def triage(playlist_id: str):
         raise HTTPException(404, "unknown playlist")
 
     input_tracks = _cached_tracks(playlist_id, by_id.get(playlist_id, {}).get("snapshot_id"))
-    tag_artists = _tag_artists_checked()
+    # Guard-on-read (see _ensure_profiles_locked) — triage must stay usable
+    # even with a stale/bad-version tags.json; the split flow is where that
+    # fails loud.
+    tag_artists = store.tag_artists()
     state["tag_artists"] = tag_artists
 
     tracks_out = []

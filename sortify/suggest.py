@@ -37,11 +37,22 @@ def _cleaned_tags(entry: dict) -> list[str]:
     Shared by the profile side and the track side so they can't drift.
     Missing artists and recorded Last.fm misses both yield no tags. Last.fm's
     weights are ignored here, same as today's genre counts — just presence
-    per artist.
+    per artist. Uses `clean_tags`' own defaults (floor 10, keep 8) rather than
+    a split's tuned params, so a split run with retuned hygiene intentionally
+    diverges from what suggestions see.
+
+    Guard-on-read: this is the suggestion path, not the user-triggered split,
+    so a malformed or wrong-version entry (e.g. a stale v1-shaped record)
+    degrades to "no tags" rather than raising — suggestions fall back to
+    artist-overlap-only instead of breaking whatever endpoint called this
+    (`/api/now` polls it every `PROFILE_TTL`).
     """
-    if not entry or entry.get("miss"):
+    if not isinstance(entry, dict) or entry.get("miss"):
         return []
-    cleaned = clean_tags(entry.get("tags", []), entry.get("name") or "")
+    try:
+        cleaned = clean_tags(entry.get("tags", []), entry.get("name") or "")
+    except (AttributeError, TypeError):
+        return []
     return [t for t, _w in cleaned]
 
 

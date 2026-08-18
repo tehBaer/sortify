@@ -152,6 +152,72 @@ def test_now_reports_no_sitting_for_an_ordinary_playlist(splits_store, now_clien
     assert resp["sitting"] is None
 
 
+# ---- suggestions survive a bad tags.json -----------------------------------
+
+NOW_TAGS_LISTING = [
+    {"id": "home1", "name": "Home One", "owner": "me", "editable": True,
+     "total": 1, "snapshot_id": "snap-home1", "image": None},
+]
+
+
+def test_now_survives_a_wrong_version_tags_json(monkeypatch):
+    """A stale/mismatched tags.json must degrade suggestions to
+    artist-overlap-only, not break /api/now — a polling endpoint hit every
+    PROFILE_TTL, unlike the user-triggered split flow where the same
+    mismatch should fail loud (`_tag_artists_checked`). This simulates the
+    historical v1 shape (tags stored as plain strings, not
+    `{"name", "count"}` dicts) that used to crash `clean_tags` deep inside
+    `split_tracks`; `suggest._cleaned_tags` must swallow it instead."""
+    s = Store()
+    original_cache, original_config, original_tags = s.cache(), s.config(), s.tags()
+
+    cache = s.cache()
+    cache["playlist_list"] = {"fetched_at": 0.0, "items": NOW_TAGS_LISTING}
+    cache["playlists"]["home1"] = {
+        "snapshot_id": "snap-home1",
+        "tracks": [{"uri": "spotify:track:h1", "type": "track", "is_local": False,
+                    "id": "h1", "artists": [{"id": "a1", "name": "Artist One"}]}],
+        "fetched_at": 0.0,
+    }
+    s.save_cache(cache)
+    s.save_config({**original_config, "input_ids": [], "home_ids": []})
+    s.save_tags({"version": 1, "artists": {
+        "a1": {"name": "Artist One", "tags": ["dream pop", "seen live"], "miss": False},
+    }})
+    appmod._profile_state.clear()
+    appmod._profile_state["built_at"] = 0.0
+
+    # Same singleton-leak defence as test_now_polling.py's route_client: an
+    # earlier test's monkeypatch.setattr on this module-level `sp` can leave
+    # a stand-in behind even after its own teardown.
+    for name in ("currently_playing", "my_playlists", "playlist_tracks"):
+        if name in vars(appmod.sp):
+            monkeypatch.delattr(appmod.sp, name)
+
+    new_track = {"uri": "spotify:track:new", "type": "track", "is_local": False,
+                 "id": "new", "artists": [{"id": "a1", "name": "Artist One"}]}
+    monkeypatch.setattr(appmod.sp, "currently_playing", lambda: {
+        "track": new_track, "is_playing": True, "progress_ms": 1000,
+        "context_playlist_id": None,
+    })
+    appmod._now_cache.update(at=0.0, value=None, ttl=appmod.NOW_TTL_IDLE)
+
+    try:
+        resp = appmod.now_playing()
+    finally:
+        s.save_cache(original_cache)
+        s.save_config(original_config)
+        s.save_tags(original_tags)
+        appmod._profile_state.clear()
+        appmod._profile_state["built_at"] = 0.0
+
+    assert resp["playing"] is True
+    suggestions = resp["suggestions"]
+    assert suggestions and suggestions[0]["playlist_id"] == "home1"
+    assert all("artist tags:" not in r for r in suggestions[0]["reasons"])
+    assert any("Artist One" in r for r in suggestions[0]["reasons"])
+
+
 def test_playlists_endpoint_carries_the_split_summary(splits_store, monkeypatch):
     Store().save_splits(
         _splits_payload(decided={"spotify:track:a": {"action": "reject", "at": "t"}}))
