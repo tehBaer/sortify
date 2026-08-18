@@ -127,3 +127,31 @@ class Store:
 
     def save_splits(self, payload: dict) -> None:
         self._save("splits.json", payload)
+
+    # queue.json / pacing.json: the queued materialiser's persisted state.
+    # boxdash reads BOTH files directly (its house pattern), so their shape is
+    # a published contract: versioned envelopes, guard-on-read like tags.json,
+    # written atomically (0600 via mkstemp) so a half-written file is never
+    # visible and the card keeps working while sortify is down.
+    QUEUE_DEFAULT = {"version": 1, "playlist_id": None, "pending": [],
+                     "current": None, "state": "stopped", "stop_reason": None,
+                     "progress": {}, "enqueued_at": None, "updated_at": None}
+    PACING_DEFAULT = {"version": 1, "rate_per_min": 1.8, "ceiling": 7.0,
+                      "clean_since": None, "max_clean_rate": None,
+                      "history_429": [], "updated_at": None}
+
+    def _versioned(self, name: str, default: dict) -> dict:
+        data = self._load(name, dict(default))
+        return data if isinstance(data, dict) and data.get("version") == default["version"] else dict(default)
+
+    def queue(self) -> dict:
+        return self._versioned("queue.json", self.QUEUE_DEFAULT)
+
+    def save_queue(self, payload: dict) -> None:
+        self._save("queue.json", payload)
+
+    def pacing(self) -> dict:
+        return self._versioned("pacing.json", self.PACING_DEFAULT)
+
+    def save_pacing(self, payload: dict) -> None:
+        self._save("pacing.json", payload)
