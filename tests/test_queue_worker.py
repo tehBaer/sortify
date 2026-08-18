@@ -9,7 +9,7 @@ import pytest
 
 import sortify.app as appmod
 import sortify.pacing as pacing
-from sortify.spotify import Spotify, SpotifyError
+from sortify.spotify import QUIET_AFTER_COOLDOWN, Spotify, SpotifyError
 from sortify.store import Store
 
 PILE_URIS = [f"spotify:track:m{i}" for i in range(3)]
@@ -38,19 +38,25 @@ def worker_env(monkeypatch):
         "decided": {}, "active_sitting": None}}})
     yield calls, s
     appmod._queue_wake.set()
-    if appmod._queue_worker:
-        appmod._queue_worker.join(timeout=5)
-        assert not appmod._queue_worker.is_alive(), "worker thread leaked past teardown"
+    worker = appmod._queue_worker
+    if worker:
+        worker.join(timeout=5)
     appmod._queue_worker = None
     appmod._queue_wake.clear()
+    # Minor 2 (fix round 2): restore the shared data dir BEFORE asserting on
+    # the join below — a failed/hung-thread assertion must not skip these
+    # and leave splits/queue/pacing poisoned for whatever test runs next.
     s.save_splits(originals["splits"])
     s.save_queue(originals["queue"])
     s.save_pacing(originals["pacing"])
-    # last_429/cooldown_until are mutated by raw assignment in some tests
-    # below (they model what spotify.py's request() would have set) rather
-    # than through a Spotify call, so they need their own restore (I5).
+    # last_429/cooldown_until are mutated by plain assignment in some tests
+    # below (they model what spotify.py's request() would have set, from
+    # the worker thread itself — see minor 3) rather than through a real
+    # Spotify call or monkeypatch, so they need their own restore (I5).
     appmod.sp.last_429 = last_429_original
     appmod.sp.cooldown_until = cooldown_original
+    if worker:
+        assert not worker.is_alive(), "worker thread leaked past teardown"
 
 
 def start_queue(s, pending=("p2", "p1")):
@@ -124,8 +130,12 @@ def test_quota_trip_stops_permanently_with_reason(worker_env, monkeypatch):
 
     def quota_create(name, description="", bulk=False):
         invocations["n"] += 1
-        monkeypatch.setattr(appmod.sp, "last_429",
-                            {"ts": time.monotonic(), "kind": "quota", "retry_after": 86400})
+        # Minor 3 (fix round 2): this closure runs ON THE WORKER THREAD
+        # (invoked from _materialise_tick inside _drain_queue), so it uses
+        # plain assignment rather than monkeypatch.setattr — pytest's
+        # monkeypatch undo list is not documented thread-safe. worker_env's
+        # fixture captures/restores appmod.sp.last_429 for exactly this.
+        appmod.sp.last_429 = {"ts": time.monotonic(), "kind": "quota", "retry_after": 86400}
         raise SpotifyError(429, "Spotify daily quota spent — cooldown ~23h.")
     monkeypatch.setattr(appmod.sp, "create_playlist", quota_create)
     start_queue(s, pending=("p2",))
@@ -137,10 +147,15 @@ def test_quota_trip_stops_permanently_with_reason(worker_env, monkeypatch):
 
 
 def test_rate_429_halves_and_keeps_going(worker_env, monkeypatch):
-    # I4: exercise the REAL bulk_block_reason() path rather than the
-    # fixture's always-allow stub — a rate 429 must drive the worker's own
-    # cooldown bookkeeping (cooldown_until) and it, in turn, must put the
-    # worker into "sleeping" before the next tick.
+    # I4 + R-T8f (fix round 2): exercise the REAL bulk_block_reason() path
+    # and ride through the actual production sequence a rate 429 causes —
+    # a "sleeping" cooldown, THEN the 6h "quiet" period that follows it —
+    # instead of the round-1 sleight of hand (cooldown_until = 0.0, which
+    # never let the worker see "quiet" at all). The quiet period is
+    # time-skipped rather than disabled: once "quiet" is observed, the
+    # remembered cooldown is pushed far enough into the past that the real
+    # bulk_block_reason() genuinely computes "quiet has elapsed", the same
+    # arithmetic a real 6-hour wait would produce.
     monkeypatch.setattr(appmod.sp, "bulk_block_reason", Spotify.bulk_block_reason.__get__(appmod.sp))
     calls, s = worker_env
     first = {"burned": False}
@@ -148,34 +163,48 @@ def test_rate_429_halves_and_keeps_going(worker_env, monkeypatch):
     def flaky_add(pid, uri, bulk=False):
         if not first["burned"]:
             first["burned"] = True
-            monkeypatch.setattr(appmod.sp, "last_429",
-                                {"ts": time.monotonic(), "kind": "rate", "retry_after": 1})
+            # Minor 3 (fix round 2): this closure runs ON THE WORKER THREAD
+            # (invoked from _materialise_tick inside _drain_queue), so it
+            # uses plain assignment rather than monkeypatch.setattr —
+            # pytest's monkeypatch undo list is not documented thread-safe.
+            # worker_env's fixture captures/restores both attributes.
+            appmod.sp.last_429 = {"ts": time.monotonic(), "kind": "rate", "retry_after": 1}
             # Mirrors what spotify.py's request() sets on a real rate 429 —
             # flaky_add stands in for add_to_playlist entirely, bypassing
-            # request()'s own cooldown bookkeeping, so this test sets it by
-            # hand to keep bulk_block_reason() honest that there is a real
-            # cooldown to sleep through (60s: comfortably past the 1s floor
-            # `_queue_next_action` applies, so the sleep is observable).
-            monkeypatch.setattr(appmod.sp, "cooldown_until", time.time() + 60)
+            # request()'s own cooldown bookkeeping. Short but real: long
+            # enough to be reliably observed as "sleeping", short enough
+            # that this test doesn't wait around for it.
+            appmod.sp.cooldown_until = time.time() + 0.5
             raise SpotifyError(429, "rate limit hit — cooldown ~1 min")
         calls.append(("add", pid, uri)); return "snap"
     monkeypatch.setattr(appmod.sp, "add_to_playlist", flaky_add)
     start_queue(s, pending=("p2",))
+
     deadline = time.time() + 5
     while time.time() < deadline and s.queue()["state"] != "sleeping":
         time.sleep(0.01)
     assert s.queue()["state"] == "sleeping"               # the real cooldown, not a stub
-    # Release it the way an operator or a time-skip would: straight back to
-    # "no cooldown at all", not a naturally-expired one — letting 60s of
-    # cooldown actually elapse would also walk into the real 6h post-
-    # cooldown quiet window (QUIET_AFTER_COOLDOWN), which this test has no
-    # business waiting out.
-    monkeypatch.setattr(appmod.sp, "cooldown_until", 0.0)
+
+    # The short real cooldown elapses on its own; once it does, the worker's
+    # own bulk_block_reason() finds itself inside the post-cooldown quiet
+    # window and moves to "quiet".
+    deadline = time.time() + 5
+    while time.time() < deadline and s.queue()["state"] != "quiet":
+        time.sleep(0.01)
+    assert s.queue()["state"] == "quiet"
+
+    # Time-skip past the quiet window instead of waiting out 6 real hours —
+    # push the remembered cooldown far enough into the past that
+    # `now < cooldown_until + QUIET_AFTER_COOLDOWN` is already false.
+    appmod.sp.cooldown_until = time.time() - QUIET_AFTER_COOLDOWN - 10
     appmod._queue_wake.set(); appmod._queue_wake.clear()
     q = wait_done(s)
     assert q["state"] == "done"
     assert [c[0] for c in calls].count("add") == 1        # the failed add was re-driven
     assert s.pacing()["history_429"][-1]["kind"] == "rate"
+    # The halving survives BOTH sleeps — sleeping's and quiet's
+    # note_interruption() calls only ever pull the rate down to at most
+    # START_RATE, never back up past an already-halved value (R-T8f).
     assert s.pacing()["rate_per_min"] == pacing.MIN_RATE   # 1.8 halved, floored
 
 

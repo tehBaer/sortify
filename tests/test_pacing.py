@@ -88,6 +88,33 @@ def test_interruption_resets_to_start_rate_and_clears_the_clock():
     assert g.to_state()["max_clean_rate"] == 1.8   # the measurement survives
 
 
+def test_interruption_never_raises_a_rate_429_halved_below_start():
+    """R-T8f: an interruption may only pull the rate DOWN to at most
+    START_RATE, never back up — otherwise a later, unrelated sleep (a quiet
+    period, a reserve-cap wait, a cooldown check spanning the worker's
+    60s wait cap) would silently undo a rate 429's halving without a
+    single clean minute ever being earned back."""
+    g = Governor(None)
+    g.note_429("rate", 5, now=1.0)
+    assert g.rate == 0.9                    # 1.8 halved
+    g.note_interruption()
+    assert g.rate == 0.9                    # stays halved, does not climb to 1.8
+
+
+def test_interruption_still_pulls_an_escalated_rate_down_to_start():
+    """A rate that climbed ABOVE START_RATE still resets down to it on an
+    interruption — only a rate already at or below START_RATE is spared."""
+    g = Governor(None)
+    t = 1_000_000.0
+    for _ in range(5):                       # 5 clean cycles: 1.8 -> ... -> 4.0
+        g.note_success(t)
+        t += CLEAN_SECONDS
+        g.note_success(t)
+    assert g.rate == 4.0
+    g.note_interruption()
+    assert g.rate == START_RATE == 1.8
+
+
 def test_state_round_trip_matches_pacing_json_shape():
     g = Governor(None)
     g.note_success(10.0)

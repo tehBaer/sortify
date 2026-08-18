@@ -1329,16 +1329,23 @@ _QUEUE_RESUMABLE = ("running", "sleeping", "quiet")
 def _set_queue_state(state: str, stop_reason: str | None = None) -> bool:
     """Check-and-set queue.json's state under one lock acquisition.
 
-    Returns False (refusing the write) when the queue is already paused or
-    stopped and this call is trying to move it back to running/sleeping/
-    quiet — i.e. the worker racing its own "resume" write against a pause it
-    hasn't read yet. Every caller MUST treat a False return as its own stop
-    signal and exit the loop; only that makes a pause/cancel unlosable no
-    matter where in the loop the worker happens to be (C2/R-T8a).
+    Returns False (refusing the write) when:
+    - the queue is already paused or stopped and this call is trying to
+      move it back to running/sleeping/quiet — the worker racing its own
+      "resume" write against a pause it hasn't read yet (C2/R-T8a); or
+    - the queue is already "stopped" (a cancel) and this call is trying to
+      downgrade it to "paused" — a non-429 error noticed after a user
+      already cancelled must not turn that cancel back into something
+      resumable (fix round 2, minor 1).
+    Every caller MUST treat a False return as its own stop signal and exit
+    the loop; the worker exits either way, so tolerating a refusal here
+    needs no extra branching at the call site.
     """
     with _queue_lock:
         q = store.queue()
         if q["state"] in _QUEUE_TERMINAL and state in _QUEUE_RESUMABLE:
+            return False
+        if q["state"] == "stopped" and state == "paused":
             return False
         q["state"] = state
         q["stop_reason"] = stop_reason
@@ -1410,19 +1417,6 @@ def _drain_queue() -> None:
             store.save_queue(q)
     if not _set_queue_state("running"):
         return                                # paused/cancelled before this thread even ran
-    # Whether the loop's last significant event was a 429 whose halving
-    # `note_429` just applied. request() always sets a fresh cooldown before
-    # raising a worker-visible rate 429, so the very next `_queue_next_action`
-    # call is guaranteed to see `bulk_block_reason()` blocked and route
-    # straight into the sleep branch below — if that branch unconditionally
-    # called `gov.note_interruption()` (which resets rate to START_RATE) it
-    # would silently wipe the halving on every single rate 429 in
-    # production, not just in a contrived test. So the sleep branch skips
-    # the reset exactly once, only for the sleep that is that 429's own
-    # direct continuation; any other sleep (reserve cap, an externally-
-    # sourced cooldown, a quiet period) still gets the full reset, since
-    # `_clean_since` genuinely no longer reflects reality after those gaps.
-    just_noted_429 = False
     while True:
         action = _queue_next_action(time.time())
         if action[0] == "stop":
@@ -1430,10 +1424,16 @@ def _drain_queue() -> None:
         if action[0] == "sleep":
             if not _set_queue_state(action[2]):
                 return                         # a pause/cancel beat us to the write (R-T8a)
-            if not just_noted_429:
-                gov.note_interruption()
-                store.save_pacing(gov.to_state())
-            just_noted_429 = False
+            # note_interruption() only ever pulls the rate DOWN to at most
+            # START_RATE (ruling R-T8f, sortify/pacing.py) — so calling it
+            # unconditionally here is safe even when this sleep is the
+            # direct continuation of a rate 429 whose halving `note_429`
+            # just applied one iteration ago: a halved rate is already at or
+            # below START_RATE, so the reset is a no-op for it, and every
+            # other sleep (reserve cap, quiet period, an externally-sourced
+            # cooldown) still gets its `_clean_since` correctly cleared.
+            gov.note_interruption()
+            store.save_pacing(gov.to_state())
             # Wake early on pause/cancel/resume; re-check at most every 60s so
             # a cooldown shortened by another process is noticed. The event
             # is cleared unconditionally right after waiting — whether it
@@ -1462,7 +1462,6 @@ def _drain_queue() -> None:
                     # the account ledger; resuming is a human's call (spec §2).
                     _set_queue_state("stopped", stop_reason="quota")
                     return
-                just_noted_429 = True        # preserve this halving through the next sleep
                 continue                     # rate: cooldown sleep happens above
             # No fresh 429 to pin this on. Some raises never touch last_429
             # at all — the pre-flight cooldown check and the bulk-reserve
@@ -1482,14 +1481,11 @@ def _drain_queue() -> None:
         fresh = info.get("ts", 0) >= tick_started
         if fresh:
             gov.note_429(info["kind"], info.get("retry_after", 60), time.time())
-            just_noted_429 = True            # preserve this halving through the next sleep
-        else:
-            just_noted_429 = False
-            if result.get("spent") == 1:
-                # Only a tick that actually spent a call earns clean-time
-                # credit (I3) — a vanished-split or in-flight-backoff tick
-                # spends nothing and must not count toward escalation.
-                gov.note_success(time.time())
+        elif result.get("spent") == 1:
+            # Only a tick that actually spent a call earns clean-time
+            # credit (I3) — a vanished-split or in-flight-backoff tick
+            # spends nothing and must not count toward escalation.
+            gov.note_success(time.time())
         store.save_pacing(gov.to_state())
         if fresh and info["kind"] == "quota":
             # A quota trip can surface on the success path too: `sp` is a

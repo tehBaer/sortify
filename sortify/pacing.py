@@ -57,8 +57,19 @@ class Governor:
 
     def note_interruption(self) -> None:
         """Pause, midnight sleep, quiet period, or process restart: the
-        conditions the clean clock measured no longer hold. Re-climb."""
-        self.rate = START_RATE
+        conditions the clean clock measured no longer hold, so any climb
+        earned during them is unproven and the clock resets.
+
+        But an interruption must never RAISE the rate. A rate 429 can be
+        followed, within the same run, by an unrelated sleep (a quiet
+        period, a reserve-cap wait, a cooldown check that spans the wait
+        cap) — and if that later interruption reset the rate back up to
+        START_RATE, the 429's halving would be silently undone without a
+        single clean minute ever being earned back (ruling R-T8f). So this
+        only ever pulls the rate DOWN to at most START_RATE; a rate already
+        below it (freshly halved by note_429) is left alone.
+        """
+        self.rate = min(self.rate, START_RATE)
         self._clean_since = None
 
     def to_state(self) -> dict:
