@@ -36,3 +36,24 @@ def test_the_background_guard_rail_survives():
     assert BACKGROUND_DAILY_CAP == 40
     assert hasattr(appmod.sp, "background_block_reason")
     assert hasattr(appmod.sp, "get_background")
+
+
+def test_the_queue_worker_cannot_self_start():
+    """No thread at import; the only creator is _start_queue_worker; its only
+    callers are the enqueue and resume endpoints. (Spec decision 4.)"""
+    import inspect, threading
+    assert appmod._queue_worker is None
+    assert "queue-materialiser" not in [t.name for t in threading.enumerate()]
+    src = inspect.getsource(appmod)
+    calls = src.count("_start_queue_worker()")
+    defs = src.count("def _start_queue_worker")
+    # DEVIATION from the brief's literal "calls == 2": a zero-arg def line
+    # ("def _start_queue_worker() -> None:") itself contains the substring
+    # "_start_queue_worker()", so `calls` also counts that def line once,
+    # in addition to the real invocation sites. `calls - defs` is the count
+    # of actual call sites; the brief's raw `calls == 2` undercounts by
+    # exactly `defs` for any zero-arg function of this name.
+    assert defs == 1 and calls - defs == 2, (
+        f"_start_queue_worker is invoked {calls - defs} times — enqueue and "
+        "resume are the only two launch sites allowed; a third is a "
+        "self-start waiting to happen")

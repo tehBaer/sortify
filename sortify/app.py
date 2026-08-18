@@ -1326,7 +1326,7 @@ _QUEUE_TERMINAL = ("paused", "stopped")
 _QUEUE_RESUMABLE = ("running", "sleeping", "quiet")
 
 
-def _set_queue_state(state: str, stop_reason: str | None = None) -> bool:
+def _set_queue_state(state: str, stop_reason: str | None = None, force: bool = False) -> bool:
     """Check-and-set queue.json's state under one lock acquisition.
 
     Returns False (refusing the write) when:
@@ -1340,13 +1340,21 @@ def _set_queue_state(state: str, stop_reason: str | None = None) -> bool:
     Every caller MUST treat a False return as its own stop signal and exit
     the loop; the worker exits either way, so tolerating a refusal here
     needs no extra branching at the call site.
+
+    `force=True` is the one deliberate override, for the human-only resume
+    endpoint: a "paused" or "stopped" queue is exactly the state resume is
+    meant to leave, so the guard would otherwise refuse the very call whose
+    job is crossing it (Task 9 binding note — an explicit escape hatch
+    rather than weakening the check-and-set itself, which everything else
+    still relies on to keep a pause/cancel from being clobbered).
     """
     with _queue_lock:
         q = store.queue()
-        if q["state"] in _QUEUE_TERMINAL and state in _QUEUE_RESUMABLE:
-            return False
-        if q["state"] == "stopped" and state == "paused":
-            return False
+        if not force:
+            if q["state"] in _QUEUE_TERMINAL and state in _QUEUE_RESUMABLE:
+                return False
+            if q["state"] == "stopped" and state == "paused":
+                return False
         q["state"] = state
         q["stop_reason"] = stop_reason
         q["updated_at"] = _now_iso()
@@ -1505,6 +1513,110 @@ def _drain_queue() -> None:
         # loop re-decides from queue.json regardless of why we woke.
         _queue_wake.wait(gov.interval())
         _queue_wake.clear()
+
+
+class QueueIn(BaseModel):
+    pile_ids: list[str] | None = None    # None = every pile in the split
+    # The echo, not a flag — same argument as the endpoint this replaces:
+    # the caller must state the price it was shown (finding I1).
+    expected_calls: int = Field(..., ge=0)
+
+
+def _start_queue_worker() -> None:
+    """The ONLY function that creates the worker thread — called from exactly
+    two places (enqueue and resume; pinned by test_the_queue_worker_cannot_self_start).
+    No other code path may bring Spotify traffic into existence on its own."""
+    global _queue_worker
+    with _queue_lock:
+        if _queue_worker and _queue_worker.is_alive():
+            return
+        _queue_wake.clear()
+        _queue_worker = threading.Thread(
+            target=_drain_queue, name="queue-materialiser", daemon=True)
+        _queue_worker.start()
+
+
+def _effective_queue() -> dict:
+    """queue.json with the state a reader should act on: a file that says
+    "running" while no worker thread is alive is a restart's leftover —
+    paused, resumable, and starting nothing by itself."""
+    q = store.queue()
+    if q["state"] in ("running", "sleeping", "quiet") and not (
+            _queue_worker and _queue_worker.is_alive()):
+        q["state"] = "paused"
+    return q
+
+
+@app.post("/api/split/{playlist_id}/queue")
+def enqueue_piles(playlist_id: str, body: QueueIn):
+    with _split_lock:
+        payload = store.splits()
+        split = payload["splits"].get(playlist_id)
+        if not split:
+            raise HTTPException(404, "no split for that playlist")
+        wanted = body.pile_ids or [p["id"] for p in split["piles"]]
+        piles = [p for p in split["piles"] if p["id"] in wanted]
+        if len(piles) != len(set(wanted)):
+            raise HTTPException(404, "unknown pile id in the request")
+        plans = {p["id"]: _materialise_plan(split, p) for p in piles}
+        total = sum(pl["calls"] for pl in plans.values())
+        if body.expected_calls != total:
+            raise HTTPException(
+                409,
+                f"cost has changed: saving these piles now spends {total} "
+                f"Spotify calls, not the {body.expected_calls} you confirmed. "
+                "Nothing was spent. Re-open the pile list and confirm the new "
+                "number.")
+        order = sorted((pid for pid in plans if plans[pid]["calls"] > 0),
+                       key=lambda pid: plans[pid]["calls"])
+    if total == 0:
+        return {"ok": True, "queued": [], "total_calls": 0, "complete": True}
+    with _queue_lock:
+        q = _effective_queue()
+        if q["state"] in ("running", "sleeping", "quiet"):
+            raise HTTPException(409, "a queue is already draining — pause or cancel it first")
+        store.save_queue({"version": 1, "playlist_id": playlist_id,
+                          "pending": order, "current": None, "state": "running",
+                          "stop_reason": None, "progress": {},
+                          "pile_count_at_enqueue": len(order),
+                          "enqueued_at": _now_iso(), "updated_at": _now_iso()})
+    _start_queue_worker()
+    return {"ok": True, "queued": order, "total_calls": total, "complete": False}
+
+
+@app.get("/api/split/{playlist_id}/queue")
+def queue_status(playlist_id: str):
+    return {"queue": _effective_queue(), "pacing": store.pacing()}
+
+
+@app.post("/api/split/{playlist_id}/queue/pause")
+def pause_queue(playlist_id: str):
+    _set_queue_state("paused")
+    _queue_wake.set()
+    return {"ok": True}
+
+
+@app.post("/api/split/{playlist_id}/queue/resume")
+def resume_queue(playlist_id: str):
+    q = store.queue()
+    if not q.get("pending") and not q.get("current"):
+        raise HTTPException(409, "nothing queued")
+    # force=True: resume's whole job is leaving "paused"/"stopped" — the
+    # check-and-set guard exists to stop everyone ELSE from doing that.
+    _set_queue_state("running", force=True)
+    _start_queue_worker()
+    return {"ok": True}
+
+
+@app.delete("/api/split/{playlist_id}/queue")
+def cancel_queue(playlist_id: str):
+    with _queue_lock:
+        q = store.queue()
+        q.update(pending=[], current=None, state="stopped",
+                 stop_reason="cancelled", updated_at=_now_iso())
+        store.save_queue(q)
+    _queue_wake.set()
+    return {"ok": True}
 
 
 class DecideIn(BaseModel):
