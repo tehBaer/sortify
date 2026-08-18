@@ -69,6 +69,12 @@ WINDOW_CAP = 12       # calls per rolling 60s
 # more than a few dozen calls a day.
 BACKGROUND_DAILY_CAP = 40
 
+# The queued materialiser's spend class: user-initiated but unattended. It
+# counts toward DAILY_CAP, but the day's LAST 150 calls are reserved for the
+# user's own interactive clicks — the bulk job sleeps to local midnight
+# instead of spending them. (Spec 2026-08-18, decision 3.)
+BULK_RESERVE = 150
+
 # Background work also yields once the day is half spent: at that point the
 # user is clearly using the app, and the rest of the budget is theirs.
 BACKGROUND_YIELD_FRACTION = 0.5
@@ -151,6 +157,10 @@ class Spotify:
         # refresh and rotate each other's refresh token into invalidity.
         self._refresh_lock = threading.Lock()
         self._refresh_fail_until = 0.0
+        # Last 429 seen by request(), including ones it retried through —
+        # the queue governor reads this to know a tick was not clean.
+        # Observation only; retry behaviour is unchanged (review finding I2).
+        self.last_429: dict | None = None
 
     # ---- local demand limiting ---------------------------------------------
 
@@ -207,15 +217,39 @@ class Spotify:
             return f"day already {yield_at}+ calls in — leaving the rest for real usage"
         return None
 
-    def _spend_budget(self, background: bool = False) -> None:
+    def bulk_spent(self) -> int:
+        usage = self.store.usage()
+        if usage["day"] != time.strftime("%Y-%m-%d"):
+            return 0
+        return usage.get("bulk", 0)
+
+    def bulk_block_reason(self) -> tuple[str, float] | None:
+        """Why the bulk worker must not call right now — None means go.
+
+        Returns (reason, resume_at). QUIET_AFTER_COOLDOWN applies here on
+        purpose: this rail survived the enricher's deletion named for "the
+        next proactive job", and the queued materialiser is that job.
+        """
+        now = time.time()
+        cd = self.effective_cooldown_until()
+        if now < cd:
+            return ("cooldown", cd)
+        if cd and now < cd + QUIET_AFTER_COOLDOWN:
+            return ("quiet", cd + QUIET_AFTER_COOLDOWN)
+        if self.budget_spent() >= DAILY_CAP - BULK_RESERVE:
+            return ("reserve", _next_local_midnight(now))
+        return None
+
+    def _spend_budget(self, background: bool = False, bulk: bool = False) -> None:
         """One API call's worth of budget; blocks briefly to honor the rolling
         window, raises if the applicable cap is spent."""
         with self._budget_lock:
             today = time.strftime("%Y-%m-%d")
             usage = self.store.usage()
             if usage["day"] != today:
-                usage = {"day": today, "count": 0, "background": 0}
+                usage = {"day": today, "count": 0, "background": 0, "bulk": 0}
             usage.setdefault("background", 0)
+            usage.setdefault("bulk", 0)
             if usage["count"] >= DAILY_CAP:
                 raise SpotifyError(
                     429, f"local daily budget ({DAILY_CAP} calls) spent — resting until midnight"
@@ -224,6 +258,12 @@ class Spotify:
                 raise SpotifyError(
                     429,
                     f"background budget ({BACKGROUND_DAILY_CAP} calls) spent — resting until midnight",
+                )
+            if bulk and usage["count"] >= DAILY_CAP - BULK_RESERVE:
+                raise SpotifyError(
+                    429,
+                    f"bulk budget: interactive reserve ({BULK_RESERVE} calls) "
+                    "reached — sleeping until midnight",
                 )
             now = time.time()
             while self._window and now - self._window[0] > 60:
@@ -242,6 +282,8 @@ class Spotify:
             usage["count"] += 1
             if background:
                 usage["background"] += 1
+            if bulk:
+                usage["bulk"] += 1
             self.store.save_usage(usage)
 
     # ---- auth -------------------------------------------------------------
@@ -337,13 +379,14 @@ class Spotify:
 
     # ---- request plumbing -------------------------------------------------
 
-    def request(self, method: str, path: str, background: bool = False, **kwargs) -> dict | None:
+    def request(self, method: str, path: str, background: bool = False, bulk: bool = False,
+                **kwargs) -> dict | None:
         if time.time() < self.effective_cooldown_until():
             mins = int(self.cooldown_until - time.time()) // 60 + 1
             raise SpotifyError(429, f"in Spotify rate-limit cooldown — try again in ~{mins} min")
         url = path if path.startswith("http") else API + path
         for attempt in range(3):
-            self._spend_budget(background=background)
+            self._spend_budget(background=background, bulk=bulk)
             # Mild throttle: bulk fetches shouldn't burst the rolling window.
             wait = self._last_call + 0.2 - time.time()
             if wait > 0:
@@ -364,6 +407,7 @@ class Spotify:
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", 2))
                 kind = classify_429(resp.text, retry_after)
+                self.last_429 = {"ts": time.time(), "kind": kind, "retry_after": retry_after}
                 # Two different limiters with opposite remedies. A rate limit is
                 # a rolling 30s window and wants a few seconds of patience; a
                 # Development Mode quota trip wants the rest of the day, and
@@ -543,8 +587,9 @@ class Spotify:
 
     # ---- mutations --------------------------------------------------------
 
-    def add_to_playlist(self, playlist_id: str, uri: str) -> str | None:
-        resp = self.request("POST", f"/playlists/{playlist_id}/items", json={"uris": [uri]})
+    def add_to_playlist(self, playlist_id: str, uri: str, bulk: bool = False) -> str | None:
+        resp = self.request("POST", f"/playlists/{playlist_id}/items",
+                            json={"uris": [uri]}, bulk=bulk)
         return (resp or {}).get("snapshot_id")
 
     def remove_from_playlist(self, playlist_id: str, uri: str) -> str | None:
@@ -560,11 +605,12 @@ class Spotify:
     def save_to_liked(self, uri: str) -> None:
         self.request("PUT", "/me/library", json={"uris": [uri]})
 
-    def create_playlist(self, name: str, description: str = "") -> str:
+    def create_playlist(self, name: str, description: str = "", bulk: bool = False) -> str:
         """Create a playlist and return its id. One call."""
         resp = self.request(
             "POST", "/me/playlists",
             json={"name": name, "description": description, "public": False},
+            bulk=bulk,
         )
         playlist_id = (resp or {}).get("id")
         if not playlist_id:

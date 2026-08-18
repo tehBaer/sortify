@@ -6,6 +6,7 @@ import pytest
 from sortify.account_ledger import ACCOUNT_DAILY_CAP, AccountLedger
 from sortify.spotify import (
     BACKGROUND_DAILY_CAP,
+    BULK_RESERVE,
     DAILY_CAP,
     QUIET_AFTER_COOLDOWN,
     Spotify,
@@ -13,6 +14,25 @@ from sortify.spotify import (
     _next_local_midnight,
 )
 from sortify.store import Store
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, headers=None, text="", json_body=None):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = text
+        self._json_body = json_body
+        self.content = b"1" if json_body is not None else text.encode()
+
+    def json(self):
+        return self._json_body
+
+
+@pytest.fixture
+def sp_and_store(tmp_path):
+    store = Store(tmp_path)
+    sp = Spotify(store)
+    return sp, store
 
 
 def test_daily_budget_blocks_at_cap(tmp_path):
@@ -163,3 +183,67 @@ def test_cooldown_earned_by_another_process_is_seen(tmp_path):
     assert "cooldown" in sp.background_block_reason()
     with pytest.raises(SpotifyError, match="cooldown"):
         sp.request("GET", "/me")
+
+
+# ---- the bulk spend class ---------------------------------------------------
+
+
+def test_bulk_never_spends_the_interactive_reserve(sp_and_store):
+    """DAILY_CAP-150 is the line: the last 150 calls of the day belong to the
+    user's own clicks, not to the unattended job."""
+    sp, store = sp_and_store
+    store.save_usage({"day": time.strftime("%Y-%m-%d"),
+                      "count": DAILY_CAP - BULK_RESERVE, "background": 0})
+    with pytest.raises(SpotifyError) as e:
+        sp._spend_budget(bulk=True)
+    assert "reserve" in str(e.value)
+    # …and an interactive call at the same spend level still goes through.
+    sp._spend_budget()
+    assert sp.budget_spent() == DAILY_CAP - BULK_RESERVE + 1
+
+
+def test_bulk_spend_is_its_own_bucket(sp_and_store):
+    sp, store = sp_and_store
+    sp._spend_budget(bulk=True)
+    u = store.usage()
+    assert u["bulk"] == 1 and u["count"] == 1 and u.get("background", 0) == 0
+    assert sp.bulk_spent() == 1
+
+
+def test_bulk_block_reason_orders_cooldown_quiet_reserve(sp_and_store, monkeypatch):
+    sp, store = sp_and_store
+    now = time.time()
+    # cooldown active
+    monkeypatch.setattr(sp, "effective_cooldown_until", lambda: now + 100)
+    reason, until = sp.bulk_block_reason()
+    assert reason == "cooldown" and until == pytest.approx(now + 100, abs=2)
+    # cooldown over, quiet running — QUIET_AFTER_COOLDOWN applies to bulk:
+    # this is exactly "the next proactive job" that rail was kept for.
+    monkeypatch.setattr(sp, "effective_cooldown_until", lambda: now - 10)
+    reason, until = sp.bulk_block_reason()
+    assert reason == "quiet" and until == pytest.approx(now - 10 + QUIET_AFTER_COOLDOWN, abs=2)
+    # quiet over, reserve line reached → sleep till local midnight
+    monkeypatch.setattr(sp, "effective_cooldown_until", lambda: 0.0)
+    store.save_usage({"day": time.strftime("%Y-%m-%d"),
+                      "count": DAILY_CAP - BULK_RESERVE, "background": 0})
+    reason, until = sp.bulk_block_reason()
+    assert reason == "reserve" and until > now
+    # clear day: no block
+    store.save_usage({"day": time.strftime("%Y-%m-%d"), "count": 0, "background": 0})
+    assert sp.bulk_block_reason() is None
+
+
+def test_request_records_the_last_429_without_changing_retries(sp_and_store, monkeypatch):
+    """Additive observation only (finding I2 forbids touching retry
+    behaviour): a transient rate 429 that request retries internally must
+    still be visible to the governor afterwards."""
+    sp, _ = sp_and_store
+    responses = [FakeResponse(429, headers={"Retry-After": "1"},
+                              text='{"error": {"status": 429}}'),
+                 FakeResponse(200, json_body={"ok": True})]
+    monkeypatch.setattr(sp.http, "request", lambda *a, **k: responses.pop(0))
+    monkeypatch.setattr(sp, "_access_token", lambda: "tok")
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    out = sp.request("GET", "/ping")
+    assert out == {"ok": True}
+    assert sp.last_429 and sp.last_429["kind"] == "rate" and sp.last_429["retry_after"] == 1
