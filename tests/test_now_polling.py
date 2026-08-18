@@ -202,6 +202,7 @@ def route_client(monkeypatch):
     """
     s = Store()
     original_cache, original_config, original_splits = s.cache(), s.config(), s.splits()
+    original_tags = s.tags()
 
     cache = s.cache()
     cache["playlist_list"] = {"fetched_at": 0.0, "items": NOW_LISTING}
@@ -210,6 +211,13 @@ def route_client(monkeypatch):
                    "input_name_pattern": r"^\[.+\]$"})
     appmod._profile_state.clear()
     appmod._profile_state["built_at"] = 0.0
+
+    # This file's `force=1` tests exist to pin polling cost, not Last.fm
+    # fetching (that's tests/test_now_tag_fetch.py) — default to "no key
+    # configured" so `_fetch_missing_now_tags` is a guaranteed no-op here and
+    # none of these tests can reach the real Last.fm service just because
+    # this machine happens to have a real key file on disk.
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: None)
 
     calls = []
 
@@ -238,6 +246,7 @@ def route_client(monkeypatch):
         s.save_cache(original_cache)
         s.save_config(original_config)
         s.save_splits(original_splits)
+        s.save_tags(original_tags)
         appmod._profile_state.clear()
         appmod._profile_state["built_at"] = 0.0
 

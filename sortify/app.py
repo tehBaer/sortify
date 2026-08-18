@@ -2124,6 +2124,54 @@ def _sitting_for_context(ctx_id: str | None) -> dict | None:
     return None
 
 
+NOW_FETCH_MAX_ARTISTS = 3  # per /api/now?force=1 call — an explicit user action, not a poll
+
+
+def _fetch_missing_now_tags(track: dict) -> int:
+    """Fetch Last.fm tags for up to `NOW_FETCH_MAX_ARTISTS` unknown artists on
+    the currently-playing track. Returns how many artists were fetched.
+
+    Callable ONLY from `now_playing`'s `?force=1` branch — opening or
+    refocusing the view, an explicit user action — never the passive poll,
+    which must never reach Last.fm at all. Reuses `_lastfm_client()`/`enrich`,
+    the same client, `MIN_INTERVAL` pacing and tags.json envelope shape the
+    split flow uses, rather than a second one; no key configured means
+    `_lastfm_client()` returns None and this does nothing, silently.
+
+    Write-once: an artist already in tags.json — a hit or a recorded
+    `miss: true` alike — is never handed to `enrich` again. `enrich` raises
+    `LastFmError` on anything other than a genuine "not found" (code 6,
+    folded into `miss: true` by `top_tags` returning None); that must not
+    break this response, so it's caught here and only `.partial` — whatever
+    was verified before the failure — is persisted. Every artist after the
+    failing one in this batch is simply left absent and retryable.
+    """
+    fm = _lastfm_client()
+    if fm is None:
+        return 0
+    names: dict[str, str] = {}
+    for a in track.get("artists") or []:
+        aid = a.get("id")
+        if aid and aid not in names:
+            names[aid] = a.get("name") or ""
+    if not names:
+        return 0
+    cached = store.tag_artists()
+    unknown = dict(list((aid, n) for aid, n in names.items() if aid not in cached)
+                   [:NOW_FETCH_MAX_ARTISTS])
+    if not unknown:
+        return 0
+    try:
+        merged = enrich(unknown, cached, fm, _now_iso())
+    except LastFmError as exc:
+        log.warning("now-playing tag fetch stopped early: %s", exc)
+        merged = exc.partial if exc.partial is not None else cached
+    fetched = len(merged) - len(cached)
+    if fetched > 0:
+        store.save_tag_artists(merged)
+    return fetched
+
+
 @app.get("/api/now")
 def now_playing(force: bool = False):
     try:
@@ -2141,10 +2189,26 @@ def now_playing(force: bool = False):
 
     state = _ensure_profiles()
     track = np["track"]
-    # There used to be a targeted artist fetch here to sharpen the card's genre
-    # reasons. It cost a call per unseen artist to learn nothing: the dev-mode
-    # API no longer returns genres at all.
+    # A targeted artist fetch used to sit here to sharpen the card's genre
+    # reasons; it cost a call per unseen artist to learn nothing, since the
+    # dev-mode API stopped returning Spotify genres at all. `_fetch_missing_now_tags`
+    # is that fetch's replacement — Last.fm instead of Spotify, bounded, and
+    # gated on `force` so the passive poll still spends nothing.
     sortable = track["type"] == "track" and not track["is_local"] and track.get("id")
+    if force and sortable:
+        try:
+            _fetch_missing_now_tags(track)
+        except Exception:
+            # A fetch failure must never break the now response — this is a
+            # bonus enrichment, not the payload the client actually needs.
+            log.exception("now-playing tag fetch failed")
+    # Guard-on-read, fresh on every request — same reasoning as `triage`'s own
+    # re-read below `_ensure_profiles`: `state["tag_artists"]` is a
+    # profile-build-time snapshot that can sit stale for up to PROFILE_TTL, so
+    # a fetch just above (or any other write to tags.json) would otherwise be
+    # invisible for up to 10 minutes. tag_artists() is a local JSON read —
+    # zero API cost — so doing it on every poll costs nothing.
+    tag_artists = store.tag_artists()
     ctx_id = np["context_playlist_id"]
     ctx = next((p for p in state["playlists"] if p["id"] == ctx_id), None)
     return {
@@ -2159,7 +2223,7 @@ def now_playing(force: bool = False):
             if ctx_id else None
         ),
         "sitting": _sitting_for_context(ctx_id),
-        "suggestions": sugg.suggest(track, state["profiles"], state["tag_artists"]) if sortable else [],
+        "suggestions": sugg.suggest(track, state["profiles"], tag_artists) if sortable else [],
         "homes": _homes_payload(state),
         "inputs": [
             {"id": l["id"], "name": l["name"], "has_track": track["uri"] in l["uris"]}
