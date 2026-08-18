@@ -306,6 +306,85 @@ def test_enrich_wraps_transport_errors_and_keeps_the_partial_map():
     assert list(excinfo.value.partial) == ["a1"]
 
 
+# ---- blank artist names: a data condition, not a service failure ----------
+#
+# Spotify's own placeholder for a removed/unavailable track carries a blank
+# artist name (and a blank track name — see the module docstring in
+# sortify/tags.py). One such track used to abort tagging for every artist
+# still waiting behind it in the batch: `enrich` passed the blank name
+# straight to `top_tags`, which rightly refuses to send it over the wire and
+# raises, and `enrich` let that raise propagate like any other failure. But
+# a blank name can never produce a different answer no matter how many times
+# it's retried — it belongs with "artist not found", not with a rate limit
+# or a bad API key.
+
+
+def test_enrich_records_a_blank_artist_name_as_a_miss_and_keeps_going():
+    client = FakeClient({"Real Artist": tagset(("rock", 50))})
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    out = enrich(
+        {"blank": "", "real": "Real Artist"}, {}, fm, now="2026-08-17T16:00:00Z"
+    )
+    assert out["blank"] == {"name": "", "lastfm_name": None, "tags": [],
+                            "fetched_at": "2026-08-17T16:00:00Z", "miss": True}
+    assert out["real"]["miss"] is False
+    assert out["real"]["tags"] == [{"name": "rock", "count": 50}]
+    # The blank name never reached the network — top_tags' own guard would
+    # have raised on it, and there was never anything to ask Last.fm anyway.
+    assert client.calls == ["Real Artist"]
+
+
+def test_enrich_records_a_none_artist_name_as_a_miss():
+    fm = LastFm("k", sleep=lambda s: None, client=FakeClient({}))
+    out = enrich({"a1": None}, {}, fm, now="2026-08-17T16:00:00Z")
+    assert out["a1"]["miss"] is True
+    assert out["a1"]["tags"] == []
+    assert out["a1"]["name"] == ""  # never store None — downstream expects a string
+
+
+def test_enrich_records_a_whitespace_only_artist_name_as_a_miss():
+    fm = LastFm("k", sleep=lambda s: None, client=FakeClient({}))
+    out = enrich({"a1": "   "}, {}, fm, now="2026-08-17T16:00:00Z")
+    assert out["a1"]["miss"] is True
+    assert out["a1"]["tags"] == []
+
+
+def test_enrich_tags_the_artists_around_a_blank_name_and_completes():
+    """The end-to-end shape of the real incident: several good artists, one
+    dead track's blank-named artist in the middle, more good artists after
+    it — the whole batch must finish, not just avoid raising on the one bad
+    entry."""
+    client = FakeClient({"A": tagset(("techno", 50)), "C": tagset(("house", 40))})
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    out = enrich(
+        {"a1": "A", "blank": "", "a3": "C"}, {}, fm, now="2026-08-17T16:00:00Z"
+    )
+    assert out["a1"]["miss"] is False
+    assert out["blank"]["miss"] is True
+    assert out["a3"]["miss"] is False
+    assert set(out) == {"a1", "blank", "a3"}
+
+
+def test_enrich_still_aborts_on_a_real_lastfm_failure_with_partial_intact():
+    """Regression guard: the blank-name-is-a-miss fix must not blunt the
+    existing rule that a genuine service failure (error 10: invalid API key)
+    aborts the batch and still hands back everything verified so far."""
+    class HalfBroken(FakeClient):
+        def get(self, url, params=None, timeout=None):
+            self.calls.append(params["artist"])
+            if params["artist"] == "B":
+                return FakeResponse({"error": 10, "message": "Invalid API key"})
+            return FakeResponse({"toptags": {"tag": tagset(("techno", 50))}})
+
+    fm = LastFm("k", sleep=lambda s: None, client=HalfBroken({}))
+    with pytest.raises(LastFmError, match="error 10") as excinfo:
+        enrich({"a1": "A", "blank": "", "a2": "B"}, {}, fm, now="2026-08-17T16:00:00Z")
+    partial = excinfo.value.partial
+    assert partial["a1"]["miss"] is False
+    assert partial["blank"]["miss"] is True  # the blank one was already resolved, for free
+    assert "a2" not in partial  # never reached — B is where the real failure hit
+
+
 def test_load_key_rejects_null(tmp_path):
     p = tmp_path / "lastfm.json"
     p.write_text("null")

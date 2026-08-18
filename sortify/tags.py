@@ -265,6 +265,10 @@ def _store_tags(raw: list[dict]) -> list[dict]:
             for item in raw]
 
 
+def _blank(name) -> bool:
+    return not isinstance(name, str) or not name.strip()
+
+
 def enrich(artist_names: dict[str, str], cached: dict, fm: LastFm, now: str) -> dict:
     """Fetch tags for artists not already in `cached`. Returns the merged map.
 
@@ -283,6 +287,19 @@ def enrich(artist_names: dict[str, str], cached: dict, fm: LastFm, now: str) -> 
     out = dict(cached)
     for aid, name in artist_names.items():
         if aid in out:
+            continue
+        if _blank(name):
+            # A blank artist name is a data condition, not a service failure —
+            # Spotify's own placeholder for a removed/unavailable track has no
+            # artist at all, and no request could ever produce a different
+            # answer for it. That makes it exactly analogous to a genuine
+            # Last.fm "not found": permanently and knowably nothing. Recording
+            # it as a miss (instead of calling top_tags, which rightly refuses
+            # to send a blank name over the wire — kept as defence in depth)
+            # means one dead track can no longer abort tagging for every
+            # artist still waiting behind it in the batch.
+            out[aid] = {"name": name if isinstance(name, str) else "", "lastfm_name": None,
+                        "tags": [], "fetched_at": now, "miss": True}
             continue
         try:
             got = fm.top_tags(name)
