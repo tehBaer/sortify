@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient
 
 import sortify.app as appmod
 from sortify.spotify import SpotifyError
-from sortify.store import Store
+from sortify.store import TAGS_VERSION, Store
 
 PILE_URIS = [f"spotify:track:m{i}" for i in range(5)]
 BIG_URIS = [f"spotify:track:b{i}" for i in range(60)]
@@ -268,7 +268,16 @@ def test_a_resplit_that_rebuilds_the_same_piles_keeps_the_record(client, monkeyp
     monkeypatch.setattr(appmod.sp, "playlist_tracks",
                         lambda pid: Store().cache()["playlists"]["PLM"]["tracks"])
 
-    assert client.post("/api/split/PLM").status_code == 200
+    # tags.json is session-shared and another module deliberately parks a
+    # version-1 file in it; create_split refuses those, so stamp a valid
+    # envelope here and put back whatever was there (see this module's
+    # docstring on isolation).
+    original_tags = Store().tags()
+    try:
+        Store().save_tags({"version": TAGS_VERSION, "artists": {}})
+        assert client.post("/api/split/PLM").status_code == 200
+    finally:
+        Store().save_tags(original_tags)
     assert record() == saved
     pile = next(p for p in client.get("/api/split/PLM").json()["piles"] if p["id"] == "p1")
     assert pile["materialise_calls"] == 0
@@ -387,6 +396,59 @@ def test_an_empty_playlist_whose_record_vanished_is_unfollowed(client, monkeypat
     assert r.status_code == 409
     assert client.calls == [("create", "cumbia · latin · salsa"), ("unfollow", "NEWP")]
     assert record() is None
+
+
+def _overwrite_record_with_a_foreign_one():
+    """What a takeover looks like on disk: the slot is occupied, but by a
+    record with somebody else's claim. `if not record` cannot tell this from
+    a record that is still ours — only comparing the claim can."""
+    s = Store()
+    payload = s.splits()
+    payload["splits"]["PLM"]["materialised"]["p1"] = {
+        "playlist_id": "OTHER", "pile_id": "p1", "name": "cumbia · latin · salsa",
+        "fingerprint": "whatever", "track_count": 5, "added": ["spotify:track:other"],
+        "claim": "a-different-claim", "created_at": "x", "updated_at": "x"}
+    s.save_splits(payload)
+
+
+def test_a_replaced_record_is_not_written_to_after_the_create(client, monkeypatch):
+    """The claim is checked, not merely the record's existence. Without the
+    comparison this attempt stamps its own playlist id over a record that
+    belongs to someone else — losing sight of one playlist and mislabelling
+    another."""
+    def create_then_take_over(name, description=""):
+        client.calls.append(("create", name))
+        _overwrite_record_with_a_foreign_one()
+        return "NEWP"
+
+    monkeypatch.setattr(appmod.sp, "create_playlist", create_then_take_over)
+    assert post(client, "p1", len(PILE_URIS) + 1).status_code == 409
+    assert ("unfollow", "NEWP") in client.calls
+    assert record() == {
+        "playlist_id": "OTHER", "pile_id": "p1", "name": "cumbia · latin · salsa",
+        "fingerprint": "whatever", "track_count": 5, "added": ["spotify:track:other"],
+        "claim": "a-different-claim", "created_at": "x", "updated_at": "x"}
+
+
+def test_a_replaced_record_is_not_written_to_mid_adds(client, monkeypatch, caplog):
+    """Same check at the other end of the run, where the slot is occupied so
+    re-recording cannot help either. The playlist is real and half full, so
+    the only honest outcome is to stop, leave the other record alone, and say
+    so in the log the way `_recover_orphan` does."""
+    def add_then_take_over(pid, uri):
+        client.calls.append(("add", pid, uri))
+        if len([c for c in client.calls if c[0] == "add"]) == 2:
+            _overwrite_record_with_a_foreign_one()
+        return "snap"
+
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", add_then_take_over)
+    with caplog.at_level("ERROR", logger="uvicorn.error"):
+        assert post(client, "p1", len(PILE_URIS) + 1).status_code == 409
+    assert not any(c[0] == "unfollow" for c in client.calls)
+    assert record()["claim"] == "a-different-claim"
+    assert record()["added"] == ["spotify:track:other"]
+    assert "NEWP" in caplog.text, "the stranded playlist id must reach the log"
+    assert "by hand" in caplog.text
 
 
 def test_a_half_filled_playlist_whose_record_vanished_is_re_recorded(client, monkeypatch):

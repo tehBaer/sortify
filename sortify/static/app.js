@@ -873,16 +873,113 @@ function renderPiles() {
     const row = document.createElement("div");
     row.className = "pile-row";
     const tags = p.tags && p.tags.length ? p.tags.join(" · ") : "";
+    const save = saveOffer(p);
     row.innerHTML = `
       <div class="pl-meta">
         <div class="name">${esc(p.name)}</div>
-        <div class="sub">${left} of ${p.total} left${tags ? " · " + esc(tags) : ""}</div>
+        <div class="sub">${left} of ${p.total} left${tags ? " · " + esc(tags) : ""}${
+          save.note ? " · " + esc(save.note) : ""}</div>
       </div>
-      <button class="primary" ${left === 0 || sittingActive ? "disabled" : ""}>Start ~2h sitting (~24 calls)</button>`;
-    row.querySelector("button").onclick = () => startSitting(p.id, p.name);
+      <button class="pile-save" ${save.disabled ? "disabled" : ""} title="${esc(save.title)}">${
+        esc(save.label)}</button>
+      <button class="pile-sitting primary" ${left === 0 || sittingActive ? "disabled" : ""}>Start ~2h sitting (~24 calls)</button>`;
+    row.querySelector(".pile-sitting").onclick = () => startSitting(p.id, p.name);
+    const saveBtn = row.querySelector(".pile-save");
+    saveBtn.onclick = () => materialisePile(p.id, save.calls, saveBtn);
     wrap.appendChild(row);
   }
   renderSplitSittingBar();
+}
+
+// What the "save this pile" button says, and what it will hand back as
+// `expected_calls`. The cost is NEVER computed here: the server sends
+// `materialise_calls` with every pile (a free, local read) and refuses the
+// POST unless the number comes back exactly, so a figure invented on this
+// side could only ever buy a refusal. A pile row from a server that didn't
+// send one is therefore offered as un-clickable rather than guessed at.
+//
+// One call per track — the Feb-2026 API has no batch add — which is ~26
+// minutes of paced requests for the 309-track pile, so the tooltip says both
+// the price and the wait before anything is spent.
+function saveOffer(p) {
+  const calls = p.materialise_calls;
+  const m = p.materialised;
+  if (!Number.isInteger(calls)) {
+    return { calls: null, disabled: true, label: "Save as playlist",
+             note: "", title: "Reopen this split to see what saving it would cost." };
+  }
+  const mins = Math.max(1, Math.ceil(calls / 12));
+  const price = `${calls} Spotify call${calls === 1 ? "" : "s"} — one per track, ` +
+    `about ${mins} min at sortify's pacing. Leave this tab open; if it stops partway ` +
+    `(a rate-limit cooldown, say) nothing is lost — pressing it again adds only the ` +
+    `tracks that are still missing.`;
+  if (calls === 0) {
+    return { calls: 0, disabled: true, label: "Saved as a playlist",
+             note: `saved as a playlist (${m && m.added} tracks)`,
+             title: "This pile is already a real playlist in your Spotify account. " +
+                    "sortify never deletes it — remove it there if you don't want it." };
+  }
+  if (m && m.stale) {
+    return { calls, disabled: false, label: `Save as a new playlist (${calls} calls)`,
+             note: "saved earlier, but the pile has changed since",
+             title: "This pile was saved before, but re-clustering has changed which " +
+                    "tracks are in it, so the old playlist is no longer this pile. " +
+                    "Saving now makes a separate one. " + price };
+  }
+  if (m && m.playlist_id) {
+    return { calls, disabled: false, label: `Resume saving (${calls} calls)`,
+             note: `${m.added} of ${p.total} saved so far`,
+             title: "Adds only the tracks still missing from the playlist this pile " +
+                    "already has. " + price };
+  }
+  return { calls, disabled: false, label: `Save as playlist (${calls} calls)`,
+           note: "", title: "Makes a permanent Spotify playlist named after this pile " +
+                            "and adds every track in it. " + price };
+}
+
+// One entry per (split, pile) currently being saved by this tab. A save can
+// run for half an hour, so "disable the button" alone is not enough — the
+// button is re-rendered on every free re-read of the split, and a re-render
+// would hand a second click a fresh, enabled one. The server refuses the
+// duplicate too (`_pending_materialise`), but the whole point of the C2
+// lesson is not to promise a spend that has to be refused.
+const materialiseInFlight = new Set();
+
+async function materialisePile(pileId, expectedCalls, btn) {
+  const splitId = split.id;
+  const key = splitId + " " + pileId;
+  if (expectedCalls === null || materialiseInFlight.has(key)) return;
+  materialiseInFlight.add(key);
+  const label = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "Saving… (already spending)"; }
+  try {
+    const data = await api(`/api/split/${splitId}/materialise`,
+                           { pile_id: pileId, expected_calls: expectedCalls });
+    toast(data.calls_spent === 0
+      ? "already saved — nothing to spend"
+      : `saved: ${data.added} of ${data.total} tracks, ${data.calls_spent} Spotify calls spent`,
+      5000);
+  } catch (e) {
+    if (e.message === "auth needed") return;
+    // A 409 here is the cost guard, not a conflict to retry blindly: the row
+    // this click came from was stale, so the free re-read below is exactly
+    // the right next step and the new price will be on the button.
+    toast(e.message, 6000);
+  } finally {
+    materialiseInFlight.delete(key);
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+  }
+  // Always re-read, on success and on failure alike: a save that stopped
+  // partway still added tracks, and the row must show what actually landed
+  // (and what resuming would now cost) rather than what it cost before. Free
+  // and local — GET /api/split spends nothing.
+  try {
+    const fresh = await api(`/api/split/${splitId}`);
+    if (split && split.id === splitId) applySplitData(fresh);
+  } catch (_) {
+    // Leave the original message on screen; a failed re-read has nothing
+    // better to say than the failure that preceded it.
+  }
 }
 
 // Shown whenever a reservation exists at all — `playlist_id` only decides
