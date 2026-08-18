@@ -8,13 +8,15 @@ isolated cache/config snapshot) but adds a trapped Last.fm client instead of
 counting Spotify calls.
 """
 
+import threading
+
 import pytest
 from fastapi.testclient import TestClient
 
 from sortify import app as appmod
-from sortify.app import NOW_FETCH_MAX_ARTISTS, _fetch_missing_now_tags
+from sortify.app import NOW_FETCH_MAX_ARTISTS, _fetch_missing_now_tags, _merge_save_tag_artists
 from sortify.store import Store
-from sortify.tags import LastFmError
+from sortify.tags import ArtistTags, LastFmError
 
 TRACK_MS = 210_000
 
@@ -273,3 +275,99 @@ def test_a_fetched_artist_is_visible_to_the_very_next_request(isolated_now, monk
 
     assert r.status_code == 200
     assert Store().tag_artists()["a1"]["tags"] == [{"name": "rock", "count": 50}]
+
+
+# ---- concurrency: fix round 1, Important 1 ---------------------------------
+#
+# FastAPI's sync routes run in a threadpool, so two overlapping `?force=1`
+# requests genuinely execute concurrently — not a hypothetical. Real threads,
+# a gated fake client, and a non-blocking `threading.Lock` around the whole
+# fetch: the second overlapping caller must see the lock held and back off
+# immediately (fetching nothing this round) rather than either blocking or
+# racing the first caller's Last.fm call for the same artist.
+
+
+def test_concurrent_force_fetches_never_double_call_last_fm(monkeypatch):
+    Store().save_tag_artists({})
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    class GatedFm:
+        def top_tags(self, name):
+            calls.append(name)
+            entered.set()
+            # Held open long enough for the second, overlapping call to run
+            # its own (non-blocking) lock attempt while this one is in flight.
+            release.wait(timeout=2)
+            return ArtistTags(matched_name=name, tags=[{"name": "rock", "count": 50}])
+
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: GatedFm())
+
+    results: list[int] = []
+
+    def run():
+        results.append(_fetch_missing_now_tags(track_with_artists(["a1"])))
+
+    t1 = threading.Thread(target=run)
+    t2 = threading.Thread(target=run)
+
+    t1.start()
+    assert entered.wait(timeout=2), "first fetch never reached Last.fm"
+    t2.start()
+    t2.join(timeout=2)  # non-blocking lock: must return promptly, fetching nothing
+    release.set()
+    t1.join(timeout=2)
+
+    assert not t1.is_alive() and not t2.is_alive()
+    assert calls == ["Artist a1"]  # never called twice for the same artist
+    assert sorted(results) == [0, 1]  # one fetched, one backed off
+    assert Store().tag_artists()["a1"]["tags"] == [{"name": "rock", "count": 50}]
+
+
+# ---- lost-update guard: fix round 1, Important 2 ---------------------------
+
+
+def test_merge_save_does_not_lose_a_concurrent_writers_work():
+    """The fetch path (and the split flow's enrich walk) reads tags.json,
+    does slow network work, then saves — a classic read-modify-write race.
+    A writer landing in between must not be clobbered by the other's save."""
+    Store().save_tag_artists({})
+
+    # This call's own work, computed against a since-gone-stale snapshot...
+    stale_view = Store().tag_artists()
+    assert stale_view == {}
+
+    # ...while another writer (e.g. a split's enrich walk) saves fresh work
+    # in the meantime.
+    Store().save_tag_artists({
+        "other": {"name": "Other", "lastfm_name": None, "tags": [],
+                   "fetched_at": "t0", "miss": False},
+    })
+
+    _merge_save_tag_artists({
+        "a1": {"name": "Artist a1", "lastfm_name": "Artist a1",
+               "tags": [{"name": "rock", "count": 50}], "fetched_at": "t1", "miss": False},
+    })
+
+    saved = Store().tag_artists()
+    assert set(saved) == {"other", "a1"}  # neither writer's work was dropped
+
+
+def test_merge_save_never_overwrites_an_existing_entry():
+    """Write-once: an entry already on disk always wins, hit or miss alike —
+    same rule `enrich` itself follows."""
+    Store().save_tag_artists({
+        "a1": {"name": "Real Name", "lastfm_name": "Real Name",
+               "tags": [{"name": "jazz", "count": 20}], "fetched_at": "t0", "miss": False},
+    })
+
+    _merge_save_tag_artists({
+        "a1": {"name": "Stale Overwrite", "lastfm_name": None, "tags": [],
+               "fetched_at": "t1", "miss": True},
+    })
+
+    saved = Store().tag_artists()["a1"]
+    assert saved["name"] == "Real Name"
+    assert saved["miss"] is False
+    assert saved["tags"] == [{"name": "jazz", "count": 20}]

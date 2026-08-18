@@ -445,6 +445,37 @@ def _tag_artists_checked() -> dict:
     return store.tag_artists()
 
 
+# Guards every save of tags.json against the lost-update race between two
+# writers that both start from a read taken before their (slow) network work:
+# the split flow's `enrich()` walk and the now-playing on-demand fetch below
+# can each hold a snapshot that predates the other's save, and a bare
+# `store.save_tag_artists(mine)` after that is last-writer-wins — silently
+# dropping the other writer's freshly fetched artists, which is permanent,
+# unrecoverable work (tags.json is never re-fetched). Both writers must
+# funnel their saves through `_merge_save_tag_artists` for the guarantee to
+# hold; a lone caller of `store.save_tag_artists` still races.
+_tags_save_lock = threading.Lock()
+
+
+def _merge_save_tag_artists(new_entries: dict) -> None:
+    """Merge `new_entries` into tags.json without losing a concurrent writer.
+
+    Re-reads `store.tag_artists()` fresh *inside* the lock, right before
+    saving — so the merge always starts from whatever the other writer most
+    recently landed, not the snapshot `new_entries` was computed against.
+    Existing entries always win (write-once, same rule `enrich` itself
+    follows): a key already on disk is never replaced by one from
+    `new_entries`, so this is also safe to call with `new_entries` being a
+    caller's whole known map rather than strictly the delta. The critical
+    section is local dict/disk work only, never a network call, so this can
+    never block a request on another request's Last.fm round trip.
+    """
+    with _tags_save_lock:
+        current = store.tag_artists()
+        merged = {**new_entries, **current}
+        store.save_tag_artists(merged)
+
+
 def _split_summary(playlist_id: str, splits: dict | None = None) -> dict | None:
     """Local read only, for the Playlists picker: pile count and how much of
     a previous split is still undecided, so a playlist someone already split
@@ -618,7 +649,7 @@ def create_split(playlist_id: str, params: SplitParams = SplitParams()):
         artists = enrich(names, cached_artists, fm, _now_iso())
     except LastFmError as exc:
         saved = exc.partial if exc.partial is not None else cached_artists
-        store.save_tag_artists(saved)
+        _merge_save_tag_artists(saved)
         # How many of *this playlist's* artists made it, not the size of the
         # whole cross-playlist cache `saved` carries forward.
         tagged_here = len(set(names) & set(saved))
@@ -628,7 +659,7 @@ def create_split(playlist_id: str, params: SplitParams = SplitParams()):
             f"artists in this playlist ({exc}); progress was saved — "
             "re-running the split will resume instead of starting over.",
         ) from exc
-    store.save_tag_artists(artists)
+    _merge_save_tag_artists(artists)
 
     piles = split_tracks(tracks, artists, params.model_dump())
     with _split_lock:
@@ -2126,6 +2157,16 @@ def _sitting_for_context(ctx_id: str | None) -> dict | None:
 
 NOW_FETCH_MAX_ARTISTS = 3  # per /api/now?force=1 call — an explicit user action, not a poll
 
+# FastAPI's sync routes run in a threadpool, so two overlapping `?force=1`
+# requests (a double-click, two tabs refocused at once) genuinely execute
+# _fetch_missing_now_tags concurrently — this is not a hypothetical. Both
+# would otherwise read tags.json as "artist unknown" and both call Last.fm
+# for the same artist. Acquired non-blocking: a fetch already in flight means
+# this round simply fetches nothing and the response renders with whatever
+# tags already exist — never block one request's /api/now on another
+# request's Last.fm round trip.
+_now_fetch_lock = threading.Lock()
+
 
 def _fetch_missing_now_tags(track: dict) -> int:
     """Fetch Last.fm tags for up to `NOW_FETCH_MAX_ARTISTS` unknown artists on
@@ -2144,32 +2185,44 @@ def _fetch_missing_now_tags(track: dict) -> int:
     folded into `miss: true` by `top_tags` returning None); that must not
     break this response, so it's caught here and only `.partial` — whatever
     was verified before the failure — is persisted. Every artist after the
-    failing one in this batch is simply left absent and retryable.
+    failing one in this batch is simply left absent and retryable. Persisting
+    goes through `_merge_save_tag_artists`, so a concurrent `enrich()` walk
+    from the split flow can't lose (or be lost by) this write.
     """
-    fm = _lastfm_client()
-    if fm is None:
-        return 0
-    names: dict[str, str] = {}
-    for a in track.get("artists") or []:
-        aid = a.get("id")
-        if aid and aid not in names:
-            names[aid] = a.get("name") or ""
-    if not names:
-        return 0
-    cached = store.tag_artists()
-    unknown = dict(list((aid, n) for aid, n in names.items() if aid not in cached)
-                   [:NOW_FETCH_MAX_ARTISTS])
-    if not unknown:
+    if not _now_fetch_lock.acquire(blocking=False):
         return 0
     try:
-        merged = enrich(unknown, cached, fm, _now_iso())
-    except LastFmError as exc:
-        log.warning("now-playing tag fetch stopped early: %s", exc)
-        merged = exc.partial if exc.partial is not None else cached
-    fetched = len(merged) - len(cached)
-    if fetched > 0:
-        store.save_tag_artists(merged)
-    return fetched
+        fm = _lastfm_client()
+        if fm is None:
+            return 0
+        names: dict[str, str] = {}
+        for a in track.get("artists") or []:
+            aid = a.get("id")
+            if aid and aid not in names:
+                names[aid] = a.get("name") or ""
+        if not names:
+            return 0
+        cached = store.tag_artists()
+        unknown: dict[str, str] = {}
+        for aid, name in names.items():
+            if aid in cached:
+                continue
+            unknown[aid] = name
+            if len(unknown) == NOW_FETCH_MAX_ARTISTS:
+                break
+        if not unknown:
+            return 0
+        try:
+            merged = enrich(unknown, cached, fm, _now_iso())
+        except LastFmError as exc:
+            log.warning("now-playing tag fetch stopped early: %s", exc)
+            merged = exc.partial if exc.partial is not None else cached
+        fetched = len(merged) - len(cached)
+        if fetched > 0:
+            _merge_save_tag_artists(merged)
+        return fetched
+    finally:
+        _now_fetch_lock.release()
 
 
 @app.get("/api/now")
@@ -2206,8 +2259,9 @@ def now_playing(force: bool = False):
     # re-read below `_ensure_profiles`: `state["tag_artists"]` is a
     # profile-build-time snapshot that can sit stale for up to PROFILE_TTL, so
     # a fetch just above (or any other write to tags.json) would otherwise be
-    # invisible for up to 10 minutes. tag_artists() is a local JSON read —
-    # zero API cost — so doing it on every poll costs nothing.
+    # invisible for up to 10 minutes. Deliberate freshness/cost trade-off: a
+    # local JSON read on every poll (zero API cost) buys always-current tags
+    # instead of leaning on the profile cache.
     tag_artists = store.tag_artists()
     ctx_id = np["context_playlist_id"]
     ctx = next((p for p in state["playlists"] if p["id"] == ctx_id), None)
