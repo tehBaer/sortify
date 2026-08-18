@@ -123,14 +123,16 @@ def merge_save(store: Store, new_entries: dict) -> dict:
     envelope to `{}` rather than raising (guard-on-read, so other callers
     fail toward "no tags" instead of crashing) — but that same behaviour
     would make this function treat a ~1400-entry permanent cache as
-    correctly empty and overwrite it with just this run's batch. `baseline`
-    is captured before the fresh re-read used for the actual merge; if that
-    later read comes back with zero artists while the baseline was
-    non-empty, that is a malformed re-read, not a real empty file, and the
-    save is refused — raises `BackfillAbort` rather than guessing. Ordinary
-    concurrent writers (the live server) only ever ADD entries, so a
-    legitimate race never collapses the count to zero; only a broken
-    envelope does.
+    correctly empty (or truncated) and overwrite it with just this run's
+    batch. `baseline` is captured before the fresh re-read used for the
+    actual merge; if that later read comes back with FEWER artists than the
+    baseline — not just zero — that is a malformed or truncated re-read, not
+    a real shrink, and the save is refused. tags.json is append-only by
+    design: no code path anywhere ever deletes an entry from it (write-once,
+    the same rule `enrich` follows), so a shrink of ANY size between two
+    reads taken moments apart is anomalous, not a legitimate race — a real
+    concurrent writer only ever ADDS entries, so a genuine race can grow the
+    count between the two reads but never shrink it.
 
     A `json.JSONDecodeError` (the file itself is not valid JSON, not merely
     a malformed envelope) is also refused rather than propagated raw:
@@ -151,11 +153,12 @@ def merge_save(store: Store, new_entries: dict) -> dict:
             "already flushed by an earlier incremental save in this run are unaffected; "
             "fix data/tags.json and re-run the backfill to retry the discarded batch."
         ) from exc
-    if baseline > 0 and not current:
+    if len(current) < baseline:
         raise BackfillAbort(
-            f"data/tags.json re-read as 0 artists but {baseline} were on disk moments "
-            "ago — the envelope is likely malformed (missing/wrong-typed 'artists' key), "
-            f"not really empty. Refusing to save: {len(new_entries)} fetched-but-unsaved "
+            f"data/tags.json shrank from {baseline} to {len(current)} artists between "
+            "two reads moments apart — refusing to save. tags.json is append-only "
+            "(nothing ever deletes an entry from it), so any shrink is a malformed or "
+            f"truncated re-read, not a real one. {len(new_entries)} fetched-but-unsaved "
             "artist(s) from this batch are discarded, but that work is re-runnable and "
             "the permanent cache is not — inspect data/tags.json and re-run the backfill."
         )

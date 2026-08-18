@@ -463,23 +463,27 @@ def _merge_save_tag_artists(new_entries: dict) -> None:
     envelope to `{}` (guard-on-read, so other readers fail toward "no tags"
     instead of crashing) rather than raising — but that same behaviour would
     make this function treat a ~1400-entry permanent cache as legitimately
-    empty and overwrite it with just `new_entries`. `baseline` is captured
-    before the lock's own fresh read; if that later read comes back with
-    zero artists while the baseline was non-empty, that is a malformed
-    re-read, not a real empty file, and the save is refused. Concurrent
-    writers only ever ADD entries, so an ordinary race never collapses the
-    count to zero — only a broken envelope does, and the fetch that would
-    have written here simply retries on the next request.
+    empty (or truncated) and overwrite it with just `new_entries`. `baseline`
+    is captured before the lock's own fresh read; if that later read comes
+    back with FEWER artists than the baseline — not just zero — that is a
+    malformed or truncated re-read, not a real shrink, and the save is
+    refused. tags.json is append-only by design: no code path anywhere ever
+    deletes an entry from it (write-once, the same rule `enrich` follows),
+    so a shrink of ANY size between two reads taken moments apart is
+    anomalous, not a legitimate race — a real concurrent writer only ever
+    ADDS entries, so a genuine race can grow the count between the two reads
+    but never shrink it, and the fetch that would have written here simply
+    retries on the next request.
     """
     baseline = len(store.tag_artists())
     with _tags_save_lock:
         current = store.tag_artists()
-        if baseline > 0 and not current:
+        if len(current) < baseline:
             log.error(
-                "refusing to save tags.json: fresh re-read returned 0 artists but "
-                "%d were on disk moments ago (envelope likely malformed); save skipped, "
+                "refusing to save tags.json: fresh re-read shrank from %d to %d artists "
+                "(envelope likely malformed or truncated); save skipped, "
                 "the fetch will retry on the next request",
-                baseline,
+                baseline, len(current),
             )
             return
         merged = {**new_entries, **current}

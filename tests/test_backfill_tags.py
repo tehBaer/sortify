@@ -286,6 +286,42 @@ def test_merge_save_refuses_when_a_malformed_reread_would_clobber_the_cache(tmp_
     }
 
 
+def test_merge_save_refuses_a_partial_shrink_not_just_total_collapse(tmp_path, monkeypatch):
+    """Re-review, residual: a total collapse (baseline non-empty, re-read
+    empty) is only the extreme case. tags.json is append-only — no code
+    path anywhere ever deletes an entry — so ANY shrink between two reads
+    taken moments apart is anomalous, not a legitimate race (a real
+    concurrent writer only ever adds entries). A truncated re-read (5 seeded
+    entries down to 2, neither empty) must be refused exactly like the
+    total-collapse case, not just the `not current` extreme."""
+    store = Store(tmp_path)
+    seed = {
+        f"a{i}": {"name": f"Artist {i}", "lastfm_name": f"Artist {i}", "tags": [],
+                   "fetched_at": "t0", "miss": False}
+        for i in range(1, 6)
+    }
+    store.save_tag_artists(seed)
+
+    calls = {"n": 0}
+    real_tag_artists = store.tag_artists
+
+    def flaky_tag_artists():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_tag_artists()  # baseline: all 5
+        truncated = real_tag_artists()
+        return {k: truncated[k] for k in list(truncated)[:2]}  # re-read: only 2
+
+    monkeypatch.setattr(store, "tag_artists", flaky_tag_artists)
+
+    with pytest.raises(BackfillAbort, match="shrank from 5 to 2"):
+        merge_save(store, {"a6": {"name": "New", "lastfm_name": "New", "tags": [],
+                                    "fetched_at": "t1", "miss": False}})
+
+    on_disk = json.loads((tmp_path / "tags.json").read_text())["artists"]
+    assert on_disk == seed  # untouched — the guard tripped before any save
+
+
 def test_merge_save_refuses_on_unreadable_json_and_reports_discarded_count(tmp_path):
     """A `json.JSONDecodeError` (the file itself is not valid JSON, not
     merely a malformed envelope) is refused with a clean message rather than

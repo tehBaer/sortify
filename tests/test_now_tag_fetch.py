@@ -519,3 +519,38 @@ def test_merge_save_refuses_when_a_malformed_reread_would_clobber_the_cache(monk
         "a1": {"name": "Real", "lastfm_name": "Real", "tags": [{"name": "jazz", "count": 20}],
                "fetched_at": "t0", "miss": False},
     }
+
+
+def test_merge_save_refuses_a_partial_shrink_not_just_total_collapse(monkeypatch):
+    """Re-review, residual: a total collapse (baseline non-empty, re-read
+    empty) is only the extreme case. tags.json is append-only — no code
+    path anywhere ever deletes an entry — so ANY shrink between two reads
+    taken moments apart is anomalous, not a legitimate race (a real
+    concurrent writer only ever adds entries). A truncated re-read (5 seeded
+    entries down to 2, none of them zero) must be refused exactly like the
+    total-collapse case, not just the `not current` extreme."""
+    seed = {
+        f"a{i}": {"name": f"Artist {i}", "lastfm_name": f"Artist {i}", "tags": [],
+                   "fetched_at": "t0", "miss": False}
+        for i in range(1, 6)
+    }
+    appmod.store.save_tag_artists(seed)
+
+    calls = {"n": 0}
+    real_tag_artists = appmod.store.tag_artists
+
+    def flaky_tag_artists():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_tag_artists()  # baseline: all 5
+        truncated = real_tag_artists()
+        return {k: truncated[k] for k in list(truncated)[:2]}  # re-read: only 2
+
+    monkeypatch.setattr(appmod.store, "tag_artists", flaky_tag_artists)
+
+    _merge_save_tag_artists({
+        "a6": {"name": "New", "lastfm_name": "New", "tags": [], "fetched_at": "t1", "miss": False},
+    })
+
+    on_disk = json.loads((appmod.store.dir / "tags.json").read_text())["artists"]
+    assert on_disk == seed  # untouched — the guard tripped before any save
