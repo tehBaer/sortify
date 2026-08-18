@@ -8,6 +8,7 @@ isolated cache/config snapshot) but adds a trapped Last.fm client instead of
 counting Spotify calls.
 """
 
+import json
 import threading
 
 import pytest
@@ -476,3 +477,45 @@ def test_merge_save_never_overwrites_an_existing_entry():
     assert saved["name"] == "Real Name"
     assert saved["miss"] is False
     assert saved["tags"] == [{"name": "jazz", "count": 20}]
+
+
+def test_merge_save_refuses_when_a_malformed_reread_would_clobber_the_cache(monkeypatch):
+    """Task 5 review, Important: `store.tag_artists()` degrades a malformed
+    (but valid-JSON) envelope to `{}` rather than raising — guard-on-read,
+    the same behaviour every other reader relies on. Without a check for
+    that here, a malformed re-read taken *inside the lock* would make
+    `_merge_save_tag_artists` treat a real ~1400-entry cache as correctly
+    gone and overwrite it with just this call's `new_entries`.
+
+    Simulates the malformed re-read by making the baseline read (before the
+    lock) see the real seeded data, then the lock's own fresh re-read see
+    `{}` — exactly the shape a malformed envelope produces."""
+    appmod.store.save_tag_artists({
+        "a1": {"name": "Real", "lastfm_name": "Real", "tags": [{"name": "jazz", "count": 20}],
+               "fetched_at": "t0", "miss": False},
+    })
+
+    calls = {"n": 0}
+    real_tag_artists = appmod.store.tag_artists
+
+    def flaky_tag_artists():
+        calls["n"] += 1
+        # First call is `_merge_save_tag_artists`'s baseline (outside the
+        # lock): real data. Every call after that stands in for the lock's
+        # own fresh re-read seeing a malformed envelope.
+        return real_tag_artists() if calls["n"] == 1 else {}
+
+    monkeypatch.setattr(appmod.store, "tag_artists", flaky_tag_artists)
+
+    _merge_save_tag_artists({
+        "a2": {"name": "New", "lastfm_name": "New", "tags": [], "fetched_at": "t1", "miss": False},
+    })
+
+    # save_tag_artists was never called with the guard tripped, so the file
+    # on disk (read directly, bypassing the now-patched tag_artists) still
+    # holds the real pre-existing entry and never picked up "a2".
+    on_disk = json.loads((appmod.store.dir / "tags.json").read_text())["artists"]
+    assert on_disk == {
+        "a1": {"name": "Real", "lastfm_name": "Real", "tags": [{"name": "jazz", "count": 20}],
+               "fetched_at": "t0", "miss": False},
+    }

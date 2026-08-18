@@ -458,9 +458,30 @@ def _merge_save_tag_artists(new_entries: dict) -> None:
     caller's whole known map rather than strictly the delta. The critical
     section is local dict/disk work only, never a network call, so this can
     never block a request on another request's Last.fm round trip.
+
+    Clobber guard: `store.tag_artists()` degrades a malformed-but-valid-JSON
+    envelope to `{}` (guard-on-read, so other readers fail toward "no tags"
+    instead of crashing) rather than raising — but that same behaviour would
+    make this function treat a ~1400-entry permanent cache as legitimately
+    empty and overwrite it with just `new_entries`. `baseline` is captured
+    before the lock's own fresh read; if that later read comes back with
+    zero artists while the baseline was non-empty, that is a malformed
+    re-read, not a real empty file, and the save is refused. Concurrent
+    writers only ever ADD entries, so an ordinary race never collapses the
+    count to zero — only a broken envelope does, and the fetch that would
+    have written here simply retries on the next request.
     """
+    baseline = len(store.tag_artists())
     with _tags_save_lock:
         current = store.tag_artists()
+        if baseline > 0 and not current:
+            log.error(
+                "refusing to save tags.json: fresh re-read returned 0 artists but "
+                "%d were on disk moments ago (envelope likely malformed); save skipped, "
+                "the fetch will retry on the next request",
+                baseline,
+            )
+            return
         merged = {**new_entries, **current}
         store.save_tag_artists(merged)
 

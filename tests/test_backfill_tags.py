@@ -2,9 +2,12 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from backfill_tags import (  # noqa: E402
+    BackfillAbort,
     artists_to_fetch,
     collect_target_artists,
     load_all_cached_tracks,
@@ -242,3 +245,94 @@ def test_run_backfill_end_to_end_saves_final_summary_matches_disk(tmp_path):
     assert summary["fetched"] == 3
     assert summary["misses"] == 1
     assert summary["already_known"] == 0
+
+
+# ---- clobber guard: fix round 1, Important -------------------------------
+
+
+def test_merge_save_refuses_when_a_malformed_reread_would_clobber_the_cache(tmp_path, monkeypatch):
+    """`store.tag_artists()` degrades a malformed-but-valid-JSON envelope to
+    `{}` rather than raising (guard-on-read, same as every other reader) —
+    without a check here, a malformed re-read would make `merge_save` treat
+    a real ~1400-entry permanent cache as legitimately empty and overwrite
+    it with just this batch. Simulated by making the baseline read (first
+    call) see real seeded data and every read after that see `{}`, the same
+    shape a malformed envelope produces."""
+    store = Store(tmp_path)
+    store.save_tag_artists({
+        "a1": {"name": "Real", "lastfm_name": "Real", "tags": [{"name": "jazz", "count": 20}],
+               "fetched_at": "t0", "miss": False},
+    })
+
+    calls = {"n": 0}
+    real_tag_artists = store.tag_artists
+
+    def flaky_tag_artists():
+        calls["n"] += 1
+        return real_tag_artists() if calls["n"] == 1 else {}
+
+    monkeypatch.setattr(store, "tag_artists", flaky_tag_artists)
+
+    with pytest.raises(BackfillAbort, match="malformed"):
+        merge_save(store, {"a2": {"name": "New", "lastfm_name": "New", "tags": [],
+                                    "fetched_at": "t1", "miss": False}})
+
+    # The file on disk is read directly, bypassing the now-patched
+    # tag_artists, and still holds only the real pre-existing entry.
+    on_disk = json.loads((tmp_path / "tags.json").read_text())["artists"]
+    assert on_disk == {
+        "a1": {"name": "Real", "lastfm_name": "Real", "tags": [{"name": "jazz", "count": 20}],
+               "fetched_at": "t0", "miss": False},
+    }
+
+
+def test_merge_save_refuses_on_unreadable_json_and_reports_discarded_count(tmp_path):
+    """A `json.JSONDecodeError` (the file itself is not valid JSON, not
+    merely a malformed envelope) is refused with a clean message rather than
+    propagated raw, and states how many fetched-but-unsaved entries were
+    discarded."""
+    store = Store(tmp_path)
+    (tmp_path / "tags.json").write_text("{not valid json")
+
+    with pytest.raises(BackfillAbort, match=r"2 fetched-but-unsaved"):
+        merge_save(store, {
+            "a1": {"name": "One", "lastfm_name": "One", "tags": [], "fetched_at": "t", "miss": False},
+            "a2": {"name": "Two", "lastfm_name": "Two", "tags": [], "fetched_at": "t", "miss": False},
+        })
+
+    # Untouched — merge_save never got as far as writing.
+    assert (tmp_path / "tags.json").read_text() == "{not valid json"
+
+
+def test_run_backfill_propagates_backfill_abort_without_losing_earlier_saves(tmp_path, monkeypatch):
+    """A clobber-guard trip partway through a run must not erase progress an
+    earlier incremental save already flushed to disk. `save_every=1` flushes
+    "First" via a real `merge_save` call before "Second" is even fetched;
+    only the SECOND call to `merge_save` is made to raise, so the win from
+    the first save must still be on disk when `BackfillAbort` propagates."""
+    import backfill_tags as bt
+
+    store = Store(tmp_path)
+    target = {"a1": "First", "a2": "Second"}
+    fm = FakeFm(responses={
+        "First": ArtistTags(matched_name="First", tags=[]),
+        "Second": ArtistTags(matched_name="Second", tags=[]),
+    })
+
+    real_merge_save = bt.merge_save
+    calls = {"n": 0}
+
+    def flaky_merge_save(store_, new_entries):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_merge_save(store_, new_entries)
+        raise BackfillAbort("simulated clobber guard trip")
+
+    monkeypatch.setattr(bt, "merge_save", flaky_merge_save)
+
+    with pytest.raises(BackfillAbort):
+        run_backfill(target, store, fm, save_every=1, print_fn=lambda *_: None)
+
+    saved = store.tag_artists()
+    assert "a1" in saved  # the earlier, already-flushed save survives
+    assert "a2" not in saved

@@ -13,6 +13,10 @@ script is not a package and importing it would run its own argparse setup
 as a side effect) and skips anything already in tags.json — hit or miss,
 write-once, same rule `tags.enrich` itself follows.
 
+`--limit N` bounds how many artists this run ATTEMPTS (fetch calls it makes),
+not how many it successfully fetches — a run that hits N skips still stops
+at N attempts with 0 fetched.
+
 Usage:
     .venv/bin/python scripts/backfill_tags.py [--limit N] [--all-cached]
 """
@@ -33,6 +37,14 @@ from sortify.tags import LastFm, LastFmError, enrich, load_key  # noqa: E402
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 PROGRESS_EVERY = 25
 SAVE_EVERY = 50
+
+
+class BackfillAbort(Exception):
+    """Raised when a save must be refused rather than risk the permanent
+    tags.json cache. Always means: fetched-but-unsaved artists from this
+    invocation of `merge_save` are discarded, but that work is re-runnable
+    (another backfill invocation re-fetches them) — the file on disk is not,
+    so refusing beats guessing."""
 
 
 # ---- loading (read-only) -----------------------------------------------
@@ -106,8 +118,47 @@ def merge_save(store: Store, new_entries: dict) -> dict:
     one artist's freshly-fetched entry silently overwritten — never file
     corruption, and always retryable on the next backfill run since a lost
     entry is just absent, not recorded as a false miss.
+
+    Clobber guard: `store.tag_artists()` degrades a malformed-but-valid-JSON
+    envelope to `{}` rather than raising (guard-on-read, so other callers
+    fail toward "no tags" instead of crashing) — but that same behaviour
+    would make this function treat a ~1400-entry permanent cache as
+    correctly empty and overwrite it with just this run's batch. `baseline`
+    is captured before the fresh re-read used for the actual merge; if that
+    later read comes back with zero artists while the baseline was
+    non-empty, that is a malformed re-read, not a real empty file, and the
+    save is refused — raises `BackfillAbort` rather than guessing. Ordinary
+    concurrent writers (the live server) only ever ADD entries, so a
+    legitimate race never collapses the count to zero; only a broken
+    envelope does.
+
+    A `json.JSONDecodeError` (the file itself is not valid JSON, not merely
+    a malformed envelope) is also refused rather than propagated raw:
+    `Store._atomic_write` writes via `mkstemp` + `os.replace`, so the file on
+    disk was never left half-written by anything this script did — a bad
+    read here means something else touched the file — but this run's
+    fetched-but-unsaved batch is still lost and that needs saying plainly.
     """
-    current = store.tag_artists()
+    try:
+        baseline = len(store.tag_artists())
+        current = store.tag_artists()
+    except json.JSONDecodeError as exc:
+        raise BackfillAbort(
+            f"data/tags.json is not valid JSON ({exc}); refusing to save. "
+            f"{len(new_entries)} fetched-but-unsaved artist(s) from this batch are "
+            "discarded (the file itself was never corrupted by this script — Store "
+            "writes atomically — but something else made it unreadable). Artists "
+            "already flushed by an earlier incremental save in this run are unaffected; "
+            "fix data/tags.json and re-run the backfill to retry the discarded batch."
+        ) from exc
+    if baseline > 0 and not current:
+        raise BackfillAbort(
+            f"data/tags.json re-read as 0 artists but {baseline} were on disk moments "
+            "ago — the envelope is likely malformed (missing/wrong-typed 'artists' key), "
+            f"not really empty. Refusing to save: {len(new_entries)} fetched-but-unsaved "
+            "artist(s) from this batch are discarded, but that work is re-runnable and "
+            "the permanent cache is not — inspect data/tags.json and re-run the backfill."
+        )
     merged = {**new_entries, **current}
     store.save_tag_artists(merged)
     return merged
@@ -126,9 +177,11 @@ def run_backfill(
     save_every: int = SAVE_EVERY,
     print_fn=print,
 ) -> dict:
-    """Fetch tags for `target_artists`, bounded by `limit`, saving
-    incrementally every `save_every` fetched artists and once more at the
-    end. Returns the summary dict also printed at the end.
+    """Fetch tags for `target_artists`. `limit` bounds how many artists this
+    call ATTEMPTS (fetch calls made), not how many succeed — a run with
+    `limit=10` that hits 10 non-code-6 errors makes exactly 10 attempts and
+    fetches 0. Saves incrementally every `save_every` fetched artists and
+    once more at the end. Returns the summary dict also printed at the end.
 
     Failure rule (spec §Fetching, binding): only Last.fm error code 6 is a
     genuine miss — `enrich` already records those as `miss: true`. Any other
@@ -138,6 +191,13 @@ def run_backfill(
     carries `.partial` (`enrich`'s contract) with every artist verified
     before the failure, which this function saves before re-raising-free
     return — an error mid-run must not lose already-fetched progress.
+
+    Lets `BackfillAbort` (from `merge_save`'s clobber guard) propagate
+    uncaught: a save that must be refused mid-run means every fetch already
+    flushed by an earlier `_save` call in this run is safe, but continuing
+    to fetch more when saves are refused just discards more work, so this
+    stops rather than looping to the end pointlessly. `main()` is
+    responsible for turning that into a clean exit.
     """
     now = now or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     known = store.tag_artists()
@@ -152,13 +212,11 @@ def run_backfill(
     misses = 0
     skipped = 0
     pending: dict[str, str] = {}  # artists not yet folded into a save
-    cached_snapshot = dict(known)  # what's on disk, kept current across saves
 
     def _save(entries: dict) -> None:
-        nonlocal cached_snapshot
         if not entries:
             return
-        cached_snapshot = merge_save(store, entries)
+        merge_save(store, entries)
 
     items = list(to_fetch.items())
     processed = 0
@@ -218,7 +276,8 @@ def _print_summary(summary: dict, print_fn=print) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int, default=None,
-                         help="max number of artists to fetch this run (default: unlimited)")
+                         help="max number of artists to ATTEMPT this run (not fetched-"
+                              "successfully; default: unlimited)")
     parser.add_argument("--all-cached", action="store_true",
                          help="widen target artists to every cached playlist, not just homes")
     args = parser.parse_args()
@@ -236,7 +295,11 @@ def main() -> None:
           f"limit={args.limit if args.limit is not None else 'unbounded'} "
           f"scope={'all-cached' if args.all_cached else 'home'}")
 
-    summary = run_backfill(target_artists, store, fm, limit=args.limit)
+    try:
+        summary = run_backfill(target_artists, store, fm, limit=args.limit)
+    except BackfillAbort as exc:
+        print(f"backfill aborted: {exc}")
+        raise SystemExit(1) from exc
     _print_summary(summary)
 
 
