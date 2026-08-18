@@ -953,9 +953,23 @@ function renderSaveAllLabel(calls) {
 // side could only ever buy a refusal. A pile row from a server that didn't
 // send one is therefore offered as un-clickable rather than guessed at.
 //
-// One call per track — the Feb-2026 API has no batch add — which is ~26
-// minutes of paced requests for the 309-track pile, so the tooltip says the
-// price, the floor disclosure, and the wait before anything is spent.
+// One call per track — the Feb-2026 API has no batch add — queued and run by
+// a server-side worker, not this tab. The governor starts at 1.8 calls/min
+// and climbs (after clean stretches) to a 7.0/min ceiling, so the honest
+// estimate is a RANGE: ~calls/7.0 minutes if it's already at ceiling, up to
+// calls/1.8 if it's still at (or has just been knocked back to) the start
+// rate. For the 309-track pile that's ~45 min at ceiling, several hours at
+// the start rate.
+const QUEUE_CEILING_RATE = 7.0;  // calls/min, sortify/pacing.py CEILING_RATE
+const QUEUE_START_RATE = 1.8;    // calls/min, sortify/pacing.py START_RATE
+
+// Minutes -> a short human string, switching to hours once it's unwieldy.
+function formatQueueDuration(mins) {
+  if (mins < 60) return `${Math.max(1, Math.round(mins))} min`;
+  const hours = mins / 60;
+  return `${hours < 10 ? hours.toFixed(1) : Math.round(hours)} hr`;
+}
+
 function saveOffer(p) {
   const calls = p.materialise_calls;
   const m = p.materialised;
@@ -963,11 +977,14 @@ function saveOffer(p) {
     return { calls: null, disabled: true, label: "Save as playlist",
              note: "", title: "Reopen this split to see what saving it would cost." };
   }
-  const mins = Math.max(1, Math.ceil(calls / 12));
-  const price = `${floorPrice(calls)} — one per track, about ${mins} min at sortify's ` +
-    `pacing (${floorDisclosure(calls)}). Leave this tab open; if it stops partway ` +
-    `(a rate-limit cooldown, say) nothing is lost — pressing it again adds only the ` +
-    `tracks that are still missing.`;
+  const fast = formatQueueDuration(calls / QUEUE_CEILING_RATE);
+  const slow = formatQueueDuration(calls / QUEUE_START_RATE);
+  const price = `${floorPrice(calls)} — one per track, paced by a server-side worker ` +
+    `(about ${fast} at sortify's fastest pace, up to ${slow} if it's still ramping up) ` +
+    `(${floorDisclosure(calls)}). This job runs on the server, not in this tab — closing ` +
+    `it doesn't stop it. If it's interrupted (a rate-limit cooldown, say) nothing is ` +
+    `lost — pressing it again, or letting it resume on its own, adds only the tracks ` +
+    `that are still missing.`;
   if (calls === 0) {
     return { calls: 0, disabled: true, label: "Saved as a playlist",
              note: `saved as a playlist (${m && m.added} tracks)`,
@@ -1115,6 +1132,12 @@ function renderQueuePanel(status) {
   if (p.max_clean_rate != null) {
     bits.push(`max clean rate ${p.max_clean_rate}/min`);
   }
+  // M-3: spend vs. cap+reserve — the same numbers _queue_progress already
+  // sends with every GET (a free, local read), just not previously shown.
+  if (prog.daily_cap != null && prog.reserve != null) {
+    bits.push(`spend ${prog.spent_today ?? 0}/${prog.daily_cap} today ` +
+               `(bulk ${prog.bulk_today ?? 0}, reserve ${prog.reserve})`);
+  }
   const summary = bits.length
     ? `<div class="queue-summary">${badge}<span>${esc(bits.join(" · "))}</span></div>`
     : `<div class="queue-summary">${badge}</div>`;
@@ -1130,6 +1153,16 @@ function renderQueuePanel(status) {
     ? `<p class="hint queue-stop-quota">daily quota tripped — resume is manual</p>`
     : q.stop_reason
       ? `<p class="hint">last stop: ${esc(q.stop_reason)}</p>` : "";
+  // M-3: the pacing side's own record of the last 429, whether or not it
+  // stopped the worker (a rate 429 the governor halved for and kept going
+  // through leaves no stop_reason at all, so this is the only place that
+  // history is visible in the UI).
+  const hist429 = Array.isArray(p.history_429) ? p.history_429 : [];
+  const last429 = hist429.length ? hist429[hist429.length - 1] : null;
+  const last429Line = last429
+    ? `<p class="hint queue-last-429">last 429: ${esc(last429.kind)} at ` +
+      `${last429.rate}/min (${esc(new Date(last429.when * 1000).toLocaleTimeString())})</p>`
+    : "";
   const canPause = QUEUE_ACTIVE_STATES.has(state);
   // Resume 409s ("nothing queued") whenever pending/current are both empty
   // — cancel leaves the queue in exactly that state (stopped, pending: [],
@@ -1138,7 +1171,7 @@ function renderQueuePanel(status) {
   const hasWork = (Array.isArray(q.pending) && q.pending.length > 0) || !!q.current;
   const canResume = (state === "paused" || state === "stopped") && hasWork;
   const canCancel = state !== "done" && state !== "stopped";
-  return `${summary}${stopLine}
+  return `${summary}${stopLine}${last429Line}
     <div class="queue-controls">
       <button id="btn-queue-pause" ${canPause ? "" : "disabled"}>Pause</button>
       <button id="btn-queue-resume" ${canResume ? "" : "disabled"}>Resume</button>

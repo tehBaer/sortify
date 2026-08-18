@@ -466,8 +466,10 @@ run("stopNowPolling()");
   check("M a re-clustered pile is offered as a NEW playlist, at full price",
         /Save as a new playlist \(≥ 2 calls\)/.test(rows[3]) && /pile has changed/.test(rows[3]),
         rows[3].slice(-180));
-  check("M the tooltip states the wait and the floor disclosure, not just the price",
-        /one per track/.test(rows[0]) && /min at sortify/.test(rows[0]) && /at least/.test(rows[0]), "");
+  check("M the tooltip states the honest server-side pace range and the floor disclosure, not just the price",
+        /one per track/.test(rows[0]) && /server-side worker/.test(rows[0]) &&
+        /at least/.test(rows[0]) && !/Leave this tab open/.test(rows[0]) &&
+        /runs on the server/.test(rows[0]) && /closing it/.test(rows[0]), rows[0]);
 
   // A double-click on the SAME pile (identical queue signature) must not
   // double-queue — the same misclick guard materialisePile had, now scoped
@@ -599,6 +601,28 @@ run("stopNowPolling()");
     pending: ["p2"], current: "p1", progress: {} }, pacing: {} })`);
   check("an ordinary rate-limit note does NOT get the quota marker",
         !/queue-stop-quota/.test(rateLimitPanel), rateLimitPanel);
+
+  // M-3: spend vs. cap+reserve, and the pacing side's last 429 — both already
+  // ride along in the GET's progress/pacing objects (free, local reads).
+  const spendPanel = run(`renderQueuePanel({ queue: { state: "running", stop_reason: null,
+    pending: ["p2"], current: "p1",
+    progress: { pile_index: 1, pile_count: 2, track: 1, track_total: 3,
+                spent_today: 210, bulk_today: 40, daily_cap: 600, reserve: 150 } },
+    pacing: { rate_per_min: 3.4, ceiling: 7.0,
+              history_429: [{ kind: "rate", rate: 1.8, when: 1755500000 },
+                             { kind: "quota", rate: 3.4, when: 1755500600 }] } })`);
+  check("M the queue panel shows spend vs. cap and reserve",
+        /210\/600/.test(spendPanel) && /bulk 40/.test(spendPanel) && /reserve 150/.test(spendPanel),
+        spendPanel);
+  check("M the queue panel shows the LAST of pacing's history_429, not an earlier one",
+        /last 429/.test(spendPanel) && /quota/.test(spendPanel) && /3\.4\/min/.test(spendPanel) &&
+        !spendPanel.includes(">last 429: rate at"),
+        spendPanel);
+  const noHistoryPanel = run(`renderQueuePanel({ queue: { state: "running", stop_reason: null,
+    pending: [], current: "p1", progress: { pile_count: 1 } },
+    pacing: { rate_per_min: 1.8, ceiling: 7.0, history_429: [] } })`);
+  check("M no last-429 line when pacing has no history yet",
+        !/last 429/.test(noHistoryPanel), noHistoryPanel);
 
   // Review fix (Minor 3): pins the disclosed-but-untested claim — a
   // single-pile save in flight must not block save-all's guard key, and
