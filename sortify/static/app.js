@@ -118,11 +118,12 @@ async function loadLists() {
 
 // A non-owned playlist can never be split, full stop: the Feb-2026 dev-mode
 // API 403s reading /playlists/{id}/items for anything this account doesn't
-// own, so clicking through here would only pay ~15-35 wasted Spotify calls
-// to discover what `editable` (already in the cached listing, zero calls)
-// says for free — see create_split's pre-flight guard, which refuses the
-// same thing server-side. A pure function so the gating logic itself is
-// unit-testable without the DOM (see ui_harness.mjs).
+// own (on the read's first page — the wasted call is one, not the whole
+// paginated read), so clicking through here would pay a call to discover
+// what `editable` (already in the cached listing, zero calls) says for
+// free — see create_split's pre-flight guard, which refuses the same thing
+// server-side. A pure function so the gating logic itself is unit-testable
+// without the DOM (see ui_harness.mjs).
 function splitDisabledReason(p) {
   return p.editable ? null : "Not yours to split — make your own copy in Spotify first, then split that copy";
 }

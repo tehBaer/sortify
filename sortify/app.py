@@ -546,11 +546,13 @@ def create_split(playlist_id: str, params: SplitParams = SplitParams()):
     # Refused before any Spotify call: the Feb-2026 dev-mode API 403s on
     # /playlists/{id}/items for anything the account doesn't own, and the
     # cached listing already knows which playlists those are (`editable` is
-    # false for them). Without this, a long non-owned playlist pays its full
-    # ~15-35-call track read only to fail at the end — the exact waste that
-    # made the "the bomb" incident opaque. Liked Songs is the one id never in
-    # `by_id` (see the check above) and is always readable, so `p is None`
-    # exempts it rather than tripping the guard.
+    # false for them). Without this, a non-owned playlist still pays one
+    # wasted call — the paginated read 403s on its first page, not partway
+    # through — but that call is entirely avoidable, and it's what made the
+    # "the bomb" incident's failure opaque (a bare 502 with no clue why).
+    # Liked Songs is the one id never in `by_id` (see the check above) and
+    # is always readable, so `p is None` exempts it rather than tripping the
+    # guard.
     p = by_id.get(playlist_id)
     if p is not None and not p["editable"]:
         raise _foreign_playlist_error(p["name"], p.get("owner"))
@@ -575,8 +577,22 @@ def create_split(playlist_id: str, params: SplitParams = SplitParams()):
     names = {}
     for t in tracks:
         for a in t.get("artists", []):
-            if a.get("id"):
-                names.setdefault(a["id"], a.get("name") or "")
+            aid = a.get("id")
+            if not aid:
+                continue
+            name = a.get("name") or ""
+            # A non-blank name always wins over a blank one, regardless of
+            # which occurrence comes first in the playlist. The same artist
+            # id can appear on a real track and on a blank-artist Spotify
+            # placeholder (a removed/unavailable track) — first-occurrence-
+            # wins would let the placeholder's blank name reach `enrich`
+            # even when a later track in the same playlist names the artist
+            # correctly, permanently poisoning data/tags.json (never
+            # re-fetched) with a false miss for an artist Last.fm actually
+            # knows. An id with only blank occurrences still ends up with
+            # "" here, which is correct: that one really is unknowable.
+            if name or aid not in names:
+                names[aid] = name
 
     try:
         artists = enrich(names, cached_artists, fm, _now_iso())

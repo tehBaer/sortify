@@ -64,6 +64,14 @@ PLAYLIST_LIST = [
     # and the real my_playlists()-reads-from-cache path the same way.
     {"id": "PL-FOREIGN", "name": "the bomb", "owner": "rightkillthaz", "editable": False,
      "total": 1372, "snapshot_id": "snap-foreign", "image": None},
+    # Owned and editable — used by the duplicate-artist-id tests below, kept
+    # separate from PL1 (and from each other) so each test's overridden
+    # playlist_tracks can't be shadowed by a snapshot-matched cache hit left
+    # behind in the shared-session cache.json by an earlier test.
+    {"id": "PL-DUP", "name": "PL-DUP", "owner": "me", "editable": True,
+     "total": 2, "snapshot_id": "snap-dup", "image": None},
+    {"id": "PL-DUP2", "name": "PL-DUP2", "owner": "me", "editable": True,
+     "total": 2, "snapshot_id": "snap-dup2", "image": None},
 ]
 
 
@@ -497,11 +505,13 @@ def test_recluster_persists_the_new_params(client):
 # ---- ownership guard: the "the bomb" incident -------------------------------
 #
 # A real split attempt on a 1372-track playlist owned by another Spotify user
-# spent ~17 calls paginating the read before the Feb-2026 dev-mode API 403'd
-# on /playlists/{id}/items — a cost that was entirely avoidable, since the
-# cached listing already carried editable: false and the real owner's name.
-# 40 non-owned 100+-track playlists in the account made this a repeatable
-# waste, not a one-off.
+# failed with a bare 502 — the Feb-2026 dev-mode API 403s on
+# /playlists/{id}/items on the read's very first page, so the actual waste
+# is one call, not a long paginated read — but that call, and the opaque
+# 502 it produced, were both entirely avoidable: the cached listing already
+# carried editable: false and the real owner's name. 40 non-owned
+# 100+-track playlists in the account made this a repeatable case, not a
+# one-off.
 
 
 def test_split_rejects_a_non_owned_playlist_before_spending_any_call(client, monkeypatch):
@@ -598,3 +608,61 @@ def test_split_still_surfaces_a_429_cooldown_as_itself(client, monkeypatch):
         assert "copy" not in r.json()["detail"].lower()
     finally:
         Store().save_cache(original_cache)
+
+
+# ---- F1: a blank name must never win over a real one for the same artist ---
+
+
+def test_split_prefers_a_real_artist_name_over_a_blank_placeholder_occurrence(client, monkeypatch):
+    """The exact "the bomb" data condition: artist id "va" appears twice —
+    blank on a dead Spotify placeholder track (a removed/unavailable track,
+    itself blank-named too) and as "Various Artists" on a real track,
+    "The Point". First-occurrence-wins would send the blank name to
+    `enrich`, which (correctly, per the separate blank-name-is-a-miss fix)
+    records it as a permanent miss in data/tags.json — poisoning every
+    future split for an artist Last.fm actually knows, even though a retry
+    with the *other* occurrence's name would have worked fine. `enrich`
+    itself is never wrong to trust the name it's handed; the bug is in
+    `create_split` handing it the wrong one.
+    """
+    placeholder = make_track("spotify:track:ph0", "ph0", "", "va", "", None)
+    real = make_track("spotify:track:va0", "va0", "The Point", "va", "Various Artists", "A")
+    # Order matters for this test: the placeholder comes first, exactly as
+    # in the real playlist.
+    monkeypatch.setattr(appmod.sp, "playlist_tracks", lambda pid: [placeholder, real])
+
+    seen_names = {}
+
+    def fake_enrich(artist_names, cached, fm, now):
+        seen_names.update(artist_names)
+        return {**cached, "va": {"name": artist_names["va"], "tags": [], "miss": False}}
+
+    monkeypatch.setattr(appmod, "enrich", fake_enrich)
+
+    r = client.post("/api/split/PL-DUP")
+    assert r.status_code == 200
+    assert seen_names["va"] == "Various Artists"  # not "" — the real name won
+    assert Store().tag_artists()["va"]["miss"] is False
+
+
+def test_split_still_records_an_id_with_only_blank_occurrences_as_blank(client, monkeypatch):
+    """The other half of the fix: an id that is blank on *every* occurrence
+    must still reach `enrich` as "" — that one really is unknowable, and the
+    blank-name-is-a-miss behaviour (tested in tests/test_tags.py) must still
+    apply to it. Only a real name occurring somewhere should ever override
+    the blank."""
+    only_blank_a = make_track("spotify:track:a0", "a0", "", "ghost", "", None)
+    only_blank_b = make_track("spotify:track:a1", "a1", "", "ghost", "", None)
+    monkeypatch.setattr(appmod.sp, "playlist_tracks", lambda pid: [only_blank_a, only_blank_b])
+
+    seen_names = {}
+
+    def fake_enrich(artist_names, cached, fm, now):
+        seen_names.update(artist_names)
+        return {**cached, "ghost": {"name": "", "tags": [], "miss": True}}
+
+    monkeypatch.setattr(appmod, "enrich", fake_enrich)
+
+    r = client.post("/api/split/PL-DUP2")
+    assert r.status_code == 200
+    assert seen_names["ghost"] == ""
