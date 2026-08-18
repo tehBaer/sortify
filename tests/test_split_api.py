@@ -57,6 +57,13 @@ PLAYLIST_LIST = [
      "total": 40, "snapshot_id": "snap-pl1", "image": None},
     {"id": "PL4", "name": "PL4", "owner": "me", "editable": True,
      "total": 21, "snapshot_id": "snap-pl4", "image": None},
+    # Not owned by the account — editable is False, same shape the real
+    # cached listing has for a followed/shared playlist. Used by the
+    # ownership-guard tests below; present here (rather than built
+    # per-test) so it flows through both the fixture's fake my_playlists
+    # and the real my_playlists()-reads-from-cache path the same way.
+    {"id": "PL-FOREIGN", "name": "the bomb", "owner": "rightkillthaz", "editable": False,
+     "total": 1372, "snapshot_id": "snap-foreign", "image": None},
 ]
 
 
@@ -485,3 +492,109 @@ def test_recluster_persists_the_new_params(client):
                json={"min_pile": 5, "resolution": 1.0, "tag_floor": 3, "max_tags_per_artist": 2})
     stored = Store().splits()["splits"]["PL1"]["params"]
     assert stored == {"resolution": 1.0, "min_pile": 5, "tag_floor": 3, "max_tags_per_artist": 2}
+
+
+# ---- ownership guard: the "the bomb" incident -------------------------------
+#
+# A real split attempt on a 1372-track playlist owned by another Spotify user
+# spent ~17 calls paginating the read before the Feb-2026 dev-mode API 403'd
+# on /playlists/{id}/items — a cost that was entirely avoidable, since the
+# cached listing already carried editable: false and the real owner's name.
+# 40 non-owned 100+-track playlists in the account made this a repeatable
+# waste, not a one-off.
+
+
+def test_split_rejects_a_non_owned_playlist_before_spending_any_call(client, monkeypatch):
+    """The pre-flight guard: `by_id["PL-FOREIGN"]["editable"]` is already
+    False in the cached listing this fixture serves, so create_split must
+    refuse before ever calling playlist_tracks — or even my_playlists() for
+    real (it's replaced here with the genuine method, reading from a warmed
+    cache.json, to prove the guard doesn't force a real listing re-read
+    either). Trapped at Spotify.request(), the one chokepoint every call
+    funnels through — same reasoning as test_get_split_spends_no_api_calls —
+    so the assertion catches ANY stray call, not just the two this endpoint
+    happens to make today.
+    """
+    original_cache = Store().cache()
+    cache = Store().cache()
+    cache["playlist_list"] = {"fetched_at": 0, "items": PLAYLIST_LIST}
+    Store().save_cache(cache)
+    try:
+        monkeypatch.delattr(appmod.sp, "playlist_tracks", raising=False)
+        monkeypatch.delattr(appmod.sp, "my_playlists", raising=False)
+
+        def fail(*a, **kw):
+            raise AssertionError("a non-owned playlist must not spend any Spotify call")
+
+        monkeypatch.setattr(appmod.sp, "request", fail)
+
+        r = client.post("/api/split/PL-FOREIGN")
+        assert r.status_code == 403
+        detail = r.json()["detail"]
+        # Actionable: says whose it is and what to do about it, not just "no".
+        assert "the bomb" in detail
+        assert "rightkillthaz" in detail
+        assert "copy" in detail.lower()
+        assert client.calls["spotify"] == 0
+    finally:
+        Store().save_cache(original_cache)
+
+
+def test_split_403_is_distinguishable_from_a_spotify_or_lastfm_502(client):
+    """A previous review flagged that both a Spotify failure and a Last.fm
+    failure land on the same 502, which is exactly what made the real
+    incident opaque (a bare 502 with no clue it was an ownership problem).
+    The new failure mode must not join that pile."""
+    r = client.post("/api/split/PL-FOREIGN")
+    assert r.status_code == 403
+    assert r.status_code != 502
+
+
+def test_split_surfaces_a_live_403_as_the_same_actionable_error(client, monkeypatch):
+    """The pre-flight guard above only catches what the cached listing
+    already knows. Ownership can change, sharing can be revoked, or the
+    playlist can be deleted between that cached listing and the read — only
+    the live call discovers that. It must still translate to the same
+    actionable message, not the bare 502 every other Spotify failure gets
+    here (see `_spotify_error`)."""
+    from sortify.spotify import SpotifyError
+
+    def raising_playlist_tracks(pid):
+        raise SpotifyError(403, "Forbidden")
+
+    monkeypatch.setattr(appmod.sp, "playlist_tracks", raising_playlist_tracks)
+    original_cache = Store().cache()
+    cache = Store().cache()
+    cache["playlists"].pop("PL1", None)  # force a cold read, past the cache
+    Store().save_cache(cache)
+    try:
+        r = client.post("/api/split/PL1")
+        assert r.status_code == 403
+        detail = r.json()["detail"]
+        assert "PL1" in detail
+        assert "copy" in detail.lower()
+    finally:
+        Store().save_cache(original_cache)
+
+
+def test_split_still_surfaces_a_429_cooldown_as_itself(client, monkeypatch):
+    """The 403 handling above must not swallow every other Spotify failure
+    into the same "make a copy" message — a 429 cooldown is a completely
+    different problem (wait, don't retry) and has to keep saying so."""
+    from sortify.spotify import SpotifyError
+
+    def raising_playlist_tracks(pid):
+        raise SpotifyError(429, "Spotify rate limit hit — cooldown ~5 min. Let it rest; retrying extends it.")
+
+    monkeypatch.setattr(appmod.sp, "playlist_tracks", raising_playlist_tracks)
+    original_cache = Store().cache()
+    cache = Store().cache()
+    cache["playlists"].pop("PL1", None)
+    Store().save_cache(cache)
+    try:
+        r = client.post("/api/split/PL1")
+        assert r.status_code == 502  # untouched: the plain SpotifyError handler, not the guard
+        assert "cooldown" in r.json()["detail"].lower()
+        assert "copy" not in r.json()["detail"].lower()
+    finally:
+        Store().save_cache(original_cache)

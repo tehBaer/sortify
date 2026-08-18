@@ -389,6 +389,28 @@ run("stopNowPolling()");
         JSON.stringify($$("split-sitting-status").textContent.slice(0, 70)));
 }
 
+// ============================================================================
+// O1 — the ownership guard: a non-owned playlist must never offer a live
+// split button. (The playlist-row DOM itself is out of reach here — the
+// stub's querySelectorAll() always returns [], by design, since it only
+// models the ids the sitting/piles paths touch — so this pins the pure
+// gating function renderLists() calls per row rather than the wired-up
+// button. The zero-Spotify-calls guarantee itself is pinned server-side, in
+// tests/test_split_api.py; this only pins that the UI won't let a click
+// through in the first place.)
+// ============================================================================
+{
+  const notOwned = run(`splitDisabledReason({ editable: false })`);
+  check("O1 a non-owned playlist gets a disabled reason",
+        typeof notOwned === "string" && notOwned.length > 0, JSON.stringify(notOwned));
+  check("O1 the reason says what to do about it",
+        /copy/i.test(notOwned), JSON.stringify(notOwned));
+
+  const owned = run(`splitDisabledReason({ editable: true })`);
+  check("O1 an owned playlist gets no disabled reason",
+        owned === null, JSON.stringify(owned));
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

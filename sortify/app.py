@@ -391,6 +391,27 @@ def _lastfm_client() -> LastFm | None:
     return LastFm(key) if key else None
 
 
+def _foreign_playlist_error(name: str, owner: str | None) -> HTTPException:
+    """403: raised both when the cached listing already shows a playlist
+    isn't ours (before any Spotify call — see `create_split`'s pre-flight
+    guard) and when a live read discovers the same thing (ownership changed,
+    sharing revoked, or the cache is simply stale). Same actionable message
+    either way, and — deliberately — a status distinct from the 502 a
+    Spotify failure gets and the 502 a Last.fm failure gets, so this class of
+    failure (nothing to retry, nothing transient, the fix is "make a copy")
+    is never mistaken for either.
+    """
+    who = owner or "another Spotify user"
+    return HTTPException(
+        403,
+        f'"{name}" belongs to {who}, not you. The Feb-2026 dev-mode API won\'t let '
+        "sortify read another user's playlist tracks at all, so splitting it can never "
+        'succeed here. Make your own copy first — in the Spotify app, right-click or '
+        'long-press the playlist and choose "Add to your Library" (this duplicates it '
+        "into a playlist you own) — then split that copy instead.",
+    )
+
+
 def _tag_artists_checked() -> dict:
     """`store.tag_artists()`, refusing a tags.json shape the splitter can't read.
 
@@ -522,8 +543,32 @@ def create_split(playlist_id: str, params: SplitParams = SplitParams()):
     if playlist_id != LIKED_ID and playlist_id not in by_id:
         raise HTTPException(404, "unknown playlist")
 
+    # Refused before any Spotify call: the Feb-2026 dev-mode API 403s on
+    # /playlists/{id}/items for anything the account doesn't own, and the
+    # cached listing already knows which playlists those are (`editable` is
+    # false for them). Without this, a long non-owned playlist pays its full
+    # ~15-35-call track read only to fail at the end — the exact waste that
+    # made the "the bomb" incident opaque. Liked Songs is the one id never in
+    # `by_id` (see the check above) and is always readable, so `p is None`
+    # exempts it rather than tripping the guard.
+    p = by_id.get(playlist_id)
+    if p is not None and not p["editable"]:
+        raise _foreign_playlist_error(p["name"], p.get("owner"))
+
     snapshot_id = by_id.get(playlist_id, {}).get("snapshot_id")
-    tracks = _cached_tracks(playlist_id, snapshot_id)
+    try:
+        tracks = _cached_tracks(playlist_id, snapshot_id)
+    except SpotifyError as e:
+        if e.status == 403:
+            # The cached listing said this was ours, but the live read just
+            # found otherwise — ownership changed, sharing was revoked, or
+            # the entry was simply stale since the last Refresh. Same
+            # actionable message as the pre-flight guard above, not a bare
+            # 502: the fix is "make a copy", not "try again later".
+            raise _foreign_playlist_error(
+                p["name"] if p else playlist_id, p.get("owner") if p else None
+            ) from e
+        raise  # e.g. a 429 cooldown must still surface as itself, not this
     if not tracks:
         raise HTTPException(400, "playlist has no tracks")
 

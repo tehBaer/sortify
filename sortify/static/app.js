@@ -116,6 +116,17 @@ async function loadLists() {
   }
 }
 
+// A non-owned playlist can never be split, full stop: the Feb-2026 dev-mode
+// API 403s reading /playlists/{id}/items for anything this account doesn't
+// own, so clicking through here would only pay ~15-35 wasted Spotify calls
+// to discover what `editable` (already in the cached listing, zero calls)
+// says for free — see create_split's pre-flight guard, which refuses the
+// same thing server-side. A pure function so the gating logic itself is
+// unit-testable without the DOM (see ui_harness.mjs).
+function splitDisabledReason(p) {
+  return p.editable ? null : "Not yours to split — make your own copy in Spotify first, then split that copy";
+}
+
 function renderLists() {
   const wrap = $("playlists");
   wrap.innerHTML = "";
@@ -152,6 +163,13 @@ function renderLists() {
       // Splitting only earns its keep on a playlist too long to work through
       // as-is — a 30-track input doesn't need piles.
       bSplit.hidden = p.id === "liked" || (p.total ?? 0) < 100;
+      // Disabled rather than hidden when it's not owned: hiding leaves a
+      // 1372-track playlist with no visible split button and no
+      // explanation, where disabling teaches the actual fix on hover
+      // instead of just hiding the dead end.
+      const reason = splitDisabledReason(p);
+      bSplit.disabled = !!reason;
+      bSplit.title = reason || "Split into piles";
     };
     bIn.onclick = () => { roles[p.id] = roles[p.id] === "input" ? null : "input"; paint(); };
     bHome.onclick = () => { roles[p.id] = roles[p.id] === "home" ? null : "home"; paint(); };
