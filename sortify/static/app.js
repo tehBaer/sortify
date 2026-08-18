@@ -45,6 +45,11 @@ async function api(path, body, method) {
 
 function show(view) {
   for (const v of views) $("view-" + v).hidden = v !== view;
+  // Triage and split are reached from (and exit back to) the Playlists view,
+  // so they keep that link lit rather than leaving the nav dark.
+  $("nav-now").classList.toggle("active", view === "now");
+  $("nav-lists").classList.toggle("active", view === "lists" || view === "triage" || view === "split");
+  $("nav-reconnect").classList.toggle("active", view === "setup");
 }
 
 let toastTimer = null;
@@ -420,24 +425,68 @@ function paintSittingBar() {
   // A reservation whose create_playlist failed carries no tracks at all —
   // "0 of 0 left" would read as "done", so say what it actually is. Either
   // way the Finish button beside this text is the escape.
-  $("now-sitting-status").textContent = uris.length
-    ? `sitting: ${s.pileName} — ${left} of ${uris.length} left`
-    : `sitting: ${s.pileName} — reserved, no tracks added (finish it to release the split)`;
+  $("now-sitting-status").innerHTML = uris.length
+    ? `Sitting: <b>${esc(s.pileName)}</b> · ${left} of ${uris.length} left
+       <span class="sb-bar"><span class="sb-fill" style="width:${Math.round(((uris.length - left) / uris.length) * 100)}%"></span></span>`
+    : `Sitting: <b>${esc(s.pileName)}</b> — reserved, no tracks added (finish it to release the split)`;
   bar.hidden = false;
 }
 $("btn-now-finish-sitting").onclick = () => finishSitting(nowState?.sitting?.split_id || sitting?.splitId);
+
+// Cooldown countdown: ticks locally every second between polls — display
+// only, no extra requests of any kind. The total sizes the progress bar and
+// survives re-polls of the same cooldown (the server re-reports shrinking
+// minutes every ~90s; treat anything within tolerance as the same event).
+let nowCooldownTimer = null;
+let nowCooldownUntil = 0;   // epoch ms
+let nowCooldownTotal = 0;   // ms at first sighting
+
+function stopCooldownTicker() { clearInterval(nowCooldownTimer); nowCooldownTimer = null; }
+
+function fmtCountdown(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const pad = (n) => String(n).padStart(2, "0");
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return h ? `${h}h ${pad(m)}m ${pad(sec)}s` : m ? `${m}m ${pad(sec)}s` : `${sec}s`;
+}
 
 function renderNowProblem(msg) {
   nowProblem = true;
   paintSittingBar();
   $("now-context").textContent = "";
   $("now-controls").hidden = true;
+  stopCooldownTicker();
   const cd = msg.match(/cooldown — try again in ~(\d+) min/);
-  $("now-card").innerHTML = cd
-    ? `<p class="done-msg">Spotify has rate-limited the app.<br>
-       Back in about <b>${Math.round(Number(cd[1]) / 60)} hours</b> — nothing to do until then,
-       your music and playlists are unaffected.</p>`
-    : `<p class="done-msg">${esc(msg)}</p>`;
+  if (!cd) {
+    nowCooldownUntil = nowCooldownTotal = 0;
+    $("now-card").innerHTML = `<p class="done-msg">${esc(msg)}</p>`;
+    return;
+  }
+  const until = Date.now() + Number(cd[1]) * 60000;
+  if (Math.abs(until - nowCooldownUntil) > 120000) nowCooldownTotal = until - Date.now();
+  nowCooldownUntil = until;
+  const at = new Date(until);
+  const pad = (n) => String(n).padStart(2, "0");
+  const pct = () => Math.max(0, Math.min(100,
+    Math.round(((nowCooldownTotal - (until - Date.now())) / (nowCooldownTotal || 1)) * 100)));
+  $("now-card").innerHTML = `<div class="cooldown-card">
+    <div class="cb-head"><span class="cb-title">Spotify has rate-limited the app</span><span class="cb-chip">paused</span></div>
+    <div class="cb-time" id="cb-time">${fmtCountdown(until - Date.now())}</div>
+    <div class="cb-at">back around <b>${pad(at.getHours())}:${pad(at.getMinutes())}</b> — nothing to do until then;
+      your music and playlists are unaffected</div>
+    <div class="cb-bar"><div class="cb-fill" id="cb-fill" style="width:${pct()}%"></div></div>
+  </div>`;
+  nowCooldownTimer = setInterval(() => {
+    const rem = until - Date.now();
+    if (rem <= 0) {
+      stopCooldownTicker();
+      $("cb-time").textContent = "any moment now";
+      $("cb-fill").style.width = "100%";
+      return;  // the normal poll schedule repaints with the real answer
+    }
+    $("cb-time").textContent = fmtCountdown(rem);
+    $("cb-fill").style.width = pct() + "%";
+  }, 1000);
 }
 
 // Playback controls only make sense against something actually playing —
@@ -518,7 +567,12 @@ function renderNow() {
   // about split decisions, so it must not stay live just because an earlier,
   // unrelated ordinary filing left nowActions > 0.
   const inSitting = !!d.sitting;
-  $("btn-undo-now").disabled = nowActions === 0 || inSitting;
+  // Hidden, not just disabled: a permanently greyed-out button at top-right
+  // is noise for the 95% of the time nothing is undoable.
+  const undo = $("btn-undo-now");
+  undo.disabled = nowActions === 0 || inSitting;
+  undo.hidden = undo.disabled;
+  if (!d.cooldown) { stopCooldownTicker(); nowCooldownUntil = nowCooldownTotal = 0; }
   paintNowControls(d);
   syncSittingFromNow(d);
   paintSittingBar();
@@ -543,7 +597,7 @@ function renderNow() {
   const ctx = d.context;
 
   $("now-context").textContent = inSitting
-    ? `sitting: ${d.sitting.pile_name}`
+    ? ""  // the sitting banner directly below already names the pile
     : ctx?.name
       ? (ctx.is_input ? `playing from ${ctx.name}` : `playing from ${ctx.name} (not an input)`)
       : "not playing from a playlist";

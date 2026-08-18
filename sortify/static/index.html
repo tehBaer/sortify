@@ -22,13 +22,13 @@
   <section id="view-now" hidden>
     <div class="triage-top">
       <span id="now-context" class="hint"></span>
-      <button id="btn-undo-now" disabled>Undo</button>
+      <button id="btn-undo-now" disabled hidden>Undo</button>
     </div>
     <div id="now-controls" class="row" hidden>
       <select id="now-input-switch" title="Play a different input playlist"></select>
       <button id="btn-now-next" title="Skip to the next track">Next ›</button>
     </div>
-    <div id="now-sitting-bar" class="row" hidden>
+    <div id="now-sitting-bar" class="row sitting-banner" hidden>
       <span id="now-sitting-status" class="hint"></span>
       <button id="btn-now-finish-sitting">Finish sitting</button>
     </div>
@@ -95,7 +95,7 @@
       <span id="split-title"></span>
     </div>
     <div id="split-loading" hidden><div class="spinner"></div><p id="split-msg"></p></div>
-    <div id="split-sitting-bar" class="row" hidden>
+    <div id="split-sitting-bar" class="row sitting-banner" hidden>
       <span id="split-sitting-status" class="hint"></span>
       <button id="btn-split-finish-sitting">Finish sitting</button>
     </div>

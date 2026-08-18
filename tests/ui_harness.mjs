@@ -45,8 +45,18 @@ class El {
   constructor(id) {
     this.id = id; this._html = ""; this.hidden = false; this.disabled = false;
     this.textContent = ""; this.value = ""; this.className = "";
-    this.dataset = {}; this.children = []; this.href = "";
-    this.classList = { toggle() {}, add() {}, remove() {} };
+    this.dataset = {}; this.children = []; this.href = ""; this.style = {};
+    const cls = new Set();
+    this.classList = {
+      add: (c) => cls.add(c),
+      remove: (c) => cls.delete(c),
+      toggle: (c, force) => {
+        const on = force === undefined ? !cls.has(c) : !!force;
+        if (on) cls.add(c); else cls.delete(c);
+        return on;
+      },
+      contains: (c) => cls.has(c),
+    };
   }
   // Assigning innerHTML replaces the subtree — so appended children go too,
   // exactly as in a real DOM. renderPiles() relies on this to clear rows.
@@ -103,7 +113,7 @@ async function fetchStub(path, opts) {
 }
 
 const ctx = vm.createContext({
-  document, fetch: fetchStub, setTimeout, clearTimeout, console,
+  document, fetch: fetchStub, setTimeout, clearTimeout, setInterval, clearInterval, console,
   Date, Math, Number, Object, JSON, Error, Map, Set, Promise, String, Array,
 });
 Object.defineProperty(ctx, "globalThis", { value: ctx });
@@ -658,6 +668,118 @@ run("stopNowPolling()");
   check("M and calling it with no price spends nothing",
         posts("/api/split/PL9/queue") === 0,
         `${posts("/api/split/PL9/queue")} POST(s)`);
+}
+
+// ============================================================================
+// V — Now-tab presentation pins (2026-08 visual refresh): cooldown countdown
+// card, hidden-until-useful Undo, sitting banner de-dupe, nav active state.
+// ============================================================================
+{
+  // V5 — the nav marks which view you're in; triage/split count as the
+  // Playlists flow (that's where the user came from and goes back to).
+  run(`show("now")`);
+  check("V5 Now link is active in the Now view",
+        $$("nav-now").classList.contains("active") === true &&
+        $$("nav-lists").classList.contains("active") === false, "");
+  run(`show("triage")`);
+  check("V5 triage marks the Playlists link active",
+        $$("nav-lists").classList.contains("active") === true &&
+        $$("nav-now").classList.contains("active") === false, "");
+  run(`show("now")`);
+}
+
+{
+  // V1 — a cooldown renders a countdown card with real h/m arithmetic and a
+  // resume time, never Math.round'ed hours ("~178 min" used to say "3 hours",
+  // "~25 min" said "0 hours").
+  routes["GET /api/now?force=1"] = {
+    status: 200,
+    body: { playing: false, cooldown: "cooldown — try again in ~178 min", poll_after_ms: 999999 },
+  };
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  let card = $$("now-card").innerHTML;
+  check("V1 a 178-min cooldown shows h/m, not a rounded hour count",
+        /2h 58m/.test(card) && !/3 hours/.test(card), JSON.stringify(card.slice(0, 120)));
+  check("V1 the card names the resume time of day",
+        /around <b>\d{1,2}:\d{2}<\/b>/.test(card), JSON.stringify(card.slice(0, 160)));
+
+  routes["GET /api/now?force=1"] = {
+    status: 200,
+    body: { playing: false, cooldown: "cooldown — try again in ~25 min", poll_after_ms: 999999 },
+  };
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  card = $$("now-card").innerHTML;
+  check("V1 a 25-min cooldown never says '0 hours'",
+        /25m/.test(card) && !/0 hours/.test(card), JSON.stringify(card.slice(0, 120)));
+
+  // V2 — the 1s countdown ticker must die the moment a real answer lands,
+  // or a long-lived tab accumulates intervals.
+  routes["GET /api/now?force=1"] = { status: 200, body: { playing: false, poll_after_ms: 999999 } };
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  let timer;
+  try { timer = run("nowCooldownTimer"); } catch (e) { timer = "missing: " + e.message; }
+  check("V2 the countdown ticker is cleared once a real answer lands",
+        timer === null, String(timer));
+}
+
+{
+  // V3 — Undo is hidden while there is nothing it could undo, and appears
+  // once a filing lands.
+  routes["GET /api/now?force=1"] = {
+    status: 200,
+    body: {
+      playing: true, poll_after_ms: 999999,
+      track: { uri: "spotify:track:v1", name: "T", artists: [{ name: "A" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[In]", is_input: true },
+      sitting: null,
+      suggestions: [{ playlist_id: "H1", pct: 90, reasons: [], already: false }],
+      homes: [{ id: "H1", name: "Home", folder: "" }],
+      inputs: [{ id: "IN1", name: "[In]", has_track: true }],
+    },
+  };
+  run(`nowActions = 0; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  check("V3 Undo is hidden while there is nothing to undo",
+        $$("btn-undo-now").hidden === true, `hidden=${$$("btn-undo-now").hidden}`);
+  routes["POST /api/act"] = { status: 200, body: { note: "filed" } };
+  run(`nowFile("H1")`);
+  await tick();
+  check("V3 Undo appears (enabled) once a filing lands",
+        $$("btn-undo-now").hidden === false && $$("btn-undo-now").disabled === false,
+        `hidden=${$$("btn-undo-now").hidden} disabled=${$$("btn-undo-now").disabled}`);
+}
+
+{
+  // V4 — in a sitting, the banner owns the pile name; the context line must
+  // not repeat it one line below.
+  routes["GET /api/now?force=1"] = {
+    status: 200,
+    body: {
+      playing: true, poll_after_ms: 999999,
+      track: { uri: "spotify:track:u9", name: "T", artists: [{ name: "A" }], sortable: true, image: null },
+      context: { id: "SP9", name: "sit" },
+      sitting: { split_id: "PL9", pile_id: "p1", pile_name: "dreamy pile",
+                 uris: ["spotify:track:u9", "u2"], decided: { u2: { action: "keep", to_id: "H1" } } },
+      suggestions: [], homes: [], inputs: [],
+    },
+  };
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  const status = $$("now-sitting-status").innerHTML;
+  check("V4 the sitting banner names the pile and the progress",
+        $$("now-sitting-bar").hidden === false && /dreamy pile/.test(status) && /1 of 2 left/.test(status),
+        JSON.stringify(status.slice(0, 100)));
+  check("V4 the context line no longer repeats the pile name",
+        $$("now-context").textContent === "",
+        JSON.stringify($$("now-context").textContent));
 }
 
 // ---- summary ---------------------------------------------------------------

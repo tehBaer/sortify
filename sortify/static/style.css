@@ -1,4 +1,8 @@
 :root {
+  /* Native form controls (select, inputs, scrollbars) follow the theme —
+     without this the input switcher renders as a glaring white UA-default
+     bar in dark mode. */
+  color-scheme: light dark;
   --bg: #fafafa; --fg: #1a1a1a; --muted: #6b6b6b;
   --card: #ffffff; --border: #e2e2e2;
   --accent: #1db954; --accent-fg: #ffffff;
@@ -25,15 +29,17 @@ header {
 h1 { font-size: 1.15rem; margin: 0; cursor: pointer; }
 #whoami { color: var(--muted); font-size: .85rem; }
 nav { display: flex; gap: 1rem; }
-nav a { cursor: pointer; color: var(--muted); font-size: .95rem; }
+nav a { cursor: pointer; color: var(--muted); font-size: .95rem;
+  padding-bottom: 2px; border-bottom: 2px solid transparent; }
 nav a:hover { color: var(--fg); }
+nav a.active { color: var(--fg); font-weight: 600; border-bottom-color: var(--accent); }
 main { max-width: 640px; margin: 0 auto; padding: 1rem; }
 h2 { font-size: 1.05rem; }
 a { color: var(--accent); }
 .hint { color: var(--muted); font-size: .85rem; }
 code { background: var(--card); border: 1px solid var(--border); padding: 0 .3em; border-radius: 4px; }
 
-input {
+input, select {
   background: var(--card); color: var(--fg); border: 1px solid var(--border);
   border-radius: 8px; padding: .55rem .7rem; font-size: 1rem; width: 100%;
 }
@@ -185,3 +191,41 @@ kbd {
   border-radius: 8px; padding: .3rem .5rem;
 }
 #split-sitting-status, #now-sitting-status { flex: 1; }
+
+/* A sitting is a mode, not a footnote: an accent-tinted banner that owns the
+   pile name, the progress, and the Finish escape. */
+.sitting-banner {
+  background: color-mix(in srgb, var(--accent) 9%, var(--card));
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  border-radius: 12px; padding: .55rem .8rem;
+}
+.sitting-banner b { color: var(--fg); }
+.sitting-banner .sb-bar {
+  display: block; height: 4px; margin-top: .4rem; border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 22%, transparent); overflow: hidden;
+}
+.sitting-banner .sb-fill { display: block; height: 100%; background: var(--accent); }
+
+/* Cooldown countdown card — amber, not red: a temporary hold that self-heals,
+   not an error. Same palette in both themes. Display-only: the ticker never
+   makes a request. */
+.cooldown-card {
+  background: #f0a92a; color: #3a2402; border-radius: 14px;
+  padding: 14px 16px 15px; text-align: center;
+}
+.cooldown-card .cb-head { display: flex; align-items: center; justify-content: space-between; gap: .6rem; }
+.cooldown-card .cb-title { font-weight: 700; text-align: left; }
+.cooldown-card .cb-chip {
+  background: #3a2402; color: #f0a92a; font-size: .66rem; font-weight: 700;
+  letter-spacing: .06em; text-transform: uppercase; padding: 3px 8px; border-radius: 999px;
+}
+.cooldown-card .cb-time {
+  font-size: 2.1rem; font-weight: 800; line-height: 1.05; margin-top: .7rem;
+  font-variant-numeric: tabular-nums;
+}
+.cooldown-card .cb-at { font-size: .8rem; color: #6b4610; margin-top: .3rem; }
+.cooldown-card .cb-bar {
+  margin-top: 12px; height: 6px; border-radius: 999px;
+  background: rgba(58, 36, 2, .22); overflow: hidden;
+}
+.cooldown-card .cb-fill { height: 100%; width: 0; background: #3a2402; transition: width 1s linear; }
