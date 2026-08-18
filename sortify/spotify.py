@@ -238,6 +238,24 @@ class Spotify:
             return ("quiet", cd + QUIET_AFTER_COOLDOWN)
         if self.budget_spent() >= DAILY_CAP - BULK_RESERVE:
             return ("reserve", _next_local_midnight(now))
+        # The local usage.json check above only sees what THIS process wrote.
+        # The shared account ledger can be further along — another process
+        # (spx, a restarted server) spent against sortify's share since the
+        # last time usage.json was written — and a LedgerFull raised out of
+        # _spend_budget would otherwise surface as an unexplained SpotifyError
+        # mid-tick and pause the run for a human. Read-only, and cheap: both
+        # reads hit the same small on-disk file, lock-free (AccountLedger.read
+        # tolerates a missing file as an empty ledger, i.e. "go").
+        if self.ledger.app_spent_today() >= DAILY_CAP - BULK_RESERVE:
+            return ("reserve", _next_local_midnight(now))
+        # Account-cap analog: the account-wide ceiling can be reached by the
+        # siblings alone even while sortify's own share is untouched (the same
+        # gap test_account_cap_binds_even_when_sortifys_own_share_is_free
+        # covers for _spend_budget). Checked against the full cap, not a
+        # reserve fraction — there's no established "interactive reserve"
+        # concept at the account level, only sortify's own share of it.
+        if self.ledger.spent_today() >= ACCOUNT_DAILY_CAP:
+            return ("reserve", _next_local_midnight(now))
         return None
 
     def _spend_budget(self, background: bool = False, bulk: bool = False) -> None:

@@ -233,6 +233,74 @@ def test_bulk_block_reason_orders_cooldown_quiet_reserve(sp_and_store, monkeypat
     assert sp.bulk_block_reason() is None
 
 
+def test_bulk_block_reason_sees_the_shared_ledger_even_when_local_usage_is_low(sp_and_store):
+    """I-2: a LedgerFull from the shared account ledger must not surface as an
+    unexplained SpotifyError mid-tick. bulk_block_reason reads the ledger's
+    own count for sortify's app share (another process — spx, a restart —
+    may have spent against it since usage.json was last written) and applies
+    the same DAILY_CAP - BULK_RESERVE line the local check uses."""
+    sp, store = sp_and_store
+    # Local usage.json is nearly empty...
+    store.save_usage({"day": time.strftime("%Y-%m-%d"), "count": 1, "background": 0})
+    assert sp.budget_spent() == 1
+    # ...but the shared ledger already has sortify at the reserve line.
+    with open(sp.ledger.path, "w") as fh:
+        json.dump(
+            {"day": time.strftime("%Y-%m-%d"), "count": DAILY_CAP - BULK_RESERVE,
+             "by_app": {"sortify": DAILY_CAP - BULK_RESERVE}, "cooldown_until": 0,
+             "cooldown_source": "", "cooldown_reason": ""},
+            fh,
+        )
+    reason, until = sp.bulk_block_reason()
+    assert reason == "reserve" and until == pytest.approx(_next_local_midnight(time.time()), abs=2)
+
+
+def test_bulk_block_reason_sees_the_account_cap_even_when_sortifys_share_is_free(sp_and_store):
+    """The account-cap analog: the siblings alone can spend the account's
+    whole allowance while sortify's own share sits untouched."""
+    sp, store = sp_and_store
+    sibling = AccountLedger("autoqueuer")
+    with open(sibling.path, "w") as fh:
+        json.dump(
+            {"day": time.strftime("%Y-%m-%d"), "count": ACCOUNT_DAILY_CAP,
+             "by_app": {"autoqueuer": ACCOUNT_DAILY_CAP}, "cooldown_until": 0,
+             "cooldown_source": "", "cooldown_reason": ""},
+            fh,
+        )
+    assert sp.budget_spent() == 0
+    reason, until = sp.bulk_block_reason()
+    assert reason == "reserve" and until == pytest.approx(_next_local_midnight(time.time()), abs=2)
+
+
+def test_bulk_block_reason_reserve_resumes_exactly_at_next_local_midnight(sp_and_store):
+    """I-4a: pin the exact value, not merely that it's in the future — a
+    resume timestamp that drifted from next_local_midnight would wake the
+    worker early or late without any test noticing."""
+    sp, store = sp_and_store
+    store.save_usage({"day": time.strftime("%Y-%m-%d"),
+                      "count": DAILY_CAP - BULK_RESERVE, "background": 0})
+    now = time.time()
+    reason, until = sp.bulk_block_reason()
+    assert reason == "reserve"
+    assert until == _next_local_midnight(now)
+
+
+def test_spend_budget_resets_all_four_buckets_on_a_new_day(sp_and_store):
+    """I-4b: _spend_budget's stale-day branch must reset count, background,
+    and bulk together — a bucket left over from yesterday would silently
+    carry a spent-out bulk reserve (or background cap) into a fresh day."""
+    sp, store = sp_and_store
+    store.save_usage({"day": "1999-01-01", "count": 500, "background": 30, "bulk": 400})
+    sp._spend_budget()
+    u = store.usage()
+    assert u["day"] == time.strftime("%Y-%m-%d")
+    assert u["count"] == 1 and u["background"] == 0 and u["bulk"] == 0
+    # The full live midnight crossing (a real day-boundary tick while a
+    # process stays up) is out of scope here — this pins the code path
+    # _spend_budget takes when it observes a stale `day`, not the passage of
+    # actual time across midnight.
+
+
 def test_request_records_the_last_429_without_changing_retries(sp_and_store, monkeypatch):
     """Additive observation only (finding I2 forbids touching retry
     behaviour): a transient rate 429 that request retries internally must
