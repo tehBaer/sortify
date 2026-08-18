@@ -1102,9 +1102,22 @@ def _claim_materialisation(
     argument: `_split_lock` makes each read-modify-write atomic, but not the
     whole span between them, and the Spotify calls in between are exactly
     where something else can replace what we observed. `claim` is a uuid4
-    minted per attempt (never a timestamp — see `_claim_reservation` for the
-    whole-second collision that cost a round), so a write from THIS attempt
-    can only ever land on the record THIS attempt created.
+    (never a timestamp — see `_claim_reservation` for the whole-second
+    collision that cost a round).
+
+    Under `_materialise_tick` (R-T7b), the claim is minted per RECORD, not
+    per attempt: a fresh record gets a fresh claim, but every tick that
+    resumes it — one Spotify call at a time, possibly hours apart — reuses
+    that same claim rather than re-minting one per tick. This is safe
+    because correctness here does not rest on the claim alone: it rests on
+    single-writer. The queue worker is the only caller of `_materialise_tick`
+    for a given pile at a time, and `_pending_materialise` (guarded by
+    `_split_lock`) is what enforces that within one process — a concurrent
+    tick for the same pile is refused outright rather than racing to CAS.
+    The claim's job, then, is narrower than "identify this attempt": it
+    identifies this RECORD, so a genuine replacement (a re-cluster's fresh
+    record, or another process's) is detected and this tick's write is
+    refused instead of landing on the wrong slot.
 
     `added_uri` appends to the confirmed-added list, which is what makes a
     retry resume. It is written only after `add_to_playlist` returned, so the
@@ -1160,7 +1173,11 @@ def _materialise_tick(playlist_id: str, pile_id: str) -> dict:
     the only change is that the loop now lives in the queue worker, which
     owns the pacing between calls (delivery is the queue's job now, not a
     request handler's). Returns {"spent", "done", "gone"}; SpotifyError
-    propagates to the caller, which classifies it.
+    propagates to the caller, which classifies it — including the two hazard
+    paths below, which raise HTTPException(409) internally (they are shared
+    with nothing else that needs a different shape) but are translated to
+    SpotifyError(409, ...) here, at the one seam where the tick's contract
+    with its caller is fixed (controller ruling R-T7a).
 
     One subtlety: a fresh claim is minted only when a record must be
     (re)stamped from scratch — a brand-new pile or one whose fingerprint went
@@ -1209,24 +1226,37 @@ def _materialise_tick(playlist_id: str, pile_id: str) -> dict:
         if need_create:
             new_id = sp.create_playlist(pile["name"], MATERIALISE_DESCRIPTION, bulk=True)
             if not _claim_materialisation(playlist_id, pile_id, claim, playlist_id=new_id):
-                _abandon_unrecorded_playlist(playlist_id, pile_id, new_id, record)
+                try:
+                    _abandon_unrecorded_playlist(playlist_id, pile_id, new_id, record)
+                except HTTPException as exc:
+                    raise SpotifyError(exc.status_code, exc.detail) from exc
+            # A create call never finishes a pile on its own — every pile
+            # has at least one track still to add afterwards — so "done" is
+            # always False here; no need to recompute it from `plan`.
+            return {"spent": 1, "done": False, "gone": False}
         else:
             sp.add_to_playlist(record["playlist_id"], next_uri, bulk=True)
             if not _claim_materialisation(playlist_id, pile_id, claim, added_uri=next_uri):
-                _readopt_materialisation(playlist_id, pile_id, record,
-                                         record["playlist_id"], [next_uri])
+                try:
+                    _readopt_materialisation(playlist_id, pile_id, record,
+                                             record["playlist_id"], [next_uri])
+                except HTTPException as exc:
+                    raise SpotifyError(exc.status_code, exc.detail) from exc
     finally:
         with _split_lock:
             _pending_materialise.discard((playlist_id, pile_id))
-    remaining = len(plan["missing"]) - (0 if need_create else 1)
-    return {"spent": 1, "done": remaining == 0 and not need_create, "gone": False}
+    remaining = len(plan["missing"]) - 1
+    return {"spent": 1, "done": remaining == 0, "gone": False}
 
 
 def _abandon_unrecorded_playlist(
     split_playlist_id: str, pile_id: str, new_id: str, record: dict
 ) -> None:
     """The record for a just-created (still empty) playlist is gone. Unfollow
-    it and fail cleanly — mirrors `_abandon_orphaned_playlist`. Always raises.
+    it and fail cleanly — mirrors `_abandon_orphaned_playlist`. Always raises
+    HTTPException(409); `_materialise_tick`, its only caller, catches that
+    and re-raises as SpotifyError(409, ...) to keep its own contract
+    (SpotifyError propagates, nothing else does) — see R-T7a.
     """
     try:
         sp.unfollow_playlist(new_id)
@@ -1252,7 +1282,11 @@ def _abandon_unrecorded_playlist(
 def _readopt_materialisation(
     split_playlist_id: str, pile_id: str, record: dict, new_id: str, added_here: list[str]
 ) -> None:
-    """The record vanished while tracks were being added. Always raises."""
+    """The record vanished while tracks were being added. Always raises
+    HTTPException(409); `_materialise_tick`, its only caller, catches that
+    and re-raises as SpotifyError(409, ...) — see R-T7a and the note on
+    `_abandon_unrecorded_playlist`.
+    """
     restored = {**record, "playlist_id": new_id,
                 "added": list(record["added"]) + list(added_here),
                 "claim": uuid.uuid4().hex, "updated_at": _now_iso()}
