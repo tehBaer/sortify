@@ -39,6 +39,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import sortify.suggest as suggest_mod  # noqa: E402
+from sortify.store import Store  # noqa: E402
 from sortify.suggest import build_profile, suggest  # noqa: E402
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -51,7 +52,19 @@ DEFAULT_TOP_K = 3
 # duplicate cells wherever two (weight, dilution) pairs shared a product).
 # These values are the deduplicated products of that original grid, so the
 # rerun is comparable to the numbers task-3-report.md already recorded.
+# Kept as a (still-tested) utility, but no longer wired to `--search`: as of
+# Task 4, TAG_WEIGHT is a committed, measured constant (see the comment on
+# sortify/suggest.py's TAG_WEIGHT) and `--search` sweeps NEIGHBOUR_WEIGHT
+# instead, below.
 SEARCH_TAG_WEIGHTS = (0.6, 0.9, 1.0, 1.2, 1.4, 1.5, 1.8, 2.0, 2.1, 2.8, 3.0, 4.0, 4.2, 6.0)
+
+# Task 4: 1-D sweep over NEIGHBOUR_WEIGHT, TAG_WEIGHT held fixed at its
+# committed value (FIXED_TAG_WEIGHT). These are the sweep points the task-4
+# assignment specifies — not sortify/suggest.py's shipped, placeholder-
+# conservative NEIGHBOUR_WEIGHT=0.3, which was deliberately under-powered
+# pending this measurement (see that constant's comment).
+NEIGHBOUR_WEIGHTS = (0.3, 0.5, 1.0, 1.5, 2.0, 3.0)
+FIXED_TAG_WEIGHT = 3.0
 
 
 # ---- loading (the only place that touches disk) -----------------------------
@@ -93,6 +106,19 @@ def load_tag_artists(data_dir: Path = DATA_DIR) -> dict[str, dict]:
         return {}
     artists = payload.get("artists") if isinstance(payload, dict) else None
     return artists if isinstance(artists, dict) else {}
+
+
+def load_track_map(data_dir: Path = DATA_DIR) -> dict[str, dict]:
+    """`Store.lastfm_track_map()` — the track-level analog of
+    `load_tag_artists`, same degrade-to-empty contract (a missing or
+    malformed `lastfm_tracks.json` yields `{}`, not a crash). Goes through
+    `Store` rather than a bespoke open()+json.load() here because
+    `lastfm_track_map()` already owns the "malformed envelope -> {}" guard
+    and the {track_key: record} unwrapping — duplicating that logic in this
+    file risks it drifting from the one `sortify/suggest.py` itself relies
+    on. `Store` never writes on a read-only call like this one; the harness's
+    zero-writes contract (module docstring) is unaffected."""
+    return Store(data_dir).lastfm_track_map()
 
 
 # ---- pure harness logic (unit-tested against hand-built fixtures) ----------
@@ -178,6 +204,7 @@ def evaluate_pair(
     tag_artists: dict[str, dict],
     uri_homes: dict[str, set[str]],
     top_k: int = DEFAULT_TOP_K,
+    track_map: dict[str, dict] | None = None,
 ) -> tuple[bool, bool, bool]:
     """Rank `track` with EVERY true home's profile rebuilt minus `track`
     itself — not just `home_id`. A multi-home track's sibling homes must
@@ -185,6 +212,19 @@ def evaluate_pair(
     no matter what the scorer does (fix round 1, finding C3: this used to
     rebuild only `home_id`'s profile, which handed a multi-home track a free
     top-1 via whichever sibling home was left untouched).
+
+    `track_map` (Task 4) feeds `suggest()`'s neighbour signal — optional,
+    keyword-only, defaulting to `{}` via the `or {}` below, same "callers
+    that haven't been updated yet keep working" contract as `suggest()`
+    itself documents. `build_profile` already rebuilds `track_keys` from
+    `held_out_tracks` above, same as every other per-track set on the
+    profile — the held-out track's own (artist, title) key is excluded from
+    `track_keys` exactly like it's excluded from `uris`/`artist_counts`/
+    `tag_counts`, nothing here bypasses that. See
+    `test_evaluate_pair_removes_held_out_track_from_its_own_track_keys` in
+    tests/test_eval_suggest.py for the validity pin: a held-out track's own
+    key cannot still be sitting in its (former) home's `track_keys`, which
+    would let it match a neighbour reference back to itself.
 
     Returns (top1_hit, top3_hit, artist_absent). `artist_absent` flags the
     spec's target case (see `_artist_absent`) so callers can report accuracy
@@ -200,8 +240,7 @@ def evaluate_pair(
         held_out_tracks = [t for t in home_tracks[hid] if t["uri"] != track["uri"]]
         profiles_for_pair[hid] = build_profile(held_out_tracks, tag_artists)
 
-    # 3-arg call — track_map deliberately not wired until Task 4's measurement.
-    results = suggest(track, profiles_for_pair, tag_artists)
+    results = suggest(track, profiles_for_pair, tag_artists, track_map or {})
     ranked_ids = [r["playlist_id"] for r in results]
 
     top1_hit = bool(true_homes & set(ranked_ids[:1]))
@@ -214,11 +253,15 @@ def run_eval(
     tag_artists: dict[str, dict],
     sampled_pairs: list[tuple[str, dict]],
     top_k: int = DEFAULT_TOP_K,
+    track_map: dict[str, dict] | None = None,
 ) -> dict:
     """Evaluate a fixed, pre-sampled set of pairs under whatever weight
     `sortify.suggest` currently holds. Takes the sample as an argument
     (rather than sampling itself) so a baseline run, a full grid search, and
     the committed-weight run all score the identical pairs.
+
+    `track_map` (Task 4) is threaded straight through to `evaluate_pair`;
+    optional and keyword-only for the same reason it is there.
 
     Reports both the overall top1/top3 and the artist-absent subset's
     top1/top3 — the subset where artist overlap cannot fire at all and only
@@ -230,7 +273,9 @@ def run_eval(
     top1 = top3 = 0
     absent_n = absent_top1 = absent_top3 = 0
     for home_id, track in sampled_pairs:
-        hit1, hit3, absent = evaluate_pair(home_id, track, home_tracks, profiles, tag_artists, uri_homes, top_k)
+        hit1, hit3, absent = evaluate_pair(
+            home_id, track, home_tracks, profiles, tag_artists, uri_homes, top_k, track_map
+        )
         top1 += hit1
         top3 += hit3
         if absent:
@@ -250,17 +295,29 @@ def run_eval(
 
 
 @contextlib.contextmanager
-def weights(tag_weight: float):
-    """Temporarily override sortify.suggest's TAG_WEIGHT constant.
-    `suggest()` reads it as a module-level lookup at call time (not a bound
-    default), so mutating the module and restoring it afterwards is
-    sufficient — no monkeypatch fixture needed outside of pytest."""
-    orig_weight = suggest_mod.TAG_WEIGHT
-    suggest_mod.TAG_WEIGHT = tag_weight
+def weights(tag_weight: float | None = None, neighbour_weight: float | None = None):
+    """Temporarily override sortify.suggest's TAG_WEIGHT and/or
+    NEIGHBOUR_WEIGHT constants. `suggest()` reads both as module-level
+    lookups at call time (not bound defaults), so mutating the module and
+    restoring it afterwards is sufficient — no monkeypatch fixture needed
+    outside of pytest.
+
+    Either argument may be omitted (stays at whatever the module currently
+    holds) — existing callers that only ever touched TAG_WEIGHT, including
+    positional `weights(0.0)`, are unaffected by NEIGHBOUR_WEIGHT support
+    being added here for Task 4.
+    """
+    orig_tag_weight = suggest_mod.TAG_WEIGHT
+    orig_neighbour_weight = suggest_mod.NEIGHBOUR_WEIGHT
+    if tag_weight is not None:
+        suggest_mod.TAG_WEIGHT = tag_weight
+    if neighbour_weight is not None:
+        suggest_mod.NEIGHBOUR_WEIGHT = neighbour_weight
     try:
         yield
     finally:
-        suggest_mod.TAG_WEIGHT = orig_weight
+        suggest_mod.TAG_WEIGHT = orig_tag_weight
+        suggest_mod.NEIGHBOUR_WEIGHT = orig_neighbour_weight
 
 
 def grid_search(
@@ -269,24 +326,64 @@ def grid_search(
     sampled_pairs: list[tuple[str, dict]],
     tag_weights: list[float],
     top_k: int = DEFAULT_TOP_K,
+    track_map: dict[str, dict] | None = None,
 ) -> dict[float, dict]:
     """Run `run_eval` once per TAG_WEIGHT value, restoring the module's
     weight to whatever it was before the search once done."""
     results = {}
     for tag_weight in tag_weights:
-        with weights(tag_weight):
-            results[tag_weight] = run_eval(home_tracks, tag_artists, sampled_pairs, top_k)
+        with weights(tag_weight=tag_weight):
+            results[tag_weight] = run_eval(home_tracks, tag_artists, sampled_pairs, top_k, track_map)
+    return results
+
+
+def _primacy_holds(tag_weight: float, neighbour_weight: float) -> bool:
+    """The artist-overlap-primacy pin, as a computed check rather than an
+    assertion: can the worst case (a perfect tag cosine AND a fully-capped
+    neighbour sum landing on the SAME home) ever outrank a single, minimal
+    (n=1) artist match? See sortify/suggest.py's NEIGHBOUR_WEIGHT comment
+    and `test_artist_overlap_still_outranks_max_combined_tag_and_neighbour`
+    in tests/test_suggest.py for the invariant this mirrors.
+
+    Task 4 explicitly does not resolve what to do when a sweep point
+    breaks this — it only has to be visible per-row so the controller's
+    measurement step can weigh a broken-primacy weight against its
+    accuracy honestly instead of missing the tradeoff.
+    """
+    worst_case = tag_weight + neighbour_weight * suggest_mod.NEIGHBOUR_SUM_CAP
+    artist_floor = suggest_mod.ARTIST_BASE + suggest_mod.ARTIST_PER_TRACK
+    return worst_case < artist_floor
+
+
+def neighbour_search(
+    home_tracks: dict[str, list[dict]],
+    tag_artists: dict[str, dict],
+    sampled_pairs: list[tuple[str, dict]],
+    track_map: dict[str, dict],
+    neighbour_weights: tuple[float, ...] = NEIGHBOUR_WEIGHTS,
+    tag_weight: float = FIXED_TAG_WEIGHT,
+    top_k: int = DEFAULT_TOP_K,
+) -> dict[float, dict]:
+    """Run `run_eval` once per NEIGHBOUR_WEIGHT value with TAG_WEIGHT held
+    fixed at `tag_weight` (the committed value, by default) — the Task 4
+    sweep. Restores both module weights to whatever they were before the
+    search once done, same contract as `grid_search`."""
+    results = {}
+    for neighbour_weight in neighbour_weights:
+        with weights(tag_weight=tag_weight, neighbour_weight=neighbour_weight):
+            results[neighbour_weight] = run_eval(home_tracks, tag_artists, sampled_pairs, top_k, track_map)
     return results
 
 
 # ---- CLI ---------------------------------------------------------------
 
 
-def _print_result(label: str, result: dict) -> None:
+def _print_result(label: str, result: dict, extra: str = "") -> None:
+    suffix = f" | {extra}" if extra else ""
     print(
         f"{label}: n={result['n']} top1={result['top1']:.3f} top3={result['top3']:.3f} | "
         f"artist-absent n={result['artist_absent_n']} "
-        f"top1={result['artist_absent_top1']:.3f} top3={result['artist_absent_top3']:.3f}"
+        f"top1={result['artist_absent_top1']:.3f} top3={result['artist_absent_top3']:.3f}{suffix}"
     )
 
 
@@ -295,8 +392,8 @@ def main() -> None:
     parser.add_argument("--n", type=int, default=DEFAULT_N, help="number of (home, track) pairs to sample")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="sampling seed, for repeatability")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
-    parser.add_argument("--baseline", action="store_true", help="force TAG_WEIGHT=0 (artist-only)")
-    parser.add_argument("--search", action="store_true", help="1-D grid search over TAG_WEIGHT")
+    parser.add_argument("--baseline", action="store_true", help="force TAG_WEIGHT=0 and NEIGHBOUR_WEIGHT=0 (artist-only)")
+    parser.add_argument("--search", action="store_true", help="1-D sweep over NEIGHBOUR_WEIGHT, TAG_WEIGHT fixed")
     args = parser.parse_args()
 
     top_k = args.top_k
@@ -307,32 +404,55 @@ def main() -> None:
 
     home_tracks = load_home_tracks()
     tag_artists = load_tag_artists()
+    track_map = load_track_map()
     pairs = collect_pairs(home_tracks)
     sampled = sample_pairs(pairs, args.n, args.seed)
 
     print(f"homes={len(home_tracks)} pairs_available={len(pairs)} sampled={len(sampled)} seed={args.seed}")
 
     if args.baseline:
-        with weights(0.0):
-            _print_result("artist-only baseline (TAG_WEIGHT=0)", run_eval(home_tracks, tag_artists, sampled, top_k))
+        with weights(tag_weight=0.0, neighbour_weight=0.0):
+            _print_result(
+                "artist-only baseline (TAG_WEIGHT=0, NEIGHBOUR_WEIGHT=0)",
+                run_eval(home_tracks, tag_artists, sampled, top_k, track_map),
+            )
         return
 
     if args.search:
-        with weights(0.0):
-            baseline = run_eval(home_tracks, tag_artists, sampled, top_k)
-        _print_result("artist-only baseline (TAG_WEIGHT=0)", baseline)
+        # Baseline (both weights 0) and tags-only (committed TAG_WEIGHT,
+        # NEIGHBOUR_WEIGHT=0) rows bracket the sweep for attribution: how
+        # much of any lift is tags vs. neighbours specifically.
+        with weights(tag_weight=0.0, neighbour_weight=0.0):
+            baseline = run_eval(home_tracks, tag_artists, sampled, top_k, track_map)
+        _print_result("artist-only baseline (TAG_WEIGHT=0, NEIGHBOUR_WEIGHT=0)", baseline)
 
-        results = grid_search(home_tracks, tag_artists, sampled, list(SEARCH_TAG_WEIGHTS), top_k)
-        for tag_weight, result in results.items():
-            _print_result(f"TAG_WEIGHT={tag_weight}", result)
+        with weights(tag_weight=FIXED_TAG_WEIGHT, neighbour_weight=0.0):
+            tags_only = run_eval(home_tracks, tag_artists, sampled, top_k, track_map)
+        _print_result(f"tags-only (TAG_WEIGHT={FIXED_TAG_WEIGHT}, NEIGHBOUR_WEIGHT=0)", tags_only)
+
+        results = neighbour_search(
+            home_tracks, tag_artists, sampled, track_map, NEIGHBOUR_WEIGHTS, FIXED_TAG_WEIGHT, top_k
+        )
+        for neighbour_weight, result in results.items():
+            holds = _primacy_holds(FIXED_TAG_WEIGHT, neighbour_weight)
+            _print_result(
+                f"TAG_WEIGHT={FIXED_TAG_WEIGHT} NEIGHBOUR_WEIGHT={neighbour_weight}",
+                result,
+                extra=f"primacy_holds={holds}",
+            )
 
         best_weight = max(results, key=lambda w: (results[w]["top3"], results[w]["top1"]))
-        print(f"best: TAG_WEIGHT={best_weight} -> {results[best_weight]}")
+        print(f"best (by top3, top1): NEIGHBOUR_WEIGHT={best_weight} -> {results[best_weight]} "
+              f"(primacy_holds={_primacy_holds(FIXED_TAG_WEIGHT, best_weight)})")
+        print(
+            "note: weight/cap decision left to the controller's measurement step "
+            "(task-4 assignment) — a broken primacy row above is reported, not resolved here."
+        )
         return
 
     _print_result(
-        f"current weight (TAG_WEIGHT={suggest_mod.TAG_WEIGHT})",
-        run_eval(home_tracks, tag_artists, sampled, top_k),
+        f"current weights (TAG_WEIGHT={suggest_mod.TAG_WEIGHT}, NEIGHBOUR_WEIGHT={suggest_mod.NEIGHBOUR_WEIGHT})",
+        run_eval(home_tracks, tag_artists, sampled, top_k, track_map),
     )
 
 

@@ -27,7 +27,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import eval_suggest as ev  # noqa: E402
+from sortify.suggest import build_profile as raw_build_profile  # noqa: E402
 from sortify.suggest import suggest as raw_suggest  # noqa: E402
+from sortify.tags import track_key  # noqa: E402
 
 
 def tag_entry(*tags, name="X", miss=False):
@@ -171,6 +173,69 @@ def test_evaluate_pair_holds_track_out_of_every_home_it_appears_in_mutation_chec
     results = raw_suggest(shared, only_home1_held_out, ARTISTS)
     ranked_ids = [r["playlist_id"] for r in results]
     assert ranked_ids[:1] == ["home2"]  # sibling home wins trivially, unfixed
+
+
+def test_evaluate_pair_removes_held_out_track_from_its_own_track_keys():
+    # Task 4's neighbour signal keys off `track_keys` in each home's
+    # profile: `suggest._neighbour_score` counts a home as containing one of
+    # a track's Last.fm neighbours when that neighbour's (artist, title) key
+    # is present in `prof["track_keys"]`. Hold-one-out therefore isn't only
+    # about `uris`/`artist_counts`/`tag_counts` (the pre-Task-4 signals) —
+    # if the held-out track's OWN key survived in `track_keys`, a neighbour
+    # list that happens to reference it back (its own record, or a data
+    # quirk) could let the held-out track match its own hold-out home via
+    # the neighbour path, the exact kind of leak hold-out exists to close
+    # for the artist/tag signals (module docstring, C3).
+    #
+    # `evaluate_pair` doesn't build a bespoke `track_keys` — it reuses
+    # `build_profile(held_out_tracks, tag_artists)` for every signal at
+    # once, so this pins that nothing about wiring `track_map` through
+    # introduced a second, divergent rebuild path that keeps the held
+    # track's key around.
+    d1 = {"uri": "spotify:track:d1", "name": "Dreams", "artists": [{"id": "beach-house", "name": "Beach House"}]}
+    decoy1 = {
+        "uri": "spotify:track:decoy1",
+        "name": "Kvelertak",
+        "artists": [{"id": "kvelertak", "name": "Kvelertak"}],
+    }
+    home_tracks = {"solo": [d1], "decoy": [decoy1]}
+    profiles = ev.build_all_profiles(home_tracks, ARTISTS)
+    idx = ev.uri_home_index(home_tracks)
+    held_key = track_key("Beach House", "Dreams")
+
+    # A self-referencing neighbour entry, standing in for "the held-out
+    # track's own key surviving in track_keys" — real Last.fm data doesn't
+    # list a track as its own neighbour, but the same-artist exclusion in
+    # `_neighbour_score` would ALSO suppress a genuine self-reference, so a
+    # bare end-to-end run here wouldn't isolate whether `track_keys` itself
+    # (as opposed to the same-artist filter) is doing the excluding. The
+    # direct assertion below checks the layer this test is about.
+    track_map = {
+        held_key: {"similar": [{"artist": "Beach House", "track": "Dreams", "match": 1.0}]},
+    }
+
+    ev.evaluate_pair("solo", d1, home_tracks, profiles, ARTISTS, idx, top_k=3, track_map=track_map)
+
+    # evaluate_pair must not mutate the passed-in `profiles` (separately
+    # pinned by test_evaluate_pair_does_not_mutate_shared_profiles below);
+    # rebuild the same way evaluate_pair does internally to inspect the
+    # per-pair profile it actually scored against.
+    held_out_tracks = [t for t in home_tracks["solo"] if t["uri"] != d1["uri"]]
+    rebuilt = raw_build_profile(held_out_tracks, ARTISTS)
+    assert held_key not in rebuilt["track_keys"]
+
+
+def test_evaluate_pair_removes_held_out_track_from_its_own_track_keys_mutation_check():
+    # Mutation check: build "solo"'s profile WITHOUT holding d1 out (the
+    # no-op hold-out this test exists to catch) and confirm the key IS
+    # present — proving the assertion above is sensitive to hold-out
+    # actually happening, not vacuously true regardless.
+    d1 = {"uri": "spotify:track:d1", "name": "Dreams", "artists": [{"id": "beach-house", "name": "Beach House"}]}
+    home_tracks = {"solo": [d1]}
+    held_key = track_key("Beach House", "Dreams")
+
+    untouched = raw_build_profile(home_tracks["solo"], ARTISTS)
+    assert held_key in untouched["track_keys"]
 
 
 def test_evaluate_pair_flags_artist_absent_pairs():
