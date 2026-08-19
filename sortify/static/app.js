@@ -404,7 +404,7 @@ $("nav-reconnect").onclick = () => {
 };
 
 $("nav-now").onclick = showNow;
-$("nav-lists").onclick = () => { stopNowPolling(); triage = null; loadLists(); };
+$("nav-lists").onclick = () => { stopNowPolling(); stopNowTicker(); triage = null; loadLists(); };
 
 // ---- now playing -----------------------------------------------------------
 
@@ -501,6 +501,7 @@ function renderNowProblem(msg) {
   $("now-context").textContent = "";
   $("now-controls").hidden = true;
   stopCooldownTicker();
+  stopNowTicker();
   const cd = msg.match(/cooldown — try again in ~(\d+) min/);
   if (!cd) {
     nowCooldownUntil = nowCooldownTotal = 0;
@@ -543,15 +544,18 @@ function renderNowProblem(msg) {
   }, 1000);
 }
 
-// Playback controls only make sense against something actually playing —
-// Spotify 404s these calls when no device is active.
+// The input switcher used to hide whenever nothing was playing — which is
+// exactly the moment "start an input" is the one useful action on the page.
+// It now stays up as the empty state's call to action; only the error-ish
+// states (cooldown, reauth) hide it, since starting playback there would
+// just bounce off the same wall.
 function paintNowControls(d) {
   const playable = (d.inputs || []).filter((l) => l.id !== "liked");
-  if (!d.playing || !playable.length) { $("now-controls").hidden = true; return; }
+  if (!playable.length || d.needs_reauth || d.cooldown) { $("now-controls").hidden = true; return; }
   const sel = $("now-input-switch");
-  const current = d.context?.id;
+  const current = d.playing ? d.context?.id : null;
   sel.innerHTML =
-    `<option value="">— play another input —</option>` +
+    `<option value="">${d.playing ? "— switch to another input —" : "▶ start an input…"}</option>` +
     playable.map((l) =>
       `<option value="${esc(l.id)}"${l.id === current ? " selected" : ""}>${esc(l.name)}</option>`
     ).join("");
@@ -565,18 +569,94 @@ function repollAfterPlaybackChange() {
   setTimeout(() => pollNow(true), 900);
 }
 
-$("btn-now-next").onclick = async () => {
+// Card-internal control (re-created by every renderNow), so it's wired per
+// render rather than once at load like the static controls below.
+async function playerNext() {
   const btn = $("btn-now-next");
-  btn.disabled = true;
+  if (btn) btn.disabled = true;
   try {
     await api("/api/player/next", {});
     repollAfterPlaybackChange();
   } catch (e) {
     toast(e.message);
   } finally {
-    btn.disabled = false;
+    const b = $("btn-now-next");
+    if (b) b.disabled = false;
   }
-};
+}
+
+// Optimistic flip, deliberately without a forced repoll: pausing doesn't
+// change the track, the server has already dropped its now-cache (see
+// _playback_call), and the next scheduled poll fetches the truth anyway —
+// so a repoll here would spend one extra call per press to learn what we
+// just did ourselves. The displayed progress is frozen at its current
+// ticked value on pause so resume continues from what the user sees.
+async function playerToggle() {
+  const d = nowState;
+  if (!d?.playing) return;
+  const wasPlaying = d.is_playing;
+  try {
+    await api(wasPlaying ? "/api/player/pause" : "/api/player/resume", {});
+    if (wasPlaying && nowTickBase && d.track?.duration_ms) {
+      d.progress_ms = Math.min(
+        d.track.duration_ms, nowTickBase.p0 + (Date.now() - nowTickBase.t0));
+    }
+    d.is_playing = !wasPlaying;
+    renderNow();
+  } catch (e) { toast(e.message); }
+}
+
+// Progress ticker: display only, between polls, zero requests. One global
+// interval; renderNow restarts it for each card and every non-track state
+// stops it.
+let nowTickTimer = null;
+let nowTickBase = null;  // {t0: Date.now() at poll, p0: progress_ms then}
+
+function stopNowTicker() { clearInterval(nowTickTimer); nowTickTimer = null; nowTickBase = null; }
+
+function fmtTime(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function startNowTicker(d, tr) {
+  stopNowTicker();
+  if (!tr.duration_ms) return;
+  nowTickBase = { t0: Date.now(), p0: d.progress_ms || 0 };
+  if (!d.is_playing) return;  // base still recorded so pause math works
+  nowTickTimer = setInterval(() => {
+    const fill = $("np-fill"), elapsed = $("np-elapsed");
+    if (!fill || !elapsed) { stopNowTicker(); return; }
+    const p = Math.min(tr.duration_ms, nowTickBase.p0 + (Date.now() - nowTickBase.t0));
+    elapsed.textContent = fmtTime(p);
+    fill.style.width = ((p / tr.duration_ms) * 100).toFixed(2) + "%";
+    // At track end just stop — the poll schedule (whose TTL is exactly the
+    // track's remaining runtime) repaints with the real next track.
+    if (p >= tr.duration_ms) stopNowTicker();
+  }, 1000);
+}
+
+const ICON_PLAY = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>';
+const ICON_PAUSE = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M7 5h3.6v14H7zM13.4 5H17v14h-3.6z"/></svg>';
+const ICON_NEXT = '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M6 5.5v13l8.5-6.5zM16.5 5.5h2v13h-2z"/></svg>';
+
+// The strip under the title: elapsed / bar / total, then play-pause + next.
+// Local files and episodes carry no duration; they get the buttons only.
+function playbackStrip(d, tr) {
+  let bar = "";
+  if (tr.duration_ms) {
+    const pct = Math.min(100, ((d.progress_ms || 0) / tr.duration_ms) * 100).toFixed(2);
+    bar = `<div class="np-progress">
+      <span id="np-elapsed" class="np-time">${fmtTime(d.progress_ms || 0)}</span>
+      <span class="np-bar"><span id="np-fill" style="width:${pct}%"></span></span>
+      <span class="np-time">${fmtTime(tr.duration_ms)}</span>
+    </div>`;
+  }
+  return `${bar}<div class="np-buttons">
+    <button id="btn-now-toggle" class="np-round" title="${d.is_playing ? "Pause" : "Play"}">${d.is_playing ? ICON_PAUSE : ICON_PLAY}</button>
+    <button id="btn-now-next" class="np-round np-small" title="Skip to the next track">${ICON_NEXT}</button>
+  </div>`;
+}
 
 $("now-input-switch").onchange = async (e) => {
   const id = e.target.value;
@@ -632,18 +712,33 @@ function renderNow() {
   paintSittingBar();
   if (d.needs_reauth) {
     nowProblem = true;
+    stopNowTicker();
     $("now-context").textContent = "";
     $("now-card").innerHTML =
-      `<p class="done-msg">Spotify needs one more permission (currently playing).<br>
-       Ask for a new login link and redo the paste-back dance.</p>`;
+      `<div class="state-card">
+        <p>Spotify needs one more permission<br>(reading what's currently playing).</p>
+        <button id="btn-reauth-go" class="primary">Reconnect Spotify</button>
+        <p class="hint">Same login-link + paste-back dance as the first time.</p>
+      </div>`;
+    // Same handler as the nav link — the card just puts it where the
+    // problem is instead of making the user find it top-right.
+    $("btn-reauth-go").onclick = $("nav-reconnect").onclick;
     return;
   }
   if (d.cooldown) { renderNowProblem(d.cooldown); return; }
   if (!d.playing) {
     nowProblem = false;
+    stopNowTicker();
     $("now-context").textContent = "";
+    const hasInputs = (d.inputs || []).some((l) => l.id !== "liked");
     $("now-card").innerHTML =
-      '<p class="done-msg">Nothing playing.<br>Put something on in Spotify and it shows up here.</p>';
+      `<div class="state-card">
+        <div class="state-icon">${ICON_PLAY}</div>
+        <p>Nothing playing.</p>
+        <p class="hint">${hasInputs
+          ? "Start one of your inputs above, or put something on in Spotify."
+          : "Put something on in Spotify and it shows up here."}</p>
+      </div>`;
     return;
   }
 
@@ -662,12 +757,18 @@ function renderNow() {
   const body = inSitting ? sittingCardBody(tr, d.sitting) : ordinaryCardBody(d, tr, ctx);
 
   nowProblem = false;  // a real card for a real track is about to go up
-  $("now-card").innerHTML = `<div class="track-card">
-    ${img}
+  $("now-card").innerHTML = `<div class="track-card${d.is_playing ? "" : " is-paused"}">
+    <div class="art">${img}${d.is_playing ? "" : '<span class="paused-chip">paused</span>'}</div>
     <div class="t-name">${esc(tr.name)}</div>
     <div class="t-artist">${esc(artists)}${tr.album ? " — " + esc(tr.album) : ""}</div>
+    ${playbackStrip(d, tr)}
     ${body}
   </div>`;
+  const tog = $("btn-now-toggle");
+  if (tog) tog.onclick = playerToggle;
+  const nxt = $("btn-now-next");
+  if (nxt) nxt.onclick = playerNext;
+  startNowTicker(d, tr);
 
   if (inSitting) {
     wireSittingCard();
@@ -694,13 +795,13 @@ function ordinaryCardBody(d, tr, ctx) {
   d.suggestions.forEach((s, i) => {
     const home = nowState.homes.get(s.playlist_id);
     if (!home) return;
-    body += `<button class="sugg${s.already ? " already" : ""}" data-to="${esc(s.playlist_id)}">
-      <span class="s-pct">${s.already ? "" : s.pct + "%"}</span>
+    body += `<button class="sugg${s.already ? " already" : ""}" data-to="${esc(s.playlist_id)}" style="--pct:${s.already ? 100 : s.pct}%">
+      <span class="s-pct">${s.already ? '<span class="s-badge">already there</span>' : s.pct + "%"}</span>
       <span class="s-name"><kbd>${i + 1}</kbd> ${esc(home.name)}</span>
       <span class="s-why">${esc([home.folder, ...s.reasons].filter(Boolean).join(" · "))}</span>
     </button>`;
   });
-  if (!d.suggestions.length) body += '<p class="hint">No confident match — use More…</p>';
+  if (!d.suggestions.length) body += '<p class="hint">No confident match — use Add to…</p>';
   body += `<div class="minor-actions">
     <button id="btn-now-more"><kbd>m</kbd> Add to…</button>
     ${ctx?.is_input ? '<button id="btn-now-remove" class="danger"><kbd>r</kbd> Remove from input</button>' : ""}
@@ -1662,8 +1763,8 @@ function sittingCardBody(tr, srvSitting) {
     (nowState.suggestions || []).forEach((s, i) => {
       const home = nowState.homes.get(s.playlist_id);
       if (!home) return;
-      html += `<button class="sugg${s.already ? " already" : ""}" data-keep="${esc(s.playlist_id)}">
-        <span class="s-pct">${s.already ? "" : s.pct + "%"}</span>
+      html += `<button class="sugg${s.already ? " already" : ""}" data-keep="${esc(s.playlist_id)}" style="--pct:${s.already ? 100 : s.pct}%">
+        <span class="s-pct">${s.already ? '<span class="s-badge">already there</span>' : s.pct + "%"}</span>
         <span class="s-name"><kbd>${i + 1}</kbd> Keep → ${esc(home.name)}</span>
         <span class="s-why">${esc([home.folder, ...s.reasons].filter(Boolean).join(" · "))}</span>
       </button>`;

@@ -2662,6 +2662,25 @@ def _fetch_missing_now_tags(track: dict, *, clock=time.monotonic) -> int:
         _now_fetch_lock.release()
 
 
+def _idle_inputs_payload() -> list[dict]:
+    """Inputs for the not-playing state's "start an input…" CTA — names only.
+
+    Deliberately from config plus the cached listing, NOT _ensure_profiles:
+    the idle branch of a polling endpoint must never fetch a missing listing
+    upstream, and must never trade "nothing playing" for the >40-homes 400
+    a profile build is allowed to raise. An empty cache just means no CTA.
+    """
+    items = (store.cache().get("playlist_list") or {}).get("items") or []
+    by_id = {p["id"]: p for p in items}
+    out = []
+    for iid in sorted(_effective_input_ids(store.config(), items)):
+        if iid == LIKED_ID:
+            out.append({"id": iid, "name": "Liked Songs", "has_track": False})
+        elif iid in by_id:
+            out.append({"id": iid, "name": by_id[iid]["name"], "has_track": False})
+    return out
+
+
 @app.get("/api/now")
 def now_playing(force: bool = False):
     try:
@@ -2675,7 +2694,8 @@ def now_playing(force: bool = False):
             return {"playing": False, "cooldown": str(e), "poll_after_ms": NOW_ERROR_POLL_MS}
         raise
     if not np:
-        return {"playing": False, "poll_after_ms": _poll_after_ms(stale_in)}
+        return {"playing": False, "poll_after_ms": _poll_after_ms(stale_in),
+                "inputs": _idle_inputs_payload()}
 
     state = _ensure_profiles()
     track = np["track"]
@@ -2762,6 +2782,16 @@ def _playback_call(fn, *args) -> dict:
 @app.post("/api/player/next")
 def player_next():
     return _playback_call(sp.skip_next)
+
+
+@app.post("/api/player/pause")
+def player_pause():
+    return _playback_call(sp.pause_playback)
+
+
+@app.post("/api/player/resume")
+def player_resume():
+    return _playback_call(sp.resume_playback)
 
 
 @app.post("/api/player/play")

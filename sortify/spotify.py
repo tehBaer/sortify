@@ -613,6 +613,14 @@ class Spotify:
     def skip_next(self) -> None:
         self.request("POST", "/me/player/next")
 
+    def pause_playback(self) -> None:
+        self.request("PUT", "/me/player/pause")
+
+    def resume_playback(self) -> None:
+        # No body: resume where playback stopped. A context_uri here would
+        # restart the playlist from the top instead (that's play_context).
+        self.request("PUT", "/me/player/play")
+
     def play_context(self, playlist_id: str) -> None:
         """Start a playlist from the top, leaving shuffle as the user set it."""
         self.request(
@@ -638,7 +646,11 @@ class Spotify:
                 "duration_ms": t.get("duration_ms"),
                 "artists": [{"id": a.get("id"), "name": a.get("name")} for a in t.get("artists", [])],
                 "album": (t.get("album") or {}).get("name"),
-                "image": ((t.get("album") or {}).get("images") or [{}])[-1].get("url"),
+                # Largest-first list; the middle entry (~300px) matches what
+                # the now card actually displays — [-1] is the 64px thumbnail,
+                # which upscaled to card size as a blur.
+                "image": (lambda imgs: imgs[(len(imgs) - 1) // 2].get("url"))(
+                    (t.get("album") or {}).get("images") or [{}]),
             },
             "is_playing": data.get("is_playing", False),
             "progress_ms": data.get("progress_ms"),

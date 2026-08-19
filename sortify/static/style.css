@@ -3,16 +3,22 @@
      without this the input switcher renders as a glaring white UA-default
      bar in dark mode. */
   color-scheme: light dark;
-  --bg: #fafafa; --fg: #1a1a1a; --muted: #6b6b6b;
-  --card: #ffffff; --border: #e2e2e2;
+  --bg: #f6f6f4; --fg: #1a1a1a; --muted: #6b6b6b;
+  --card: #ffffff; --card2: #f1f1ef; --border: #e5e5e2;
   --accent: #1db954; --accent-fg: #ffffff;
   --danger: #c0392b;
+  /* Depth comes from shadow, not 1px borders — borders stay as a fallback
+     hairline so nothing floats when shadows are clipped or disabled. */
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, .05), 0 8px 24px -12px rgba(0, 0, 0, .18);
+  --shadow-art: 0 10px 32px -10px rgba(0, 0, 0, .45);
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #121212; --fg: #ececec; --muted: #9a9a9a;
-    --card: #1e1e1e; --border: #333;
+    --bg: #101012; --fg: #ececec; --muted: #9a9a9a;
+    --card: #1c1c20; --card2: #26262b; --border: #2e2e33;
     --accent: #1db954; --accent-fg: #06230f;
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, .4), 0 10px 28px -12px rgba(0, 0, 0, .6);
+    --shadow-art: 0 12px 36px -10px rgba(0, 0, 0, .8);
   }
 }
 
@@ -25,6 +31,10 @@ body {
 header {
   display: flex; align-items: baseline; justify-content: space-between;
   padding: .7rem 1rem; border-bottom: 1px solid var(--border);
+  /* Stays put so the nav is always reachable mid-scroll on a phone. */
+  position: sticky; top: 0; z-index: 5;
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
 }
 h1 { font-size: 1.15rem; margin: 0; cursor: pointer; }
 #whoami { color: var(--muted); font-size: .85rem; }
@@ -41,14 +51,18 @@ code { background: var(--card); border: 1px solid var(--border); padding: 0 .3em
 
 input, select {
   background: var(--card); color: var(--fg); border: 1px solid var(--border);
-  border-radius: 8px; padding: .55rem .7rem; font-size: 1rem; width: 100%;
+  border-radius: 12px; padding: .6rem .8rem; font-size: 1rem; width: 100%;
+  min-height: 44px;
 }
 button {
   background: var(--card); color: var(--fg); border: 1px solid var(--border);
-  border-radius: 8px; padding: .55rem .9rem; font-size: .95rem; cursor: pointer;
-  touch-action: manipulation;
+  border-radius: 12px; padding: .55rem 1rem; font-size: .95rem; cursor: pointer;
+  touch-action: manipulation; min-height: 44px;
+  transition: background-color .15s ease, border-color .15s ease, transform .06s ease;
 }
-button:disabled { opacity: .4; cursor: default; }
+button:active { transform: scale(.97); }
+button:hover { border-color: color-mix(in srgb, var(--fg) 22%, var(--border)); }
+button:disabled { opacity: .4; cursor: default; transform: none; }
 button.primary { background: var(--accent); color: var(--accent-fg); border-color: transparent; font-weight: 600; }
 .row { display: flex; gap: .5rem; margin: .5rem 0; }
 .row input { flex: 1; }
@@ -91,35 +105,111 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 #triage-loading p { text-align: center; color: var(--muted); }
 
 .track-card {
-  background: var(--card); border: 1px solid var(--border); border-radius: 14px;
-  padding: 1rem; text-align: center;
+  background: var(--card); border: 1px solid var(--border); border-radius: 18px;
+  padding: 1.25rem 1.1rem 1.1rem; text-align: center;
+  box-shadow: var(--shadow-card);
+  animation: card-in .18s ease-out;
 }
+@keyframes card-in { from { opacity: .4; transform: translateY(5px); } }
+@media (prefers-reduced-motion: reduce) {
+  .track-card { animation: none; }
+  button:active { transform: none; }
+}
+.track-card .art { position: relative; display: inline-block; line-height: 0; }
 .track-card img, .track-card .noimg {
-  width: min(46vw, 190px); height: min(46vw, 190px);
-  border-radius: 10px; object-fit: cover; background: var(--border);
+  width: min(58vw, 230px); height: min(58vw, 230px);
+  border-radius: 14px; object-fit: cover; background: var(--border);
+  box-shadow: var(--shadow-art);
+  transition: opacity .2s ease;
 }
-.track-card .t-name { font-size: 1.15rem; font-weight: 700; margin: .6rem 0 .15rem; }
-.track-card .t-artist { color: var(--muted); margin-bottom: 1rem; }
+.track-card .noimg { display: inline-block; }
+.track-card.is-paused img, .track-card.is-paused .noimg { opacity: .55; }
+.paused-chip {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  background: color-mix(in srgb, var(--bg) 85%, transparent); color: var(--fg);
+  font-size: .7rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  padding: .3rem .7rem; border-radius: 999px; line-height: 1.2;
+  backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+}
+.track-card .t-name { font-size: 1.3rem; font-weight: 700; letter-spacing: -.01em; margin: .8rem 0 .15rem; }
+.track-card .t-artist { color: var(--muted); font-size: .95rem; margin-bottom: .9rem; }
+
+/* playback strip: elapsed / bar / total, then the two round buttons */
+.np-progress {
+  display: flex; align-items: center; gap: .6rem; margin: 0 .3rem .5rem;
+}
+.np-time {
+  color: var(--muted); font-size: .75rem; font-variant-numeric: tabular-nums;
+  min-width: 2.4em;
+}
+.np-bar {
+  flex: 1; display: block; height: 4px; border-radius: 999px;
+  background: color-mix(in srgb, var(--fg) 12%, transparent); overflow: hidden;
+}
+#np-fill { display: block; height: 100%; background: var(--accent); border-radius: 999px;
+           transition: width 1s linear; }
+.np-buttons { display: flex; align-items: center; justify-content: center; gap: .8rem; margin-bottom: 1rem; }
+.np-round {
+  width: 52px; height: 52px; min-height: 0; padding: 0; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--fg); color: var(--bg); border-color: transparent;
+}
+.np-round:hover { border-color: transparent; opacity: .88; }
+.np-round.np-small {
+  width: 42px; height: 42px; background: var(--card2); color: var(--fg);
+  border: 1px solid var(--border);
+}
 
 .sugg {
   display: block; width: 100%; text-align: left; margin-bottom: .5rem;
-  padding: .7rem .85rem; border-radius: 10px;
+  padding: .7rem .9rem .8rem; border-radius: 12px;
+  background: var(--card2); border-color: transparent;
+  position: relative; overflow: hidden;
 }
+/* confidence as a slim bar along the button's bottom edge, sized by --pct */
+.sugg::after {
+  content: ""; position: absolute; left: 0; bottom: 0; height: 3px;
+  width: var(--pct, 0%);
+  background: color-mix(in srgb, var(--accent) 75%, transparent);
+  border-radius: 0 999px 999px 0;
+}
+.sugg:hover { border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
 .sugg .s-name { font-weight: 650; }
-.sugg .s-why { display: block; color: var(--muted); font-size: .8rem; margin-top: .1rem; }
-.sugg.already { border-color: var(--accent); }
-.sugg.already .s-name::after { content: " — already there"; color: var(--accent); font-weight: 400; font-size: .85rem; }
-.sugg .s-pct { float: right; color: var(--muted); font-size: .8rem; }
+.sugg .s-why { display: block; color: var(--muted); font-size: .8rem; margin-top: .15rem; }
+.sugg.already::after { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+.sugg .s-pct { float: right; color: var(--muted); font-size: .8rem; margin-top: .1rem; }
+.s-badge {
+  color: var(--accent); font-size: .72rem; font-weight: 600;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  padding: .1rem .5rem; border-radius: 999px;
+}
 
 .minor-actions { display: flex; gap: .5rem; margin-top: .8rem; }
-.minor-actions button { flex: 1; }
+.minor-actions button { flex: 1; white-space: nowrap; }
 .capture {
-  display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; justify-content: center;
-  margin-top: .9rem; padding-top: .7rem; border-top: 1px solid var(--border);
+  display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; justify-content: center;
+  margin-top: .9rem; padding-top: .8rem; border-top: 1px solid var(--border);
 }
 .in-chip.has { border-color: var(--accent); color: var(--accent); opacity: .75; }
 .danger { color: var(--danger); }
 .done-msg { text-align: center; padding: 3rem 0; color: var(--muted); }
+
+/* full-page states (nothing playing, reauth): centered in the viewport
+   instead of a text strip floating over 60% dead whitespace */
+.state-card {
+  text-align: center; color: var(--muted);
+  display: flex; flex-direction: column; align-items: center; gap: .4rem;
+  padding: 16vh 1rem 2rem;
+}
+.state-card p { margin: 0; }
+.state-card .hint { max-width: 26rem; }
+.state-card button { margin-top: .8rem; }
+.state-icon {
+  width: 56px; height: 56px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--card2); color: var(--muted); margin-bottom: .4rem;
+}
+.state-icon svg { width: 26px; height: 26px; }
 kbd {
   background: var(--bg); border: 1px solid var(--border); border-bottom-width: 2px;
   border-radius: 4px; padding: 0 .35em; font-size: .75em;

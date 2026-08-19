@@ -58,6 +58,27 @@ def test_skip_next_asks_spotify_for_the_next_track(sp, monkeypatch):
     assert sent["url"].endswith("/me/player/next")
 
 
+def test_pause_stops_playback(sp, monkeypatch):
+    sent = record(sp, monkeypatch)
+
+    sp.pause_playback()
+
+    assert sent["method"] == "PUT"
+    assert sent["url"].endswith("/me/player/pause")
+
+
+def test_resume_continues_without_restarting_the_context(sp, monkeypatch):
+    """PUT /me/player/play with no body resumes where playback stopped; a body
+    with a context_uri would restart the playlist from the top instead."""
+    sent = record(sp, monkeypatch)
+
+    sp.resume_playback()
+
+    assert sent["method"] == "PUT"
+    assert sent["url"].endswith("/me/player/play")
+    assert sent["json"] is None
+
+
 def test_playing_an_input_starts_that_playlist(sp, monkeypatch):
     sent = record(sp, monkeypatch)
 
@@ -77,6 +98,40 @@ def test_a_stale_token_is_reported_as_missing_permission(sp, monkeypatch):
         sp.skip_next()
 
 
+def test_now_playing_art_is_the_mid_size_image(sp, monkeypatch):
+    """Spotify lists album images largest-first ([640, 300, 64]). The now card
+    displays art at up to ~240px, so the 64px thumbnail upscales to a blur and
+    the 640px original is wasted bytes — the middle one is the right fetch.
+    Same URL cost either way; this is a quality choice, not a budget one."""
+    payload = {
+        "item": {
+            "uri": "spotify:track:x", "id": "x", "name": "X", "type": "track",
+            "artists": [], "duration_ms": 1000,
+            "album": {"name": "Alb", "images": [
+                {"url": "http://img/640"}, {"url": "http://img/300"}, {"url": "http://img/64"},
+            ]},
+        },
+        "is_playing": True, "progress_ms": 0,
+    }
+    record(sp, monkeypatch, FakeResponse(200, payload))
+
+    assert sp.currently_playing()["track"]["image"] == "http://img/300"
+
+
+def test_now_playing_art_survives_a_single_image(sp, monkeypatch):
+    payload = {
+        "item": {
+            "uri": "spotify:track:x", "id": "x", "name": "X", "type": "track",
+            "artists": [], "duration_ms": 1000,
+            "album": {"name": "Alb", "images": [{"url": "http://img/only"}]},
+        },
+        "is_playing": True, "progress_ms": 0,
+    }
+    record(sp, monkeypatch, FakeResponse(200, payload))
+
+    assert sp.currently_playing()["track"]["image"] == "http://img/only"
+
+
 # ---- endpoints -------------------------------------------------------------
 
 
@@ -92,6 +147,27 @@ def test_next_endpoint_skips(appmod, monkeypatch):
 
     assert appmod.player_next()["ok"] is True
     assert called == [True]
+
+
+def test_pause_and_resume_endpoints(appmod, monkeypatch):
+    calls = []
+    monkeypatch.setattr(appmod.sp, "pause_playback", lambda: calls.append("pause"))
+    monkeypatch.setattr(appmod.sp, "resume_playback", lambda: calls.append("resume"))
+
+    assert appmod.player_pause()["ok"] is True
+    assert appmod.player_resume()["ok"] is True
+    assert calls == ["pause", "resume"]
+
+
+def test_pause_invalidates_the_now_cache(appmod, monkeypatch):
+    """Same reasoning as skip: the cache now predicts is_playing wrongly, and
+    the client's optimistic flip needs the next poll to fetch the truth."""
+    monkeypatch.setattr(appmod.sp, "pause_playback", lambda: None)
+    appmod._now_cache.update(at=9_999_999.0, value={"is_playing": True}, ttl=300)
+
+    appmod.player_pause()
+
+    assert appmod._now_cache["at"] == 0.0
 
 
 def test_play_endpoint_starts_the_requested_input(appmod, monkeypatch):

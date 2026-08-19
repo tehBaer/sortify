@@ -277,6 +277,32 @@ def test_forced_refreshes_of_the_endpoint_obey_the_floor(route_client):
     assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]
 
 
+def test_an_idle_poll_lists_inputs_for_the_start_cta(route_client, monkeypatch):
+    """When nothing is playing, the input switcher is the page's one useful
+    action ("start an input…"), so the idle payload has to name the inputs.
+    They must come from config plus the cached listing only — not a profile
+    build, which can fetch a missing listing or refuse with the >40-homes 400.
+    An idle poll therefore stays exactly one Spotify call, like any other."""
+    s = Store()
+    cache = s.cache()
+    cache["playlist_list"]["items"] = NOW_LISTING + [
+        {"id": "IN9", "name": "[Inbox]", "owner": "me", "editable": True,
+         "total": 1, "snapshot_id": "snap-in9", "image": None}]
+    s.save_cache(cache)
+
+    def idle(method, path, background=False, **kwargs):
+        route_client.spotify_calls.append((method, path))
+        return {}
+
+    monkeypatch.setattr(appmod.sp, "request", idle)
+
+    body = route_client.get("/api/now").json()
+
+    assert body["playing"] is False
+    assert [l["id"] for l in body["inputs"]] == ["IN9"]
+    assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]
+
+
 def test_the_sitting_lookup_on_the_poll_path_is_free(route_client):
     """`_sitting_for_context` is this branch's addition to the hottest path in
     the app. It answers from splits.json on purpose; resolving the context
