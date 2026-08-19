@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from sortify.tags import LastFm, LastFmError, enrich, load_key
+from sortify.tags import LastFm, LastFmError, enrich, fetch_track, load_key, track_key
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -407,3 +407,201 @@ def test_load_key_rejects_empty_key(tmp_path):
     p = tmp_path / "lastfm.json"
     p.write_text('{"api_key": ""}')
     assert load_key(p) is None
+
+
+# ---- track_key --------------------------------------------------------
+
+
+def test_track_key_lowercases_and_collapses_whitespace():
+    assert track_key("Aerosmith", "Dream On") == track_key("aerosmith", "dream  on")
+    assert track_key("  Aerosmith ", "Dream On") == track_key("Aerosmith", " Dream On ")
+
+
+def test_track_key_uses_unit_separator():
+    assert track_key("Aerosmith", "Dream On") == "aerosmith\x1fdream on"
+
+
+def test_track_key_separator_prevents_dash_collision():
+    """Without a dedicated separator, 'A' + '-' + 'B-C' and 'A-B' + '-' + 'C'
+    would collide on a plain dash join."""
+    k1 = track_key("A", "B-C")
+    k2 = track_key("A-B", "C")
+    assert k1 != k2
+
+
+# ---- track_similar / track_top_tags ------------------------------------
+
+
+class FakeTrackClient:
+    """Stands in for httpx.Client for track.getSimilar / track.getTopTags."""
+
+    def __init__(self, similar=None, tags=None, errors=None):
+        self.similar = similar or {}
+        self.tags = tags or {}
+        self.errors = errors or {}
+        self.calls = []
+
+    def get(self, url, params=None, timeout=None):
+        method = params["method"]
+        key = (params["artist"], params["track"])
+        self.calls.append((method, key))
+        if key in self.errors.get(method, {}):
+            return FakeResponse(self.errors[method][key])
+        if method == "track.getSimilar":
+            tracks = self.similar.get(key)
+            if tracks is None:
+                return FakeResponse(
+                    {"error": 6, "message": "Track not found"})
+            return FakeResponse({"similartracks": {"track": tracks}})
+        if method == "track.getTopTags":
+            tags = self.tags.get(key)
+            if tags is None:
+                return FakeResponse(
+                    {"error": 6, "message": "Track not found"})
+            return FakeResponse({"toptags": {"tag": tags}})
+        raise AssertionError(f"unexpected method {method!r}")
+
+
+def test_track_similar_returns_slim_records():
+    client = FakeTrackClient(similar={
+        ("Aerosmith", "Dream On"): [
+            {"name": "Dream On", "match": "0.21", "artist": {"name": "Nazareth"}},
+            {"name": "Free Bird", "match": 0.15, "artist": {"name": "Lynyrd Skynyrd"}},
+        ]
+    })
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    got = fm.track_similar("Aerosmith", "Dream On")
+    assert got == [
+        {"artist": "Nazareth", "track": "Dream On", "match": 0.21},
+        {"artist": "Lynyrd Skynyrd", "track": "Free Bird", "match": 0.15},
+    ]
+
+
+def test_track_similar_returns_none_for_unknown_track():
+    fm = LastFm("k", sleep=lambda s: None, client=FakeTrackClient())
+    assert fm.track_similar("Nobody", "Nothing") is None
+
+
+def test_track_similar_params():
+    client = FakeTrackClient(similar={("A", "B"): []})
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    fm.track_similar("A", "B")
+    assert client.calls == [("track.getSimilar", ("A", "B"))]
+
+
+def test_track_similar_raises_on_non_notfound_error():
+    client = FakeTrackClient(errors={
+        "track.getSimilar": {("A", "B"): {"error": 29, "message": "Rate limit exceeded"}}
+    })
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    with pytest.raises(LastFmError, match="error 29"):
+        fm.track_similar("A", "B")
+
+
+def test_track_similar_code_6_non_notfound_message_raises():
+    client = FakeTrackClient(errors={
+        "track.getSimilar": {("A", "B"): {
+            "error": 6, "message": "Invalid parameters - your request is missing a required parameter"}}
+    })
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    with pytest.raises(LastFmError, match="error 6"):
+        fm.track_similar("A", "B")
+
+
+def test_track_top_tags_returns_plain_names():
+    client = FakeTrackClient(tags={
+        ("Aerosmith", "Dream On"): [{"name": "ballad", "count": 50},
+                                    {"name": "classic rock", "count": 40}]
+    })
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    assert fm.track_top_tags("Aerosmith", "Dream On") == ["ballad", "classic rock"]
+
+
+def test_track_top_tags_returns_none_for_unknown_track():
+    fm = LastFm("k", sleep=lambda s: None, client=FakeTrackClient())
+    assert fm.track_top_tags("Nobody", "Nothing") is None
+
+
+def test_track_top_tags_raises_on_non_notfound_error():
+    client = FakeTrackClient(errors={
+        "track.getTopTags": {("A", "B"): {"error": 10, "message": "Invalid API key"}}
+    })
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    with pytest.raises(LastFmError, match="error 10"):
+        fm.track_top_tags("A", "B")
+
+
+def test_track_methods_reject_blank_artist_or_title():
+    fm = LastFm("k", sleep=lambda s: None, client=FakeTrackClient())
+    for bad in ("", "   ", None):
+        with pytest.raises(LastFmError, match="artist"):
+            fm.track_similar(bad, "T")
+        with pytest.raises(LastFmError, match="title"):
+            fm.track_similar("A", bad)
+        with pytest.raises(LastFmError, match="artist"):
+            fm.track_top_tags(bad, "T")
+        with pytest.raises(LastFmError, match="title"):
+            fm.track_top_tags("A", bad)
+
+
+def test_track_similar_sleeps_min_interval():
+    slept = []
+    client = FakeTrackClient(similar={("A", "B"): []})
+    fm = LastFm("k", sleep=slept.append, client=client)
+    fm.track_similar("A", "B")
+    assert slept == [pytest.approx(0.25)]
+
+
+# ---- fetch_track --------------------------------------------------------
+
+
+def test_fetch_track_records_both_hits():
+    client = FakeTrackClient(
+        similar={("Aerosmith", "Dream On"): [
+            {"name": "Dream On", "match": 0.21, "artist": {"name": "Nazareth"}}]},
+        tags={("Aerosmith", "Dream On"): [{"name": "ballad", "count": 50}]},
+    )
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    rec = fetch_track(fm, "Aerosmith", "Dream On", now=123.0)
+    assert rec == {
+        "similar": [{"artist": "Nazareth", "track": "Dream On", "match": 0.21}],
+        "tags": ["ballad"],
+        "fetched_at": 123.0,
+        "miss": False,
+    }
+
+
+def test_fetch_track_half_miss_keeps_the_hit():
+    """getSimilar 404s but tags succeed: not a miss, similar is just empty."""
+    client = FakeTrackClient(tags={("A", "B"): [{"name": "ballad", "count": 50}]})
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    rec = fetch_track(fm, "A", "B", now=1.0)
+    assert rec["miss"] is False
+    assert rec["similar"] == []
+    assert rec["tags"] == ["ballad"]
+
+
+def test_fetch_track_half_miss_the_other_way():
+    """getTopTags 404s but similar succeeds: not a miss, tags is just empty."""
+    client = FakeTrackClient(similar={("A", "B"): [
+        {"name": "C", "match": 0.5, "artist": {"name": "D"}}]})
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    rec = fetch_track(fm, "A", "B", now=1.0)
+    assert rec["miss"] is False
+    assert rec["tags"] == []
+    assert rec["similar"] == [{"artist": "D", "track": "C", "match": 0.5}]
+
+
+def test_fetch_track_both_miss():
+    fm = LastFm("k", sleep=lambda s: None, client=FakeTrackClient())
+    rec = fetch_track(fm, "A", "B", now=1.0)
+    assert rec == {"similar": [], "tags": [], "fetched_at": 1.0, "miss": True}
+
+
+def test_fetch_track_propagates_errors():
+    client = FakeTrackClient(errors={
+        "track.getSimilar": {("A", "B"): {"error": 29, "message": "Rate limit exceeded"}}
+    })
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    with pytest.raises(LastFmError, match="error 29"):
+        fetch_track(fm, "A", "B", now=1.0)

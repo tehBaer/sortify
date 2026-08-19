@@ -232,6 +232,23 @@ def _looks_like_not_found(message: str) -> bool:
     return any(p in low for p in _NOT_FOUND_PHRASES)
 
 
+# Unit separator (0x1F) rather than a printable character: track titles
+# routinely contain dashes and slashes ("Free - Bird", "AC/DC"), so a plain
+# join could collide two distinct (artist, title) pairs onto the same key.
+TRACK_KEY_SEP = "\x1f"
+
+
+def track_key(artist: str, title: str) -> str:
+    """Normalise (artist, title) into `lastfm_tracks.json`'s lookup key.
+
+    Lowercase and whitespace-collapsed so "Aerosmith" / " aerosmith " and
+    "Dream On" / "Dream  On" land on the same record.
+    """
+    a = " ".join((artist or "").split()).lower()
+    t = " ".join((title or "").split()).lower()
+    return f"{a}{TRACK_KEY_SEP}{t}"
+
+
 def load_key(path: Path | None = None) -> str | None:
     """Read the API key from ~/state/sortify/lastfm.json.
 
@@ -352,6 +369,126 @@ class LastFm:
         return ArtistTags(matched_name=matched if isinstance(matched, str) else None,
                           tags=[t for t in tags if isinstance(t, dict)])
 
+    def _validate_track_args(self, artist_name: str, track_name: str) -> None:
+        if not isinstance(artist_name, str) or not artist_name.strip():
+            raise LastFmError(f"artist name must be a non-empty string, got {artist_name!r}")
+        if not isinstance(track_name, str) or not track_name.strip():
+            raise LastFmError(f"track title must be a non-empty string, got {track_name!r}")
+
+    def track_similar(self, artist_name: str, track_name: str) -> list[dict] | None:
+        """Similar tracks for (artist, title), or None if Last.fm has no such track.
+
+        Mirrors `top_tags`' request/error/pacing structure exactly. Entries are
+        slimmed to `{"artist", "track", "match"}` — Last.fm's own shape nests
+        the artist name and carries fields this design has no use for.
+        """
+        self._validate_track_args(artist_name, track_name)
+        self._sleep(MIN_INTERVAL)
+        resp = self._client.get(
+            API,
+            params={
+                "method": "track.getSimilar",
+                "artist": artist_name,
+                "track": track_name,
+                "api_key": self.key,
+                "format": "json",
+                "limit": 20,
+            },
+            timeout=self._timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise LastFmError(f"Last.fm returned a non-object body: {type(data).__name__}")
+        if "error" in data:
+            error_code = data.get("error")
+            error_msg = data.get("message", "")
+            try:
+                code = int(error_code)
+            except (TypeError, ValueError):
+                code = None
+            if code == NOT_FOUND_CODE and _looks_like_not_found(error_msg):
+                return None
+            raise LastFmError(f"Last.fm error {error_code}: {error_msg}")
+        similartracks = data.get("similartracks")
+        if not isinstance(similartracks, dict):
+            raise LastFmError(
+                f"Last.fm response for {artist_name!r}/{track_name!r} has no usable "
+                "'similartracks' object"
+            )
+        tracks = similartracks.get("track", [])
+        if isinstance(tracks, dict):
+            tracks = [tracks]
+        if not isinstance(tracks, list):
+            raise LastFmError(
+                f"Last.fm returned a non-list 'track' for {artist_name!r}/{track_name!r}"
+            )
+        out = []
+        for t in tracks:
+            if not isinstance(t, dict):
+                continue
+            name = t.get("name")
+            artist_field = t.get("artist")
+            similar_artist = artist_field.get("name") if isinstance(artist_field, dict) else None
+            try:
+                match = float(t.get("match", 0))
+            except (TypeError, ValueError):
+                match = 0.0
+            out.append({"artist": similar_artist, "track": name, "match": match})
+        return out
+
+    def track_top_tags(self, artist_name: str, track_name: str) -> list[str] | None:
+        """Top tags for (artist, title), or None if Last.fm has no such track.
+
+        Mirrors `top_tags`' request/error/pacing structure exactly. Unlike
+        `top_tags`, this returns plain tag names — the scoring layer only
+        needs the vocabulary, not the per-tag counts.
+        """
+        self._validate_track_args(artist_name, track_name)
+        self._sleep(MIN_INTERVAL)
+        resp = self._client.get(
+            API,
+            params={
+                "method": "track.getTopTags",
+                "artist": artist_name,
+                "track": track_name,
+                "api_key": self.key,
+                "format": "json",
+                "limit": 20,
+            },
+            timeout=self._timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise LastFmError(f"Last.fm returned a non-object body: {type(data).__name__}")
+        if "error" in data:
+            error_code = data.get("error")
+            error_msg = data.get("message", "")
+            try:
+                code = int(error_code)
+            except (TypeError, ValueError):
+                code = None
+            if code == NOT_FOUND_CODE and _looks_like_not_found(error_msg):
+                return None
+            raise LastFmError(f"Last.fm error {error_code}: {error_msg}")
+        toptags = data.get("toptags")
+        if not isinstance(toptags, dict):
+            raise LastFmError(
+                f"Last.fm response for {artist_name!r}/{track_name!r} has no usable "
+                "'toptags' object"
+            )
+        tags = toptags.get("tag", [])
+        if isinstance(tags, dict):
+            tags = [tags]
+        if not isinstance(tags, list):
+            raise LastFmError(
+                f"Last.fm returned a non-list 'tag' for {artist_name!r}/{track_name!r}"
+            )
+        return [name for name in (
+            (t.get("name") or "").strip() for t in tags if isinstance(t, dict)
+        ) if name]
+
 
 def _store_tags(raw: list[dict]) -> list[dict]:
     """Normalise Last.fm's tag list to name+count. Nothing is dropped."""
@@ -410,3 +547,25 @@ def enrich(artist_names: dict[str, str], cached: dict, fm: LastFm, now: str) -> 
                         "tags": _store_tags(got.tags),
                         "fetched_at": now, "miss": False}
     return out
+
+
+def fetch_track(fm: LastFm, artist: str, title: str, now: float) -> dict:
+    """One `data/lastfm_tracks.json` record for (artist, title): getSimilar
+    plus track top tags.
+
+    A code-6 "not found" on one call does not make the whole record a miss —
+    it just leaves that half empty. `miss` is True only when BOTH calls come
+    back not-found, matching `Store.lastfm_track_map()`'s never-re-fetch
+    convention for genuine misses. Any raised `LastFmError` (or other
+    exception from the transport) propagates untouched; the caller leaves the
+    key absent from the map so the next run retries it, exactly as `enrich`'s
+    callers do for artist tags on a real failure.
+    """
+    similar = fm.track_similar(artist, title)
+    tags = fm.track_top_tags(artist, title)
+    return {
+        "similar": similar if similar is not None else [],
+        "tags": tags if tags is not None else [],
+        "fetched_at": now,
+        "miss": similar is None and tags is None,
+    }

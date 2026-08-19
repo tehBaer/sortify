@@ -160,3 +160,27 @@ class Store:
 
     def save_pacing(self, payload: dict) -> None:
         self._save("pacing.json", payload)
+
+    # lastfm_tracks.json: rebuildable Last.fm track-level cache (getSimilar +
+    # track top tags), keyed by tags.track_key(artist, title). Deliberately
+    # separate from tags.json (the artist-level cache, owned by the splitting
+    # workstream) and from descriptions.json/user_tags.json (precious,
+    # user-typed data) — see the design doc's Storage section. Safe to delete
+    # at any time; a missing or malformed file is just an empty cache.
+    LASTFM_TRACKS_DEFAULT = {"version": 1, "tracks": {}}
+
+    def lastfm_tracks(self) -> dict:
+        """The whole envelope. Consumers almost always want `lastfm_track_map()`."""
+        return self._versioned("lastfm_tracks.json", self.LASTFM_TRACKS_DEFAULT)
+
+    def save_lastfm_tracks(self, payload: dict) -> None:
+        self._save("lastfm_tracks.json", payload)
+
+    def lastfm_track_map(self) -> dict:
+        """The inner `{track_key: record}` map — the analog of `tag_artists()`.
+
+        {} on anything malformed, so a corrupt or hand-edited file degrades to
+        "nothing cached yet" instead of raising mid-fetch.
+        """
+        tracks = self.lastfm_tracks().get("tracks")
+        return tracks if isinstance(tracks, dict) else {}
