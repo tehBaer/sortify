@@ -57,29 +57,26 @@ TAG_WEIGHT = 3.0
 MIN_SCORE = 0.8
 TOP_N = 3
 
-# Neighbours (Last.fm getSimilar) are a phase-2 signal on top of the tag
-# layer above, not a replacement for it — see the design spec. A neighbour's
-# `match` is a per-pair similarity in [0, 1]; summing it over every matching
-# neighbour is unbounded in principle (many neighbours can each score close
-# to 1.0), so the sum is capped at NEIGHBOUR_SUM_CAP before it is weighted —
-# `_neighbour_score` itself still returns the raw, uncapped sum (its
-# documented interface), the cap is applied where the score is computed.
+# Neighbours (Last.fm getSimilar): a neighbour's `match` is per-pair
+# similarity in [0, 1]; the summed matches are capped at NEIGHBOUR_SUM_CAP
+# before weighting (unbounded sums would swamp everything else), and
+# `_neighbour_score` still returns the raw sum (its documented interface).
 #
-# NEIGHBOUR_WEIGHT is placeholder-conservative on purpose: the pre-flight
-# scan for this task flagged that a naive placeholder of 2.0 combined with
-# an uncapped sum could blow past ARTIST_BASE outright, and even with the
-# sum capped at 1.0, TAG_WEIGHT alone already spends 3.0 of the 3.4
-# (ARTIST_BASE + ARTIST_PER_TRACK) a single, minimal (n=1) artist match is
-# worth. That leaves under 0.4 of headroom for neighbours to occupy without
-# letting the worst case — a perfect tag cosine AND a fully-capped neighbour
-# sum on the same home, against a track whose artist appears exactly once
-# elsewhere — outrank the artist match (the primacy pin,
-# test_artist_overlap_still_outranks_max_combined_tag_and_neighbour). 0.3
-# keeps a real margin (3.0 + 0.3 = 3.3 < 3.4). This is deliberately
-# under-powered for now: Task 4 measures real neighbour coverage/accuracy
-# the way TAG_WEIGHT was measured, and can raise this (and/or revisit the
-# cap) once there is evidence instead of a guess — same discipline as
-# TAG_WEIGHT's own history above.
+# Measured 2026-08-19 by scripts/eval_suggest.py after the getSimilar
+# backfill (scripts/backfill_similar.py: 2101/2101 home tracks, 987 with
+# similar data, 2 misses):
+#   .venv/bin/python scripts/eval_suggest.py --n 500 --seed 7 --search
+#   artist-only baseline:            top1 0.278 top3 0.408 | absent 0.000
+#   tags-only (incl. track tags):    top1 0.314 top3 0.546 | absent 0.325
+#   NEIGHBOUR_WEIGHT=0.3 (this):     top1 0.314 top3 0.550 | absent 0.331
+#   NEIGHBOUR_WEIGHT=1.0..3.0:       top3 up to 0.558 | absent up to 0.344
+#     — but every weight above 0.3 breaks artist-overlap primacy
+#     (TAG_WEIGHT + w*NEIGHBOUR_SUM_CAP must stay < 3.4), so 0.3 is the
+#     committed ceiling: ~0.008 top3 is the measured price of the "owning
+#     the artist always outranks similarity" invariant, paid knowingly.
+# Note the tags-only row already includes track-level tags from
+# lastfm_tracks.json (fetched by the same backfill) — that is what moved
+# tags from 0.534 to 0.546 vs the 2026-08-18 artist-tag-only measurement.
 NEIGHBOUR_WEIGHT = 0.3
 NEIGHBOUR_SUM_CAP = 1.0
 
