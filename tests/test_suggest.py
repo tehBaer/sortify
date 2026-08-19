@@ -1,7 +1,15 @@
 from collections import Counter
 
 import sortify.suggest as suggest_mod
-from sortify.suggest import build_profile, suggest
+from sortify.suggest import (
+    ARTIST_BASE,
+    ARTIST_PER_TRACK,
+    NEIGHBOUR_WEIGHT,
+    TAG_WEIGHT,
+    build_profile,
+    suggest,
+)
+from sortify.tags import track_key
 
 
 def tag_entry(*tags, name="X", miss=False):
@@ -16,9 +24,13 @@ ARTISTS = {
 }
 
 
-def track(uri, artists):
-    names = {"beach-house": "Beach House", "slowdive": "Slowdive", "kvelertak": "Kvelertak", "unknown": "Unknown"}
-    return {"uri": uri, "artists": [{"id": a, "name": names.get(a, a)} for a in artists]}
+def track(uri, artists, title="Some Song"):
+    names = {
+        "beach-house": "Beach House", "slowdive": "Slowdive", "kvelertak": "Kvelertak",
+        "unknown": "Unknown", "same-artist": "Same", "other-artist": "Other",
+        "new-artist": "New",
+    }
+    return {"uri": uri, "name": title, "artists": [{"id": a, "name": names.get(a, a)} for a in artists]}
 
 
 def profiles():
@@ -219,3 +231,208 @@ def test_a_freshly_fetched_artists_tags_lag_in_the_home_profile():
     rebuilt_profile = build_profile(home_tracks, fresh_tag_artists)
     res_after_rebuild = suggest(playing, {"dreamy": rebuilt_profile}, fresh_tag_artists)
     assert any("artist tags" in r for r in res_after_rebuild[0]["reasons"])
+
+
+# ---- Task 2: neighbour scoring + track-tag resolution ---------------------
+
+
+def track_record(similar, tags=None, miss=False):
+    return {"similar": similar, "tags": tags or [], "fetched_at": "t", "miss": miss}
+
+
+def neighbour(artist, track_name, match):
+    return {"artist": artist, "track": track_name, "match": match}
+
+
+def test_build_profile_captures_every_artist_track_key():
+    home_tracks = [
+        track("d1", ["beach-house"], title="Space Song"),
+        track("d2", ["slowdive"], title="Alison"),
+    ]
+    prof = build_profile(home_tracks, ARTISTS)
+    assert prof["track_keys"] == {
+        track_key("Beach House", "Space Song"),
+        track_key("Slowdive", "Alison"),
+    }
+
+
+def test_neighbour_same_artist_only_scores_zero():
+    # BINDING regression pin: a neighbour whose artist matches the seed
+    # track's own artist (case-insensitively) must be excluded before
+    # scoring and before the count — even though the home actually holds
+    # that exact (artist, title) pair.
+    seed = track("new", ["beach-house"], title="Space Song")
+    home_tracks = [track("h1", ["beach-house"], title="Other Song")]
+    prof = build_profile(home_tracks, ARTISTS)
+    track_map = {
+        track_key("Beach House", "Space Song"): track_record([
+            neighbour("Beach House", "Other Song", 0.9),
+            neighbour("beach house", "Other Song", 0.5),  # case-insensitive match too
+        ]),
+    }
+    assert suggest_mod._neighbour_score(seed, prof, track_map) == (0.0, 0)
+
+    # And through the full pipeline: still suggested (artist overlap), but
+    # with no neighbour score contribution and no neighbour reason.
+    res = suggest(seed, {"dreamy": prof}, ARTISTS, track_map)
+    assert res and res[0]["playlist_id"] == "dreamy"
+    assert not any("similar track" in r for r in res[0]["reasons"])
+
+
+def test_neighbour_cross_artist_present_scores_and_reasons():
+    seed = track("new", ["unknown"], title="Mystery Song")
+    prof = build_profile([track("h1", ["slowdive"], title="Alison")], ARTISTS)
+    track_map = {
+        track_key("Unknown", "Mystery Song"): track_record([
+            neighbour("Slowdive", "Alison", 0.7),
+        ]),
+    }
+    score, count = suggest_mod._neighbour_score(seed, prof, track_map)
+    assert (score, count) == (0.7, 1)
+
+
+def test_neighbour_match_weighting_favors_higher_match():
+    prof = build_profile([track("h1", ["slowdive"], title="Alison")], ARTISTS)
+    track_map = {
+        track_key("Unknown", "SongA"): track_record([neighbour("Slowdive", "Alison", 0.9)]),
+        track_key("Unknown", "SongB"): track_record([neighbour("Slowdive", "Alison", 0.2)]),
+    }
+    score_a, _ = suggest_mod._neighbour_score(track("a", ["unknown"], title="SongA"), prof, track_map)
+    score_b, _ = suggest_mod._neighbour_score(track("b", ["unknown"], title="SongB"), prof, track_map)
+    assert score_a == 0.9
+    assert score_b == 0.2
+    assert score_a > score_b
+
+
+def test_neighbour_missing_or_miss_records_contribute_nothing():
+    seed = track("new", ["unknown"], title="Nope")
+    prof = build_profile([track("h1", ["slowdive"], title="Alison")], ARTISTS)
+    assert suggest_mod._neighbour_score(seed, prof, {}) == (0.0, 0)
+
+    track_map = {
+        track_key("Unknown", "Nope"): track_record(
+            [neighbour("Slowdive", "Alison", 0.9)], miss=True
+        ),
+    }
+    assert suggest_mod._neighbour_score(seed, prof, track_map) == (0.0, 0)
+
+
+def test_neighbour_sum_uncapped_in_return_value_but_capped_in_scoring():
+    # The 10-neighbour-all-match-1.0 fixture: _neighbour_score itself returns
+    # the raw (uncapped) sum per its documented interface; the cap that keeps
+    # the artist-overlap-primacy pin intact lives in suggest()'s scoring.
+    h2_tracks = [track(f"h2t{i}", ["other-artist"], title=f"H2 Song {i}") for i in range(10)]
+    ta = {"other-artist": tag_entry("cumbia", name="Other"), "new-artist": tag_entry(name="New")}
+    prof = build_profile(h2_tracks, ta)
+    seed = track("new", ["new-artist"], title="New Song")
+    similar = [neighbour("Other", f"H2 Song {i}", 1.0) for i in range(10)]
+    track_map = {track_key("New", "New Song"): track_record(similar)}
+
+    raw_sum, count = suggest_mod._neighbour_score(seed, prof, track_map)
+    assert count == 10
+    assert raw_sum == 10.0
+
+
+def test_artist_overlap_still_outranks_max_combined_tag_and_neighbour():
+    # Extends the existing tag-only primacy pin: even the worst case, a
+    # perfect tag cosine PLUS a fully-capped neighbour score (the
+    # 10-neighbour-all-match-1.0 fixture), must not outrank a single,
+    # minimal (n=1) artist match. "same-artist" is deliberately untagged so
+    # H1's score is the true floor (ARTIST_BASE + ARTIST_PER_TRACK, no tag
+    # bonus of its own) rather than getting an accidental boost.
+    ta = {
+        "same-artist": tag_entry(name="Same"),
+        "other-artist": tag_entry("cumbia", name="Other"),
+        "new-artist": tag_entry("cumbia", name="New"),
+    }
+    h1_track = track("h1t", ["same-artist"], title="H1 Song")
+    h2_tracks = [track(f"h2t{i}", ["other-artist"], title=f"H2 Song {i}") for i in range(10)]
+    profs = {"H1": build_profile([h1_track], ta), "H2": build_profile(h2_tracks, ta)}
+
+    new_track = track("new", ["same-artist"], title="New Song")
+    tag_only_track = track("tagonly", ["new-artist"], title="New Song2")
+    similar = [neighbour("Other", f"H2 Song {i}", 1.0) for i in range(10)]
+    track_map = {track_key("New", "New Song2"): track_record(similar)}
+
+    scores = {}
+    for pid, prof in profs.items():
+        seed = new_track if pid == "H1" else tag_only_track
+        res = suggest(seed, {pid: prof}, ta, track_map)
+        scores[pid] = res[0]["score"] if res else 0.0
+
+    assert scores["H1"] == ARTIST_BASE + ARTIST_PER_TRACK  # 3.4: the true floor, no tag bonus
+    assert scores["H2"] == round(TAG_WEIGHT + NEIGHBOUR_WEIGHT, 2)  # 3.3: both signals maxed
+    assert scores["H1"] > scores["H2"]
+
+
+def test_resolve_tags_track_level_replaces_artist_level():
+    t = track("new", ["beach-house"], title="Space Song")
+    track_map = {
+        track_key("Beach House", "Space Song"): track_record([], tags=["ambient", "psychedelic"]),
+    }
+    tags, level = suggest_mod._resolve_tags(t, ARTISTS, track_map)
+    assert level == "track"
+    assert set(tags) == {"ambient", "psychedelic"}
+
+
+def test_resolve_tags_falls_back_to_artist_when_no_track_record():
+    t = track("new", ["beach-house"], title="Space Song")
+    tags, level = suggest_mod._resolve_tags(t, ARTISTS, {})
+    assert level == "artist"
+    assert set(tags) == {"dream pop", "shoegaze"}
+
+
+def test_resolve_tags_falls_back_when_track_record_has_no_usable_tags():
+    t = track("new", ["beach-house"], title="Space Song")
+    track_map = {track_key("Beach House", "Space Song"): track_record([], tags=[])}
+    tags, level = suggest_mod._resolve_tags(t, ARTISTS, track_map)
+    assert level == "artist"
+    assert set(tags) == {"dream pop", "shoegaze"}
+
+
+def test_resolve_tags_ignores_a_miss_record():
+    t = track("new", ["beach-house"], title="Space Song")
+    track_map = {
+        track_key("Beach House", "Space Song"): track_record([], tags=["ambient"], miss=True),
+    }
+    tags, level = suggest_mod._resolve_tags(t, ARTISTS, track_map)
+    assert level == "artist"
+
+
+def test_suggest_track_level_tags_replace_artist_and_switch_reason_wording():
+    ta = {**ARTISTS, "h-artist": tag_entry("ambient", name="H Artist")}
+    home_track = track("h1", ["h-artist"], title="Home Song")
+    prof = build_profile([home_track], ta)
+
+    # "unknown" has no artist-level tags at all in ARTISTS, so any tag
+    # signal here can only have come from the track-level record.
+    seed = track("new", ["unknown"], title="New Song")
+    track_map = {track_key("Unknown", "New Song"): track_record([], tags=["ambient"])}
+
+    res = suggest(seed, {"H": prof}, ta, track_map)
+    assert res
+    assert any(r.startswith("tags:") for r in res[0]["reasons"])
+    assert not any(r.startswith("artist tags:") for r in res[0]["reasons"])
+
+
+def test_neighbour_score_finds_record_under_any_credited_artist_key():
+    # A collab track's lastfm_tracks record may have been fetched under
+    # either credited artist's name — _neighbour_score must not require it
+    # to be the first one.
+    def multi_track(uri, artist_ids, title):
+        names = {"beach-house": "Beach House", "slowdive": "Slowdive"}
+        return {
+            "uri": uri, "name": title,
+            "artists": [{"id": a, "name": names[a]} for a in artist_ids],
+        }
+
+    seed = multi_track("new", ["beach-house", "slowdive"], "Collab Song")
+    prof = build_profile([track("h1", ["unknown"], title="Other Song")], ARTISTS)
+    # Record only exists under the SECOND credited artist's key.
+    track_map = {
+        track_key("Slowdive", "Collab Song"): track_record(
+            [neighbour("Unknown", "Other Song", 0.6)]
+        ),
+    }
+    score, count = suggest_mod._neighbour_score(seed, prof, track_map)
+    assert (score, count) == (0.6, 1)

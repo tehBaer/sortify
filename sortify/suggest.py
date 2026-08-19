@@ -1,18 +1,25 @@
 """Score how well a track fits each home playlist.
 
-Two signals, both explainable to the user:
+Three signals, all explainable to the user:
   - artist overlap: the playlist already contains tracks by this artist
-  - artist-tag similarity: cosine between the track's artists' Last.fm tags
-    and the playlist's tag profile
+  - tag similarity: cosine between the track's tags and the playlist's tag
+    profile. Track-level Last.fm tags (`track.getTopTags`) REPLACE the
+    weaker artist-level tags when available (`_resolve_tags`) — resolution,
+    not mixing (ledger ruling P1) — and the reason string says which kind
+    it saw (`tags: …` vs `artist tags: …`).
+  - neighbours: this track's Last.fm `getSimilar` list, summed over
+    whichever neighbours are already in the home — see `_neighbour_score`
+    for the binding same-artist exclusion this signal depends on to avoid
+    just re-deriving artist overlap under a new name.
 
 Spotify's audio-features endpoint is deprecated for new apps, and Spotify no
 longer returns artist genres at all in development mode — tags come from
-Last.fm instead (see `sortify/tags.py`). They describe the *artist*, not the
-track, which is weaker evidence than a track-level tag would be. TAG_WEIGHT
-is the single knob for how much that weaker evidence counts against artist
-overlap, which stays the primary signal (see the constant's comment: only
-~7% of this library's home artists have any Last.fm tags at all, so the
-weight is provisional until more artists are tagged).
+Last.fm instead (see `sortify/tags.py`). Artist-level tags describe the
+*artist*, not the track, which is weaker evidence than a track-level tag.
+TAG_WEIGHT is the single knob for how much that weaker evidence counts
+against artist overlap, which stays the primary signal (see the constant's
+comment: only ~7% of this library's home artists have any Last.fm tags at
+all, so the weight is provisional until more artists are tagged).
 """
 
 from __future__ import annotations
@@ -20,7 +27,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 
-from .tags import clean_tags
+from .tags import clean_tags, track_key
 
 # Measured 2026-08-18 by scripts/eval_suggest.py AFTER the home-artist
 # backfill (scripts/backfill_tags.py: 1427/1427 home artists attempted,
@@ -49,6 +56,32 @@ TAG_WEIGHT = 3.0
 # artist-level one and the two should not compete at face value.
 MIN_SCORE = 0.8
 TOP_N = 3
+
+# Neighbours (Last.fm getSimilar) are a phase-2 signal on top of the tag
+# layer above, not a replacement for it — see the design spec. A neighbour's
+# `match` is a per-pair similarity in [0, 1]; summing it over every matching
+# neighbour is unbounded in principle (many neighbours can each score close
+# to 1.0), so the sum is capped at NEIGHBOUR_SUM_CAP before it is weighted —
+# `_neighbour_score` itself still returns the raw, uncapped sum (its
+# documented interface), the cap is applied where the score is computed.
+#
+# NEIGHBOUR_WEIGHT is placeholder-conservative on purpose: the pre-flight
+# scan for this task flagged that a naive placeholder of 2.0 combined with
+# an uncapped sum could blow past ARTIST_BASE outright, and even with the
+# sum capped at 1.0, TAG_WEIGHT alone already spends 3.0 of the 3.4
+# (ARTIST_BASE + ARTIST_PER_TRACK) a single, minimal (n=1) artist match is
+# worth. That leaves under 0.4 of headroom for neighbours to occupy without
+# letting the worst case — a perfect tag cosine AND a fully-capped neighbour
+# sum on the same home, against a track whose artist appears exactly once
+# elsewhere — outrank the artist match (the primacy pin,
+# test_artist_overlap_still_outranks_max_combined_tag_and_neighbour). 0.3
+# keeps a real margin (3.0 + 0.3 = 3.3 < 3.4). This is deliberately
+# under-powered for now: Task 4 measures real neighbour coverage/accuracy
+# the way TAG_WEIGHT was measured, and can raise this (and/or revisit the
+# cap) once there is evidence instead of a guess — same discipline as
+# TAG_WEIGHT's own history above.
+NEIGHBOUR_WEIGHT = 0.3
+NEIGHBOUR_SUM_CAP = 1.0
 
 
 def _cleaned_tags(entry: dict) -> list[str]:
@@ -81,15 +114,22 @@ def build_profile(tracks: list[dict], tag_artists: dict[str, dict]) -> dict:
     artist_counts: Counter = Counter()
     tag_counts: Counter = Counter()
     uris = set()
+    track_keys: set[str] = set()
     for t in tracks:
         uris.add(t["uri"])
         for a in t["artists"]:
+            track_keys.add(track_key(a.get("name") or "", t.get("name") or ""))
             if not a.get("id"):
                 continue
             artist_counts[a["id"]] += 1
             for tag in _cleaned_tags(tag_artists.get(a["id"], {})):
                 tag_counts[tag] += 1
-    return {"artist_counts": artist_counts, "tag_counts": tag_counts, "uris": uris}
+    return {
+        "artist_counts": artist_counts,
+        "tag_counts": tag_counts,
+        "uris": uris,
+        "track_keys": track_keys,
+    }
 
 
 def _cosine(a: Counter, b: Counter) -> float:
@@ -109,9 +149,114 @@ def _track_tags(track: dict, tag_artists: dict[str, dict]) -> Counter:
     return c
 
 
-def suggest(track: dict, profiles: dict[str, dict], tag_artists: dict[str, dict]) -> list[dict]:
-    """Rank home playlists for one track. Returns [{playlist_id, score, already, reasons}]."""
-    track_tags = _track_tags(track, tag_artists)
+def _track_record(track: dict, track_map: dict[str, dict]) -> dict | None:
+    """The track's `lastfm_tracks.json` record, or None if it has none.
+
+    Tried under EVERY one of the track's (artist, title) keys, not just the
+    first — a collab's fetch may have run under any one of its credited
+    artists, and there is exactly one record to find, so the first non-miss
+    hit wins. `_resolve_tags` still cleans whatever record this returns using
+    the first artist's name specifically (its own contract), independent of
+    which artist's key actually located it.
+    """
+    title = track.get("name") or ""
+    for a in track.get("artists") or []:
+        key = track_key(a.get("name") or "", title)
+        record = track_map.get(key)
+        if isinstance(record, dict) and not record.get("miss"):
+            return record
+    return None
+
+
+def _resolve_tags(
+    track: dict, tag_artists: dict[str, dict], track_map: dict[str, dict]
+) -> tuple[Counter, str]:
+    """The tags to score this track with, and which level they came from.
+
+    Track-level tags (Last.fm `track.getTopTags`, via the track's own
+    `lastfm_tracks.json` record) REPLACE artist-level tags when non-empty —
+    resolution, not mixing (ledger ruling P1) — because a track-level tag is
+    real evidence about this recording, not an average over everything the
+    artist has made. Falls back to the artist-level tags (`_track_tags`)
+    when there is no usable track record, exactly like before this feature.
+
+    `track.getTopTags` doesn't hand back Last.fm's per-tag counts (see
+    `LastFm.track_top_tags`), so `clean_tags`' floor can't apply the same way
+    it does to artist tags — every stored track tag survives that gate
+    (`floor=0`); only the stoplist and self-name filters still run.
+    """
+    record = _track_record(track, track_map)
+    if record is not None:
+        raw = record.get("tags") or []
+        if raw:
+            artists = track.get("artists") or []
+            artist_name = artists[0].get("name") or "" if artists else ""
+            cleaned = clean_tags(
+                [{"name": t, "count": 0} for t in raw], artist_name, floor=0
+            )
+            if cleaned:
+                return Counter(t for t, _w in cleaned), "track"
+    return _track_tags(track, tag_artists), "artist"
+
+
+def _neighbour_score(
+    track: dict, prof: dict, track_map: dict[str, dict]
+) -> tuple[float, int]:
+    """Sum of `match` over this track's Last.fm neighbours already in `prof`.
+
+    BINDING regression pin: a neighbour whose artist case-insensitively
+    matches ANY of the seed track's own artists is excluded before it is
+    scored and before it is counted — a home whose only matching neighbours
+    are by the seed artist must get zero neighbour score and no neighbour
+    reason. Without this exclusion the feature just re-derives artist
+    overlap under a new name, which is the exact failure (an artist only
+    ever getting suggested into its own playlists) this project exists to
+    fix.
+
+    The returned sum is intentionally uncapped — the cap that protects the
+    artist-overlap-primacy pin (see NEIGHBOUR_SUM_CAP) is applied where the
+    score is computed, not here, so this function's return value stays a
+    plain, honest total for callers (Task 4's eval harness among them) that
+    want the raw signal.
+    """
+    record = _track_record(track, track_map)
+    if record is None:
+        return 0.0, 0
+    seed_artists = {
+        (a.get("name") or "").strip().lower() for a in (track.get("artists") or [])
+    }
+    total = 0.0
+    count = 0
+    for n in record.get("similar") or []:
+        n_artist = n.get("artist") or ""
+        if n_artist.strip().lower() in seed_artists:
+            continue
+        key = track_key(n_artist, n.get("track") or "")
+        if key not in prof["track_keys"]:
+            continue
+        try:
+            total += float(n.get("match", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        count += 1
+    return total, count
+
+
+def suggest(
+    track: dict,
+    profiles: dict[str, dict],
+    tag_artists: dict[str, dict],
+    track_map: dict[str, dict] | None = None,
+) -> list[dict]:
+    """Rank home playlists for one track. Returns [{playlist_id, score, already, reasons}].
+
+    `track_map` is optional ({} when omitted) so callers that haven't been
+    updated to pass `store.lastfm_track_map()` yet keep working — see
+    app.py's call sites, which all pass a fresh one.
+    """
+    track_map = track_map or {}
+    track_tags, tag_level = _resolve_tags(track, tag_artists, track_map)
+    tag_reason_prefix = "tags: " if tag_level == "track" else "artist tags: "
     results = []
     for pid, prof in profiles.items():
         reasons = []
@@ -132,7 +277,14 @@ def suggest(track: dict, profiles: dict[str, dict], tag_artists: dict[str, dict]
                 reverse=True,
             )
             if overlap:
-                reasons.append("artist tags: " + ", ".join(overlap[:3]))
+                reasons.append(tag_reason_prefix + ", ".join(overlap[:3]))
+
+        neighbour_sum, neighbour_count = _neighbour_score(track, prof, track_map)
+        if neighbour_count:
+            score += NEIGHBOUR_WEIGHT * min(neighbour_sum, NEIGHBOUR_SUM_CAP)
+            reasons.append(
+                f"{neighbour_count} similar track{'s' if neighbour_count > 1 else ''} already here"
+            )
 
         already = track["uri"] in prof["uris"]
         if already or score >= MIN_SCORE:

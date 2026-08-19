@@ -352,8 +352,13 @@ def triage(playlist_id: str):
     input_tracks = _cached_tracks(playlist_id, by_id.get(playlist_id, {}).get("snapshot_id"))
     # Guard-on-read (see _ensure_profiles_locked) — triage must stay usable
     # even with a stale/bad-version tags.json; the split flow is where that
-    # fails loud.
+    # fails loud. lastfm_track_map() gets the same fresh-on-every-request
+    # treatment as tag_artists, for the same reason: it's a local JSON read
+    # (zero API cost), so there is no case for leaning on the profile cache
+    # and letting a just-fetched neighbour record sit invisible for up to
+    # PROFILE_TTL.
     tag_artists = store.tag_artists()
+    track_map = store.lastfm_track_map()
 
     tracks_out = []
     for t in input_tracks:
@@ -362,7 +367,7 @@ def triage(playlist_id: str):
             {
                 **t,
                 "sortable": bool(sortable),
-                "suggestions": sugg.suggest(t, state["profiles"], tag_artists) if sortable else [],
+                "suggestions": sugg.suggest(t, state["profiles"], tag_artists, track_map) if sortable else [],
             }
         )
 
@@ -2323,8 +2328,11 @@ def now_playing(force: bool = False):
     # so a fetch just above (or any other write to tags.json) would otherwise
     # be invisible for up to 10 minutes. Deliberate freshness/cost trade-off: a
     # local JSON read on every poll (zero API cost) buys always-current tags
-    # instead of leaning on the profile cache.
+    # instead of leaning on the profile cache. lastfm_track_map() gets the
+    # same treatment, and for the same reason — the force-path fetch just
+    # above can land a brand-new neighbour/track-tag record mid-poll.
     tag_artists = store.tag_artists()
+    track_map = store.lastfm_track_map()
     ctx_id = np["context_playlist_id"]
     ctx = next((p for p in state["playlists"] if p["id"] == ctx_id), None)
     return {
@@ -2339,7 +2347,7 @@ def now_playing(force: bool = False):
             if ctx_id else None
         ),
         "sitting": _sitting_for_context(ctx_id),
-        "suggestions": sugg.suggest(track, state["profiles"], tag_artists) if sortable else [],
+        "suggestions": sugg.suggest(track, state["profiles"], tag_artists, track_map) if sortable else [],
         "homes": _homes_payload(state),
         "inputs": [
             {"id": l["id"], "name": l["name"], "has_track": track["uri"] in l["uris"]}
