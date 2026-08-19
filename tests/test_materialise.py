@@ -297,8 +297,8 @@ def test_tick_add_race_re_adopts_without_unfollow_and_raises_spotify_error(
     """Same race at the other end of a tick, where the slot is occupied so
     re-recording cannot help either. The playlist is real and holds a track
     the user paid for, so it is never unfollowed — the only honest outcome is
-    to stop, leave the other record alone, and say so in the log the way
-    `_recover_orphan` does."""
+    to stop, leave the other record alone, and say so in the log the way the
+    sitting path's abandon does."""
     tick()   # create
 
     def add_then_replace(pid, uri, bulk=False):

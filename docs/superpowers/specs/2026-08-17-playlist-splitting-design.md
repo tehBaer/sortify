@@ -303,6 +303,47 @@ session drawn from one pile.
 
 At the default 2 h target that is ~22 tracks and **~24 calls per sitting**.
 
+### Cleanup is reconciliation, not bookkeeping
+
+`active_sitting` says which playlist a sitting *meant* to create. It cannot
+say which playlists the account actually holds, because creating a playlist
+and recording that fact are two operations and no ordering makes them one.
+Four rounds of fixes closed every concurrency window and three leak classes
+still survived (Ruling R17): a lost response to `POST /me/playlists` after
+Spotify created the playlist, a crash between the create returning and the
+record persisting, and a failed unfollow with no free slot to re-record into.
+The first two involve no concurrency at all and leaked on every version.
+
+So the **account is the authority**, and the record is only a convenience.
+Every sitting playlist marks itself — name prefixed `▶ `, description
+`sortify sitting — safe to delete` — and cleanup means "unfollow every marked
+playlist the user owns that nothing currently claims":
+
+- **Finding them is free.** `my_playlists()` serves from
+  `cache.json["playlist_list"]`, so orphans are read at **zero Spotify
+  calls**. Cleanup never triggers a listing fetch, even on a cold cache: no
+  cached listing means no known orphans, never "go and find out".
+- **Removing them is user-initiated**, one call per playlist, capped at
+  `SITTING_SWEEP_CAP` (10) per action with the remainder reported. There is no
+  scheduler, no startup sweep and no background traffic of any kind.
+- **Three things are never swept**: a playlist the user doesn't own, a
+  *materialised pile* (permanent, and its own description promises sortify
+  will never delete it), and any sitting currently claimed — either recorded
+  as live in a split, or in flight in this process. While a start is between
+  its create call and its record, no id can be excluded reliably, so the sweep
+  declines entirely rather than risk deleting a sitting being made.
+- **A failed unfollow changes nothing.** The playlist stays listed and is
+  offered again next time. Nothing is re-stamped into `splits.json`; a second
+  authority over the same playlist is what the old recovery path was.
+
+Orphans surface on the Playlists view, beside the Refresh button that produces
+the listing they are read from — the listing is only re-read when the user
+asks, so that is the honest place for them to appear.
+
+Measured with `tests/fuzz_sittings.py` (300 rounds, 4–6 real threads, zero
+network), injecting all three classes at 2%: **59/300 rounds left a stranded
+playlist before, 0/300 after**. At 15% injection, still 0/300.
+
 ## Section 5 — Decisions
 
 Decisions go through the existing `/api/act`, which already supports this

@@ -32,7 +32,15 @@ from .spotify import (
     Spotify,
     SpotifyError,
 )
-from .split import UNTAGGED, pick_sitting, split_tracks
+from .split import (
+    SITTING_DESCRIPTION,
+    SITTING_PREFIX,
+    UNTAGGED,
+    is_sitting_playlist,
+    pick_sitting,
+    select_orphans,
+    split_tracks,
+)
 from .store import TAGS_VERSION, Store
 from .tags import LastFm, LastFmError, enrich, fetch_track, load_key, track_key
 
@@ -158,7 +166,11 @@ def playlists():
         )
         p["split"] = _split_summary(p["id"], splits)
     entry = store.cache().get("playlist_list") or {}
-    return {"playlists": out, "fetched_at": entry.get("fetched_at")}
+    # Leftover sittings, from the same listing already in hand — zero calls.
+    # Surfaced here because this is the view whose Refresh button produces
+    # that listing: the orphans a refresh reveals appear right next to it.
+    return {"playlists": out, "fetched_at": entry.get("fetched_at"),
+            "sitting_orphans": _find_sitting_orphans(splits)}
 
 
 @app.post("/api/folders")
@@ -960,6 +972,119 @@ def _reservation_alive(split_playlist_id: str, claim: str) -> bool:
         return bool(active and active.get("claim") == claim)
 
 
+# One user action never unfollows more than this. The rule that decides what
+# a sitting is (split.is_sitting_playlist) is conservative, but it is still a
+# rule about the user's real account: if it is ever wrong, being wrong should
+# cost ten calls and be visible, not one call per playlist in the library.
+# The remainder is reported and the button can simply be pressed again.
+SITTING_SWEEP_CAP = 10
+
+# Sitting playlists this process is materialising right now, and a count of
+# the materialisations that have not yet learned their playlist's id.
+#
+# `_inflight` is the ordinary case: between create_playlist returning and the
+# add loop finishing, a playlist exists that a refreshed listing can already
+# show, and no sweep may touch it. `_materialising` covers the window BEFORE
+# that, where the playlist may exist in the account while nothing — not even
+# this process — knows its id yet. Nothing can be excluded by id in that
+# window, so the sweep declines to run at all rather than delete a sitting
+# somebody is starting. Both are read and mutated only under `_split_lock`,
+# the same convention `_materialising_piles` follows.
+_inflight: set[str] = set()
+_materialising = 0
+
+
+def _cached_listing() -> list[dict]:
+    """The playlist listing as of the user's last Refresh, or nothing.
+
+    Deliberately NOT `sp.my_playlists()`: that falls back to fetching when the
+    cache is cold, which would turn a finish or a cleanup into ~21 paginated
+    calls the user never asked for — the exact shape of proactive traffic
+    CLAUDE.md forbids. No cache means no orphans are known, which is the
+    correct answer here rather than a reason to spend.
+    """
+    entry = store.cache().get("playlist_list") or {}
+    return entry.get("items") or []
+
+
+def _sweep_protection(splits: dict | None = None) -> tuple[set[str], bool]:
+    """Ids no sweep may touch, and whether it must decline entirely.
+
+    `splits` may be passed in by a caller that has already read splits.json,
+    because /api/playlists reads it exactly once for the whole listing — on a
+    real account that file is hundreds of KB and a second read per request is
+    a measurable stall (see the comment in `playlists`).
+    """
+    with _split_lock:
+        protected = set(_inflight)
+        blind = _materialising > 0
+        if splits is None:
+            splits = store.splits()["splits"]
+        for split in splits.values():
+            active = split.get("active_sitting") or {}
+            if active.get("playlist_id"):
+                protected.add(active["playlist_id"])
+    return protected, blind
+
+
+def _sweep_sitting_orphans(cap: int | None = None) -> dict:
+    """Unfollow every leftover sitting the cached listing knows about.
+
+    This is the whole point of the redesign. `splits.json` cannot be the
+    authority on what exists in the account, because creating a playlist and
+    recording it are not atomic: a lost create response, a crash before the
+    record saves, or a failed unfollow all leave a real playlist that no
+    record names (Ruling R17). The account itself is authoritative instead,
+    read through `my_playlists()` — which serves from cache.json at **zero
+    Spotify calls**, so finding orphans is free and only removing them costs
+    anything, one call each.
+
+    Reading the listing is deliberately NOT a refresh. The listing is re-read
+    only when the user asks for it, so this sees the account as of their last
+    Refresh — which is why orphans surface on the Playlists view, next to the
+    button that updates it, rather than appearing by magic.
+    """
+    protected, blind = _sweep_protection()
+    if blind:
+        # A start is between its create call and its record. Anything marked
+        # in the listing might be that playlist, and it would be unfollowed
+        # out from under a sitting the user just asked for.
+        return {"removed": [], "remaining": None, "deferred": True}
+    me = (store.cache().get("me") or {}).get("id")
+    found, remaining = select_orphans(
+        _cached_listing(), me, protected,
+        SITTING_SWEEP_CAP if cap is None else cap)
+    removed: list[str] = []
+    for entry in found:
+        try:
+            sp.unfollow_playlist(entry["id"])
+        except SpotifyError as e:
+            if e.status != 404:
+                # Leave it in the cached listing. It is still in the account,
+                # so it must stay visible as an orphan — pruning it here is
+                # exactly the "sortify can no longer see it" failure this
+                # change exists to end. No retry: the user presses the button
+                # again, and one 429 must not become a burst of them.
+                log.warning("could not unfollow leftover sitting %s (%s) — "
+                            "it stays listed for the next cleanup", entry["id"], e)
+                continue
+            # 404 means already gone: nothing to unfollow, and the listing
+            # entry is simply stale. Treated as removed.
+        removed.append(entry["id"])
+    sp.forget_playlists(set(removed))
+    return {"removed": removed, "remaining": remaining, "deferred": False}
+
+
+def _find_sitting_orphans(splits: dict | None = None) -> list[dict]:
+    """The same selection, without spending anything. Zero calls."""
+    protected, blind = _sweep_protection(splits)
+    if blind:
+        return []
+    me = (store.cache().get("me") or {}).get("id")
+    found, _ = select_orphans(_cached_listing(), me, protected, cap=1000)
+    return [{"id": p["id"], "name": p.get("name") or ""} for p in found]
+
+
 def _abandon_orphaned_playlist(
     split_playlist_id: str, pile_id: str, new_id: str, detail: str
 ) -> None:
@@ -984,44 +1109,24 @@ def _abandon_orphaned_playlist(
     user has to find and delete by hand. Unfollowing `new_id` can never harm
     another sitting either — it is this request's own playlist and no other
     reservation can name it.
+
+    When the unfollow itself fails, this used to re-stamp a fresh reservation
+    for `new_id` so a later finish could still reach it — and when no free
+    slot existed it gave up and logged, which was leak class (c), ~10/300 at
+    2% injection. Both halves are gone. The playlist marks itself, so the
+    next cleanup finds it in the listing whether or not splits.json has room
+    for it; re-stamping now would only invent a second, competing authority
+    over the same playlist. Logged at warning, not error: this is a known,
+    self-healing state, not an unrecoverable one.
     """
     try:
         sp.unfollow_playlist(new_id)
     except SpotifyError as e:
         if e.status != 404:
-            _recover_orphan(split_playlist_id, pile_id, new_id, e)
+            log.warning(
+                "sitting playlist %s was left in the account (unfollow failed: %s) — "
+                "it is marked, so the next Playlists cleanup will remove it", new_id, e)
     raise HTTPException(409, detail)
-
-
-def _recover_orphan(split_playlist_id: str, pile_id: str, new_id: str, cause: SpotifyError) -> None:
-    """The unfollow itself failed (not 404 — a real error, e.g. a 429 or a
-    5xx). Rather than let the playlist drop out of sight entirely, re-stamp
-    a fresh reservation for it so a later `finish` can still clean it up —
-    but only into a genuinely empty slot, never clobbering a different
-    sitting that has since legitimately claimed it. Always raises: the
-    caller's own attempt to materialise a sitting still failed either way.
-    """
-    with _split_lock:
-        payload = store.splits()
-        split = payload["splits"].get(split_playlist_id)
-        if split is not None and not split.get("active_sitting"):
-            split["active_sitting"] = {
-                "playlist_id": new_id, "pile_id": pile_id, "uris": [],
-                "started_at": _now_iso(), "claim": uuid.uuid4().hex,
-            }
-            store.save_splits(payload)
-        else:
-            # No free slot to re-record it in — a different sitting won it
-            # in the meantime. Nothing in splits.json can point at new_id
-            # right now; surfaced in the logs since the API response alone
-            # would otherwise be the only trace of it.
-            log.error(
-                "sitting playlist %s orphaned beyond automatic recovery: lost a "
-                "start/finish race, then unfollow failed (%s), and no free slot "
-                "to re-record it in — needs manual cleanup in the Spotify app",
-                new_id, cause,
-            )
-    raise SpotifyError(cause.status, str(cause)) from cause
 
 
 @app.post("/api/split/{playlist_id}/sitting")
@@ -1085,8 +1190,34 @@ def start_sitting(playlist_id: str, body: SittingIn):
                                    "uris": [], "started_at": _now_iso(), "claim": claim}
         store.save_splits(payload)
 
-    new_id = sp.create_playlist(f"▶ {pile['name']}", "sortify sitting — safe to delete")
+    # The name and description are the marker the account is read back by —
+    # see split.is_sitting_playlist. They are not decoration: they are the
+    # only thing that makes a stray playlist recognisable after a crash.
+    global _materialising
+    with _split_lock:
+        _materialising += 1
+    try:
+        new_id = sp.create_playlist(f"{SITTING_PREFIX}{pile['name']}", SITTING_DESCRIPTION)
+        with _split_lock:
+            _inflight.add(new_id)
+    finally:
+        # Dropped only once the id is claimed (or known never to exist), so
+        # there is no instant where a sweep can neither see the id nor know
+        # that a start is in progress.
+        with _split_lock:
+            _materialising -= 1
 
+    try:
+        return _materialise_sitting(playlist_id, claim, pile, new_id, uris, durations)
+    finally:
+        with _split_lock:
+            _inflight.discard(new_id)
+
+
+def _materialise_sitting(playlist_id, claim, pile, new_id, uris, durations):
+    """The add loop, split out so `start_sitting` can hold the in-flight claim
+    across every exit path — including the HTTPExceptions raised from the
+    abandon checkpoints."""
     if not _claim_reservation(playlist_id, claim, playlist_id=new_id):
         _abandon_orphaned_playlist(
             playlist_id, pile["id"], new_id,
@@ -1123,7 +1254,8 @@ def finish_sitting(playlist_id: str):
     starts and populates a real playlist, and then the slower one's clear
     lands and wipes B's record: B's playlist is live, full, playing, and
     nothing in splits.json points at it, so `finish` can never reach it
-    again. It also erased _recover_orphan's re-stamp the same way.
+    again. (It erased the abandon path's re-stamp the same way, back when
+    that path had one.)
 
     So the clear is a compare-and-swap on what we actually observed — same
     claim, same playlist_id — and otherwise the slot is left exactly as
@@ -1136,9 +1268,18 @@ def finish_sitting(playlist_id: str):
     with _split_lock:
         payload = store.splits()
         split = payload["splits"].get(playlist_id)
-        if not split or not split.get("active_sitting"):
+        sitting = dict(split["active_sitting"]) if split and split.get("active_sitting") else None
+    if sitting is None:
+        # No record — but "no record" is precisely the state a lost create
+        # response or a crash mid-start leaves behind, and the account may
+        # still hold the playlist. Sweeping first means finish cleans up the
+        # case the old 404 used to strand. Only a genuinely empty account
+        # still 404s.
+        swept = _sweep_sitting_orphans()
+        if not swept["removed"] and not swept["remaining"]:
             raise HTTPException(404, "no active sitting")
-        sitting = dict(split["active_sitting"])
+        return {"ok": True, "cleared": False, "swept": swept["removed"],
+                "remaining": swept["remaining"]}
 
     claim = sitting.get("claim")
     playlist_ref = sitting.get("playlist_id")
@@ -1171,7 +1312,29 @@ def finish_sitting(playlist_id: str):
             split["active_sitting"] = None
             store.save_splits(payload)
             cleared = True
-    return {"ok": True, "cleared": cleared}
+
+    # Clear first, then sweep: the record is gone by now, so this call's own
+    # playlist is no longer protected and a leftover from an EARLIER sitting
+    # (one whose record never existed) is removed in the same click. The
+    # unfollow above already dealt with this sitting; if it is still listed,
+    # the 404 path below treats it as gone and prunes the stale entry.
+    swept = _sweep_sitting_orphans()
+    if playlist_ref:
+        sp.forget_playlists({playlist_ref})
+    return {"ok": True, "cleared": cleared, "swept": swept["removed"],
+            "remaining": swept["remaining"]}
+
+
+@app.post("/api/sittings/cleanup")
+def cleanup_sittings():
+    """Remove leftover sitting playlists the account still holds.
+
+    User-initiated, one call per playlist, capped at SITTING_SWEEP_CAP, and
+    never proactive — it runs when the button on the Playlists view is
+    pressed and at no other time. Finding the orphans costs nothing; the
+    listing it reads is the one the user last refreshed.
+    """
+    return {"ok": True, **_sweep_sitting_orphans()}
 
 
 # ---- materialising a pile as a permanent playlist ---------------------------
@@ -1339,7 +1502,7 @@ def _rerecord_materialisation(split_playlist_id: str, pile_id: str, record: dict
     """Put a record back for a playlist that really exists, if and only if the
     slot is genuinely empty. False means something else legitimately owns it.
 
-    The materialise counterpart of `_recover_orphan`'s re-stamp, minus its
+    The materialise counterpart of the sitting path's old re-stamp, minus its
     unfollow: the playlist here is one the user asked to keep and (past the
     first add) already holds their tracks, so deleting it to tidy up the
     bookkeeping would be the worse error by far. Re-recording keeps it

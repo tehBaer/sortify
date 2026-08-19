@@ -620,42 +620,63 @@ def test_reservations_in_the_same_wall_clock_second_do_not_collide(client, monke
 
 # Residual flagged alongside the token fix: _abandon_orphaned_playlist's own
 # unfollow call can itself fail (429, 5xx — anything but "already gone").
-# Previously that just propagated as a 502 and dropped the playlist with no
-# record anywhere. _recover_orphan now re-stamps a fresh reservation for it
-# instead, so a later finish can still find and clean it up.
+# Originally that propagated as a 502 and dropped the playlist with no record
+# anywhere; then _recover_orphan re-stamped a reservation for it, which worked
+# only when a slot happened to be free. Both are gone. The playlist marks
+# itself in the account, so it stays findable with no record at all — see the
+# test below.
 
 
-def test_abandon_unfollow_failure_restamps_a_findable_reservation(client, monkeypatch):
-    def create_then_lose_race(name, description=""):
+def test_abandon_unfollow_failure_leaves_the_playlist_reconcilable(client, monkeypatch):
+    """The successor to `..._restamps_a_findable_reservation`.
+
+    That test pinned the old recovery: when the abandon path's unfollow
+    failed, a fresh reservation was stamped for the playlist so a later
+    finish could still reach it — and when no free slot existed (leak class
+    (c), ~10/300 at 2% injection) the playlist was lost for good.
+
+    The re-stamp is gone, and deliberately: the playlist marks itself in the
+    account, so it needs no slot in splits.json to stay findable. The
+    guarantee this test now holds is the one that actually matters — the
+    playlist never becomes invisible — and it holds without a free slot,
+    which the re-stamp could not manage.
+    """
+    from sortify.split import SITTING_DESCRIPTION, SITTING_PREFIX
+
+    def create_then_lose_race(name, description="", **kw):
         s = Store()
         payload = s.splits()
         payload["splits"]["PL1"]["active_sitting"] = None  # the "finish"
         s.save_splits(payload)
         return "NEW1"
 
-    def failing_unfollow(pid):
-        raise SpotifyError(500, "upstream hiccup")
-
     monkeypatch.setattr(appmod.sp, "create_playlist", create_then_lose_race)
-    monkeypatch.setattr(appmod.sp, "unfollow_playlist", failing_unfollow)
+    monkeypatch.setattr(appmod.sp, "unfollow_playlist",
+                        lambda pid, **kw: (_ for _ in ()).throw(SpotifyError(500, "hiccup")))
 
     r = client.post("/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30})
-    assert r.status_code == 502  # the caller's own attempt still failed
+    assert r.status_code == 409  # the caller's own attempt still failed
 
-    # But the playlist was not simply dropped: a fresh reservation exists
-    # for it, findable by a later finish.
-    active = Store().splits()["splits"]["PL1"]["active_sitting"]
-    assert active is not None
-    assert active["playlist_id"] == "NEW1"
-
-    # And finish can actually clean it up once unfollow works again.
-    monkeypatch.setattr(appmod.sp, "unfollow_playlist",
-                        lambda pid: client.calls.append(("unfollow", pid)))
-    client.calls.clear()
-    r2 = client.post("/api/split/PL1/sitting/finish")
-    assert r2.status_code == 200
-    assert client.calls == [("unfollow", "NEW1")]
+    # No reservation was invented for it — splits.json is no longer where a
+    # stray playlist has to be remembered.
     assert Store().splits()["splits"]["PL1"]["active_sitting"] is None
+
+    # It is remembered by the account instead. Once the user refreshes the
+    # listing, the playlist shows up as an orphan and cleanup removes it.
+    s = Store()
+    cache = s.cache()
+    cache["me"] = {"id": "tester"}
+    cache["playlist_list"] = {"fetched_at": 0, "items": [
+        {"id": "NEW1", "name": f"{SITTING_PREFIX}dream pop", "owner": "tester",
+         "editable": True, "description": SITTING_DESCRIPTION}]}
+    s.save_cache(cache)
+
+    assert [o["id"] for o in client.get("/api/playlists").json()["sitting_orphans"]] == ["NEW1"]
+
+    unfollowed = []
+    monkeypatch.setattr(appmod.sp, "unfollow_playlist", lambda pid, **kw: unfollowed.append(pid))
+    assert client.post("/api/sittings/cleanup").json()["removed"] == ["NEW1"]
+    assert unfollowed == ["NEW1"]
 
 
 # ---- Fix Round 4 -------------------------------------------------------
@@ -665,8 +686,8 @@ def test_abandon_unfollow_failure_restamps_a_findable_reservation(client, monkey
 # acquisition of _split_lock and then cleared the slot under a later one,
 # unconditionally, with a network call in between. Anything that changed the
 # slot in that window was silently destroyed — including a fully materialised
-# sitting whose playlist was live and playing, and _recover_orphan's
-# re-stamped reservation. The clear is now a compare-and-swap on the
+# sitting whose playlist was live and playing, and (while it existed) the
+# abandon path's re-stamped reservation. The clear is now a compare-and-swap on the
 # (claim, playlist_id) pair the call actually saw.
 
 
@@ -766,4 +787,5 @@ def test_double_clicked_finish_does_not_wipe_the_next_sitting(client, monkeypatc
 def test_finish_reports_whether_it_cleared(client):
     r = client.post("/api/split/PL1/sitting", json={"pile_id": "p1", "target_minutes": 30})
     assert r.status_code == 200
-    assert client.post("/api/split/PL1/sitting/finish").json() == {"ok": True, "cleared": True}
+    body = client.post("/api/split/PL1/sitting/finish").json()
+    assert (body["ok"], body["cleared"]) == (True, True)

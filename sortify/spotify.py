@@ -103,6 +103,11 @@ class SpotifyError(Exception):
         super().__init__(f"Spotify API {status}: {message}")
 
 
+# Serialises read-modify-write on cache["playlist_list"] between the refresh
+# that replaces the listing and the prune that removes swept sittings from it.
+_LIST_LOCK = threading.Lock()
+
+
 def pkce_pair() -> tuple[str, str]:
     verifier = secrets.token_urlsafe(64)
     return verifier, code_challenge(verifier)
@@ -502,10 +507,37 @@ class Spotify:
             if entry and entry.get("items") is not None:
                 return entry["items"]
         items = self._fetch_my_playlists()
-        cache = self.store.cache()
-        cache["playlist_list"] = {"fetched_at": time.time(), "items": items}
-        self.store.save_cache(cache)
+        with _LIST_LOCK:
+            cache = self.store.cache()
+            cache["playlist_list"] = {"fetched_at": time.time(), "items": items}
+            self.store.save_cache(cache)
         return items
+
+    def forget_playlists(self, ids: set[str]) -> None:
+        """Drop ids from the cached listing after they have been unfollowed.
+
+        Costs nothing and touches no network. Without it the listing keeps
+        advertising playlists that no longer exist, so a swept sitting would
+        be re-offered as an orphan on every Playlists view until the next
+        manual refresh — cleanup that visibly does nothing.
+
+        Read-modify-write under a lock local to this file, which is the same
+        lock the refresh path takes. A refresh that lands between this read
+        and its own write still wins, and correctly so: it has just asked
+        Spotify what actually exists.
+        """
+        if not ids:
+            return
+        with _LIST_LOCK:
+            cache = self.store.cache()
+            entry = cache.get("playlist_list")
+            if not entry or entry.get("items") is None:
+                return
+            kept = [p for p in entry["items"] if p.get("id") not in ids]
+            if len(kept) == len(entry["items"]):
+                return
+            entry["items"] = kept
+            self.store.save_cache(cache)
 
     def _fetch_my_playlists(self) -> list[dict]:
         me = (self.store.cache().get("me") or {}).get("id")
@@ -527,6 +559,12 @@ class Spotify:
                     "total": meta.get("total"),
                     "snapshot_id": p.get("snapshot_id"),
                     "image": images[-1].get("url") if images else None,
+                    # Kept so a sitting playlist can be recognised from the
+                    # cached listing alone, at zero calls. It arrives in this
+                    # same response either way; discarding it was what forced
+                    # sitting cleanup to trust splits.json instead of the
+                    # account. `or ""` because Spotify sends null here.
+                    "description": p.get("description") or "",
                 }
             )
         return out

@@ -946,6 +946,63 @@ run("stopNowPolling()");
         $$("split-progress").hidden === true, `hidden=${$$("split-progress").hidden}`);
 }
 
+// ============================================================================
+// R1 — leftover sitting playlists are surfaced, priced, and removable
+// ============================================================================
+{
+  resetLog();
+  routes["GET /api/playlists"] = { status: 200, body: {
+    playlists: [], fetched_at: 0,
+    sitting_orphans: [{ id: "S1", name: "\u25b6 one" }, { id: "S2", name: "\u25b6 two" }] } };
+
+  await run("loadLists()");
+  await tick();
+  check("R1 the orphan bar is shown when the server reports leftovers",
+        $$("pl-orphan-bar").hidden === false, `hidden=${$$("pl-orphan-bar").hidden}`);
+  check("R1 it says how many and names them",
+        /2 leftover sitting playlists/.test($$("pl-orphan-status").textContent),
+        JSON.stringify($$("pl-orphan-status").textContent));
+  // Every spending control in this app states its price before it is pressed.
+  check("R1 the button prices the removal in Spotify calls",
+        /Remove \(2 calls\)/.test($$("btn-clean-sittings").textContent),
+        JSON.stringify($$("btn-clean-sittings").textContent));
+
+  routes["POST /api/sittings/cleanup"] = { status: 200, body: {
+    ok: true, removed: ["S1", "S2"], remaining: 0, deferred: false } };
+  routes["GET /api/playlists"] = { status: 200, body: {
+    playlists: [], fetched_at: 0, sitting_orphans: [] } };
+  resetLog();
+  await run(`$("btn-clean-sittings").onclick()`);
+  await tick();
+  check("R1 pressing Remove reaches the cleanup endpoint exactly once",
+        posts("/api/sittings/cleanup") === 1, `${posts("/api/sittings/cleanup")} POST(s)`);
+  check("R1 the bar disappears once the account is clean",
+        $$("pl-orphan-bar").hidden === true, `hidden=${$$("pl-orphan-bar").hidden}`);
+
+  // Nothing to remove must not leave a bar advertising an action that would
+  // spend a call and find nothing.
+  routes["GET /api/playlists"] = { status: 200, body: {
+    playlists: [], fetched_at: 0, sitting_orphans: [] } };
+  await run("loadLists()");
+  await tick();
+  check("R1 no bar at all when there are no leftovers",
+        $$("pl-orphan-bar").hidden === true, `hidden=${$$("pl-orphan-bar").hidden}`);
+
+  // A start in flight defers the sweep; the user is told to retry, not that
+  // nothing was wrong.
+  routes["GET /api/playlists"] = { status: 200, body: {
+    playlists: [], fetched_at: 0, sitting_orphans: [{ id: "S3", name: "\u25b6 three" }] } };
+  routes["POST /api/sittings/cleanup"] = { status: 200, body: {
+    ok: true, removed: [], remaining: null, deferred: true } };
+  await run("loadLists()");
+  await tick();
+  await run(`$("btn-clean-sittings").onclick()`);
+  await tick();
+  check("R1 a deferred sweep says a sitting is starting rather than failing silently",
+        /starting right now/.test($$("toast").textContent),
+        JSON.stringify($$("toast").textContent));
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

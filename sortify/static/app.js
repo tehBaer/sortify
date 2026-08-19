@@ -115,6 +115,7 @@ async function loadLists() {
     // The list is cached until refreshed by hand, so say how old it is rather
     // than present a stale list as current.
     $("pl-age").textContent = ageText(data.fetched_at);
+    renderOrphans(data.sitting_orphans || []);
     renderLists();
   } catch (e) {
     if (e.message === "auth needed") return;
@@ -197,6 +198,50 @@ function renderLists() {
 }
 
 $("pl-filter").oninput = renderLists;
+
+// Leftover sitting playlists: ones sortify created and never managed to
+// remove — a lost response to the create call, or a crash before the record
+// was saved. They are found by reading the cached listing (zero Spotify
+// calls) and matching the marker every sitting playlist carries, so they can
+// only appear for a listing the user has actually refreshed. That is why this
+// lives next to Refresh: the button that reveals them is right here.
+let orphanCount = 0;
+function renderOrphans(orphans) {
+  orphanCount = orphans.length;
+  const bar = $("pl-orphan-bar");
+  bar.hidden = orphanCount === 0;
+  if (!orphanCount) return;
+  const names = orphans.slice(0, 3).map((o) => o.name).join(", ");
+  $("pl-orphan-status").textContent =
+    `${orphanCount} leftover sitting playlist${orphanCount === 1 ? "" : "s"} — ` +
+    `${names}${orphanCount > 3 ? "…" : ""}`;
+  // The price is on the button, the same way every other spending control in
+  // this app states its cost before it is pressed.
+  $("btn-clean-sittings").textContent =
+    `Remove (${Math.min(orphanCount, 10)} call${Math.min(orphanCount, 10) === 1 ? "" : "s"})`;
+}
+
+$("btn-clean-sittings").onclick = async () => {
+  const btn = $("btn-clean-sittings");
+  btn.disabled = true;
+  try {
+    const res = await api("/api/sittings/cleanup", {});
+    if (res.deferred) {
+      toast("a sitting is starting right now — try again once it has");
+    } else {
+      const n = res.removed.length;
+      toast(n
+        ? `removed ${n} leftover playlist${n === 1 ? "" : "s"}` +
+          (res.remaining ? ` — ${res.remaining} still to go, press Remove again` : "")
+        : "nothing could be removed — try again in a moment");
+    }
+    await loadLists();
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    btn.disabled = false;
+  }
+};
 
 // The only thing that re-reads the listing from Spotify. It is slow on
 // purpose — ~21 paginated calls paced by the rolling-window throttle — so the

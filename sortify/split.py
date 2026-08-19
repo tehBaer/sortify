@@ -205,3 +205,63 @@ def pick_sitting(
         picked.append(u)
         total += d
     return picked
+
+
+# ---- sitting markers and reconciliation ------------------------------------
+#
+# A sitting playlist names itself so the ACCOUNT, not `splits.json`, can say
+# which ones exist. That inversion is the point: creating a playlist and
+# recording it are two operations that cannot be made atomic, so a record-
+# authoritative design leaks on a lost create response, on a crash between
+# create and save, and on a failed unfollow with no free slot to re-record
+# into — none of which is a concurrency bug, and all of which survived four
+# rounds of per-slot fixes (see
+# `.superpowers/sdd/2026-08-17-playlist-splitting/progress.md`, Ruling R17).
+# Reading them back costs nothing: `my_playlists()` serves from cache.json.
+
+SITTING_PREFIX = "▶ "
+SITTING_DESCRIPTION = "sortify sitting — safe to delete"
+
+
+def is_sitting_playlist(entry: dict, me: str | None) -> bool:
+    """True if this cached listing entry is one of sortify's own sittings.
+
+    Three conditions, each load-bearing:
+
+    - **the name prefix**, which is what a human sees in the Spotify app;
+    - **owned by the user**, because unfollowing someone else's playlist
+      removes it from their library — the sweep must never reach a playlist
+      sortify did not create;
+    - **the description**, which is the only marker a user is unlikely to
+      reproduce by accident, and the one that separates a sitting from a
+      *materialised pile* — a permanent playlist whose own description
+      promises sortify will never delete it.
+
+    A missing `description` key means the entry was cached before the listing
+    kept descriptions, and falls back to the prefix. Absent is permissive;
+    present-and-different is not. Refusing absent would find nothing until the
+    user spent ~21 calls on a Refresh, while trusting a description that is
+    there and says something else would be the dangerous direction. The rule
+    therefore tightens by itself on the next refresh, with no migration.
+    """
+    if not me or entry.get("owner") != me:
+        return False
+    if not (entry.get("name") or "").startswith(SITTING_PREFIX):
+        return False
+    description = entry.get("description")
+    return description is None or description == SITTING_DESCRIPTION
+
+
+def select_orphans(
+    playlists: list[dict], me: str | None, protected: set[str], cap: int
+) -> tuple[list[dict], int]:
+    """Leftover sittings in a cached listing, capped, plus how many remain.
+
+    `protected` holds every id that is legitimately in use right now — an
+    in-flight materialisation, or another split's live sitting. The cap bounds
+    one user action's burst: if this rule is ever wrong, being wrong costs
+    `cap` calls rather than one per playlist in the library.
+    """
+    found = [p for p in playlists
+             if p.get("id") not in protected and is_sitting_playlist(p, me)]
+    return found[:cap], max(len(found) - cap, 0)
