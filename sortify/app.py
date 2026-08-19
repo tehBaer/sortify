@@ -2328,50 +2328,79 @@ def _fetch_missing_now_tags(track: dict, *, clock=time.monotonic) -> int:
         attempted = False
         fetched = 0
 
-        names: dict[str, str] = {}
-        for a in track.get("artists") or []:
-            aid = a.get("id")
-            if aid and aid not in names:
-                names[aid] = a.get("name") or ""
-        if names:
-            cached = store.tag_artists()
-            unknown: dict[str, str] = {}
-            for aid, name in names.items():
-                if aid in cached:
-                    continue
-                unknown[aid] = name
-                if len(unknown) == NOW_FETCH_MAX_ARTISTS:
-                    break
-            if unknown:
-                attempted = True
-                try:
-                    merged = enrich(unknown, cached, fm, _now_iso())
-                except LastFmError as exc:
-                    log.warning("now-playing tag fetch stopped early: %s", exc)
-                    merged = exc.partial if exc.partial is not None else cached
-                fetched = len(merged) - len(cached)
-                if fetched > 0:
-                    _merge_save_tag_artists(merged)
+        # Fix round 1, Critical (C1): everything from the first possible
+        # spend (the artist-tags `enrich` call) to the last (the
+        # track-record `fetch_track`/save) now lives inside ONE try/finally.
+        # The bug this fixes: `store.lastfm_track_map()` below is a bare
+        # file read that raises `json.JSONDecodeError` on a truly corrupt
+        # lastfm_tracks.json (not just a malformed-but-valid-JSON envelope,
+        # which `_versioned` already degrades gracefully) — that used to sit
+        # OUTSIDE any try, so it could escape past the `if attempted:` floor
+        # stamp below even after the artist-tags step had already spent up
+        # to NOW_FETCH_MAX_ARTISTS calls. Proven repro: a corrupt
+        # lastfm_tracks.json meant the floor never advanced, so every
+        # `?force=1` re-spent those calls indefinitely, ~10s apart. The
+        # `finally` here stamps the floor whenever `attempted` was set True
+        # BEFORE the exception, regardless of where in this block the raise
+        # happened — and the `except Exception` means neither a corrupt
+        # file nor any other failure in either fetch kind can ever escape
+        # this function (a bonus enrichment must never break the response
+        # it rides on, exactly like the narrower catches this replaces).
+        try:
+            names: dict[str, str] = {}
+            for a in track.get("artists") or []:
+                aid = a.get("id")
+                if aid and aid not in names:
+                    names[aid] = a.get("name") or ""
+            if names:
+                cached = store.tag_artists()
+                unknown: dict[str, str] = {}
+                for aid, name in names.items():
+                    if aid in cached:
+                        continue
+                    unknown[aid] = name
+                    if len(unknown) == NOW_FETCH_MAX_ARTISTS:
+                        break
+                if unknown:
+                    attempted = True
+                    try:
+                        merged = enrich(unknown, cached, fm, _now_iso())
+                    except LastFmError as exc:
+                        log.warning("now-playing tag fetch stopped early: %s", exc)
+                        merged = exc.partial if exc.partial is not None else cached
+                    fetched = len(merged) - len(cached)
+                    if fetched > 0:
+                        _merge_save_tag_artists(merged)
 
-        # ---- track-level record: getSimilar + track top tags -------------
-        title = track.get("name") or ""
-        artist_names = [a.get("name") for a in (track.get("artists") or []) if a.get("name")]
-        if title and artist_names:
-            keys = [track_key(n, title) for n in artist_names]
-            track_map = store.lastfm_track_map()
-            if not any(k in track_map for k in keys):
-                attempted = True
-                try:
+            # ---- track-level record: getSimilar + track top tags --------
+            title = track.get("name") or ""
+            artist_names = [a.get("name") for a in (track.get("artists") or []) if a.get("name")]
+            if title and artist_names:
+                keys = [track_key(n, title) for n in artist_names]
+                # See the block comment above: this read can raise on a
+                # truly corrupt file, and now does so INSIDE the guarded
+                # region instead of past the floor stamp.
+                track_map = store.lastfm_track_map()
+                # M1: a presence check alone (`k in track_map`) would treat
+                # a non-dict value at that key (defensive only — nothing
+                # legitimate ever writes one) as "known"; require it to
+                # actually be a record, the same predicate
+                # `suggest._track_record` and
+                # `backfill_similar.tracks_to_fetch` both use.
+                known = any(isinstance(track_map.get(k), dict) for k in keys)
+                if not known:
+                    attempted = True
                     record = fetch_track(fm, artist_names[0], title, time.time())
                     _merge_save_lastfm_tracks({keys[0]: record})
-                except Exception:
-                    log.warning("now-playing track-record fetch failed", exc_info=True)
-
-        if attempted:
-            # Recorded for success and failure alike, and for either fetch
-            # kind — the floor above is about "was an attempt just made",
-            # not "did it work" or "which of the two kinds".
-            _now_fetch_last_attempt = clock()
+        except Exception:
+            log.warning("now-playing tag/track fetch failed", exc_info=True)
+        finally:
+            if attempted:
+                # Recorded for success and failure alike, and for either
+                # fetch kind — the floor above is about "was an attempt
+                # just made", not "did it work" or "which of the two
+                # kinds". Runs even when the try block above raised.
+                _now_fetch_last_attempt = clock()
         return fetched
     finally:
         _now_fetch_lock.release()

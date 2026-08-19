@@ -294,10 +294,21 @@ def test_a_partial_batch_persists_what_succeeded_before_the_error(monkeypatch):
 
 
 def test_passive_poll_never_touches_last_fm(isolated_now, monkeypatch):
-    monkeypatch.setattr(appmod, "_lastfm_client", lambda: RaisingFm())
+    # Fix round 1, I4: a raising fake here is toothless — `now_playing`'s
+    # `?force=1` branch wraps `_fetch_missing_now_tags` in a broad `except
+    # Exception: log.exception(...)`, so if a future regression called it on
+    # a passive poll too, `RaisingFm`'s AssertionError would be silently
+    # swallowed by that same broad except and this test would still see a
+    # 200 — a false negative. A counting fake that never raises, asserted
+    # empty afterward, catches that regression directly instead of relying
+    # on an exception surviving a catch-all.
+    fm = FakeFmFull()
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: fm)
     r = isolated_now.get("/api/now")
     assert r.status_code == 200
     assert r.json()["playing"] is True
+    assert fm.calls == []
+    assert fm.track_calls == []
 
 
 def test_forced_poll_fetches_and_persists_unknown_artists(isolated_now, monkeypatch):
@@ -744,10 +755,17 @@ def test_forced_poll_fetches_the_track_record_too(isolated_now, monkeypatch):
 
 
 def test_passive_poll_never_fetches_the_track_record(isolated_now, monkeypatch):
-    monkeypatch.setattr(appmod, "_lastfm_client", lambda: RaisingFm())
+    # Fix round 1, I4: same reasoning as `test_passive_poll_never_touches_last_fm`
+    # — a raising fake here would have its AssertionError swallowed by the
+    # `?force=1` branch's broad except, making it toothless. Counting fake,
+    # asserted empty, instead.
+    fm = FakeFmFull()
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: fm)
     r = isolated_now.get("/api/now")
     assert r.status_code == 200
     assert Store().lastfm_track_map() == {}
+    assert fm.calls == []
+    assert fm.track_calls == []
 
 
 def test_floor_is_shared_between_artist_and_track_fetch(monkeypatch):
@@ -803,6 +821,41 @@ def test_no_attempt_at_all_does_not_touch_the_floor(monkeypatch):
     assert appmod._now_fetch_last_attempt == 500.0  # untouched
     assert fm.calls == []
     assert fm.track_calls == []
+
+
+# ---- fix round 1, Critical (C1): floor must advance even when the track-
+# record read blows up on a corrupt lastfm_tracks.json ----------------------
+
+
+def test_corrupt_lastfm_tracks_json_still_advances_the_floor(monkeypatch):
+    """Proven repro: `store.lastfm_track_map()` used to be a bare read
+    OUTSIDE any try in this function, so a truly corrupt (invalid-JSON, not
+    just malformed-envelope) lastfm_tracks.json raised past the `if
+    attempted:` floor stamp — even after the artist-tags step had already
+    spent calls. That meant the floor never advanced and every subsequent
+    `?force=1` re-spent those calls, unbounded. Fixed: the whole attempt is
+    now inside one try/finally, so the floor advances regardless."""
+    Store().save_tag_artists({})
+    (appmod.store.dir / "lastfm_tracks.json").write_text("{not valid json")
+    fm = FakeFmFull(tags_by_name={f"Artist {aid}": [{"name": "rock", "count": 50}]
+                                  for aid in ("a1", "a2", "a3")})
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: fm)
+    clock = {"t": 1_000.0}
+
+    n1 = _fetch_missing_now_tags(track_with_artists(["a1", "a2", "a3"]),
+                                  clock=lambda: clock["t"])
+
+    assert n1 == 3  # the artist-tags spend still happened and was persisted
+    assert Store().tag_artists()  # saved despite the later crash on the track read
+    assert appmod._now_fetch_last_attempt == 1_000.0  # the floor DID advance
+
+    fm.calls.clear()
+    clock["t"] += 10  # well within NOW_FETCH_MIN_INTERVAL (60s)
+    n2 = _fetch_missing_now_tags(track_with_artists(["a1", "a2", "a3"]),
+                                  clock=lambda: clock["t"])
+
+    assert n2 == 0
+    assert fm.calls == []  # nothing re-spent — the floor held
 
 
 # ---- _merge_save_lastfm_tracks: same guarantees as _merge_save_tag_artists -
