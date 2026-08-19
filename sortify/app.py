@@ -34,7 +34,7 @@ from .spotify import (
 )
 from .split import UNTAGGED, pick_sitting, split_tracks
 from .store import TAGS_VERSION, Store
-from .tags import LastFm, LastFmError, enrich, load_key
+from .tags import LastFm, LastFmError, enrich, fetch_track, load_key, track_key
 
 LIKED_TTL = 120  # seconds; Liked Songs has no snapshot_id to validate against
 
@@ -493,6 +493,45 @@ def _merge_save_tag_artists(new_entries: dict) -> None:
             return
         merged = {**new_entries, **current}
         store.save_tag_artists(merged)
+
+
+# Same lost-update guard as `_merge_save_tag_artists`, its own lock and its
+# own baseline, for `lastfm_tracks.json` instead of `tags.json`. Currently
+# has exactly one writer in this process (`_fetch_missing_now_tags`'s track-
+# record step below), but the guard costs nothing to have in place before a
+# second one exists, and it keeps the two envelopes' save paths symmetric —
+# a future backfill-triggered-from-the-app writer gets the same guarantee
+# for free. Unlike `tags.json`, `lastfm_tracks.json` is rebuildable (see
+# `Store.LASTFM_TRACKS_DEFAULT`'s docstring), so a refused save here is
+# lower-stakes than the tags.json case — but still worth refusing rather
+# than guessing, for the same reason `scripts/backfill_similar.py`'s
+# `merge_save` refuses: a malformed re-read must not be mistaken for a real
+# shrink and clobber the file with just this call's `new_entries`.
+_lastfm_tracks_save_lock = threading.Lock()
+
+
+def _merge_save_lastfm_tracks(new_entries: dict) -> None:
+    """Merge `new_entries` into lastfm_tracks.json without losing a
+    concurrent writer. Mirrors `_merge_save_tag_artists` exactly — see that
+    function's docstring for the full reasoning.
+
+    `Store.save_lastfm_tracks` writes the WHOLE envelope (unlike
+    `save_tag_artists`, which wraps the inner map for its caller), so this
+    wraps `merged` in `{"version": 1, "tracks": ...}` itself before saving.
+    """
+    baseline = len(store.lastfm_track_map())
+    with _lastfm_tracks_save_lock:
+        current = store.lastfm_track_map()
+        if len(current) < baseline:
+            log.error(
+                "refusing to save lastfm_tracks.json: fresh re-read shrank from %d to %d "
+                "tracks (envelope likely malformed or truncated); save skipped, "
+                "the fetch will retry on the next request",
+                baseline, len(current),
+            )
+            return
+        merged = {**new_entries, **current}
+        store.save_lastfm_tracks({"version": 1, "tracks": merged})
 
 
 def _split_summary(playlist_id: str, splits: dict | None = None) -> dict | None:
@@ -2209,7 +2248,12 @@ _now_fetch_last_attempt = 0.0
 
 def _fetch_missing_now_tags(track: dict, *, clock=time.monotonic) -> int:
     """Fetch Last.fm tags for up to `NOW_FETCH_MAX_ARTISTS` unknown artists on
-    the currently-playing track. Returns how many artists were fetched.
+    the currently-playing track, THEN — same lock, same floor, same bounded
+    client — fetch its `lastfm_tracks.json` record (getSimilar + track top
+    tags) if it has none yet. Returns how many artists' TAGS were fetched;
+    the track-record step is a side effect on `lastfm_tracks.json`, checked
+    by tests via the store rather than this return value (mirroring how
+    `_merge_save_tag_artists`'s own writes aren't reflected in it either).
 
     Callable ONLY from `now_playing`'s `?force=1` branch — opening or
     refocusing the view, an explicit user action — never the passive poll,
@@ -2226,10 +2270,14 @@ def _fetch_missing_now_tags(track: dict, *, clock=time.monotonic) -> int:
     on every request, which in httpx overrides whatever the client itself was
     constructed with. Setting only the client would leave every actual
     request still bounded by the splitter's 15s default; both need setting
-    for this path to actually be bounded at 5s. `NOW_FETCH_MIN_INTERVAL`
+    for this path to actually be bounded at 5s — and the SAME swapped
+    instance is reused for the track-record step below, so that step is
+    bounded exactly the same way without a second swap. `NOW_FETCH_MIN_INTERVAL`
     floors how often an attempt happens at all, checked (and skipped on)
-    before any client is even touched. `clock` is injectable so tests can
-    move time without sleeping.
+    before any client is even touched — ONE floor shared by both fetch
+    kinds, not two independent ones, so a request that only needs a track
+    record still respects the same 60s spacing an artist-tags fetch would.
+    `clock` is injectable so tests can move time without sleeping.
 
     Write-once: an artist already in tags.json — a hit or a recorded
     `miss: true` alike — is never handed to `enrich` again. `enrich` raises
@@ -2241,6 +2289,24 @@ def _fetch_missing_now_tags(track: dict, *, clock=time.monotonic) -> int:
     the floor above rather than retried on the very next force. Persisting
     goes through `_merge_save_tag_artists`, so a concurrent `enrich()` walk
     from the split flow can't lose (or be lost by) this write.
+
+    The track-record step follows the same write-once rule via
+    `Store.lastfm_track_map()`, but checked under EVERY credited artist's
+    `track_key`, not just the first — `sortify.suggest._track_record`'s own
+    convention for where a collab's record lives, and the same rule
+    `scripts/backfill_similar.py`'s `tracks_to_fetch` follows for the
+    backfill's skip-known check. The record itself is always fetched (and,
+    if fetched, stored) under the FIRST credited artist's key, matching that
+    script's fetch-key convention too, so a later backfill run recognises it
+    as already known instead of re-fetching under the same key. `fetch_track`
+    makes two Last.fm requests (getSimilar, then track top tags) and does
+    NOT wrap a bare transport exception into `LastFmError` the way `enrich`
+    does — its own docstring says any exception from either call propagates
+    untouched — so the catch below is deliberately broad, exactly like
+    `scripts/backfill_similar.py`'s run loop. A failure here leaves the
+    track's key absent (retried on a later force, once the floor allows) and
+    never raises out of this function — a bonus enrichment must never break
+    the response it rides on.
     """
     global _now_fetch_last_attempt
     if not _now_fetch_lock.acquire(blocking=False):
@@ -2258,35 +2324,54 @@ def _fetch_missing_now_tags(track: dict, *, clock=time.monotonic) -> int:
             # overrides the client's own configured default in httpx.
             fm._client = httpx.Client(timeout=NOW_FETCH_TIMEOUT)
             fm._timeout = NOW_FETCH_TIMEOUT
+
+        attempted = False
+        fetched = 0
+
         names: dict[str, str] = {}
         for a in track.get("artists") or []:
             aid = a.get("id")
             if aid and aid not in names:
                 names[aid] = a.get("name") or ""
-        if not names:
-            return 0
-        cached = store.tag_artists()
-        unknown: dict[str, str] = {}
-        for aid, name in names.items():
-            if aid in cached:
-                continue
-            unknown[aid] = name
-            if len(unknown) == NOW_FETCH_MAX_ARTISTS:
-                break
-        if not unknown:
-            return 0
-        try:
-            merged = enrich(unknown, cached, fm, _now_iso())
-        except LastFmError as exc:
-            log.warning("now-playing tag fetch stopped early: %s", exc)
-            merged = exc.partial if exc.partial is not None else cached
-        finally:
-            # Recorded for success and failure alike — the floor above is
-            # about "was an attempt just made", not "did it work".
+        if names:
+            cached = store.tag_artists()
+            unknown: dict[str, str] = {}
+            for aid, name in names.items():
+                if aid in cached:
+                    continue
+                unknown[aid] = name
+                if len(unknown) == NOW_FETCH_MAX_ARTISTS:
+                    break
+            if unknown:
+                attempted = True
+                try:
+                    merged = enrich(unknown, cached, fm, _now_iso())
+                except LastFmError as exc:
+                    log.warning("now-playing tag fetch stopped early: %s", exc)
+                    merged = exc.partial if exc.partial is not None else cached
+                fetched = len(merged) - len(cached)
+                if fetched > 0:
+                    _merge_save_tag_artists(merged)
+
+        # ---- track-level record: getSimilar + track top tags -------------
+        title = track.get("name") or ""
+        artist_names = [a.get("name") for a in (track.get("artists") or []) if a.get("name")]
+        if title and artist_names:
+            keys = [track_key(n, title) for n in artist_names]
+            track_map = store.lastfm_track_map()
+            if not any(k in track_map for k in keys):
+                attempted = True
+                try:
+                    record = fetch_track(fm, artist_names[0], title, time.time())
+                    _merge_save_lastfm_tracks({keys[0]: record})
+                except Exception:
+                    log.warning("now-playing track-record fetch failed", exc_info=True)
+
+        if attempted:
+            # Recorded for success and failure alike, and for either fetch
+            # kind — the floor above is about "was an attempt just made",
+            # not "did it work" or "which of the two kinds".
             _now_fetch_last_attempt = clock()
-        fetched = len(merged) - len(cached)
-        if fetched > 0:
-            _merge_save_tag_artists(merged)
         return fetched
     finally:
         _now_fetch_lock.release()
