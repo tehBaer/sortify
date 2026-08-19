@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import suggest as sugg
+from .deezer import Deezer
 from .folders import extract_folder_map, home_name_excluded, select_home_ids
 from .pacing import Governor
 from .spotify import (
@@ -67,6 +68,9 @@ class AuthFinish(BaseModel):
 class ConfigIn(BaseModel):
     input_ids: list[str]
     home_ids: list[str] = []
+    # {playlist_id: "ambient, piano"} — the user's own matching hints per
+    # home, free text split on commas at profile-build time.
+    home_hints: dict[str, str] = {}
 
 
 class PlayIn(BaseModel):
@@ -157,6 +161,7 @@ def playlists():
     # btn-back, btn-split-back, post-refresh). Zero Spotify calls either way;
     # this was a purely local-disk cost the user was still paying constantly.
     splits = store.splits()["splits"]
+    hints = cfg.get("home_hints") or {}
     for p in out:
         p["folder"] = (folders.get(p["id"]) or {}).get("path")
         p["role"] = (
@@ -165,6 +170,7 @@ def playlists():
             else None
         )
         p["split"] = _split_summary(p["id"], splits)
+        p["hints"] = hints.get(p["id"], "")
     entry = store.cache().get("playlist_list") or {}
     # Leftover sittings, from the same listing already in hand — zero calls.
     # Surfaced here because this is the view whose Refresh button produces
@@ -217,8 +223,25 @@ def ingest_folders(tree: Any = Body(...)):
 
 @app.post("/api/config")
 def set_config(body: ConfigIn):
-    store.update_config(input_ids=body.input_ids, home_ids=body.home_ids)
+    store.update_config(
+        input_ids=body.input_ids, home_ids=body.home_ids,
+        home_hints={k: v.strip() for k, v in body.home_hints.items() if v.strip()},
+    )
+    # Hints feed the tag profiles, which otherwise sit cached for PROFILE_TTL —
+    # a save should be visible on the very next suggestion, not 10 min later.
+    _profile_state.clear()
+    _profile_state["built_at"] = 0.0
     return {"ok": True}
+
+
+def _parse_hints(cfg: dict) -> dict[str, list[str]]:
+    """config's `home_hints` ({id: "a, b"}) as {id: ["a", "b"]}, lowercased."""
+    out = {}
+    for pid, text in (cfg.get("home_hints") or {}).items():
+        tags = [t.strip().lower() for t in str(text).split(",") if t.strip()]
+        if tags:
+            out[pid] = tags
+    return out
 
 
 def _effective_input_ids(cfg: dict, playlists: list[dict]) -> set[str]:
@@ -303,7 +326,11 @@ def _ensure_profiles_locked(force: bool) -> dict:
     # actionable 400 belongs only to the user-initiated split flow
     # (`_tag_artists_checked`).
     tag_artists = store.tag_artists()
-    profiles = {h["id"]: sugg.build_profile(home_tracks[h["id"]], tag_artists) for h in homes}
+    hints = _parse_hints(cfg)
+    profiles = {
+        h["id"]: sugg.build_profile(home_tracks[h["id"]], tag_artists, hints=hints.get(h["id"]))
+        for h in homes
+    }
 
     # Input contents too, so the capture chips can show membership.
     by_id = {p["id"]: p for p in all_playlists}
@@ -2662,6 +2689,75 @@ def _fetch_missing_now_tags(track: dict, *, clock=time.monotonic) -> int:
         _now_fetch_lock.release()
 
 
+# ---- BPM (Deezer) -----------------------------------------------------------
+#
+# Deezer is not Spotify — none of the budget ledger applies (its own limit is
+# 50 req/5s per IP; this path does at most 2 per minute). The /api/now manners
+# still do: fetch only on ?force=1, write-once into deezer.json, one attempt
+# per NOW_BPM_MIN_INTERVAL, non-blocking, and a failure never breaks the
+# response it rides on.
+
+NOW_BPM_MIN_INTERVAL = 60  # seconds between fetch attempts, success or failure
+_now_bpm_lock = threading.Lock()
+_now_bpm_last_attempt = 0.0
+_deezer = None
+
+
+def _deezer_client() -> Deezer:
+    global _deezer
+    if _deezer is None:
+        _deezer = Deezer(timeout=5.0)
+    return _deezer
+
+
+def _fetch_missing_now_bpm(track: dict, *, clock=time.monotonic) -> None:
+    """Fetch and cache the playing track's BPM if deezer.json lacks it.
+
+    Known-or-miss under ANY credited artist's key means done (the same
+    convention `_track_record` reads by); a fetched record is stored under
+    the FIRST artist's key (the same convention the Last.fm side writes by).
+    DeezerError/transport failures record nothing — retryable on a later
+    force once the floor allows, exactly like the Last.fm fetch above.
+    """
+    global _now_bpm_last_attempt
+    if not _now_bpm_lock.acquire(blocking=False):
+        return
+    try:
+        if clock() - _now_bpm_last_attempt < NOW_BPM_MIN_INTERVAL:
+            return
+        artists = track.get("artists") or []
+        title = track.get("name") or ""
+        first = (artists[0].get("name") or "") if artists else ""
+        if not first or not title:
+            return
+        keys = [track_key(a.get("name") or "", title) for a in artists]
+        known = store.deezer_map()
+        if any(k in known for k in keys):
+            return
+        _now_bpm_last_attempt = clock()
+        try:
+            record = _deezer_client().fetch_track(first, title)
+        except Exception:
+            log.warning("deezer bpm fetch failed for %r — will retry later", title)
+            return
+        payload = store.deezer_tracks()
+        payload.setdefault("tracks", {})[keys[0]] = record
+        store.save_deezer_tracks(payload)
+    finally:
+        _now_bpm_lock.release()
+
+
+def _bpm_for(track: dict) -> float | None:
+    """The cached BPM for this track, or None. Local read, zero requests."""
+    known = store.deezer_map()
+    title = track.get("name") or ""
+    for a in track.get("artists") or []:
+        rec = known.get(track_key(a.get("name") or "", title))
+        if isinstance(rec, dict) and rec.get("bpm"):
+            return rec["bpm"]
+    return None
+
+
 def _idle_inputs_payload() -> list[dict]:
     """Inputs for the not-playing state's "start an input…" CTA — names only.
 
@@ -2712,6 +2808,10 @@ def now_playing(force: bool = False):
             # A fetch failure must never break the now response — this is a
             # bonus enrichment, not the payload the client actually needs.
             log.exception("now-playing tag fetch failed")
+        try:
+            _fetch_missing_now_bpm(track)
+        except Exception:
+            log.exception("now-playing bpm fetch failed")
     # Guard-on-read, fresh on every request — same reasoning as `triage`'s own
     # re-read below `_ensure_profiles`: `_profile_state`'s cached profiles are
     # a profile-build-time snapshot that can sit stale for up to PROFILE_TTL,
@@ -2730,7 +2830,7 @@ def now_playing(force: bool = False):
         "poll_after_ms": _poll_after_ms(stale_in),
         "is_playing": np["is_playing"],
         "progress_ms": np["progress_ms"],
-        "track": {**track, "sortable": bool(sortable)},
+        "track": {**track, "sortable": bool(sortable), "bpm": _bpm_for(track)},
         "context": (
             {"id": ctx_id, "name": ctx["name"] if ctx else None,
              "is_input": ctx_id in state["input_ids"]}

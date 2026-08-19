@@ -110,7 +110,9 @@ def _cleaned_tags(entry: dict) -> list[str]:
     return [t for t, _w in cleaned]
 
 
-def build_profile(tracks: list[dict], tag_artists: dict[str, dict]) -> dict:
+def build_profile(
+    tracks: list[dict], tag_artists: dict[str, dict], hints: list[str] | None = None
+) -> dict:
     """Precompute what the suggester needs to know about one home playlist.
 
     tag_counts is built from ARTIST tags only; the seed track's vector may be
@@ -118,6 +120,15 @@ def build_profile(tracks: list[dict], tag_artists: dict[str, dict]) -> dict:
     against an artist-tag profile. Asymmetric on purpose for now — only ~4% of
     cached tracks carry track tags, and the measured effect of the asymmetry
     is positive; revisit if track-tag coverage is ever backfilled harder.
+
+    `hints` are the user's own words about this home (config's `home_hints`),
+    already split and lowercased by the caller. They enter tag_counts at the
+    strength of the profile's strongest ORGANIC tag — strong enough that a
+    200-track home can't dilute them to noise, but inside the same TAG_WEIGHT
+    channel as everything else, so the artist-overlap-primacy invariant needs
+    no new analysis. Deliberately NOT run through `clean_tags`: the stoplist
+    exists to drop Last.fm junk, and a word the user typed on purpose is the
+    opposite of junk.
     """
     artist_counts: Counter = Counter()
     tag_counts: Counter = Counter()
@@ -132,11 +143,17 @@ def build_profile(tracks: list[dict], tag_artists: dict[str, dict]) -> dict:
             artist_counts[a["id"]] += 1
             for tag in _cleaned_tags(tag_artists.get(a["id"], {})):
                 tag_counts[tag] += 1
+    hint_set = {h.strip().lower() for h in (hints or []) if h.strip()}
+    if hint_set:
+        weight = max(tag_counts.values(), default=1)
+        for h in hint_set:
+            tag_counts[h] += weight
     return {
         "artist_counts": artist_counts,
         "tag_counts": tag_counts,
         "uris": uris,
         "track_keys": track_keys,
+        "hints": hint_set,
     }
 
 
@@ -285,8 +302,14 @@ def suggest(
         sim = _cosine(track_tags, prof["tag_counts"])
         if sim > 0.05:
             score += TAG_WEIGHT * sim
+            hints = prof.get("hints") or set()
+            hint_hits = sorted(t for t in track_tags if t in hints)
+            if hint_hits:
+                reasons.append("your hint: " + ", ".join(hint_hits[:3]))
+            # Hint matches get their own line above; listing them again here
+            # would double-credit one signal in the user's eyes.
             overlap = sorted(
-                (t for t in track_tags if t in prof["tag_counts"]),
+                (t for t in track_tags if t in prof["tag_counts"] and t not in hints),
                 key=lambda t: track_tags[t] * prof["tag_counts"][t],
                 reverse=True,
             )

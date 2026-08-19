@@ -303,6 +303,28 @@ def test_an_idle_poll_lists_inputs_for_the_start_cta(route_client, monkeypatch):
     assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]
 
 
+def test_a_cached_bpm_rides_the_poll_for_free(route_client, monkeypatch):
+    """BPM comes from deezer.json on the poll path — a local read. The passive
+    poll must never construct a Deezer client at all; only ?force=1 may fetch."""
+    from sortify.tags import track_key
+
+    s = Store()
+    original = s.deezer_tracks()
+    monkeypatch.setattr(appmod, "_deezer_client",
+                        lambda: (_ for _ in ()).throw(AssertionError("passive poll fetched")))
+    try:
+        payload = s.deezer_tracks()
+        payload["tracks"][track_key("A", "X")] = {"bpm": 128.0, "deezer_id": 1, "fetched_at": 1.0}
+        s.save_deezer_tracks(payload)
+
+        body = route_client.get("/api/now").json()
+
+        assert body["track"]["bpm"] == 128.0
+        assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]
+    finally:
+        s.save_deezer_tracks(original)
+
+
 def test_the_sitting_lookup_on_the_poll_path_is_free(route_client):
     """`_sitting_for_context` is this branch's addition to the hottest path in
     the app. It answers from splits.json on purpose; resolving the context

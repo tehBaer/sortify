@@ -88,6 +88,9 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 .chip.on-input { background: #2d6cdf; color: #fff; border-color: transparent; }
 .chip.on-home { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
 .pl-sort { font-size: 1.1rem; padding: .3rem .6rem; }
+/* full-width second line inside the (flex-wrap) row, homes only */
+.pl-row { flex-wrap: wrap; }
+.pl-hints { flex-basis: 100%; font-size: .85rem; min-height: 38px; margin-top: .1rem; }
 .actionbar { position: sticky; bottom: 0; padding: .8rem 0; background: var(--bg); }
 .actionbar button { width: 100%; }
 
@@ -144,6 +147,10 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 }
 .track-card .t-name { font-size: 1.3rem; font-weight: 700; letter-spacing: -.01em; margin: .8rem 0 .15rem; }
 .track-card .t-artist { color: var(--muted); font-size: .95rem; margin-bottom: .9rem; }
+.track-card .t-meta {
+  color: var(--muted); font-size: .72rem; font-weight: 600;
+  letter-spacing: .08em; margin: -.7rem 0 .9rem;
+}
 
 /* playback strip: elapsed / bar / total, then the two round buttons */
 .np-progress {

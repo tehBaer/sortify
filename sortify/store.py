@@ -184,3 +184,20 @@ class Store:
         """
         tracks = self.lastfm_tracks().get("tracks")
         return tracks if isinstance(tracks, dict) else {}
+
+    # deezer.json: {"version": 1, "tracks": {track_key: {"bpm", "deezer_id",
+    # "fetched_at"} | {"miss": true}}} — BPM per track from Deezer's public
+    # API (Spotify's audio-features endpoint is gone for dev-mode apps).
+    # Same write-once discipline and key convention as lastfm_tracks.json.
+    DEEZER_DEFAULT = {"version": 1, "tracks": {}}
+
+    def deezer_tracks(self) -> dict:
+        """The whole envelope. Consumers almost always want `deezer_map()`."""
+        return self._versioned("deezer.json", self.DEEZER_DEFAULT)
+
+    def save_deezer_tracks(self, payload: dict) -> None:
+        self._save("deezer.json", payload)
+
+    def deezer_map(self) -> dict:
+        tracks = self.deezer_tracks().get("tracks")
+        return tracks if isinstance(tracks, dict) else {}

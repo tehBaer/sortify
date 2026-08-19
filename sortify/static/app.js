@@ -6,6 +6,7 @@ const views = ["setup", "lists", "triage", "now", "split"];
 let statusData = null;
 let playlistData = [];   // lists view
 let roles = {};          // id -> "input" | "home" | null
+let hintTexts = {};      // id -> "ambient, piano" — per-home matching hints
 let triage = null;       // {id, name, homes:Map, tracks, idx, sorted, skipped, history}
 let split = null;        // {id, name, piles, decided, active_sitting} — the open split view
 // {splitId, sittingId, pileId, pileName, uris, decided} — a UI convenience,
@@ -112,6 +113,8 @@ async function loadLists() {
     const data = await api("/api/playlists");
     playlistData = data.playlists;
     roles = Object.fromEntries(playlistData.map((p) => [p.id, p.role]));
+    hintTexts = Object.fromEntries(
+      playlistData.filter((p) => p.hints).map((p) => [p.id, p.hints]));
     // The list is cached until refreshed by hand, so say how old it is rather
     // than present a stale list as current.
     $("pl-age").textContent = ageText(data.fetched_at);
@@ -164,13 +167,25 @@ function renderLists() {
         <button class="chip r-home">Home</button>
         <button class="pl-sort" title="Sort this input">▶</button>
         <button class="pl-split" title="Split into piles">⑃</button>
-      </div>`;
+      </div>
+      <input class="pl-hints" placeholder="matching hints, e.g. ambient, piano"
+             title="Your own words about what belongs here — they join this home's tag profile (docs/matching.md)">`;
     const [bIn, bHome, bSort, bSplit] = row.querySelectorAll("button");
+    const hintsEl = row.querySelector(".pl-hints");
+    hintsEl.value = hintTexts[p.id] || "";
+    hintsEl.oninput = () => {
+      if (hintsEl.value.trim()) hintTexts[p.id] = hintsEl.value;
+      else delete hintTexts[p.id];
+    };
     const paint = () => {
       bIn.classList.toggle("on-input", roles[p.id] === "input");
       bHome.classList.toggle("on-home", roles[p.id] === "home");
       bHome.hidden = p.id === "liked" || !p.editable;
       bSort.hidden = roles[p.id] !== "input";
+      // The hints field only makes sense for a home — it feeds that home's
+      // matching profile. Kept visible if it has leftover text so the user
+      // can still see (and clear) hints on a demoted playlist.
+      hintsEl.hidden = roles[p.id] !== "home" && !hintsEl.value.trim();
       // Splitting only earns its keep on a playlist too long to work through
       // as-is — a 30-track input doesn't need piles.
       bSplit.hidden = p.id === "liked" || (p.total ?? 0) < 100;
@@ -267,7 +282,7 @@ $("btn-refresh-lists").onclick = async () => {
 async function saveConfig() {
   const input_ids = Object.keys(roles).filter((k) => roles[k] === "input");
   const home_ids = Object.keys(roles).filter((k) => roles[k] === "home");
-  await api("/api/config", { input_ids, home_ids });
+  await api("/api/config", { input_ids, home_ids, home_hints: hintTexts });
 }
 
 $("btn-save-config").onclick = async () => {
@@ -794,6 +809,7 @@ function renderNow() {
     <div class="art">${img}${d.is_playing ? "" : '<span class="paused-chip">paused</span>'}</div>
     <div class="t-name">${esc(tr.name)}</div>
     <div class="t-artist">${esc(artists)}${tr.album ? " — " + esc(tr.album) : ""}</div>
+    ${tr.bpm ? `<div class="t-meta">${Math.round(tr.bpm)} BPM</div>` : ""}
     ${playbackStrip(d, tr)}
     ${body}
   </div>`;

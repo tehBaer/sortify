@@ -456,3 +456,55 @@ def test_neighbour_score_finds_record_under_any_credited_artist_key():
     }
     score, count = suggest_mod._neighbour_score(seed, prof, track_map)
     assert (score, count) == (0.6, 1)
+
+
+# ---- user hints -------------------------------------------------------------
+#
+# Hints are the user's own words about a home ("ambient, piano"), injected
+# into that home's tag profile at the strength of its strongest organic tag.
+# They deliberately ride the existing TAG_WEIGHT channel — no new weight knob
+# exists to break the artist-overlap-primacy invariant.
+
+
+def test_hints_lift_a_home_the_organic_tags_would_miss():
+    quiet = build_profile([track("q1", ["unknown"])], ARTISTS, hints=["shoegaze"])
+    plain = build_profile([track("p1", ["unknown"])], ARTISTS)
+    res = suggest(track("new", ["slowdive"]), {"quiet": quiet, "plain": plain}, ARTISTS)
+    assert res and res[0]["playlist_id"] == "quiet"
+    assert any(r.startswith("your hint: shoegaze") for r in res[0]["reasons"])
+
+
+def test_hint_match_never_outranks_a_real_artist_match():
+    hinted = build_profile(
+        [track("q1", ["unknown"])], ARTISTS,
+        hints=["dream pop", "shoegaze"],  # a perfect hint vector for the seed
+    )
+    owns_artist = build_profile([track("d1", ["beach-house"])], ARTISTS)
+    res = suggest(
+        track("new", ["beach-house"]), {"hinted": hinted, "owns": owns_artist}, ARTISTS
+    )
+    assert res and res[0]["playlist_id"] == "owns"
+
+
+def test_hint_tags_stay_out_of_the_organic_tag_reason():
+    prof = build_profile(
+        [track("d1", ["beach-house"])], ARTISTS, hints=["shoegaze"]
+    )
+    res = suggest(track("new", ["slowdive"]), {"H": prof}, ARTISTS)
+    assert res
+    hint_reasons = [r for r in res[0]["reasons"] if r.startswith("your hint:")]
+    tag_reasons = [r for r in res[0]["reasons"] if r.startswith("artist tags:")]
+    assert hint_reasons == ["your hint: shoegaze"]
+    # dream pop is organic overlap; shoegaze must not be listed twice
+    assert tag_reasons and "shoegaze" not in tag_reasons[0]
+
+
+def test_hints_weigh_like_the_strongest_organic_tag():
+    # Two beach-house tracks -> organic "dream pop" count 2; the hint must
+    # enter at 2 as well, not at 1, or a big home dilutes hints to nothing.
+    prof = build_profile(
+        [track("d1", ["beach-house"]), track("d2", ["beach-house"])],
+        ARTISTS, hints=["ambient"],
+    )
+    assert prof["tag_counts"]["ambient"] == 2
+    assert prof["hints"] == {"ambient"}
