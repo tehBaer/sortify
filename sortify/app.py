@@ -618,15 +618,98 @@ _split_lock = threading.Lock()
 _pending_keeps: set[tuple[str, str]] = set()
 
 
+# How long a split has got to, keyed by playlist id. Module state on purpose:
+# the alternative — writing progress into splits.json — would be ~700 writes
+# of a file that has reached 269 KB, per split. This is one small dict per
+# playlist ever split in this process's lifetime, and sortify is a single
+# process (one systemd unit, no uvicorn workers), so there is nothing to
+# share it with. `create_split` is a sync `def`, so FastAPI runs it in a
+# worker thread and the poll endpoint below is served concurrently with it.
+_split_progress: dict[str, dict] = {}
+_split_progress_lock = threading.Lock()
+
+_IDLE_PROGRESS = {"state": "idle", "phase": None, "done": 0, "total": 0, "detail": None}
+
+# Only ever read by the client while a split is actually running. 1s is far
+# below the ~0.25s-per-artist the tagging phase moves at, and the endpoint it
+# paces is a dict lookup under a lock — no disk, no network, nothing that can
+# reach Spotify. That last part is the whole reason a poll is allowed here at
+# all; see test_split_progress_spends_no_api_calls.
+SPLIT_PROGRESS_POLL_MS = 1000
+
+
+def _progress_begin(playlist_id: str) -> None:
+    with _split_progress_lock:
+        _split_progress[playlist_id] = dict(_IDLE_PROGRESS, state="running", phase="starting")
+
+
+def _progress_set(playlist_id: str, **fields) -> None:
+    """Merge into the live entry, leaving untouched fields alone — the failure
+    path relies on this to keep the `done` count the last `on_progress` call
+    published, which is what the resume message is built from."""
+    with _split_progress_lock:
+        entry = _split_progress.get(playlist_id)
+        if entry is not None:
+            entry.update(fields)
+
+
 @app.post("/api/split/{playlist_id}")
 def create_split(playlist_id: str, params: SplitParams = SplitParams()):
     """Read a playlist, tag its artists via Last.fm, cluster into piles.
 
-    The only Spotify spend is the track read (~15 calls for 1372, and zero if
-    the snapshot hasn't moved since the last read — see `_cached_tracks`, the
-    same cache `triage` uses). Tagging is Last.fm, one request per
-    not-yet-cached artist; clustering is local and free. A Last.fm failure
-    partway through does not lose what was already verified — see
+    Progress reporting lives here rather than inside `_run_split` so that
+    every exit — including the ones that refuse before any work starts, like
+    the ownership pre-flight and the active-sitting guard — lands in a
+    terminal state. A refusal has to be distinguishable from a run stuck at
+    zero, or the progress bar answers "is it working?" with a shrug.
+    """
+    _progress_begin(playlist_id)
+    try:
+        result = _run_split(playlist_id, params)
+    except HTTPException as e:
+        # `detail` is the message the UI already shows for this failure, so
+        # a poll that lands after the POST has rejected tells the same story
+        # rather than a vaguer one.
+        _progress_set(playlist_id, state="failed", detail=str(e.detail))
+        raise
+    except Exception as e:
+        _progress_set(playlist_id, state="failed", detail=f"{type(e).__name__}: {e}")
+        raise
+    _progress_set(playlist_id, state="done", phase="complete")
+    return result
+
+
+@app.get("/api/split/{playlist_id}/progress")
+def split_progress(playlist_id: str):
+    """How far the split for this playlist has got. Costs nothing at all.
+
+    Reads one module-level dict and nothing else — no `store` read (which
+    could trigger a fetch), no Spotify call, no Last.fm call. That is the
+    condition on which this endpoint is allowed to be polled on a timer:
+    CLAUDE.md's rule is that a 6s client poll against a 5s cache once cost
+    ~600 Spotify calls an hour from a single open tab, and this feature adds
+    a poll running once a second for three minutes.
+
+    A playlist with no run on record answers "idle" rather than 404, the same
+    choice `queue_status` makes: the split view polls this before anything
+    has ever been split, and that is the most frequent call of all.
+    """
+    with _split_progress_lock:
+        entry = dict(_split_progress.get(playlist_id) or _IDLE_PROGRESS)
+    # The client obeys this instead of choosing an interval of its own — the
+    # same contract /api/now has. Zero means stop: a terminal run cannot
+    # change again, and a client still polling one would be the orphaned
+    # interval this feature is under orders not to create.
+    entry["poll_after_ms"] = SPLIT_PROGRESS_POLL_MS if entry["state"] == "running" else 0
+    return entry
+
+
+def _run_split(playlist_id: str, params: SplitParams) -> dict:
+    """The split itself. Only the Spotify spend is the track read (~15 calls
+    for 1372, and zero if the snapshot hasn't moved since the last read — see
+    `_cached_tracks`, the same cache `triage` uses). Tagging is Last.fm, one
+    request per not-yet-cached artist; clustering is local and free. A Last.fm
+    failure partway through does not lose what was already verified — see
     `_tag_artists_checked` and the `LastFmError` handling below.
     """
     # Checked before anything else, including the Last.fm key: replacing the
@@ -667,6 +750,7 @@ def create_split(playlist_id: str, params: SplitParams = SplitParams()):
         raise _foreign_playlist_error(p["name"], p.get("owner"))
 
     snapshot_id = by_id.get(playlist_id, {}).get("snapshot_id")
+    _progress_set(playlist_id, phase="reading")
     try:
         tracks = _cached_tracks(playlist_id, snapshot_id)
     except SpotifyError as e:
@@ -703,8 +787,16 @@ def create_split(playlist_id: str, params: SplitParams = SplitParams()):
             if name or aid not in names:
                 names[aid] = name
 
+    # Set before the first artist, so a poll landing in the gap between the
+    # track read and the first Last.fm answer already reads "tagging" rather
+    # than showing the reading phase for longer than it actually ran.
+    _progress_set(playlist_id, phase="tagging", done=0, total=0)
     try:
-        artists = enrich(names, cached_artists, fm, _now_iso())
+        artists = enrich(
+            names, cached_artists, fm, _now_iso(),
+            on_progress=lambda done, total: _progress_set(
+                playlist_id, done=done, total=total),
+        )
     except LastFmError as exc:
         saved = exc.partial if exc.partial is not None else cached_artists
         _merge_save_tag_artists(saved)
@@ -719,6 +811,7 @@ def create_split(playlist_id: str, params: SplitParams = SplitParams()):
         ) from exc
     _merge_save_tag_artists(artists)
 
+    _progress_set(playlist_id, phase="clustering")
     piles = split_tracks(tracks, artists, params.model_dump())
     with _split_lock:
         payload = store.splits()

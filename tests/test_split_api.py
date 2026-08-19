@@ -86,8 +86,14 @@ def client(monkeypatch):
     def fake_my_playlists(refresh=False):
         return PLAYLIST_LIST
 
-    def fake_enrich(artist_names, cached, fm, now):
+    def fake_enrich(artist_names, cached, fm, now, on_progress=None):
         calls["lastfm"] += 1
+        # The real `enrich` reports one step per artist it fetches; mirroring
+        # that here keeps the progress the endpoint publishes honest in every
+        # test that doesn't override this fake.
+        for i, aid in enumerate(artist_names, start=1):
+            if on_progress:
+                on_progress(i, len(artist_names))
         return {**cached, **{a: TAGS[a] for a in artist_names if a in TAGS}}
 
     monkeypatch.setattr(appmod.sp, "playlist_tracks", fake_playlist_tracks)
@@ -393,7 +399,7 @@ def test_split_on_lastfm_failure_persists_the_partial_and_reports_clearly(client
     Store().save_splits(splits_payload)
 
     try:
-        def failing_enrich(artist_names, cached, fm, now):
+        def failing_enrich(artist_names, cached, fm, now, on_progress=None):
             partial = {**cached, "bh": TAGS["bh"]}
             raise LastFmError("Last.fm error 29: rate limited", partial=partial)
 
@@ -447,7 +453,7 @@ def test_recluster_tag_floor_changes_the_result_with_zero_api_calls(client, monk
         client.calls["spotify"] += 1
         return faint_tracks()
 
-    def fake_enrich(artist_names, cached, fm, now):
+    def fake_enrich(artist_names, cached, fm, now, on_progress=None):
         client.calls["lastfm"] += 1
         return {**cached, **{a: FAINT_TAGS[a] for a in artist_names if a in FAINT_TAGS}}
 
@@ -633,7 +639,7 @@ def test_split_prefers_a_real_artist_name_over_a_blank_placeholder_occurrence(cl
 
     seen_names = {}
 
-    def fake_enrich(artist_names, cached, fm, now):
+    def fake_enrich(artist_names, cached, fm, now, on_progress=None):
         seen_names.update(artist_names)
         return {**cached, "va": {"name": artist_names["va"], "tags": [], "miss": False}}
 
@@ -657,7 +663,7 @@ def test_split_still_records_an_id_with_only_blank_occurrences_as_blank(client, 
 
     seen_names = {}
 
-    def fake_enrich(artist_names, cached, fm, now):
+    def fake_enrich(artist_names, cached, fm, now, on_progress=None):
         seen_names.update(artist_names)
         return {**cached, "ghost": {"name": "", "tags": [], "miss": True}}
 
@@ -666,3 +672,147 @@ def test_split_still_records_an_id_with_only_blank_occurrences_as_blank(client, 
     r = client.post("/api/split/PL-DUP2")
     assert r.status_code == 200
     assert seen_names["ghost"] == ""
+
+
+# ---- split progress --------------------------------------------------------
+#
+# The Last.fm phase is ~700 artists paced at 0.25s — about three minutes in
+# which the UI previously showed nothing but a static spinner. Progress is
+# published to module state and read back by a poll endpoint that must be
+# provably free: a progress bar means a client polling on a timer, and this
+# app has three multi-hour Spotify lockouts behind it, one of them caused by
+# a 6s poll against a 5s cache. See test_split_progress_spends_no_api_calls.
+
+
+@pytest.fixture(autouse=True)
+def clean_split_progress():
+    """`_split_progress` is module state on a module the whole session shares,
+    so a run left behind by one test would be read as live by the next — and
+    `PL1` in particular is split by tests in several files. Clear on the way
+    in (isolation) and restore on the way out (leave the session as found);
+    the suite has had four isolation leaks already, and doing only the second
+    half is what made this fixture pass alone and fail in a full run."""
+    before = dict(appmod._split_progress)
+    appmod._split_progress.clear()
+    try:
+        yield
+    finally:
+        appmod._split_progress.clear()
+        appmod._split_progress.update(before)
+
+
+def test_split_progress_is_idle_for_a_playlist_that_never_split(client):
+    r = client.get("/api/split/PL1/progress")
+    assert r.status_code == 200
+    assert r.json()["state"] == "idle"
+
+
+def test_split_progress_spends_no_api_calls(client, monkeypatch):
+    """The one hard constraint on this feature. The client polls this endpoint
+    on a timer for the whole ~3 minute Last.fm phase, so a single Spotify call
+    hiding behind it — a `sp.my_playlists(refresh=True)`, a `store` read that
+    triggers a fetch — is a per-second cost against a budget that has already
+    earned three multi-hour lockouts.
+
+    Guarded at `Spotify.request()`, the chokepoint every call funnels through,
+    rather than at the methods this endpoint happens not to call today — same
+    reasoning as test_get_split_spends_no_api_calls, including why the
+    fixture's pure stand-in fakes have to be removed first for the guard to be
+    reachable at all.
+    """
+    client.post("/api/split/PL1")
+    before = dict(client.calls)
+
+    monkeypatch.delattr(appmod.sp, "playlist_tracks", raising=False)
+    monkeypatch.delattr(appmod.sp, "my_playlists", raising=False)
+
+    def fail(*a, **kw):
+        raise AssertionError("GET /api/split/{id}/progress must not touch the Spotify API")
+
+    monkeypatch.setattr(appmod.sp, "request", fail)
+
+    assert client.get("/api/split/PL1/progress").status_code == 200
+    assert client.calls == before
+
+    # The idle path is polled too — it is what a tab sitting on an unsplit
+    # playlist would hit — so it has to be free for the same reason.
+    assert client.get("/api/split/NEVER-SPLIT/progress").status_code == 200
+    assert client.calls == before
+
+
+def test_split_progress_reports_the_tagging_phase_while_it_runs(client, monkeypatch):
+    """Read mid-run, through the endpoint itself rather than by peeking at the
+    dict, so the wiring between the two is what's actually pinned."""
+    seen = []
+
+    def fake_enrich(artist_names, cached, fm, now, on_progress=None):
+        client.calls["lastfm"] += 1
+        for i, aid in enumerate(artist_names, start=1):
+            if on_progress:
+                on_progress(i, len(artist_names))
+            seen.append(appmod.split_progress("PL1"))
+        return {**cached, **{a: TAGS[a] for a in artist_names if a in TAGS}}
+
+    monkeypatch.setattr(appmod, "enrich", fake_enrich)
+    client.post("/api/split/PL1")
+
+    assert [(s["phase"], s["done"], s["total"]) for s in seen] == [
+        ("tagging", 1, 2), ("tagging", 2, 2)]
+    assert all(s["state"] == "running" for s in seen)
+
+
+def test_split_progress_ends_done_after_a_successful_split(client):
+    client.post("/api/split/PL1")
+    p = client.get("/api/split/PL1/progress").json()
+    assert p["state"] == "done"
+
+
+def test_split_progress_ends_failed_when_lastfm_stops(client, monkeypatch):
+    """The failure the resume card is built from. `detail` carries the
+    endpoint's own message so a poll that lands after the POST rejects still
+    tells the user what happened."""
+    def boom(artist_names, cached, fm, now, on_progress=None):
+        if on_progress:
+            on_progress(1, 2)
+        raise LastFmError("rate limited", partial={"bh": TAGS["bh"]})
+
+    monkeypatch.setattr(appmod, "enrich", boom)
+    assert client.post("/api/split/PL1").status_code == 502
+
+    p = client.get("/api/split/PL1/progress").json()
+    assert p["state"] == "failed"
+    assert p["done"] == 1
+    assert "resume" in p["detail"].lower()
+
+
+def test_split_progress_ends_failed_when_the_playlist_is_not_ours(client):
+    """A split can now be refused before any phase begins — the ownership
+    pre-flight costs no Spotify call and no Last.fm call. That must land as a
+    terminal failure, not as a run stuck at zero: a progress bar that sits at
+    0% forever is exactly the "is it working?" question this feature exists to
+    answer."""
+    assert client.post("/api/split/PL-FOREIGN").status_code == 403
+
+    p = client.get("/api/split/PL-FOREIGN/progress").json()
+    assert p["state"] == "failed"
+    assert "belongs to" in p["detail"]
+
+
+def test_split_progress_tells_the_client_when_to_poll_again(client, monkeypatch):
+    """Pacing is the server's to decide — the same rule /api/now follows. The
+    client obeys this number rather than picking an interval of its own."""
+    seen = []
+
+    def fake_enrich(artist_names, cached, fm, now, on_progress=None):
+        if on_progress:
+            on_progress(1, 2)
+        seen.append(appmod.split_progress("PL1"))
+        return {**cached, **{a: TAGS[a] for a in artist_names if a in TAGS}}
+
+    monkeypatch.setattr(appmod, "enrich", fake_enrich)
+    client.post("/api/split/PL1")
+
+    assert seen[0]["poll_after_ms"] > 0
+    # Nothing left to watch once it is terminal: a client that kept polling a
+    # finished run would be the orphaned-interval bug in a new costume.
+    assert client.get("/api/split/PL1/progress").json()["poll_after_ms"] == 0

@@ -346,7 +346,7 @@ def test_recluster_sweeps_records_for_vanished_pile_ids_to_history(client, monke
     piles = Store().splits()["splits"]["PLM"]["piles"]
     monkeypatch.setattr(appmod, "split_tracks", lambda tracks, artists, params: piles)
     monkeypatch.setattr(appmod, "_lastfm_client", lambda: object())
-    monkeypatch.setattr(appmod, "enrich", lambda names, cached, fm, now: cached)
+    monkeypatch.setattr(appmod, "enrich", lambda names, cached, fm, now, on_progress=None: cached)
     monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: [
         {"id": "PLM", "name": "PLM", "owner": "me", "editable": True,
          "total": 65, "snapshot_id": None, "image": None}])

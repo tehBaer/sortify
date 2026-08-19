@@ -605,3 +605,82 @@ def test_fetch_track_propagates_errors():
     fm = LastFm("k", sleep=lambda s: None, client=client)
     with pytest.raises(LastFmError, match="error 29"):
         fetch_track(fm, "A", "B", now=1.0)
+# ---- progress reporting ----------------------------------------------------
+#
+# `enrich` is the slow phase of a split (~700 artists at MIN_INTERVAL = 0.25s,
+# about three minutes), and it is the only phase whose progress is worth
+# reporting: the track read is ~14 Spotify calls and clustering is local and
+# instant. The callback exists so app.py can publish a count without tags.py
+# learning anything about HTTP, splits, or the Spotify layer — see
+# test_module_never_imports_spotify_source, which this must not break.
+
+
+def test_enrich_reports_progress_for_each_fetched_artist():
+    fm = LastFm("k", sleep=lambda s: None,
+                client=FakeClient({"A": tagset(("techno", 50)),
+                                   "B": tagset(("house", 50))}))
+    seen = []
+    enrich({"a1": "A", "a2": "B"}, {}, fm, now="2026-08-19T10:00:00Z",
+           on_progress=lambda done, total: seen.append((done, total)))
+    assert seen == [(1, 2), (2, 2)]
+
+
+def test_enrich_progress_total_counts_only_artists_it_will_fetch():
+    """The total must be the work actually left to do, not the size of the
+    playlist's artist set. The UI turns `total - done` into a time estimate
+    (remaining x MIN_INTERVAL); counting artists that are already cached — the
+    common case on a re-run, where tags.json may already hold nearly all of
+    them — would promise minutes of work that takes seconds.
+    """
+    client = FakeClient({"B": tagset(("house", 50))})
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    cached = {"a1": {"name": "A", "tags": [], "miss": False,
+                     "fetched_at": "2026-08-01T00:00:00Z"}}
+    seen = []
+    enrich({"a1": "A", "a2": "B"}, cached, fm, now="2026-08-19T10:00:00Z",
+           on_progress=lambda done, total: seen.append((done, total)))
+    assert seen == [(1, 1)]
+    assert client.calls == ["B"]
+
+
+def test_enrich_progress_total_excludes_blank_names():
+    """A blank name is recorded as a miss without a request, so it costs no
+    time — counting it would make the estimate overshoot.
+    """
+    fm = LastFm("k", sleep=lambda s: None, client=FakeClient({"B": tagset(("house", 50))}))
+    seen = []
+    out = enrich({"a1": "", "a2": "B"}, {}, fm, now="2026-08-19T10:00:00Z",
+                 on_progress=lambda done, total: seen.append((done, total)))
+    assert seen == [(1, 1)]
+    assert out["a1"]["miss"] is True
+
+
+def test_enrich_reports_progress_before_the_failure_that_stops_it():
+    """The partial count is what the resume message is built from, so the
+    progress seen by the caller must match what `.partial` actually holds.
+    """
+    client = FakeClient({"A": tagset(("techno", 50))})
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    boom = {"n": 0}
+
+    def get(url, params=None, timeout=None):
+        boom["n"] += 1
+        if boom["n"] == 2:
+            raise RuntimeError("connection reset")
+        return FakeResponse({"toptags": {"tag": tagset(("techno", 50))}})
+
+    client.get = get
+    seen = []
+    with pytest.raises(LastFmError) as e:
+        enrich({"a1": "A", "a2": "B"}, {}, fm, now="2026-08-19T10:00:00Z",
+               on_progress=lambda done, total: seen.append((done, total)))
+    assert seen == [(1, 2)]
+    assert set(e.value.partial) == {"a1"}
+
+
+def test_enrich_without_a_callback_still_works():
+    """The callback is optional — `suggest` and the backfill command call
+    `enrich` too, and neither wants progress."""
+    fm = LastFm("k", sleep=lambda s: None, client=FakeClient({"A": tagset(("techno", 50))}))
+    out = enrich({"a1": "A"}, {}, fm, now="2026-08-19T10:00:00Z")
+    assert out["a1"]["miss"] is False

@@ -804,6 +804,85 @@ async function openSplit(id, name) {
 // double-click and a doubled spend.
 let splitInFlight = false;
 
+// ---- split progress --------------------------------------------------------
+//
+// GET /api/split/{id}/progress reads one module-level dict on the server and
+// cannot reach Spotify (pinned server-side by
+// test_split_progress_spends_no_api_calls), so none of the /api/now
+// call-budget rules apply to polling it — the same reasoning that lets the
+// queue panel poll. What DOES apply is stopping. This runs about once a second
+// for the ~3 minutes the Last.fm phase takes, and a timer left armed after the
+// split ends is the exact shape of the bug that once cost ~600 Spotify calls
+// an hour from a single open tab. Two independent gates hold it closed:
+// `splitInFlight` (the POST is still running) and the server's own
+// poll_after_ms, which is 0 the moment the run reaches a terminal state.
+
+// Last.fm is paced at one artist per MIN_INTERVAL (0.25s, tags.py), which is
+// what makes a count of remaining artists convertible into a time at all.
+const LASTFM_SECONDS_PER_ARTIST = 0.25;
+
+let splitProgress = null;
+let splitProgressTimer = null;
+
+function stopSplitProgressPolling() {
+  clearTimeout(splitProgressTimer);
+  splitProgressTimer = null;
+}
+
+function etaText(seconds) {
+  // Rounded coarsely on purpose: the estimate is only as good as Last.fm's
+  // latency, and "about 2 min left" ages better than a false "1:47".
+  if (seconds >= 90) return `about ${Math.round(seconds / 60)} min left`;
+  return `about ${Math.max(5, Math.round(seconds / 5) * 5)} sec left`;
+}
+
+// Pure — takes the exact shape GET /api/split/{id}/progress returns and gives
+// back markup, so ui_harness.mjs can exercise it without a DOM. Same shape as
+// renderQueuePanel. "" means there is nothing to show, which is also what
+// hides the bar.
+function renderSplitProgress(p) {
+  if (!p || p.state !== "running") return "";
+  if (p.phase === "reading") {
+    return `<p class="hint">Reading the playlist's tracks from Spotify…</p>`;
+  }
+  if (p.phase === "clustering") {
+    return `<p class="hint">Tagged. Sorting tracks into piles — local, no calls.</p>`;
+  }
+  if (p.phase !== "tagging" || !p.total) {
+    return `<p class="hint">Starting…</p>`;
+  }
+  const done = p.done || 0;
+  const pct = Math.min(100, Math.round((done / p.total) * 100));
+  const eta = etaText((p.total - done) * LASTFM_SECONDS_PER_ARTIST);
+  return `<div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
+     <p class="hint">Tagging artists via Last.fm — ${done} of ${p.total} (${pct}%),
+     ${eta}. This phase costs no Spotify calls.</p>`;
+}
+
+function paintSplitProgress() {
+  const el = $("split-progress");
+  const html = renderSplitProgress(splitProgress);
+  el.innerHTML = html;
+  el.hidden = !html;
+}
+
+async function pollSplitProgress(splitId) {
+  try {
+    const p = await api(`/api/split/${splitId}/progress`);
+    if (!split || split.id !== splitId) { stopSplitProgressPolling(); return; }
+    splitProgress = p;
+  } catch (_) {
+    // Local and free — a failed poll leaves the last-known state on screen
+    // rather than blanking the bar mid-run.
+  }
+  paintSplitProgress();
+  stopSplitProgressPolling();
+  const ms = splitProgress ? splitProgress.poll_after_ms : 0;
+  if (splitInFlight && ms > 0) {
+    splitProgressTimer = setTimeout(() => pollSplitProgress(splitId), ms);
+  }
+}
+
 async function doSplit() {
   if (splitInFlight) return;
   splitInFlight = true;
@@ -812,6 +891,11 @@ async function doSplit() {
   if (btn) { btn.disabled = true; btn.textContent = "Splitting… (already spending)"; }
   $("split-loading").hidden = false;
   $("split-msg").textContent = "Reading tracks, then tagging artists via Last.fm…";
+  // Kicked off before the POST is awaited, so the first answer lands while the
+  // track read is still running rather than after everything is over.
+  splitProgress = null;
+  paintSplitProgress();
+  pollSplitProgress(split.id);
   try {
     const data = await api(`/api/split/${split.id}`, splitParams());
     toast(`${data.tagged} tagged, ${data.untagged} untagged`);
@@ -839,16 +923,44 @@ async function doSplit() {
       $("btn-retry-split-load").onclick = () => openSplit(split.id, split.name);
     }
   } catch (e) {
-    // 404 here is not "no split yet" (that's the GET) — create_split
-    // validates the id against the cached listing, so it means the playlist
-    // isn't in the listing sortify last read. The fix is a Refresh, which
-    // is not something the raw "unknown playlist" detail says.
-    toast(e.status === 404
-      ? "Spotify's listing here doesn't have this playlist — go back and press " +
-        "Refresh on the Playlists view (it re-reads the listing), then try again"
-      : e.message, e.status === 404 ? 6000 : 2600);
+    if (e.status === 404) {
+      // 404 here is not "no split yet" (that's the GET) — create_split
+      // validates the id against the cached listing, so it means the playlist
+      // isn't in the listing sortify last read. The fix is a Refresh, which
+      // is not something the raw "unknown playlist" detail says.
+      toast("Spotify's listing here doesn't have this playlist — go back and press " +
+            "Refresh on the Playlists view (it re-reads the listing), then try again", 6000);
+    } else if (e.status === 403) {
+      // Not ours, and no retry can change that: the Feb-2026 dev-mode API will
+      // not read another user's playlist tracks at all. This is deliberately a
+      // different status from the two 502s so it can be told apart from
+      // something transient — re-offering the paid button here would invite a
+      // spend guaranteed to fail. A persistent card, because the fix ("make
+      // your own copy") is an instruction to follow, not a flash to catch.
+      $("split-empty").innerHTML = `<p class="hint">${esc(e.message)}</p>`;
+    } else if (e.status === 502 && /progress was saved/i.test(e.message)) {
+      // Partial Last.fm failure. The server has already persisted every artist
+      // it got an answer for, so this is resumable — but a 2600ms toast
+      // vanished long before a user could learn that, and "stopped after 431
+      // of 712 artists" reads like several hundred lost answers.
+      $("split-empty").innerHTML =
+        `<p class="hint">${esc(e.message)}</p>
+         <p class="hint">Nothing already fetched is lost. <b>Resume</b> picks up
+          where it stopped: it re-reads the track list (0 Spotify calls unless
+          the playlist changed since the last read) and asks Last.fm only about
+          the artists still missing.</p>
+         <button id="btn-resume-split" class="primary">Resume tagging</button>`;
+      $("btn-resume-split").onclick = doSplit;
+    } else {
+      toast(e.message);
+    }
   } finally {
+    // Cleared before the timer is, so a poll already awaiting a response
+    // cannot re-arm itself on the way out.
     splitInFlight = false;
+    stopSplitProgressPolling();
+    splitProgress = null;
+    paintSplitProgress();
     $("split-loading").hidden = true;
     // Gone from the DOM on the success path (split-empty was cleared above);
     // still there after a failure, where re-offering the spend is correct.

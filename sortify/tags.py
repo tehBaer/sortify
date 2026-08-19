@@ -511,7 +511,8 @@ def _blank(name) -> bool:
     return not isinstance(name, str) or not name.strip()
 
 
-def enrich(artist_names: dict[str, str], cached: dict, fm: LastFm, now: str) -> dict:
+def enrich(artist_names: dict[str, str], cached: dict, fm: LastFm, now: str,
+           on_progress=None) -> dict:
     """Fetch tags for artists not already in `cached`. Returns the merged map.
 
     `cached` is the **inner** artists map from `data/tags.json`
@@ -525,8 +526,24 @@ def enrich(artist_names: dict[str, str], cached: dict, fm: LastFm, now: str) -> 
     On failure the exception carries `.partial`: the map as it stood, holding
     only verified-good entries plus whatever was already cached. Callers should
     persist it rather than discard several hundred answered requests.
+
+    `on_progress(done, total)`, if given, is called after each artist that
+    actually cost a request. This is the slow phase of a split — ~700 artists
+    paced at MIN_INTERVAL — so it is the one worth reporting; the caller turns
+    it into a progress bar. It stays a plain callable rather than anything
+    richer so this module keeps knowing nothing about HTTP servers or the
+    Spotify layer (test_module_never_imports_spotify_source).
     """
     out = dict(cached)
+    # Counts only artists that will actually go over the wire. The caller
+    # turns `total - done` into a time estimate (remaining x MIN_INTERVAL), so
+    # an artist answered without a round trip — already cached, or blank —
+    # must not inflate it. On a re-run after a failure, tags.json may already
+    # hold nearly all of them, and counting those would promise minutes of
+    # work that finishes in seconds.
+    total = sum(1 for aid, name in artist_names.items()
+                if aid not in out and not _blank(name))
+    done = 0
     for aid, name in artist_names.items():
         if aid in out:
             continue
@@ -557,6 +574,11 @@ def enrich(artist_names: dict[str, str], cached: dict, fm: LastFm, now: str) -> 
             out[aid] = {"name": name, "lastfm_name": got.matched_name,
                         "tags": _store_tags(got.tags),
                         "fetched_at": now, "miss": False}
+        # After the entry is stored, so a caller that reads `.partial` on the
+        # next artist's failure sees exactly the count it was last told.
+        done += 1
+        if on_progress is not None:
+            on_progress(done, total)
     return out
 
 

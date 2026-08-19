@@ -782,6 +782,138 @@ run("stopNowPolling()");
         JSON.stringify($$("now-context").textContent));
 }
 
+// ============================================================================
+// P — split progress: a bar that moves, a poll that stops, and failures that
+// say what to do next.
+//
+// The poll is the sensitive part. GET /api/split/{id}/progress reads one
+// module dict and cannot reach Spotify (pinned server-side by
+// test_split_progress_spends_no_api_calls), which is the only reason a
+// once-a-second poll is allowed here at all. What this harness pins is the
+// other half: that the poll STOPS. An interval left running after the split
+// ends is the shape of the bug that once cost ~600 Spotify calls an hour.
+// ============================================================================
+{
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const PROG = "/api/split/PL-P/progress";
+
+  routes["GET /api/split/PL-P"] = { status: 404, body: { detail: "no split for that playlist" } };
+  let release;
+  routes["POST /api/split/PL-P"] = () => new Promise((r) => (release = r));
+  // A fast poll_after_ms so the harness doesn't sit for seconds — the client
+  // takes its interval from the server, so this also pins that it obeys it
+  // rather than hard-coding one of its own.
+  routes[`GET ${PROG}`] = { status: 200, body: {
+    state: "running", phase: "tagging", done: 120, total: 700, detail: null, poll_after_ms: 5 } };
+
+  run(`openSplit("PL-P", "PL-P")`);
+  await tick();
+  resetLog();
+  // The stub DOM creates elements on demand with hidden=false, so without
+  // this the "is it showing?" check below would pass against an app.js that
+  // never touches the bar at all. Seed it the way index.html ships it.
+  $$("split-progress").hidden = true;
+  $$("btn-do-split").onclick();
+  await sleep(40);
+
+  check("P1 the progress bar is showing while the split runs",
+        $$("split-progress").hidden === false,
+        `hidden=${$$("split-progress").hidden}`);
+  check("P1 it reports artists done against the total",
+        /120/.test($$("split-progress").innerHTML) && /700/.test($$("split-progress").innerHTML),
+        JSON.stringify($$("split-progress").innerHTML.slice(0, 120)));
+  check("P1 it estimates the time left rather than only a count",
+        /min|sec/i.test($$("split-progress").innerHTML),
+        JSON.stringify($$("split-progress").innerHTML.slice(0, 120)));
+
+  const polled = gets(PROG);
+  check("P1 it polls on the interval the server handed it",
+        polled >= 2, `${polled} poll(s) in 40ms at poll_after_ms=5`);
+
+  routes[`GET ${PROG}`] = { status: 200, body: {
+    state: "done", phase: "complete", done: 700, total: 700, detail: null, poll_after_ms: 0 } };
+  routes["GET /api/split/PL-P"] = { status: 200, body: splitBody(null) };
+  release({ status: 200, body: { piles: PILES, tagged: 3, untagged: 0 } });
+  await tick();
+
+  const settled = gets(PROG);
+  await sleep(60);
+  check("P2 polling stops when the split finishes (no orphaned timer)",
+        gets(PROG) === settled,
+        `${gets(PROG) - settled} extra poll(s) in the 60ms after it finished`);
+  check("P2 the bar is hidden once the split is done",
+        $$("split-progress").hidden === true, `hidden=${$$("split-progress").hidden}`);
+}
+
+// ============================================================================
+// P3 — a partial Last.fm failure must say that retrying RESUMES.
+//
+// The server already saves the partial and says so in its 502 detail, but the
+// client dropped that into a 2600ms toast. A user who reads "stopped after
+// 431 of 712 artists" three seconds before it vanishes has no way to know
+// that pressing Split again resumes instead of starting over, and that the
+// several hundred answers already paid for are not lost.
+// ============================================================================
+{
+  routes["GET /api/split/PL-R"] = { status: 404, body: { detail: "no split for that playlist" } };
+  routes[`GET /api/split/PL-R/progress`] = { status: 200, body: {
+    state: "failed", phase: "tagging", done: 431, total: 712, poll_after_ms: 0,
+    detail: "Last.fm tagging stopped after 431 of 712 artists in this playlist" } };
+  routes["POST /api/split/PL-R"] = { status: 502, body: {
+    detail: "Last.fm tagging stopped after 431 of 712 artists in this playlist " +
+            "(Last.fm error 29: rate limited); progress was saved — re-running " +
+            "the split will resume instead of starting over." } };
+
+  run(`openSplit("PL-R", "PL-R")`);
+  await tick();
+  $$("btn-do-split").onclick();
+  await tick();
+
+  const card = $$("split-empty").innerHTML;
+  check("P3 the partial failure is a persistent card, not a vanishing toast",
+        /431/.test(card) && /712/.test(card), JSON.stringify(card.slice(0, 140)));
+  check("P3 it says plainly that trying again resumes",
+        /resume/i.test(card), JSON.stringify(card.slice(0, 200)));
+  check("P3 it offers a button to do exactly that",
+        /id="btn-resume-split"/.test(card), JSON.stringify(card.slice(0, 200)));
+
+  resetLog();
+  // Guarded: an unwired button is a failed check, not an exception that ends
+  // the run before P4 gets to say anything.
+  if (typeof $$("btn-resume-split").onclick === "function") $$("btn-resume-split").onclick();
+  await tick();
+  check("P3 pressing it re-runs the split",
+        posts("/api/split/PL-R") === 1, `${posts("/api/split/PL-R")} POST(s)`);
+}
+
+// ============================================================================
+// P4 — a playlist that isn't ours can never succeed, so it must NOT be
+// re-offered as a retry. The 403 is deliberately a different status from the
+// two 502s for exactly this reason; the client has to honour that.
+// ============================================================================
+{
+  routes["GET /api/split/PL-F"] = { status: 404, body: { detail: "no split for that playlist" } };
+  routes["POST /api/split/PL-F"] = { status: 403, body: {
+    detail: '"the bomb" belongs to rightkillthaz, not you. The Feb-2026 dev-mode API ' +
+            "won't let sortify read another user's playlist tracks at all, so splitting " +
+            'it can never succeed here. Make your own copy first' } };
+
+  run(`openSplit("PL-F", "the bomb")`);
+  await tick();
+  $$("split-progress").hidden = false;   // see P1 — prove app.js hides it
+  $$("btn-do-split").onclick();
+  await tick();
+
+  const card = $$("split-empty").innerHTML;
+  check("P4 the ownership refusal is explained persistently",
+        /belongs to rightkillthaz/.test(card), JSON.stringify(card.slice(0, 140)));
+  check("P4 it does not offer a retry of something that can never work",
+        !/btn-resume-split/.test(card) && !/btn-do-split/.test(card),
+        JSON.stringify(card.slice(0, 200)));
+  check("P4 the progress bar is not left up after an instant refusal",
+        $$("split-progress").hidden === true, `hidden=${$$("split-progress").hidden}`);
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
