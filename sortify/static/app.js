@@ -462,8 +462,17 @@ function renderNowProblem(msg) {
     $("now-card").innerHTML = `<p class="done-msg">${esc(msg)}</p>`;
     return;
   }
-  const until = Date.now() + Number(cd[1]) * 60000;
-  if (Math.abs(until - nowCooldownUntil) > 120000) nowCooldownTotal = until - Date.now();
+  // One clock read for the whole first paint. Deriving `until` from Date.now()
+  // and then formatting `until - Date.now()` read the clock twice, so the
+  // opening frame depended on how many milliseconds fell between the two: on a
+  // cooldown that is a whole number of minutes — every cooldown the server
+  // reports — a single millisecond rendered "2h 57m 59s" for what had just
+  // been computed as 2h 58m. The ticker below still reads the clock live,
+  // which is correct; it is only this first frame that must agree with the
+  // deadline it was derived from.
+  const now = Date.now();
+  const until = now + Number(cd[1]) * 60000;
+  if (Math.abs(until - nowCooldownUntil) > 120000) nowCooldownTotal = until - now;
   nowCooldownUntil = until;
   const at = new Date(until);
   const pad = (n) => String(n).padStart(2, "0");
@@ -471,7 +480,7 @@ function renderNowProblem(msg) {
     Math.round(((nowCooldownTotal - (until - Date.now())) / (nowCooldownTotal || 1)) * 100)));
   $("now-card").innerHTML = `<div class="cooldown-card">
     <div class="cb-head"><span class="cb-title">Spotify has rate-limited the app</span><span class="cb-chip">paused</span></div>
-    <div class="cb-time" id="cb-time">${fmtCountdown(until - Date.now())}</div>
+    <div class="cb-time" id="cb-time">${fmtCountdown(until - now)}</div>
     <div class="cb-at">back around <b>${pad(at.getHours())}:${pad(at.getMinutes())}</b> — nothing to do until then;
       your music and playlists are unaffected</div>
     <div class="cb-bar"><div class="cb-fill" id="cb-fill" style="width:${pct()}%"></div></div>

@@ -716,6 +716,38 @@ run("stopNowPolling()");
   check("V1 a 25-min cooldown never says '0 hours'",
         /25m/.test(card) && !/0 hours/.test(card), JSON.stringify(card.slice(0, 120)));
 
+  // V1c — the first countdown must be computed from ONE clock read.
+  //
+  // renderNowProblem derived `until` from Date.now() and then formatted
+  // `until - Date.now()`, reading the clock a second time. A cooldown of
+  // "~178 min" is a whole number of minutes, so it lands exactly on a minute
+  // boundary: one millisecond crossing between those two reads turns
+  // "2h 58m 00s" into "2h 57m 59s", and the h/m check above fails. That is
+  // what made this file fail about one run in thirty — nothing to do with the
+  // ticker, which writes cb-time's textContent and cannot alter now-card's
+  // innerHTML at all.
+  //
+  // Advancing the clock 1ms on every read makes the worst case the only case,
+  // so this pins the bug deterministically instead of one run in thirty.
+  const RealDate = ctx.Date;
+  function DriftingDate(...a) { return new RealDate(...a); }
+  DriftingDate.now = (() => { let n = 0; return () => RealDate.now() + n++; })();
+  ctx.Date = DriftingDate;
+  try {
+    routes["GET /api/now?force=1"] = {
+      status: 200,
+      body: { playing: false, cooldown: "cooldown — try again in ~178 min", poll_after_ms: 999999 },
+    };
+    run(`pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+    card = $$("now-card").innerHTML;
+    check("V1c the countdown does not lose a second to a second clock read",
+          /2h 58m/.test(card) && !/3 hours/.test(card), JSON.stringify(card.slice(0, 200)));
+  } finally {
+    ctx.Date = RealDate;
+  }
+
   // V2 — the 1s countdown ticker must die the moment a real answer lands,
   // or a long-lived tab accumulates intervals.
   routes["GET /api/now?force=1"] = { status: 200, body: { playing: false, poll_after_ms: 999999 } };
