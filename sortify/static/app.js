@@ -423,6 +423,38 @@ let filedUris = {};    // uri -> home name we filed it to this session
 
 function stopNowPolling() { clearTimeout(nowTimer); nowTimer = null; }
 
+// Manual mode ("data saver"): no automatic polling at all — the refresh
+// button (and opening the view) are the only fetches. Client-side by
+// design: the server's pacing already guarantees auto mode costs ~1 call
+// per track, so this is for people who want zero background traffic, not a
+// budget-safety mechanism. Persisted per browser.
+let nowManual = false;
+try { nowManual = localStorage.getItem("sortify-manual") === "1"; } catch (_) {}
+
+function paintManualChip() {
+  const b = $("btn-now-manual");
+  b.textContent = nowManual ? "manual" : "auto";
+  b.classList.toggle("on", nowManual);
+  b.title = nowManual
+    ? "Manual: nothing is fetched until you press refresh. Tap to switch back to auto."
+    : "Auto: the server paces polling (~1 request per track). Tap for manual mode.";
+}
+
+$("btn-now-manual").onclick = () => {
+  nowManual = !nowManual;
+  try { localStorage.setItem("sortify-manual", nowManual ? "1" : "0"); } catch (_) {}
+  paintManualChip();
+  // Back to auto = "show me current truth, then resume the server's pace".
+  if (nowManual) stopNowPolling(); else pollNow(true);
+};
+
+$("btn-now-refresh").onclick = async () => {
+  const b = $("btn-now-refresh");
+  b.disabled = true;
+  b.classList.add("spinning");
+  try { await pollNow(true); } finally { b.disabled = false; b.classList.remove("spinning"); }
+};
+
 function showNow() {
   show("now");
   stopNowPolling();
@@ -434,6 +466,7 @@ function showNow() {
 // is what used to make every poll a guaranteed cache miss.
 function scheduleNext(ms) {
   stopNowPolling();
+  if (nowManual) return;  // manual mode: the refresh button is the schedule
   nowTimer = setTimeout(() => pollNow(), ms);
 }
 
@@ -872,7 +905,12 @@ function openPicker(homesMap, onPick) {
     for (const h of homes) {
       if (filter && !(h.name + " " + (h.folder || "")).toLowerCase().includes(filter)) continue;
       const b = document.createElement("button");
-      b.textContent = (h.folder ? h.folder + " / " : "") + h.name + (h.total != null ? ` (${h.total})` : "");
+      b.className = "picker-row";
+      // Name first and bold; the folder path demoted to a small second line —
+      // the full "folder / name (n)" string was unscannable on a phone.
+      const sub = [h.folder, h.total != null ? `${h.total} tracks` : ""].filter(Boolean).join(" · ");
+      b.innerHTML = `<span class="p-name">${esc(h.name)}</span>` +
+        (sub ? `<span class="p-sub">${esc(sub)}</span>` : "");
       b.onclick = () => { closePicker(); onPick(h.id); };
       list.appendChild(b);
     }
@@ -1921,7 +1959,11 @@ document.addEventListener("keydown", (e) => {
 // Coming back to the tab is the moment a skip is most likely to have happened
 // behind our back, so this one bypasses the predicted TTL.
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && !$("view-now").hidden) pollNow(true);
+  // Manual mode means exactly that — not even the refocus poll fires; the
+  // refresh button is the only trigger the user hasn't pressed themselves.
+  if (!document.hidden && !$("view-now").hidden && !nowManual) pollNow(true);
 });
+
+paintManualChip();
 
 boot().catch((e) => { if (e.message !== "auth needed") toast(e.message); });

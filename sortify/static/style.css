@@ -95,6 +95,17 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 .triage-top {
   display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;
 }
+.now-top-actions { display: flex; gap: .4rem; align-items: center; flex-shrink: 0; }
+.icon-btn {
+  min-height: 40px; min-width: 40px; padding: .3rem .55rem; border-radius: 999px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.icon-btn.spinning svg { animation: spin .8s linear infinite; }
+.mode-chip {
+  min-height: 40px; padding: .3rem .8rem; border-radius: 999px;
+  font-size: .8rem; color: var(--muted);
+}
+.mode-chip.on { border-color: var(--accent); color: var(--accent); }
 #triage-progress { color: var(--muted); font-variant-numeric: tabular-nums; }
 .spinner {
   width: 28px; height: 28px; margin: 2rem auto .6rem;
@@ -221,17 +232,25 @@ kbd {
   kbd { display: none; }
 }
 
-/* picker overlay */
+/* picker overlay — anchored to the TOP of the visual viewport, not the
+   bottom: a bottom sheet sits exactly where the phone keyboard opens, so
+   the filter results were typed at and never seen. dvh tracks the keyboard
+   shrinking the viewport, so the list scrolls instead of hiding. */
 #picker {
   position: fixed; inset: 0; background: rgba(0,0,0,.55);
-  display: flex; align-items: flex-end; justify-content: center; z-index: 10;
+  display: flex; align-items: flex-start; justify-content: center; z-index: 10;
 }
 .picker-inner {
-  background: var(--bg); border-radius: 14px 14px 0 0; width: 100%; max-width: 640px;
-  max-height: 75vh; padding: 1rem; display: flex; flex-direction: column; gap: .6rem;
+  background: var(--bg); border-radius: 16px; width: calc(100% - 1.6rem); max-width: 640px;
+  margin-top: .8rem; max-height: min(80vh, calc(100dvh - 1.6rem));
+  padding: 1rem; display: flex; flex-direction: column; gap: .6rem;
+  box-shadow: var(--shadow-card);
 }
 #picker-list { overflow-y: auto; flex: 1; }
 #picker-list button { display: block; width: 100%; text-align: left; margin-bottom: .4rem; }
+.picker-row { padding: .55rem .8rem; }
+.picker-row .p-name { display: block; font-weight: 600; }
+.picker-row .p-sub { display: block; color: var(--muted); font-size: .78rem; margin-top: .1rem; }
 
 #toast {
   position: fixed; left: 50%; bottom: 1.2rem; transform: translateX(-50%);
