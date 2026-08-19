@@ -279,6 +279,26 @@ def test_neighbour_same_artist_only_scores_zero():
     assert not any("similar track" in r for r in res[0]["reasons"])
 
 
+def test_neighbour_same_artist_exclusion_survives_internal_whitespace_drift():
+    # Fix round 1 regression: the seed-artist exclusion must use the SAME
+    # normalizer track_key uses (tags._norm_name), not an independently
+    # written .strip().lower() — otherwise an artist name with an internal
+    # double space ("Beach  House") stops matching "Beach House" and the
+    # same-artist exclusion silently fails to fire.
+    seed = {
+        "uri": "new", "name": "Space Song",
+        "artists": [{"id": "beach-house", "name": "Beach  House"}],  # internal double space
+    }
+    home_tracks = [track("h1", ["beach-house"], title="Other Song")]
+    prof = build_profile(home_tracks, ARTISTS)
+    track_map = {
+        track_key("Beach  House", "Space Song"): track_record([
+            neighbour("Beach House", "Other Song", 0.9),  # single space — must still match
+        ]),
+    }
+    assert suggest_mod._neighbour_score(seed, prof, track_map) == (0.0, 0)
+
+
 def test_neighbour_cross_artist_present_scores_and_reasons():
     seed = track("new", ["unknown"], title="Mystery Song")
     prof = build_profile([track("h1", ["slowdive"], title="Alison")], ARTISTS)

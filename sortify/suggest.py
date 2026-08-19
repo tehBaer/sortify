@@ -27,7 +27,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 
-from .tags import clean_tags, track_key
+from .tags import _norm_name, clean_tags, track_key
 
 # Measured 2026-08-18 by scripts/eval_suggest.py AFTER the home-artist
 # backfill (scripts/backfill_tags.py: 1427/1427 home artists attempted,
@@ -213,6 +213,14 @@ def _neighbour_score(
     ever getting suggested into its own playlists) this project exists to
     fix.
 
+    Fix round 1: the exclusion check reuses `tags._norm_name` — the same
+    normaliser `track_key` uses internally — rather than its own inline
+    `.strip().lower()`. A separately-written normalizer is exactly how this
+    drifted the first time: an artist name with an internal double space
+    ("Beach  House") collapses to "beach house" via `track_key`/`_norm_name`
+    but NOT via a bare `.strip().lower()`, so the same-artist exclusion
+    silently failed to fire for exactly the case it exists to catch.
+
     The returned sum is intentionally uncapped — the cap that protects the
     artist-overlap-primacy pin (see NEIGHBOUR_SUM_CAP) is applied where the
     score is computed, not here, so this function's return value stays a
@@ -222,14 +230,12 @@ def _neighbour_score(
     record = _track_record(track, track_map)
     if record is None:
         return 0.0, 0
-    seed_artists = {
-        (a.get("name") or "").strip().lower() for a in (track.get("artists") or [])
-    }
+    seed_artists = {_norm_name(a.get("name")) for a in (track.get("artists") or [])}
     total = 0.0
     count = 0
     for n in record.get("similar") or []:
         n_artist = n.get("artist") or ""
-        if n_artist.strip().lower() in seed_artists:
+        if _norm_name(n_artist) in seed_artists:
             continue
         key = track_key(n_artist, n.get("track") or "")
         if key not in prof["track_keys"]:

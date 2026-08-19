@@ -200,6 +200,7 @@ def evaluate_pair(
         held_out_tracks = [t for t in home_tracks[hid] if t["uri"] != track["uri"]]
         profiles_for_pair[hid] = build_profile(held_out_tracks, tag_artists)
 
+    # 3-arg call — track_map deliberately not wired until Task 4's measurement.
     results = suggest(track, profiles_for_pair, tag_artists)
     ranked_ids = [r["playlist_id"] for r in results]
 

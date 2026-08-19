@@ -238,15 +238,26 @@ def _looks_like_not_found(message: str) -> bool:
 TRACK_KEY_SEP = "\x1f"
 
 
+def _norm_name(s: str) -> str:
+    """Lowercase, whitespace-collapsed normalisation of one name.
+
+    The name-half of `track_key`, factored out and exported so any other
+    code that needs to decide "is this the same artist name" (e.g.
+    `suggest._neighbour_score`'s same-artist exclusion) uses the exact same
+    rule `track_key` uses — a second, independently-written `.strip().lower()`
+    nearby is exactly how "Beach  House" (internal double space) stops
+    matching "Beach House" in one of the two call sites and not the other.
+    """
+    return " ".join((s or "").split()).lower()
+
+
 def track_key(artist: str, title: str) -> str:
     """Normalise (artist, title) into `lastfm_tracks.json`'s lookup key.
 
     Lowercase and whitespace-collapsed so "Aerosmith" / " aerosmith " and
     "Dream On" / "Dream  On" land on the same record.
     """
-    a = " ".join((artist or "").split()).lower()
-    t = " ".join((title or "").split()).lower()
-    return f"{a}{TRACK_KEY_SEP}{t}"
+    return f"{_norm_name(artist)}{TRACK_KEY_SEP}{_norm_name(title)}"
 
 
 def load_key(path: Path | None = None) -> str | None:
