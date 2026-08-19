@@ -18,8 +18,8 @@ Last.fm instead (see `sortify/tags.py`). Artist-level tags describe the
 *artist*, not the track, which is weaker evidence than a track-level tag.
 TAG_WEIGHT is the single knob for how much that weaker evidence counts
 against artist overlap, which stays the primary signal (see the constant's
-comment: only ~7% of this library's home artists have any Last.fm tags at
-all, so the weight is provisional until more artists are tagged).
+comment for the measured numbers; home-artist tag coverage is ~99% since
+the 2026-08-18 backfill).
 """
 
 from __future__ import annotations
@@ -74,6 +74,10 @@ TOP_N = 3
 #     (TAG_WEIGHT + w*NEIGHBOUR_SUM_CAP must stay < 3.4), so 0.3 is the
 #     committed ceiling: ~0.008 top3 is the measured price of the "owning
 #     the artist always outranks similarity" invariant, paid knowingly.
+#   One further accepted consequence: 0.3 * NEIGHBOUR_SUM_CAP = 0.3 < MIN_SCORE
+#   (0.8), so a home matched ONLY by neighbours can never surface a new
+#   suggestion — neighbours re-rank homes that artist overlap or tags already
+#   lifted over the threshold. Deliberate (ledger R2a), not an oversight.
 # Note the tags-only row already includes track-level tags from
 # lastfm_tracks.json (fetched by the same backfill) — that is what moved
 # tags from 0.534 to 0.546 vs the 2026-08-18 artist-tag-only measurement.
@@ -107,7 +111,14 @@ def _cleaned_tags(entry: dict) -> list[str]:
 
 
 def build_profile(tracks: list[dict], tag_artists: dict[str, dict]) -> dict:
-    """Precompute what the suggester needs to know about one home playlist."""
+    """Precompute what the suggester needs to know about one home playlist.
+
+    tag_counts is built from ARTIST tags only; the seed track's vector may be
+    track-level tags (_resolve_tags), so the cosine compares track vocabulary
+    against an artist-tag profile. Asymmetric on purpose for now — only ~4% of
+    cached tracks carry track tags, and the measured effect of the asymmetry
+    is positive; revisit if track-tag coverage is ever backfilled harder.
+    """
     artist_counts: Counter = Counter()
     tag_counts: Counter = Counter()
     uris = set()
