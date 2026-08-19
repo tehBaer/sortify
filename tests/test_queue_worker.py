@@ -239,7 +239,14 @@ def test_rate_429_halves_and_keeps_going(worker_env, monkeypatch):
     # push the remembered cooldown far enough into the past that
     # `now < cooldown_until + QUIET_AFTER_COOLDOWN` is already false.
     appmod.sp.cooldown_until = time.time() - QUIET_AFTER_COOLDOWN - 10
-    appmod._queue_wake.set(); appmod._queue_wake.clear()
+    # set() only — never set()+clear() from the nudging side. Producers in
+    # app.py (pause, cancel) only ever set(); the WAITER clears, right after
+    # its own `_queue_wake.wait()` returns. Clearing here too raced that
+    # wait(): if the worker was between its post-wait clear() and its next
+    # wait() call, both our set and our clear landed first, the signal was
+    # gone before wait() ever looked at it, and the worker rode out the full
+    # 60s chunk — wait_done then timed out at "quiet" about 1 run in 30.
+    appmod._queue_wake.set()
     q = wait_done(s)
     assert q["state"] == "done"
     assert [c[0] for c in calls].count("add") == 1        # the failed add was re-driven
@@ -261,7 +268,7 @@ def test_block_reason_sleeps_with_the_labelled_state(worker_env, monkeypatch):
         time.sleep(0.01)
     assert s.queue()["state"] == "sleeping" and calls == []
     blocked["on"] = False
-    appmod._queue_wake.set(); appmod._queue_wake.clear()
+    appmod._queue_wake.set()          # set() only — the waiter does the clear()
     q = wait_done(s)
     assert q["state"] == "done" and len(calls) == 2
 
@@ -339,7 +346,7 @@ def test_sleep_loop_does_not_rewrite_queue_json_for_an_unchanged_block(worker_en
     assert writes.count("sleeping") == 1, writes   # one entry write, not one per chunk
 
     unblock["on"] = True
-    appmod._queue_wake.set(); appmod._queue_wake.clear()
+    appmod._queue_wake.set()          # set() only — the waiter does the clear()
     q = wait_done(s)
     assert q["state"] == "done"
     assert calls == [("create", "tiny"), ("add", "NEW-tiny", TINY)]
