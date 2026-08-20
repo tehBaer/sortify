@@ -1,6 +1,6 @@
 import json
 
-from sortify.spotify import code_challenge, parse_redirect
+from sortify.spotify import code_challenge
 from sortify.store import Store
 
 
@@ -19,11 +19,6 @@ def test_store_roundtrip(tmp_path):
 def test_pkce_challenge_rfc7636_vector():
     verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
     assert code_challenge(verifier) == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-
-
-def test_parse_redirect():
-    code, state = parse_redirect("http://127.0.0.1:8888/callback?code=AQD-xyz&state=s123")
-    assert (code, state) == ("AQD-xyz", "s123")
 
 
 def test_queue_and_pacing_default_when_missing(tmp_path):

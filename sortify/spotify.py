@@ -3,21 +3,22 @@
 PKCE means no client secret exists anywhere — only the public client ID.
 The refresh token in tokens.json is the long-lived credential.
 
-Spotify requires redirect URIs to be HTTPS or a loopback IP literal, so we
-register http://127.0.0.1:8888/callback and never actually serve it: the
-user copies the URL their browser lands on and pastes it back into the UI.
+Spotify requires redirect URIs to be HTTPS or a loopback IP literal. The
+app is reached over tailnet HTTPS, so the callback is a real route on this
+server and the browser comes straight back after consenting.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import os
 import secrets
 import threading
 import time
 from collections import deque
 from typing import Iterator
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import urlencode
 
 import httpx
 
@@ -30,7 +31,12 @@ from .store import Store
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API = "https://api.spotify.com/v1"
-REDIRECT_URI = "http://127.0.0.1:8888/callback"
+# Must byte-match a Redirect URI registered in the Spotify dashboard app.
+# The tailnet HTTPS origin is how every real device reaches sortify
+# (tailscale serve :9800 → 127.0.0.1:8800).
+REDIRECT_URI = os.environ.get(
+    "SORTIFY_REDIRECT_URI", "https://mbp.tail916fc5.ts.net:9800/auth/callback"
+)
 SCOPES = " ".join(
     [
         "playlist-read-private",
@@ -103,6 +109,12 @@ class SpotifyError(Exception):
         super().__init__(f"Spotify API {status}: {message}")
 
 
+class AuthFlowError(SpotifyError):
+    """The login attempt itself is broken (no pending auth, stale state) —
+    distinct from Spotify refusing the exchange, so the callback page can say
+    "start again" instead of "try again"."""
+
+
 # Serialises read-modify-write on cache["playlist_list"] between the refresh
 # that replaces the listing and the prune that removes swept sittings from it.
 _LIST_LOCK = threading.Lock()
@@ -130,16 +142,6 @@ def build_auth_url(client_id: str, challenge: str, state: str) -> str:
             "state": state,
         }
     )
-
-
-def parse_redirect(url: str) -> tuple[str, str]:
-    """Extract (code, state) from the pasted-back redirect URL."""
-    qs = parse_qs(urlparse(url.strip()).query)
-    if "error" in qs:
-        raise SpotifyError(400, f"authorization failed: {qs['error'][0]}")
-    if "code" not in qs:
-        raise SpotifyError(400, "no ?code= in that URL — paste the full address the browser ended up on")
-    return qs["code"][0], qs.get("state", [""])[0]
 
 
 class Spotify:
@@ -312,34 +314,37 @@ class Spotify:
     # ---- auth -------------------------------------------------------------
 
     def start_auth(self, client_id: str) -> str:
+        # The client ID rides in the pending entry and is only persisted by
+        # finish_auth on a successful exchange — an abandoned or mistyped
+        # attempt must not overwrite the ID a working login was made with.
         verifier, challenge = pkce_pair()
         state = secrets.token_urlsafe(16)
         tokens = self.store.tokens()
-        tokens["pending"] = {"verifier": verifier, "state": state}
+        tokens["pending"] = {"verifier": verifier, "state": state, "client_id": client_id}
         self.store.save_tokens(tokens)
-        self.store.update_config(client_id=client_id)
         return build_auth_url(client_id, challenge, state)
 
-    def finish_auth(self, redirect_url: str) -> dict:
+    def finish_auth(self, code: str, state: str) -> dict:
         tokens = self.store.tokens()
         pending = tokens.get("pending")
         if not pending:
-            raise SpotifyError(400, "no auth in progress — start over")
-        code, state = parse_redirect(redirect_url)
+            raise AuthFlowError(400, "no auth in progress — start over")
         if state != pending["state"]:
-            raise SpotifyError(400, "state mismatch — start the auth again")
+            raise AuthFlowError(400, "state mismatch — start the auth again")
+        client_id = pending.get("client_id") or self.store.config()["client_id"]
         resp = self.http.post(
             TOKEN_URL,
             data={
                 "grant_type": "authorization_code",
                 "code": code,
                 "redirect_uri": REDIRECT_URI,
-                "client_id": self.store.config()["client_id"],
+                "client_id": client_id,
                 "code_verifier": pending["verifier"],
             },
         )
         if resp.status_code != 200:
             raise SpotifyError(resp.status_code, resp.text)
+        self.store.update_config(client_id=client_id)
         self._store_token_response(resp.json(), clear_pending=True)
         # The token exchange (accounts.spotify.com) can succeed while the API
         # (api.spotify.com) is rate-cooled — auth is done either way.

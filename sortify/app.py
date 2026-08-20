@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import logging
 import os
 import re
@@ -16,7 +17,7 @@ from typing import Any
 import httpx
 import uvicorn
 from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -29,6 +30,8 @@ from .spotify import (
     BULK_RESERVE,
     DAILY_CAP,
     LIKED_ID,
+    REDIRECT_URI,
+    AuthFlowError,
     AuthNeeded,
     Spotify,
     SpotifyError,
@@ -59,10 +62,6 @@ undo_stack: list[dict] = []
 
 class AuthStart(BaseModel):
     client_id: str
-
-
-class AuthFinish(BaseModel):
-    redirect_url: str
 
 
 class ConfigIn(BaseModel):
@@ -124,21 +123,71 @@ def status():
     }
 
 
+# What a Spotify Client ID looks like. Typos get caught here, before the
+# user is bounced to accounts.spotify.com and back for an opaque error.
+CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9]{32}$")
+
+
+def _auth_page(status: int, msg: str) -> HTMLResponse:
+    """Full-page notice for the callback route — it renders in a bare browser
+    tab mid-redirect, so there is no app shell to toast into."""
+    body = (
+        "<!doctype html><meta charset=utf-8>"
+        '<meta name=viewport content="width=device-width,initial-scale=1">'
+        "<title>sortify</title>"
+        '<body style="font-family:system-ui,sans-serif;background:#121212;color:#ededed;'
+        'max-width:26rem;margin:0 auto;padding:2rem;text-align:center">'
+        f'<h2 style="font-size:1.15rem;font-weight:500;line-height:1.4">{msg}</h2>'
+        '<p style="margin-top:1.75rem"><a style="color:#08210f;background:#1db954;'
+        "text-decoration:none;padding:.65rem 1.3rem;border-radius:999px;font-weight:500;"
+        'display:inline-block" href="/">Back to sortify</a></p></body>'
+    )
+    return HTMLResponse(body, status_code=status)
+
+
+@app.get("/api/auth/redirect-uri")
+def auth_redirect_uri():
+    # The setup wizard shows this so the user can paste it into the Spotify
+    # dashboard app's Redirect URIs — it must byte-match what start_auth sends.
+    return {"redirect_uri": REDIRECT_URI}
+
+
 @app.post("/api/auth/start")
 def auth_start(body: AuthStart):
     # Re-authorising to pick up a new scope is now the common case, and the
     # client ID is already on file — only first-time setup should have to go
     # and fetch it. Falling back also stops a blank field from overwriting the
     # stored id with "".
-    client_id = body.client_id.strip() or (store.config().get("client_id") or "")
+    typed = body.client_id.strip()
+    if typed and not CLIENT_ID_RE.match(typed):
+        raise HTTPException(400, "that doesn't look like a Client ID — it's 32 letters and numbers")
+    client_id = typed or (store.config().get("client_id") or "")
     if not client_id:
         raise HTTPException(400, "paste the Client ID from your Spotify dashboard app")
     return {"auth_url": sp.start_auth(client_id)}
 
 
-@app.post("/api/auth/finish")
-def auth_finish(body: AuthFinish):
-    return {"me": sp.finish_auth(body.redirect_url)}
+@app.get("/auth/callback")
+def auth_callback(code: str | None = None, state: str | None = None, error: str | None = None):
+    if error == "access_denied":
+        return _auth_page(400, "You cancelled the Spotify connection.")
+    if error:
+        return _auth_page(
+            400,
+            f"Spotify returned an error: {html.escape(error)}. If it mentions the redirect URI, "
+            f"paste this exact value into your dashboard app's settings: {html.escape(REDIRECT_URI)}",
+        )
+    if not code or not state:
+        return _auth_page(400, "That sign-in link was incomplete. Please start again.")
+    try:
+        me = sp.finish_auth(code, state)
+    except AuthFlowError:
+        return _auth_page(400, "That sign-in expired or didn't match. Please start again.")
+    except SpotifyError as e:
+        log.warning("auth callback: exchange failed: %s", e)
+        return _auth_page(502, "Couldn't complete the Spotify sign-in. Please try again.")
+    log.info("auth callback: connected as %s", me.get("name"))
+    return RedirectResponse("/", status_code=303)
 
 
 # ---- playlists & config ----------------------------------------------------

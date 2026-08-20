@@ -33,7 +33,7 @@ async function api(path, body, method) {
   const resp = await fetch(path, opts);
   let data = {};
   try { data = await resp.json(); } catch (_) {}
-  if (resp.status === 401 && data.needs_auth) { show("setup"); throw new Error("auth needed"); }
+  if (resp.status === 401 && data.needs_auth) { show("setup"); loadSetup(); throw new Error("auth needed"); }
   if (!resp.ok) {
     // .status lets a caller tell "not split yet" (404) apart from a
     // transient failure worth retrying instead of re-offering a paid action.
@@ -71,28 +71,52 @@ function esc(s) {
 async function boot() {
   statusData = await api("/api/status");
   $("whoami").textContent = statusData.me ? statusData.me.name : "";
-  if (!statusData.authed) { show("setup"); return; }
+  if (!statusData.authed) { show("setup"); loadSetup(); return; }
   showNow();
 }
+
+const CID_RE = /^[A-Za-z0-9]{32}$/;
+
+async function loadSetup() {
+  $("client-id").value = localStorage.getItem("spotifyClientId") || "";
+  validateClientId();
+  try {
+    const { redirect_uri } = await api("/api/auth/redirect-uri");
+    $("redirect-uri").textContent = redirect_uri;
+  } catch (_) { $("redirect-uri").textContent = "(couldn't load — refresh the page)"; }
+}
+
+function validateClientId() {
+  const v = $("client-id").value.trim();
+  const ok = CID_RE.test(v);
+  $("client-id-hint").textContent =
+    v ? (ok ? "Looks right — 32 characters." : "A Client ID is 32 letters and numbers.") : "";
+  return ok;
+}
+$("client-id").oninput = validateClientId;
+
+$("btn-copy-redirect").onclick = async () => {
+  try {
+    await navigator.clipboard.writeText($("redirect-uri").textContent);
+    $("btn-copy-redirect").textContent = "Copied";
+    setTimeout(() => { $("btn-copy-redirect").textContent = "Copy"; }, 1500);
+  } catch {
+    const r = document.createRange(); r.selectNode($("redirect-uri"));
+    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); // fallback: select for manual copy
+  }
+};
 
 $("btn-auth-start").onclick = async () => {
   // Blank is allowed when reconnecting — the server falls back to the stored
   // Client ID and answers with a readable 400 if there isn't one.
   const clientId = $("client-id").value.trim();
+  if (clientId && !validateClientId()) { $("client-id").focus(); return; }
   try {
     const { auth_url } = await api("/api/auth/start", { client_id: clientId });
-    const a = $("auth-link");
-    a.href = auth_url;
-    $("step-authlink").hidden = false;
-    a.scrollIntoView({ behavior: "smooth" });
-  } catch (e) { toast(e.message); }
-};
-
-$("btn-auth-finish").onclick = async () => {
-  try {
-    const { me } = await api("/api/auth/finish", { redirect_url: $("redirect-url").value });
-    toast(`hello, ${me.name}`);
-    await boot();
+    if (clientId) localStorage.setItem("spotifyClientId", clientId);
+    // Same tab: Spotify's consent page redirects back to /auth/callback,
+    // which lands on / as a fresh, now-authed load of the app.
+    location.href = auth_url;
   } catch (e) { toast(e.message); }
 };
 
@@ -414,7 +438,10 @@ $("nav-reconnect").onclick = () => {
   stopNowPolling();
   triage = null;
   $("reconnect-hint").hidden = !statusData?.authed;
-  $("client-id").value = "";
+  loadSetup();
+  // Reconnect reuses the server's stored ID — a prefilled field would suggest
+  // it needs retyping, so blank wins over the localStorage prefill here.
+  if (statusData?.authed) { $("client-id").value = ""; validateClientId(); }
   show("setup");
 };
 
