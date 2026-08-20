@@ -661,6 +661,44 @@ def _merge_save_lastfm_tracks(new_entries: dict) -> None:
         store.save_lastfm_tracks({"version": 1, "tracks": merged})
 
 
+# Same lost-update guard as `_merge_save_lastfm_tracks`, its own lock and its
+# own baseline, for `lastfm_artists.json` instead — a rename-copy, not a
+# reuse, because the two envelopes are unrelated caches with independent
+# writers (this one from `_fetch_missing_now_tags`'s artist-similar step
+# below, plus `scripts/backfill_artist_similar.py` in its own process).
+# Unlike `tags.json`, `lastfm_artists.json` is rebuildable (see
+# `Store.LASTFM_ARTISTS_DEFAULT`'s docstring), so a refused save here is
+# lower-stakes than the tags.json case — but still worth refusing rather
+# than guessing, for the same reason `scripts/backfill_artist_similar.py`'s
+# `merge_save` refuses: a malformed re-read must not be mistaken for a real
+# shrink and clobber the file with just this call's `new_entries`.
+_lastfm_artists_save_lock = threading.Lock()
+
+
+def _merge_save_lastfm_artists(new_entries: dict) -> None:
+    """Merge `new_entries` into lastfm_artists.json without losing a
+    concurrent writer. Mirrors `_merge_save_lastfm_tracks` exactly — see that
+    function's docstring for the full reasoning.
+
+    `Store.save_lastfm_artists` writes the WHOLE envelope (unlike
+    `save_tag_artists`, which wraps the inner map for its caller), so this
+    wraps `merged` in `{"version": 1, "artists": ...}` itself before saving.
+    """
+    baseline = len(store.lastfm_artist_map())
+    with _lastfm_artists_save_lock:
+        current = store.lastfm_artist_map()
+        if len(current) < baseline:
+            log.error(
+                "refusing to save lastfm_artists.json: fresh re-read shrank from %d to %d "
+                "artists (envelope likely malformed or truncated); save skipped, "
+                "the fetch will retry on the next request",
+                baseline, len(current),
+            )
+            return
+        merged = {**new_entries, **current}
+        store.save_lastfm_artists({"version": 1, "artists": merged})
+
+
 def _split_summary(playlist_id: str, splits: dict | None = None) -> dict | None:
     """Local read only, for the Playlists picker: pile count and how much of
     a previous split is still undecided, so a playlist someone already split
@@ -2595,6 +2633,13 @@ def _sitting_for_context(ctx_id: str | None) -> dict | None:
 
 NOW_FETCH_MAX_ARTISTS = 3  # per /api/now?force=1 call — an explicit user action, not a poll
 
+# Bound for the third piggyback step (artist-similar, lastfm_artists.json),
+# same 3-credited-artists cap as the artist-tags step but its OWN constant —
+# the two steps are independent write-once caches (tags.json vs
+# lastfm_artists.json) with independent "already known" sets, so one being
+# fully known must not shrink the other's slice of `track["artists"]`.
+NOW_FETCH_MAX_SIMILAR_ARTISTS = 3  # per /api/now?force=1 call, same as NOW_FETCH_MAX_ARTISTS
+
 # FastAPI's sync routes run in a threadpool, so two overlapping `?force=1`
 # requests (a double-click, two tabs refocused at once) genuinely execute
 # _fetch_missing_now_tags concurrently — this is not a hypothetical. Both
@@ -2630,10 +2675,13 @@ def _fetch_missing_now_tags(track: dict, *, clock=time.monotonic) -> int:
     """Fetch Last.fm tags for up to `NOW_FETCH_MAX_ARTISTS` unknown artists on
     the currently-playing track, THEN — same lock, same floor, same bounded
     client — fetch its `lastfm_tracks.json` record (getSimilar + track top
-    tags) if it has none yet. Returns how many artists' TAGS were fetched;
-    the track-record step is a side effect on `lastfm_tracks.json`, checked
-    by tests via the store rather than this return value (mirroring how
-    `_merge_save_tag_artists`'s own writes aren't reflected in it either).
+    tags) if it has none yet, THEN — same lock, same floor, same bounded
+    client again — fetch `lastfm_artists.json`'s artist-similar record for up
+    to `NOW_FETCH_MAX_SIMILAR_ARTISTS` of its credited artists. Returns how
+    many artists' TAGS were fetched; the track-record and artist-similar
+    steps are side effects on `lastfm_tracks.json`/`lastfm_artists.json`,
+    checked by tests via the store rather than this return value (mirroring
+    how `_merge_save_tag_artists`'s own writes aren't reflected in it either).
 
     Callable ONLY from `now_playing`'s `?force=1` branch — opening or
     refocusing the view, an explicit user action — never the passive poll,
@@ -2772,6 +2820,53 @@ def _fetch_missing_now_tags(track: dict, *, clock=time.monotonic) -> int:
                     attempted = True
                     record = fetch_track(fm, artist_names[0], title, time.time())
                     _merge_save_lastfm_tracks({keys[0]: record})
+
+            # ---- artist-similar: lastfm_artists.json ---------------------
+            # Unlike the artist-tags step above (which scans every credited
+            # artist and stops once NOW_FETCH_MAX_SIMILAR_ARTISTS unknowns
+            # are found), this takes the first NOW_FETCH_MAX_SIMILAR_ARTISTS
+            # CREDITED artists outright (id present), then skips whichever
+            # of those are already known — hit or `miss: true` alike, same
+            # write-once rule `backfill_artist_similar.py` follows. A track
+            # with more than the cap's worth of unknown artists simply never
+            # reaches the later ones from this path; the backfill script is
+            # the place for full coverage.
+            similar_targets = [a for a in (track.get("artists") or []) if a.get("id")][
+                :NOW_FETCH_MAX_SIMILAR_ARTISTS
+            ]
+            if similar_targets:
+                known_similar = store.lastfm_artist_map()
+                to_fetch = [
+                    (a["id"], a.get("name") or "") for a in similar_targets
+                    if not isinstance(known_similar.get(a["id"]), dict)
+                ]
+                if to_fetch:
+                    attempted = True
+                    for aid, name in to_fetch:
+                        # `LastFm.artist_similar`, unlike `enrich`/`top_tags`,
+                        # does not wrap a non-Last.fm transport failure into
+                        # `LastFmError` — so this catches broadly, exactly
+                        # like `backfill_artist_similar.run_backfill`'s own
+                        # per-artist loop. A failure here leaves this one
+                        # artist's key absent (retried on a later force, once
+                        # the floor allows) and never stops the rest of this
+                        # batch — a bonus enrichment must never lose more
+                        # progress than the single artist that actually failed.
+                        try:
+                            similar = fm.artist_similar(name)
+                        except Exception:
+                            log.warning(
+                                "now-playing artist-similar fetch failed for %r", name,
+                                exc_info=True,
+                            )
+                            continue
+                        record = {
+                            "name": name,
+                            "similar": similar or [],
+                            "fetched_at": _now_iso(),
+                            "miss": similar is None,  # code 6 only
+                        }
+                        _merge_save_lastfm_artists({aid: record})
         except Exception:
             log.warning("now-playing tag/track fetch failed", exc_info=True)
         finally:
