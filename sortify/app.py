@@ -485,6 +485,7 @@ def triage(playlist_id: str):
     # PROFILE_TTL.
     tag_artists = store.tag_artists()
     track_map = store.lastfm_track_map()
+    artist_map = store.lastfm_artist_map()
 
     tracks_out = []
     for t in input_tracks:
@@ -493,7 +494,7 @@ def triage(playlist_id: str):
             {
                 **t,
                 "sortable": bool(sortable),
-                "suggestions": sugg.suggest(t, state["profiles"], tag_artists, track_map) if sortable else [],
+                "suggestions": sugg.suggest(t, state["profiles"], tag_artists, track_map, artist_map) if sortable else [],
             }
         )
 
@@ -2919,6 +2920,7 @@ def now_playing(force: bool = False):
     # above can land a brand-new neighbour/track-tag record mid-poll.
     tag_artists = store.tag_artists()
     track_map = store.lastfm_track_map()
+    artist_map = store.lastfm_artist_map()
     ctx_id = np["context_playlist_id"]
     ctx = next((p for p in state["playlists"] if p["id"] == ctx_id), None)
     return {
@@ -2933,7 +2935,7 @@ def now_playing(force: bool = False):
             if ctx_id else None
         ),
         "sitting": _sitting_for_context(ctx_id),
-        "suggestions": sugg.suggest(track, state["profiles"], tag_artists, track_map) if sortable else [],
+        "suggestions": sugg.suggest(track, state["profiles"], tag_artists, track_map, artist_map) if sortable else [],
         "homes": _homes_payload(state),
         "inputs": [
             {"id": l["id"], "name": l["name"], "has_track": track["uri"] in l["uris"]}
