@@ -121,6 +121,20 @@ def load_track_map(data_dir: Path = DATA_DIR) -> dict[str, dict]:
     return Store(data_dir).lastfm_track_map()
 
 
+def load_artist_map(data_dir: Path = DATA_DIR) -> dict[str, dict]:
+    """`Store.lastfm_artist_map()` — the artist-level analog of
+    `load_track_map`, same degrade-to-empty contract (a missing or malformed
+    `lastfm_artists.json` yields `{}`, not a crash). Goes through `Store`
+    rather than a bespoke open()+json.load() here for the same reason
+    `load_track_map` does: `lastfm_artist_map()` already owns the
+    "malformed envelope -> {}" guard and the {artist_id: record} unwrapping,
+    and duplicating that logic here risks it drifting from the one
+    `sortify/suggest.py` itself relies on. `Store` never writes on a
+    read-only call like this one; the harness's zero-writes contract
+    (module docstring) is unaffected."""
+    return Store(data_dir).lastfm_artist_map()
+
+
 # ---- pure harness logic (unit-tested against hand-built fixtures) ----------
 
 
@@ -205,6 +219,7 @@ def evaluate_pair(
     uri_homes: dict[str, set[str]],
     top_k: int = DEFAULT_TOP_K,
     track_map: dict[str, dict] | None = None,
+    artist_map: dict[str, dict] | None = None,
 ) -> tuple[bool, bool, bool]:
     """Rank `track` with EVERY true home's profile rebuilt minus `track`
     itself — not just `home_id`. A multi-home track's sibling homes must
@@ -213,10 +228,11 @@ def evaluate_pair(
     rebuild only `home_id`'s profile, which handed a multi-home track a free
     top-1 via whichever sibling home was left untouched).
 
-    `track_map` (Task 4) feeds `suggest()`'s neighbour signal — optional,
-    keyword-only, defaulting to `{}` via the `or {}` below, same "callers
-    that haven't been updated yet keep working" contract as `suggest()`
-    itself documents. `build_profile` already rebuilds `track_keys` from
+    `track_map` (Task 4) feeds `suggest()`'s neighbour signal and `artist_map`
+    (Task 5) feeds its artist-similar signal — both optional, keyword-only,
+    defaulting to `{}` via the `or {}` below, same "callers that haven't been
+    updated yet keep working" contract as `suggest()` itself documents.
+    `build_profile` already rebuilds `track_keys` from
     `held_out_tracks` above, same as every other per-track set on the
     profile — the held-out track's own (artist, title) key is excluded from
     `track_keys` exactly like it's excluded from `uris`/`artist_counts`/
@@ -240,7 +256,7 @@ def evaluate_pair(
         held_out_tracks = [t for t in home_tracks[hid] if t["uri"] != track["uri"]]
         profiles_for_pair[hid] = build_profile(held_out_tracks, tag_artists)
 
-    results = suggest(track, profiles_for_pair, tag_artists, track_map or {})
+    results = suggest(track, profiles_for_pair, tag_artists, track_map or {}, artist_map or {})
     ranked_ids = [r["playlist_id"] for r in results]
 
     top1_hit = bool(true_homes & set(ranked_ids[:1]))
@@ -254,14 +270,16 @@ def run_eval(
     sampled_pairs: list[tuple[str, dict]],
     top_k: int = DEFAULT_TOP_K,
     track_map: dict[str, dict] | None = None,
+    artist_map: dict[str, dict] | None = None,
 ) -> dict:
     """Evaluate a fixed, pre-sampled set of pairs under whatever weight
     `sortify.suggest` currently holds. Takes the sample as an argument
     (rather than sampling itself) so a baseline run, a full grid search, and
     the committed-weight run all score the identical pairs.
 
-    `track_map` (Task 4) is threaded straight through to `evaluate_pair`;
-    optional and keyword-only for the same reason it is there.
+    `track_map` (Task 4) and `artist_map` (Task 5) are threaded straight
+    through to `evaluate_pair`; both optional and keyword-only for the same
+    reason they are there.
 
     Reports both the overall top1/top3 and the artist-absent subset's
     top1/top3 — the subset where artist overlap cannot fire at all and only
@@ -274,7 +292,7 @@ def run_eval(
     absent_n = absent_top1 = absent_top3 = 0
     for home_id, track in sampled_pairs:
         hit1, hit3, absent = evaluate_pair(
-            home_id, track, home_tracks, profiles, tag_artists, uri_homes, top_k, track_map
+            home_id, track, home_tracks, profiles, tag_artists, uri_homes, top_k, track_map, artist_map
         )
         top1 += hit1
         top3 += hit3
@@ -295,29 +313,37 @@ def run_eval(
 
 
 @contextlib.contextmanager
-def weights(tag_weight: float | None = None, neighbour_weight: float | None = None):
-    """Temporarily override sortify.suggest's TAG_WEIGHT and/or
-    NEIGHBOUR_WEIGHT constants. `suggest()` reads both as module-level
-    lookups at call time (not bound defaults), so mutating the module and
-    restoring it afterwards is sufficient — no monkeypatch fixture needed
-    outside of pytest.
+def weights(
+    tag_weight: float | None = None,
+    neighbour_weight: float | None = None,
+    artist_sim_weight: float | None = None,
+):
+    """Temporarily override sortify.suggest's TAG_WEIGHT, NEIGHBOUR_WEIGHT,
+    and/or ARTIST_SIM_WEIGHT constants. `suggest()` reads all three as
+    module-level lookups at call time (not bound defaults), so mutating the
+    module and restoring it afterwards is sufficient — no monkeypatch
+    fixture needed outside of pytest.
 
-    Either argument may be omitted (stays at whatever the module currently
-    holds) — existing callers that only ever touched TAG_WEIGHT, including
-    positional `weights(0.0)`, are unaffected by NEIGHBOUR_WEIGHT support
-    being added here for Task 4.
+    Any argument may be omitted (stays at whatever the module currently
+    holds) — existing callers that only ever touched TAG_WEIGHT and/or
+    NEIGHBOUR_WEIGHT, including positional `weights(0.0)`, are unaffected by
+    ARTIST_SIM_WEIGHT support being added here for Task 5.
     """
     orig_tag_weight = suggest_mod.TAG_WEIGHT
     orig_neighbour_weight = suggest_mod.NEIGHBOUR_WEIGHT
+    orig_artist_sim_weight = suggest_mod.ARTIST_SIM_WEIGHT
     if tag_weight is not None:
         suggest_mod.TAG_WEIGHT = tag_weight
     if neighbour_weight is not None:
         suggest_mod.NEIGHBOUR_WEIGHT = neighbour_weight
+    if artist_sim_weight is not None:
+        suggest_mod.ARTIST_SIM_WEIGHT = artist_sim_weight
     try:
         yield
     finally:
         suggest_mod.TAG_WEIGHT = orig_tag_weight
         suggest_mod.NEIGHBOUR_WEIGHT = orig_neighbour_weight
+        suggest_mod.ARTIST_SIM_WEIGHT = orig_artist_sim_weight
 
 
 def grid_search(
@@ -394,6 +420,7 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--baseline", action="store_true", help="force TAG_WEIGHT=0 and NEIGHBOUR_WEIGHT=0 (artist-only)")
     parser.add_argument("--search", action="store_true", help="1-D sweep over NEIGHBOUR_WEIGHT, TAG_WEIGHT fixed")
+    parser.add_argument("--search-artist-sim", action="store_true", help="1-D sweep over ARTIST_SIM_WEIGHT, everything else fixed")
     args = parser.parse_args()
 
     top_k = args.top_k
@@ -405,6 +432,7 @@ def main() -> None:
     home_tracks = load_home_tracks()
     tag_artists = load_tag_artists()
     track_map = load_track_map()
+    artist_map = load_artist_map()
     pairs = collect_pairs(home_tracks)
     sampled = sample_pairs(pairs, args.n, args.seed)
 
@@ -414,8 +442,15 @@ def main() -> None:
         with weights(tag_weight=0.0, neighbour_weight=0.0):
             _print_result(
                 "artist-only baseline (TAG_WEIGHT=0, NEIGHBOUR_WEIGHT=0)",
-                run_eval(home_tracks, tag_artists, sampled, top_k, track_map),
+                run_eval(home_tracks, tag_artists, sampled, top_k, track_map, artist_map),
             )
+        return
+
+    if args.search_artist_sim:
+        for w in (0.25, 0.5, 1.0, 1.5, 2.0, 3.0):
+            with weights(artist_sim_weight=w):
+                _print_result(f"ARTIST_SIM_WEIGHT={w}", run_eval(
+                    home_tracks, tag_artists, sampled, top_k, track_map, artist_map=artist_map))
         return
 
     if args.search:
