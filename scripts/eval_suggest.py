@@ -418,7 +418,7 @@ def main() -> None:
     parser.add_argument("--n", type=int, default=DEFAULT_N, help="number of (home, track) pairs to sample")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="sampling seed, for repeatability")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
-    parser.add_argument("--baseline", action="store_true", help="force TAG_WEIGHT=0 and NEIGHBOUR_WEIGHT=0 (artist-only)")
+    parser.add_argument("--baseline", action="store_true", help="force TAG_WEIGHT=0, NEIGHBOUR_WEIGHT=0, and ARTIST_SIM_WEIGHT=0 (artist-overlap-only)")
     parser.add_argument("--search", action="store_true", help="1-D sweep over NEIGHBOUR_WEIGHT, TAG_WEIGHT fixed")
     parser.add_argument("--search-artist-sim", action="store_true", help="1-D sweep over ARTIST_SIM_WEIGHT, everything else fixed")
     args = parser.parse_args()
@@ -439,9 +439,9 @@ def main() -> None:
     print(f"homes={len(home_tracks)} pairs_available={len(pairs)} sampled={len(sampled)} seed={args.seed}")
 
     if args.baseline:
-        with weights(tag_weight=0.0, neighbour_weight=0.0):
+        with weights(tag_weight=0.0, neighbour_weight=0.0, artist_sim_weight=0.0):
             _print_result(
-                "artist-only baseline (TAG_WEIGHT=0, NEIGHBOUR_WEIGHT=0)",
+                "artist-overlap-only baseline (TAG_WEIGHT=0, NEIGHBOUR_WEIGHT=0, ARTIST_SIM_WEIGHT=0)",
                 run_eval(home_tracks, tag_artists, sampled, top_k, track_map, artist_map),
             )
         return

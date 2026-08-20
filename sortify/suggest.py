@@ -101,6 +101,7 @@ NEIGHBOUR_SUM_CAP = 1.0
 #   .venv/bin/python scripts/eval_suggest.py --n 500 --seed 7
 #   .venv/bin/python scripts/eval_suggest.py --n 500 --seed 7 --search-artist-sim
 #   OFF (ARTIST_SIM_WEIGHT=0, signal disabled): top1 0.312 top3 0.524 | artist-absent n=161 top1 0.155 top3 0.317
+#   (OFF row produced by pinning artist_sim_weight=0 via the harness's weights() context)
 #   ARTIST_SIM_WEIGHT=0.25 .. 3.0 (every swept value): top1 0.314 top3 0.530 | artist-absent top1 0.161 top3 0.335
 # Every non-zero weight from 0.25 to 3.0 produced IDENTICAL numbers - the
 # signal either fires (any weight > 0, sim_sum capped by ARTIST_SIM_CAP
