@@ -486,8 +486,9 @@ def main() -> None:
         return
 
     _print_result(
-        f"current weights (TAG_WEIGHT={suggest_mod.TAG_WEIGHT}, NEIGHBOUR_WEIGHT={suggest_mod.NEIGHBOUR_WEIGHT})",
-        run_eval(home_tracks, tag_artists, sampled, top_k, track_map),
+        f"current weights (TAG_WEIGHT={suggest_mod.TAG_WEIGHT}, NEIGHBOUR_WEIGHT={suggest_mod.NEIGHBOUR_WEIGHT}, "
+        f"ARTIST_SIM_WEIGHT={suggest_mod.ARTIST_SIM_WEIGHT})",
+        run_eval(home_tracks, tag_artists, sampled, top_k, track_map, artist_map),
     )
 
 

@@ -91,8 +91,29 @@ NEIGHBOUR_SUM_CAP = 1.0
 # Artist-similar (Last.fm artist.getSimilar): guess-tier-only by construction
 # (see suggest()'s gate) — this signal is only ever consulted after a home
 # has already failed to clear MIN_SCORE, so it can never itself promote a
-# home into the confident tier no matter how high it scores. Placeholders
-# until Task 5's eval sweep measures real values.
+# home into the confident tier no matter how high it scores, and sweeping
+# ARTIST_SIM_WEIGHT therefore cannot touch a primacy invariant the way
+# NEIGHBOUR_WEIGHT can - there is no confident-tier row to break.
+#
+# Measured 2026-08-21 by scripts/eval_suggest.py after the artist-similar
+# backfill (scripts/backfill_artist_similar.py: 1449/1449 home artists
+# attempted, 1438 tagged (10 misses, 1 error left absent)):
+#   .venv/bin/python scripts/eval_suggest.py --n 500 --seed 7
+#   .venv/bin/python scripts/eval_suggest.py --n 500 --seed 7 --search-artist-sim
+#   OFF (ARTIST_SIM_WEIGHT=0, signal disabled): top1 0.312 top3 0.524 | artist-absent n=161 top1 0.155 top3 0.317
+#   ARTIST_SIM_WEIGHT=0.25 .. 3.0 (every swept value): top1 0.314 top3 0.530 | artist-absent top1 0.161 top3 0.335
+# Every non-zero weight from 0.25 to 3.0 produced IDENTICAL numbers - the
+# signal either fires (any weight > 0, sim_sum capped by ARTIST_SIM_CAP
+# below scales the guess-tier score but never reorders which home wins for
+# this sample) or it doesn't (weight 0). Verified the self-check this
+# implies (spec Evaluation 4): the non-absent-subset counts are bit-
+# identical across the OFF row and every swept weight (n=339, top1=131,
+# top3=211 in all seven runs) - the signal cannot reach the confident tier
+# by construction, and it didn't. All weights tie, so per the task-5
+# assignment ("if every weight ties, keep 1.0 and record the tie") this
+# stays at the placeholder value, now a measured one: on the artist-absent
+# subset it lifts top1 0.155 to 0.161 and top3 0.317 to 0.335 versus OFF,
+# at any positive weight.
 ARTIST_SIM_WEIGHT = 1.0
 ARTIST_SIM_CAP = 1.0
 
