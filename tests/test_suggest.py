@@ -499,6 +499,122 @@ def test_hint_tags_stay_out_of_the_organic_tag_reason():
     assert tag_reasons and "shoegaze" not in tag_reasons[0]
 
 
+# ---- weak guesses: sub-threshold fill when nothing is confident ------------
+#
+# When no home clears MIN_SCORE and the track is filed nowhere, the ranking
+# that was computed anyway surfaces as up-to-TOP_N entries flagged
+# weak: True, each carrying at least one real reason (score > 0). The
+# confident tier is untouched: a confident list never mixes with guesses,
+# and its entries never carry the weak key. Ledger R2a ("a home matched only
+# by neighbours can never surface a suggestion") scopes to the confident
+# tier — a neighbour-only home MAY appear as a labeled guess; that mood-ish
+# similarity evidence is exactly what the guess tier exists to show.
+
+
+def test_weak_guesses_surface_when_nothing_clears_the_threshold():
+    # Track's artist shares one tag in four with the home's profile:
+    # cosine 1/(2*2) = 0.25 -> score 0.75, under MIN_SCORE but real.
+    ta = {
+        "h1": tag_entry("t1", name="H1"),
+        "h2": tag_entry("u1", name="H2"),
+        "h3": tag_entry("u2", name="H3"),
+        "h4": tag_entry("u3", name="H4"),
+        "seed": tag_entry("t1", "t2", "t3", "t4", name="Seed"),
+    }
+    prof = build_profile([track(f"u{i}", [f"h{i}"]) for i in range(1, 5)], ta)
+    res = suggest(track("new", ["seed"]), {"H": prof, "heavy": profiles()["heavy"]}, ta)
+    assert len(res) == 1
+    r = res[0]
+    assert r["playlist_id"] == "H"
+    assert r["weak"] is True
+    assert r["already"] is False
+    assert 0 < r["score"] < suggest_mod.MIN_SCORE
+    assert r["pct"] == round(r["score"] * 10)
+    assert any(x.startswith("artist tags:") for x in r["reasons"])
+
+
+def test_weak_guesses_ranked_and_capped_at_top_n():
+    # Four neighbour-only homes at 0.27/0.21/0.15/0.09 — only TOP_N surface,
+    # best first, all flagged weak.
+    homes = {}
+    track_map_similar = []
+    for i, match in enumerate((0.9, 0.7, 0.5, 0.3)):
+        homes[f"P{i}"] = build_profile(
+            [track(f"p{i}", ["unknown"], title=f"Neigh {i}")], ARTISTS
+        )
+        track_map_similar.append(neighbour("Unknown", f"Neigh {i}", match))
+    track_map = {track_key("Seedless", "New Song"): track_record(track_map_similar)}
+    seed = {"uri": "new", "name": "New Song",
+            "artists": [{"id": "seedless", "name": "Seedless"}]}
+    res = suggest(seed, homes, ARTISTS, track_map)
+    assert [r["playlist_id"] for r in res] == ["P0", "P1", "P2"]
+    assert all(r["weak"] is True for r in res)
+    assert res[0]["score"] > res[1]["score"] > res[2]["score"]
+
+
+def test_neighbour_only_home_can_surface_as_weak_guess():
+    # The R2a scoping pin: neighbour evidence alone (max 0.3 < MIN_SCORE)
+    # still can't produce a CONFIDENT suggestion, but it now surfaces as a
+    # labeled guess with its reason intact.
+    prof = build_profile([track("h1", ["slowdive"], title="Alison")], ARTISTS)
+    seed = {"uri": "new", "name": "Mystery Song",
+            "artists": [{"id": "seedless", "name": "Seedless"}]}
+    track_map = {
+        track_key("Seedless", "Mystery Song"): track_record(
+            [neighbour("Slowdive", "Alison", 0.7)]
+        ),
+    }
+    res = suggest(seed, {"H": prof}, ARTISTS, track_map)
+    assert len(res) == 1
+    assert res[0]["weak"] is True
+    assert res[0]["reasons"] == ["1 similar track already here"]
+
+
+def test_confident_results_never_carry_weak_or_mix_with_guesses():
+    # One home is confident (artist overlap); another scores sub-threshold.
+    # The confident list is returned exactly as today: no weak key anywhere,
+    # no guess entries appended.
+    ta = {
+        **ARTISTS,
+        "h1": tag_entry("t1", name="H1"),
+        "h2": tag_entry("u1", name="H2"),
+        "h3": tag_entry("u2", name="H3"),
+        "h4": tag_entry("u3", name="H4"),
+        "seed2": tag_entry("t1", "t2", "t3", "t4", name="Beach House"),
+    }
+    weakish = build_profile([track(f"u{i}", [f"h{i}"]) for i in range(1, 5)], ta)
+    owns = build_profile([track("d1", ["beach-house"])], ta)
+    seed = {"uri": "new", "name": "New Song", "artists": [
+        {"id": "beach-house", "name": "Beach House"},
+        {"id": "seed2", "name": "Beach House"},
+    ]}
+    res = suggest(seed, {"weakish": weakish, "owns": owns}, ta)
+    assert [r["playlist_id"] for r in res] == ["owns"]
+    assert all("weak" not in r for r in res)
+
+
+def test_already_filed_track_suppresses_weak_fill():
+    # A track already in a home (even one scoring zero there) means the
+    # list is non-empty — guesses only fill a would-be-EMPTY list.
+    ta = {
+        "h1": tag_entry("t1", name="H1"),
+        "h2": tag_entry("u1", name="H2"),
+        "h3": tag_entry("u2", name="H3"),
+        "h4": tag_entry("u3", name="H4"),
+        "seed": tag_entry("t1", "t2", "t3", "t4", name="Seed"),
+    }
+    weakish = build_profile([track(f"u{i}", [f"h{i}"]) for i in range(1, 5)], ta)
+    filed = build_profile(
+        [{"uri": "filed", "name": "Old", "artists": [{"id": None, "name": "Nameless"}]}],
+        ta,
+    )
+    seed = {"uri": "filed", "name": "Old", "artists": [{"id": None, "name": "Nameless"}]}
+    res = suggest(seed, {"weakish": weakish, "filed": filed}, ta)
+    assert [r["playlist_id"] for r in res] == ["filed"]
+    assert res[0]["already"] is True
+    assert "weak" not in res[0]
+
+
 def test_hints_weigh_like_the_strongest_organic_tag():
     # Two beach-house tracks -> organic "dream pop" count 2; the hint must
     # enter at 2 as well, not at 1, or a big home dilutes hints to nothing.

@@ -815,6 +815,67 @@ run("stopNowPolling()");
 }
 
 // ============================================================================
+// W — weak guesses: sub-threshold suggestions render as labeled guesses,
+// visually distinct from confident ones, in both the ordinary now card and
+// the sitting decide list. The server only ever sends weak entries when
+// NOTHING was confident, so the lead-in hint keys off suggestions[0].
+// ============================================================================
+{
+  routes["GET /api/now?force=1"] = {
+    status: 200,
+    body: {
+      playing: true, poll_after_ms: 999999,
+      track: { uri: "spotify:track:w1", name: "T", artists: [{ name: "A" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[In]", is_input: true },
+      sitting: null,
+      suggestions: [
+        { playlist_id: "H1", pct: 3, reasons: ["1 similar track already here"], already: false, weak: true },
+        { playlist_id: "H2", pct: 2, reasons: ["artist tags: cumbia"], already: false, weak: true },
+      ],
+      homes: [{ id: "H1", name: "Guess One", folder: "" }, { id: "H2", name: "Guess Two", folder: "" }],
+      inputs: [],
+    },
+  };
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  const card = $$("now-card").innerHTML;
+  check("W1 the now card leads weak entries with the guesses hint",
+        /No confident match — closest guesses:/.test(card), JSON.stringify(card.slice(0, 200)));
+  check("W1 weak entries render as .sugg.weak buttons, reasons intact",
+        (card.match(/class="sugg weak"/g) || []).length === 2 &&
+        /similar track already here/.test(card), JSON.stringify(card.slice(0, 200)));
+  check("W1 the empty-list hint does not double up",
+        !/No confident match — use Add to…/.test(card), "");
+
+  // Confident entries must render exactly as before — no hint, no weak class.
+  routes["GET /api/now?force=1"].body.suggestions = [
+    { playlist_id: "H1", pct: 90, reasons: ["3 tracks by A here"], already: false },
+  ];
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  check("W1 confident suggestions keep today's rendering",
+        !/closest guesses/.test($$("now-card").innerHTML) &&
+        !/class="sugg weak"/.test($$("now-card").innerHTML), "");
+
+  // And the sitting decide list gets the same treatment.
+  routes["GET /api/now?force=1"].body.sitting =
+    { split_id: "PLW", pile_id: "p1", pile_name: "pile", uris: ["spotify:track:w1"], decided: {} };
+  routes["GET /api/now?force=1"].body.suggestions = [
+    { playlist_id: "H1", pct: 3, reasons: ["artist tags: cumbia"], already: false, weak: true },
+  ];
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  const decide = $$("now-card").innerHTML;
+  check("W2 the decide list leads weak entries with the guesses hint",
+        /No confident match — closest guesses:/.test(decide) &&
+        (decide.match(/class="sugg weak"/g) || []).length === 1,
+        JSON.stringify(decide.slice(0, 200)));
+}
+
+// ============================================================================
 // P — split progress: a bar that moves, a poll that stops, and failures that
 // say what to do next.
 //
