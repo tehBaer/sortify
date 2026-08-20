@@ -273,8 +273,9 @@ def ingest_folders(tree: Any = Body(...)):
 
 @app.get("/api/naming")
 def naming():
-    """Naming-convention violations among marked playlists. Free: reads the
-    cached listing, so it can run on every Playlists-view open."""
+    """Naming-convention violations among marked playlists. Reads the cached
+    listing (free once the listing has been fetched), so it can run on every
+    Playlists-view open."""
     cfg = store.config()
     items = sp.my_playlists()
     inputs = _effective_input_ids(cfg, items)

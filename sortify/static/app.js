@@ -328,6 +328,8 @@ function renderNaming(rows) {
       } catch (e) {
         toast(e.message);
         btn.disabled = false;
+        // A 409 means the listing moved on — show the current state.
+        if (e.status === 409) await loadLists();
       }
     };
     list.appendChild(row);

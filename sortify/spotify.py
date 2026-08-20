@@ -557,6 +557,7 @@ class Spotify:
             for p in entry["items"]:
                 if p["id"] == playlist_id:
                     p["name"] = name
+                    break
             self.store.save_cache(cache)
 
     def _fetch_my_playlists(self) -> list[dict]:
