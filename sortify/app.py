@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from . import suggest as sugg
 from .deezer import Deezer
 from .folders import extract_folder_map, home_name_excluded, select_home_ids
+from .naming import violations as naming_violations
 from .pacing import Governor
 from .spotify import (
     BACKGROUND_DAILY_CAP,
@@ -268,6 +269,19 @@ def ingest_folders(tree: Any = Body(...)):
         "rule": rule,
         "home_folders": sorted({mapping[pid]["path"] for pid in home_ids}),
     }
+
+
+@app.get("/api/naming")
+def naming():
+    """Naming-convention violations among marked playlists. Free: reads the
+    cached listing, so it can run on every Playlists-view open."""
+    cfg = store.config()
+    items = sp.my_playlists()
+    inputs = _effective_input_ids(cfg, items)
+    return {"violations": naming_violations(
+        items, inputs, set(cfg.get("home_ids") or []),
+        cfg.get("input_name_pattern"),
+    )}
 
 
 @app.post("/api/config")
