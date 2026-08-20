@@ -544,6 +544,21 @@ class Spotify:
             entry["items"] = kept
             self.store.save_cache(cache)
 
+    def rename_playlist(self, playlist_id: str, name: str) -> None:
+        """One PUT, then patch the cached listing so the new name is visible
+        without a paid Refresh. Same lock as the refresh path; a refresh
+        landing in between still wins, and correctly so."""
+        self.request("PUT", f"/playlists/{playlist_id}", json={"name": name})
+        with _LIST_LOCK:
+            cache = self.store.cache()
+            entry = cache.get("playlist_list")
+            if not entry or entry.get("items") is None:
+                return
+            for p in entry["items"]:
+                if p["id"] == playlist_id:
+                    p["name"] = name
+            self.store.save_cache(cache)
+
     def _fetch_my_playlists(self) -> list[dict]:
         me = (self.store.cache().get("me") or {}).get("id")
         out = []

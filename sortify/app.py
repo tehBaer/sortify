@@ -284,6 +284,29 @@ def naming():
     )}
 
 
+@app.post("/api/naming/{playlist_id}/rename")
+def apply_naming_rename(playlist_id: str):
+    """Apply one approved rename — exactly one Spotify call.
+
+    The proposal is recomputed here from the cached listing rather than
+    trusted from the client: a stale tab posting an old violation gets a
+    409, not a rename based on a name that no longer exists.
+    """
+    cfg = store.config()
+    items = sp.my_playlists()
+    inputs = _effective_input_ids(cfg, items)
+    rows = naming_violations(items, inputs, set(cfg.get("home_ids") or []),
+                             cfg.get("input_name_pattern"))
+    row = next((r for r in rows if r["playlist_id"] == playlist_id), None)
+    if row is None:
+        raise HTTPException(
+            409, "that playlist has no naming issue any more — the list was "
+                 "stale. Reopen the Playlists view to see the current state.")
+    sp.rename_playlist(playlist_id, row["proposed"])
+    return {"renamed": {"playlist_id": playlist_id,
+                        "from": row["current"], "to": row["proposed"]}}
+
+
 @app.post("/api/config")
 def set_config(body: ConfigIn):
     store.update_config(

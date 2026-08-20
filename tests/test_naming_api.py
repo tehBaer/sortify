@@ -48,3 +48,43 @@ def test_naming_lists_violations(client):
 def test_naming_never_refreshes_the_listing(client):
     client.get("/api/naming")
     assert client.calls["refreshes"] == 0
+
+
+def test_rename_applies_the_proposal(client, monkeypatch):
+    renamed = []
+    monkeypatch.setattr(appmod.sp, "rename_playlist",
+                        lambda pid, name: renamed.append((pid, name)))
+    resp = client.post("/api/naming/h1/rename")
+    assert resp.status_code == 200
+    assert renamed == [("h1", "BEACH VIBES")]
+    assert resp.json()["renamed"] == {
+        "playlist_id": "h1", "from": "beach vibes", "to": "BEACH VIBES"}
+
+
+def test_rename_conforming_playlist_is_409(client, monkeypatch):
+    # A stale tab must not rename something already fixed: the server
+    # recomputes from the cached listing and refuses when nothing is wrong.
+    monkeypatch.setattr(appmod.sp, "rename_playlist",
+                        lambda pid, name: pytest.fail("must not spend a call"))
+    assert client.post("/api/naming/ok/rename").status_code == 409
+    assert client.post("/api/naming/nonexistent/rename").status_code == 409
+
+
+def test_rename_playlist_patches_the_cached_listing(monkeypatch):
+    # The client method itself: one PUT, then the cached name changes so
+    # the UI shows the result without a paid Refresh.
+    put = []
+    monkeypatch.setattr(
+        appmod.sp, "request",
+        lambda method, path, **kw: put.append((method, path, kw.get("json"))))
+    cache = appmod.store.cache()
+    cache["playlist_list"] = {"fetched_at": 1.0, "items": [
+        {"id": "h1", "name": "beach vibes", "owner": "me", "editable": True,
+         "total": 40, "snapshot_id": "s-h1", "image": None}]}
+    appmod.store.save_cache(cache)
+
+    appmod.sp.rename_playlist("h1", "BEACH VIBES")
+
+    assert put == [("PUT", "/playlists/h1", {"name": "BEACH VIBES"})]
+    items = appmod.store.cache()["playlist_list"]["items"]
+    assert items[0]["name"] == "BEACH VIBES"
