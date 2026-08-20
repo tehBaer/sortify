@@ -76,8 +76,12 @@ TOP_N = 3
 #     the artist always outranks similarity" invariant, paid knowingly.
 #   One further accepted consequence: 0.3 * NEIGHBOUR_SUM_CAP = 0.3 < MIN_SCORE
 #   (0.8), so a home matched ONLY by neighbours can never surface a new
-#   suggestion — neighbours re-rank homes that artist overlap or tags already
-#   lifted over the threshold. Deliberate (ledger R2a), not an oversight.
+#   CONFIDENT suggestion — neighbours re-rank homes that artist overlap or
+#   tags already lifted over the threshold. Deliberate (ledger R2a), not an
+#   oversight. R2a scopes to the confident tier (2026-08-20): when NOTHING
+#   clears MIN_SCORE, sub-threshold homes — neighbour-only ones included —
+#   may surface flagged `weak: True` (see `suggest()`); the confident
+#   list's contract is unchanged.
 # Note the tags-only row already includes track-level tags from
 # lastfm_tracks.json (fetched by the same backfill) — that is what moved
 # tags from 0.534 to 0.546 vs the 2026-08-18 artist-tag-only measurement.
@@ -284,11 +288,20 @@ def suggest(
     `track_map` is optional ({} when omitted) so callers that haven't been
     updated to pass `store.lastfm_track_map()` yet keep working — see
     app.py's call sites, which all pass a fresh one.
+
+    When no home clears MIN_SCORE and the track is filed nowhere, the
+    sub-threshold ranking is returned instead — up to TOP_N homes with
+    score > 0 (i.e. at least one real reason), each flagged `weak: True`
+    so the frontend can present them as guesses, not confidence. A track
+    with an `already` home never gets guesses (the list wasn't empty), and
+    confident entries never carry the key at all, so the confident payload
+    stays byte-identical to before this tier existed.
     """
     track_map = track_map or {}
     track_tags, tag_level = _resolve_tags(track, tag_artists, track_map)
     tag_reason_prefix = "tags: " if tag_level == "track" else "artist tags: "
     results = []
+    weak_pool = []
     for pid, prof in profiles.items():
         reasons = []
         score = 0.0
@@ -334,6 +347,20 @@ def suggest(
                     "reasons": reasons,
                 }
             )
+        elif score > 0:
+            weak_pool.append(
+                {
+                    "playlist_id": pid,
+                    "score": round(score, 2),
+                    "pct": min(round(score * 10), 100),
+                    "already": False,
+                    "reasons": reasons,
+                    "weak": True,
+                }
+            )
 
+    if not results and weak_pool:
+        weak_pool.sort(key=lambda r: -r["score"])
+        return weak_pool[:TOP_N]
     results.sort(key=lambda r: (not r["already"], -r["score"]))
     return results[:TOP_N]

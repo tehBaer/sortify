@@ -411,10 +411,13 @@ function renderCard() {
   const artists = tr.artists.map((a) => a.name).join(", ");
 
   let suggHtml = "";
+  if (tr.suggestions.length && tr.suggestions[0].weak) {
+    suggHtml += '<p class="hint">No confident match — closest guesses:</p>';
+  }
   tr.suggestions.forEach((s, i) => {
     const home = t.homes.get(s.playlist_id);
     if (!home) return;
-    suggHtml += `<button class="sugg${s.already ? " already" : ""}" data-to="${esc(s.playlist_id)}">
+    suggHtml += `<button class="sugg${s.already ? " already" : ""}${s.weak ? " weak" : ""}" data-to="${esc(s.playlist_id)}">
       <span class="s-pct">${s.already ? "" : s.pct + "%"}</span>
       <span class="s-name"><kbd>${i + 1}</kbd> ${esc(home.name)}</span>
       <span class="s-why">${esc([home.folder, ...s.reasons].filter(Boolean).join(" · "))}</span>
@@ -922,10 +925,13 @@ function ordinaryCardBody(d, tr, ctx) {
   if (!tr.sortable) return '<p class="hint">Can\'t be sorted via the API (local file or episode).</p>';
 
   let body = "";
+  if (d.suggestions.length && d.suggestions[0].weak) {
+    body += '<p class="hint">No confident match — closest guesses:</p>';
+  }
   d.suggestions.forEach((s, i) => {
     const home = nowState.homes.get(s.playlist_id);
     if (!home) return;
-    body += `<button class="sugg${s.already ? " already" : ""}" data-to="${esc(s.playlist_id)}" style="--pct:${s.already ? 100 : s.pct}%">
+    body += `<button class="sugg${s.already ? " already" : ""}${s.weak ? " weak" : ""}" data-to="${esc(s.playlist_id)}" style="--pct:${s.already ? 100 : s.pct}%">
       <span class="s-pct">${s.already ? '<span class="s-badge">already there</span>' : s.pct + "%"}</span>
       <span class="s-name"><kbd>${i + 1}</kbd> ${esc(home.name)}</span>
       <span class="s-why">${esc([home.folder, ...s.reasons].filter(Boolean).join(" · "))}</span>
@@ -1896,10 +1902,14 @@ function sittingCardBody(tr, srvSitting) {
   if (!tr.sortable) {
     html += '<p class="hint">Can\'t be kept via the API (local file or episode) — reject it instead.</p>';
   } else {
-    (nowState.suggestions || []).forEach((s, i) => {
+    const sugg = nowState.suggestions || [];
+    if (sugg.length && sugg[0].weak) {
+      html += '<p class="hint">No confident match — closest guesses:</p>';
+    }
+    sugg.forEach((s, i) => {
       const home = nowState.homes.get(s.playlist_id);
       if (!home) return;
-      html += `<button class="sugg${s.already ? " already" : ""}" data-keep="${esc(s.playlist_id)}" style="--pct:${s.already ? 100 : s.pct}%">
+      html += `<button class="sugg${s.already ? " already" : ""}${s.weak ? " weak" : ""}" data-keep="${esc(s.playlist_id)}" style="--pct:${s.already ? 100 : s.pct}%">
         <span class="s-pct">${s.already ? '<span class="s-badge">already there</span>' : s.pct + "%"}</span>
         <span class="s-name"><kbd>${i + 1}</kbd> Keep → ${esc(home.name)}</span>
         <span class="s-why">${esc([home.folder, ...s.reasons].filter(Boolean).join(" · "))}</span>

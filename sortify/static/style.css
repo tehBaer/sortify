@@ -197,6 +197,9 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 .sugg .s-name { font-weight: 650; }
 .sugg .s-why { display: block; color: var(--muted); font-size: .8rem; margin-top: .15rem; }
 .sugg.already::after { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+/* a guess, not a match: dimmed until pointed at, dashed to say "tentative" */
+.sugg.weak { opacity: .65; border: 1px dashed var(--border); }
+.sugg.weak:hover { opacity: 1; }
 .sugg .s-pct { float: right; color: var(--muted); font-size: .8rem; margin-top: .1rem; }
 .s-badge {
   color: var(--accent); font-size: .72rem; font-weight: 600;
