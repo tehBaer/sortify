@@ -65,6 +65,7 @@ button:hover { border-color: color-mix(in srgb, var(--fg) 22%, var(--border)); }
 button:disabled { opacity: .4; cursor: default; transform: none; }
 button.primary { background: var(--accent); color: var(--accent-fg); border-color: transparent; font-weight: 600; }
 .row { display: flex; gap: .5rem; margin: .5rem 0; }
+#btn-refresh-lists { min-height: 48px; }
 .row input { flex: 1; }
 .setup-steps li { margin-bottom: 1.2rem; }
 
@@ -100,12 +101,13 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 }
 .now-top-actions { display: flex; gap: .4rem; align-items: center; flex-shrink: 0; }
 .icon-btn {
-  min-height: 40px; min-width: 40px; padding: .3rem .55rem; border-radius: 999px;
+  /* 48px is the Android/iOS minimum comfortable touch target. */
+  min-height: 48px; min-width: 48px; padding: .3rem .55rem; border-radius: 999px;
   display: inline-flex; align-items: center; justify-content: center;
 }
 .icon-btn.spinning svg { animation: spin .8s linear infinite; }
 .mode-chip {
-  min-height: 40px; padding: .3rem .8rem; border-radius: 999px;
+  min-height: 48px; padding: .3rem .8rem; border-radius: 999px;
   font-size: .8rem; color: var(--muted);
 }
 .mode-chip.on { border-color: var(--accent); color: var(--accent); }
