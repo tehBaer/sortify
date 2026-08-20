@@ -143,6 +143,7 @@ async function loadLists() {
     // than present a stale list as current.
     $("pl-age").textContent = ageText(data.fetched_at);
     renderOrphans(data.sitting_orphans || []);
+    loadNaming();
     renderLists();
   } catch (e) {
     if (e.message === "auth needed") return;
@@ -281,6 +282,59 @@ $("btn-clean-sittings").onclick = async () => {
     btn.disabled = false;
   }
 };
+
+// Naming-convention violations: computed server-side from the cached
+// listing (zero Spotify calls), so checking on every view open is free.
+// Renames are approved one at a time — never bulk — and each states its
+// price on the button, like every other spending control here.
+let namingOpen = false;
+async function loadNaming() {
+  let rows = [];
+  try {
+    rows = (await api("/api/naming")).violations || [];
+  } catch (_) { /* a broken check must not break the Playlists view */ }
+  const bar = $("pl-naming-bar");
+  bar.hidden = rows.length === 0;
+  if (!rows.length) { $("pl-naming-list").hidden = true; namingOpen = false; return; }
+  $("pl-naming-status").textContent =
+    `${rows.length} naming issue${rows.length === 1 ? "" : "s"}`;
+  $("btn-naming-toggle").textContent = namingOpen ? "Hide" : "Show";
+  $("btn-naming-toggle").onclick = () => { namingOpen = !namingOpen; renderNaming(rows); };
+  renderNaming(rows);
+}
+
+function renderNaming(rows) {
+  const list = $("pl-naming-list");
+  list.hidden = !namingOpen;
+  $("btn-naming-toggle").textContent = namingOpen ? "Hide" : "Show";
+  if (!namingOpen) return;
+  list.innerHTML = "";
+  for (const r of rows) {
+    const row = document.createElement("div");
+    row.className = "pl-row";
+    row.innerHTML = `
+      <div class="pl-meta">
+        <div class="name">${esc(r.current)} → ${esc(r.proposed)}</div>
+        <div class="sub">${esc(r.rule)}</div>
+      </div>
+      <button class="rename-btn">Rename (1 call)</button>`;
+    const btn = row.querySelector("button");
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        const res = await api(`/api/naming/${r.playlist_id}/rename`, {});
+        toast(`renamed to ${res.renamed.to}`);
+        await loadLists();   // re-reads cache + naming; the fixed row disappears
+      } catch (e) {
+        toast(e.message);
+        btn.disabled = false;
+        // A 409 means the listing moved on — show the current state.
+        if (e.status === 409) await loadLists();
+      }
+    };
+    list.appendChild(row);
+  }
+}
 
 // The only thing that re-reads the listing from Spotify. It is slow on
 // purpose — ~21 paginated calls paced by the rolling-window throttle — so the
