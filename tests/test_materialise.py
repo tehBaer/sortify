@@ -50,10 +50,10 @@ def _split(piles=None):
 def client(monkeypatch):
     calls = []
     monkeypatch.setattr(appmod.sp, "create_playlist",
-                        lambda name, description="", bulk=False:
+                        lambda name, description="", bulk=False, spend_reserve=False:
                             calls.append(("create", name)) or "NEWP")
     monkeypatch.setattr(appmod.sp, "add_to_playlist",
-                        lambda pid, uri, bulk=False: calls.append(("add", pid, uri)) or "snap")
+                        lambda pid, uri, bulk=False, spend_reserve=False: calls.append(("add", pid, uri)) or "snap")
     monkeypatch.setattr(appmod.sp, "unfollow_playlist",
                         lambda pid: calls.append(("unfollow", pid)))
     s = Store()
@@ -127,9 +127,9 @@ def test_tick_spends_from_the_bulk_bucket(client, monkeypatch):
     """The unattended job must never masquerade as interactive traffic."""
     seen = []
     monkeypatch.setattr(appmod.sp, "create_playlist",
-                        lambda name, description="", bulk=False: seen.append(bulk) or "NEWP")
+                        lambda name, description="", bulk=False, spend_reserve=False: seen.append(bulk) or "NEWP")
     monkeypatch.setattr(appmod.sp, "add_to_playlist",
-                        lambda pid, uri, bulk=False: seen.append(bulk) or "snap")
+                        lambda pid, uri, bulk=False, spend_reserve=False: seen.append(bulk) or "snap")
     tick(); tick()
     assert seen == [True, True]
 
@@ -146,11 +146,11 @@ def test_tick_holds_nothing_blocking_under_split_lock(client, monkeypatch):
     asserting inside it, so a fake that's never called can't pass vacuously."""
     observed = {"create": None, "add": None}
 
-    def create_checking_lock(name, description="", bulk=False):
+    def create_checking_lock(name, description="", bulk=False, spend_reserve=False):
         observed["create"] = not appmod._split_lock.locked()
         return "NEWP"
 
-    def add_checking_lock(pid, uri, bulk=False):
+    def add_checking_lock(pid, uri, bulk=False, spend_reserve=False):
         observed["add"] = not appmod._split_lock.locked()
         return "snap"
 
@@ -187,7 +187,7 @@ def test_a_create_failure_still_leaves_a_record_pointing_at_the_pile(client, mon
     heard of. `_materialise_tick` raises SpotifyError, not the plain
     exception create_playlist threw."""
     monkeypatch.setattr(appmod.sp, "create_playlist",
-                        lambda name, description="", bulk=False: (_ for _ in ()).throw(
+                        lambda name, description="", bulk=False, spend_reserve=False: (_ for _ in ()).throw(
                             SpotifyError(429, "cooldown landed on the create")))
     with pytest.raises(SpotifyError):
         tick()
@@ -203,14 +203,14 @@ def test_tick_resumes_after_a_spotify_error_mid_pile_without_a_second_create(cli
     tick()   # add PILE_URIS[0]
 
     monkeypatch.setattr(appmod.sp, "add_to_playlist",
-                        lambda pid, uri, bulk=False: (_ for _ in ()).throw(
+                        lambda pid, uri, bulk=False, spend_reserve=False: (_ for _ in ()).throw(
                             SpotifyError(429, "cooldown landed mid-run")))
     with pytest.raises(SpotifyError):
         tick()
     assert record()["added"] == PILE_URIS[:1]
 
     monkeypatch.setattr(appmod.sp, "add_to_playlist",
-                        lambda pid, uri, bulk=False: client.calls.append(("add", pid, uri))
+                        lambda pid, uri, bulk=False, spend_reserve=False: client.calls.append(("add", pid, uri))
                         or "snap")
     out = tick()
     assert out["spent"] == 1
@@ -278,7 +278,7 @@ def test_tick_create_race_unfollows_the_orphan_and_raises_spotify_error(client, 
     replacing record must be left alone; and the tick's contract (R-T7a)
     means this surfaces as SpotifyError, not the HTTPException the hazard
     helper raises internally."""
-    def create_then_replace(name, description="", bulk=False):
+    def create_then_replace(name, description="", bulk=False, spend_reserve=False):
         client.calls.append(("create", name))
         _overwrite_record_with_a_foreign_one()
         return "NEWP"
@@ -301,7 +301,7 @@ def test_tick_add_race_re_adopts_without_unfollow_and_raises_spotify_error(
     sitting path's abandon does."""
     tick()   # create
 
-    def add_then_replace(pid, uri, bulk=False):
+    def add_then_replace(pid, uri, bulk=False, spend_reserve=False):
         client.calls.append(("add", pid, uri))
         _overwrite_record_with_a_foreign_one(added=["spotify:track:other"])
         return "snap"

@@ -127,6 +127,9 @@
     <div id="split-empty"></div>
     <div id="split-save-all" class="row" hidden>
       <button id="btn-save-all" class="primary"></button>
+      <label class="hint" title="Normally a queued run sleeps until midnight once the day's last 150 calls are all that's left, so your own clicking always has budget. Ticking this lets the run enqueued next spend those too — it finishes sooner, but interactive use can hit the daily cap.">
+        <input type="checkbox" id="chk-spend-reserve"> spend the interactive reserve too
+      </label>
     </div>
     <div id="queue-panel" hidden></div>
     <div id="piles"></div>

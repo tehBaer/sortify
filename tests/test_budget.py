@@ -233,6 +233,34 @@ def test_bulk_block_reason_orders_cooldown_quiet_reserve(sp_and_store, monkeypat
     assert sp.bulk_block_reason() is None
 
 
+def test_spend_reserve_lets_bulk_spend_into_the_reserve_but_not_past_the_cap(sp_and_store):
+    """The per-run override (enqueue's spend_reserve flag): the run may spend
+    the day's last BULK_RESERVE calls — DAILY_CAP itself still binds."""
+    sp, store = sp_and_store
+    store.save_usage({"day": time.strftime("%Y-%m-%d"),
+                      "count": DAILY_CAP - BULK_RESERVE, "background": 0})
+    sp._spend_budget(bulk=True, spend_reserve=True)
+    assert sp.budget_spent() == DAILY_CAP - BULK_RESERVE + 1
+    usage = store.usage()
+    usage["count"] = DAILY_CAP
+    store.save_usage(usage)
+    with pytest.raises(SpotifyError, match="daily budget"):
+        sp._spend_budget(bulk=True, spend_reserve=True)
+
+
+def test_spend_reserve_moves_the_bulk_block_line_to_the_full_cap(sp_and_store):
+    sp, store = sp_and_store
+    store.save_usage({"day": time.strftime("%Y-%m-%d"),
+                      "count": DAILY_CAP - BULK_RESERVE, "background": 0})
+    reason, _ = sp.bulk_block_reason()
+    assert reason == "reserve"
+    assert sp.bulk_block_reason(spend_reserve=True) is None
+    store.save_usage({"day": time.strftime("%Y-%m-%d"),
+                      "count": DAILY_CAP, "background": 0})
+    reason, until = sp.bulk_block_reason(spend_reserve=True)
+    assert reason == "reserve" and until > time.time()
+
+
 def test_bulk_block_reason_sees_the_shared_ledger_even_when_local_usage_is_low(sp_and_store):
     """I-2: a LedgerFull from the shared account ledger must not surface as an
     unexplained SpotifyError mid-tick. bulk_block_reason reads the ledger's

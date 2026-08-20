@@ -42,10 +42,10 @@ TINY = [f"spotify:track:t{i}" for i in range(1)]
 def client(monkeypatch):
     calls = []
     monkeypatch.setattr(appmod.sp, "create_playlist",
-                        lambda name, description="", bulk=False: calls.append(("create", name)) or f"NEW-{name}")
+                        lambda name, description="", bulk=False, spend_reserve=False: calls.append(("create", name)) or f"NEW-{name}")
     monkeypatch.setattr(appmod.sp, "add_to_playlist",
-                        lambda pid, uri, bulk=False: calls.append(("add", pid, uri)) or "snap")
-    monkeypatch.setattr(appmod.sp, "bulk_block_reason", lambda: None)
+                        lambda pid, uri, bulk=False, spend_reserve=False: calls.append(("add", pid, uri)) or "snap")
+    monkeypatch.setattr(appmod.sp, "bulk_block_reason", lambda spend_reserve=False: None)
     monkeypatch.setattr(pacing.Governor, "interval", lambda self: 0.0)
     s = Store()
     originals = {f: getattr(s, f)() for f in ("splits", "queue", "pacing")}
@@ -104,6 +104,25 @@ def test_enqueue_orders_smallest_first_and_starts_the_worker(client):
     assert r.status_code == 200 and r.json()["queued"] == ["p2", "p1"]
     q = wait_done(Store())
     assert q["state"] == "done"
+
+
+def test_enqueue_records_the_spend_reserve_flag(client):
+    """The per-run override: spend_reserve rides the enqueue into queue.json,
+    where the worker (and a later resume) reads it."""
+    r = client.post("/api/split/PLQ/queue",
+                    json={"pile_ids": ["p2"], "expected_calls": 2,
+                          "spend_reserve": True})
+    assert r.status_code == 200
+    q = wait_done(Store())
+    assert q["state"] == "done" and q["spend_reserve"] is True
+
+
+def test_enqueue_spend_reserve_defaults_off(client):
+    r = client.post("/api/split/PLQ/queue",
+                    json={"pile_ids": ["p2"], "expected_calls": 2})
+    assert r.status_code == 200
+    q = wait_done(Store())
+    assert q["state"] == "done" and q["spend_reserve"] is False
 
 
 def test_enqueue_is_free(client, monkeypatch):

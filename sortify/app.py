@@ -1635,7 +1635,7 @@ def _rerecord_materialisation(split_playlist_id: str, pile_id: str, record: dict
         return True
 
 
-def _materialise_tick(playlist_id: str, pile_id: str) -> dict:
+def _materialise_tick(playlist_id: str, pile_id: str, spend_reserve: bool = False) -> dict:
     """Advance one pile's materialisation by at most ONE Spotify call.
 
     The one-shot endpoint this replaces spent a whole pile in a blocking
@@ -1695,7 +1695,8 @@ def _materialise_tick(playlist_id: str, pile_id: str) -> dict:
 
     try:
         if need_create:
-            new_id = sp.create_playlist(pile["name"], MATERIALISE_DESCRIPTION, bulk=True)
+            new_id = sp.create_playlist(pile["name"], MATERIALISE_DESCRIPTION, bulk=True,
+                                        spend_reserve=spend_reserve)
             if not _claim_materialisation(playlist_id, pile_id, claim, playlist_id=new_id):
                 try:
                     _abandon_unrecorded_playlist(playlist_id, pile_id, new_id, record)
@@ -1706,7 +1707,8 @@ def _materialise_tick(playlist_id: str, pile_id: str) -> dict:
             # always False here; no need to recompute it from `plan`.
             return {"spent": 1, "done": False, "gone": False}
         else:
-            sp.add_to_playlist(record["playlist_id"], next_uri, bulk=True)
+            sp.add_to_playlist(record["playlist_id"], next_uri, bulk=True,
+                               spend_reserve=spend_reserve)
             if not _claim_materialisation(playlist_id, pile_id, claim, added_uri=next_uri):
                 try:
                     _readopt_materialisation(playlist_id, pile_id, record,
@@ -1864,18 +1866,19 @@ def _queue_progress(q: dict) -> dict:
             "track": len(rec.get("added", [])),
             "track_total": len(_unique(cur["uris"])) if cur else 0,
             "spent_today": sp.budget_spent(), "bulk_today": sp.bulk_spent(),
-            "daily_cap": DAILY_CAP, "reserve": BULK_RESERVE}
+            "daily_cap": DAILY_CAP, "reserve": BULK_RESERVE,
+            "spend_reserve": bool(q.get("spend_reserve"))}
 
 
 def _queue_next_action(now: float) -> tuple:
     """Decide, without doing: ("stop", reason) | ("sleep", secs, state) |
-    ("tick", playlist_id, pile_id). Mutates queue.json only to advance
-    current/pending as piles finish (free, local)."""
+    ("tick", playlist_id, pile_id, spend_reserve). Mutates queue.json only to
+    advance current/pending as piles finish (free, local)."""
     with _queue_lock:
         q = store.queue()
         if q["state"] in _QUEUE_TERMINAL:
             return ("stop", q["state"])
-        block = sp.bulk_block_reason()
+        block = sp.bulk_block_reason(spend_reserve=bool(q.get("spend_reserve")))
         if block:
             reason, until = block
             state = "quiet" if reason == "quiet" else "sleeping"
@@ -1897,7 +1900,7 @@ def _queue_next_action(now: float) -> tuple:
                 q["current"] = None          # vanished or finished: next pile
                 store.save_queue(q)
                 continue
-            return ("tick", q["playlist_id"], pid)
+            return ("tick", q["playlist_id"], pid, bool(q.get("spend_reserve")))
 
 
 def _worker_may_stop() -> bool:
@@ -2023,10 +2026,11 @@ def _drain_queue_body() -> None:
                 # (C1/I1).
                 _queue_wake.clear()
                 with _queue_lock:
-                    current_state = store.queue()["state"]
-                if current_state not in _QUEUE_RESUMABLE:
+                    sleeping_q = store.queue()
+                if sleeping_q["state"] not in _QUEUE_RESUMABLE:
                     break                      # paused/cancelled — let the write below report it
-                still_blocked = sp.bulk_block_reason()
+                still_blocked = sp.bulk_block_reason(
+                    spend_reserve=bool(sleeping_q.get("spend_reserve")))
                 if still_blocked:
                     reason, until = still_blocked
                     state_label = "quiet" if reason == "quiet" else "sleeping"
@@ -2039,10 +2043,10 @@ def _drain_queue_body() -> None:
                     return                     # paused/cancelled during the sleep
                 # else: a resume raced in first (I4) — keep going
             continue
-        _, playlist_id, pile_id = action
+        _, playlist_id, pile_id, spend_reserve = action
         tick_started = time.monotonic()
         try:
-            result = _materialise_tick(playlist_id, pile_id)
+            result = _materialise_tick(playlist_id, pile_id, spend_reserve=spend_reserve)
         except SpotifyError as e:
             info = sp.last_429 or {}
             if e.status == 429 and info.get("ts", 0) >= tick_started:
@@ -2069,7 +2073,7 @@ def _drain_queue_body() -> None:
             # this as a hard stop (ruling R-T8b): a reserve-crossing race or
             # a cooldown that started between calls must ride out as a
             # sleep, not park a multi-day run on a transient race.
-            if sp.bulk_block_reason():
+            if sp.bulk_block_reason(spend_reserve=spend_reserve):
                 continue                     # next loop's sleep branch labels it correctly
             # Auth failures, 5xx, and anything else unexplained: stop
             # spending and surface the reason rather than grind a broken loop.
@@ -2115,6 +2119,10 @@ class QueueIn(BaseModel):
     # The echo, not a flag — same argument as the endpoint this replaces:
     # the caller must state the price it was shown (finding I1).
     expected_calls: int = Field(..., ge=0)
+    # Per-run opt-out of BULK_RESERVE: this run may spend the day's last
+    # 150 calls instead of sleeping at DAILY_CAP - BULK_RESERVE. Recorded in
+    # queue.json so a resume keeps the choice made at enqueue time.
+    spend_reserve: bool = False
 
 
 def _start_queue_worker() -> None:
@@ -2190,6 +2198,7 @@ def enqueue_piles(playlist_id: str, body: QueueIn):
         store.save_queue({"version": 1, "playlist_id": playlist_id,
                           "pending": order, "current": None, "state": "running",
                           "stop_reason": None, "progress": {},
+                          "spend_reserve": body.spend_reserve,
                           "pile_count_at_enqueue": len(order),
                           "enqueued_at": _now_iso(), "updated_at": _now_iso()})
     _start_queue_worker()

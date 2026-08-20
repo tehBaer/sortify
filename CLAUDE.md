@@ -11,12 +11,16 @@ escalating penalties. Therefore:
   Every manual call goes through `.venv/bin/spx GET <path>` — it shares the app's
   ledger (`data/usage.json`), throttle, and cooldown guard, and refuses beyond
   **150 dev calls/day**. The remaining budget belongs to the user's real usage.
-- **Budget layers** (`sortify/spotify.py`): `DAILY_CAP` 600/day and `WINDOW_CAP`
+- **Budget layers** (`sortify/spotify.py`): `DAILY_CAP` 1000/day and `WINDOW_CAP`
   12/60s across all sources; `BACKGROUND_DAILY_CAP` 40/day for anything proactive.
   These are set from observed damage, not from the docs — raising one needs
   evidence, not optimism. The 2026-08-13 ban came from 678 calls in ~70 minutes.
+  (`DAILY_CAP` was raised 600 → 1000 on 2026-08-20 on the strength of
+  autoqueuer's clean 1208-call day — the rate protections are unchanged.)
   The queued materialiser adds two more: `BULK_RESERVE` 150 means it never
-  spends the day's last 150 calls and sleeps to local midnight instead; its
+  spends the day's last 150 calls and sleeps to local midnight instead — unless
+  the run was enqueued with `spend_reserve: true` (per-run checkbox/API flag,
+  recorded in queue.json), which moves that line to `DAILY_CAP` itself; its
   governor holds a 7.0/min ceiling and only escalates after 15 clean minutes.
   `data/pacing.json` carries the measured `max_clean_rate` — the number that
   replaces the guess band once the rate has actually been observed clean.

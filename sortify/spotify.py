@@ -62,12 +62,18 @@ LIKED_ID = "liked"  # pseudo-playlist id for the user's Liked Songs
 # 2026-08-13: the background enricher spent 678 calls in ~70 minutes and
 # earned a ~23h ban. The old 1200/day and 30-per-60s were guesses, and both
 # sat above what actually trips the limiter. Everything here is now below it.
-# sortify's *share* of the account budget, unchanged at 600. Since Jul 2026
-# Spotify counts quota per developer account, so this is now backed by
-# ACCOUNT_DAILY_CAP in ~/kode/spotify-ledger, which all three apps spend from —
-# and, more importantly, by the shared cooldown recorded there. This stays as a
-# local guard so a missing ledger file still can't uncork us.
-DAILY_CAP = 600       # api.spotify.com calls per local day, sortify's share
+# sortify's *share* of the account budget. Since Jul 2026 Spotify counts
+# quota per developer account, so this is now backed by ACCOUNT_DAILY_CAP in
+# ~/kode/spotify-ledger, which all three apps spend from — and, more
+# importantly, by the shared cooldown recorded there. This stays as a local
+# guard so a missing ledger file still can't uncork us.
+#
+# 2026-08-20: raised 600 → 1000. Evidence, not optimism: spotify-autoqueuer
+# spent 1208 calls on 2026-08-14 at ~1.8/min with no penalty, while the bans
+# came from RATE (678 calls at ~9.7/min, 2026-08-13). WINDOW_CAP and the
+# governor pacing are the real protection and are unchanged; this cap remains
+# the runaway backstop.
+DAILY_CAP = 1000      # api.spotify.com calls per local day, sortify's share
 WINDOW_CAP = 12       # calls per rolling 60s
 
 # Proactive background work (genre enrichment) draws from this much smaller
@@ -78,7 +84,9 @@ BACKGROUND_DAILY_CAP = 40
 # The queued materialiser's spend class: user-initiated but unattended. It
 # counts toward DAILY_CAP, but the day's LAST 150 calls are reserved for the
 # user's own interactive clicks — the bulk job sleeps to local midnight
-# instead of spending them. (Spec 2026-08-18, decision 3.)
+# instead of spending them. (Spec 2026-08-18, decision 3.) A run enqueued
+# with spend_reserve=True opts out per run (2026-08-20): the reserve line
+# moves to DAILY_CAP itself, trading interactive headroom for finishing.
 BULK_RESERVE = 150
 
 # Background work also yields once the day is half spent: at that point the
@@ -230,20 +238,26 @@ class Spotify:
             return 0
         return usage.get("bulk", 0)
 
-    def bulk_block_reason(self) -> tuple[str, float] | None:
+    def bulk_block_reason(self, spend_reserve: bool = False) -> tuple[str, float] | None:
         """Why the bulk worker must not call right now — None means go.
 
         Returns (reason, resume_at). QUIET_AFTER_COOLDOWN applies here on
         purpose: this rail survived the enricher's deletion named for "the
         next proactive job", and the queued materialiser is that job.
+
+        spend_reserve is the per-run opt-out (queue.json's flag): the reserve
+        line moves to DAILY_CAP itself, so the run finishes instead of
+        sleeping at DAILY_CAP - BULK_RESERVE. The cooldown/quiet rails are
+        not the reserve's business and always apply.
         """
+        floor = DAILY_CAP if spend_reserve else DAILY_CAP - BULK_RESERVE
         now = time.time()
         cd = self.effective_cooldown_until()
         if now < cd:
             return ("cooldown", cd)
         if cd and now < cd + QUIET_AFTER_COOLDOWN:
             return ("quiet", cd + QUIET_AFTER_COOLDOWN)
-        if self.budget_spent() >= DAILY_CAP - BULK_RESERVE:
+        if self.budget_spent() >= floor:
             return ("reserve", _next_local_midnight(now))
         # The local usage.json check above only sees what THIS process wrote.
         # The shared account ledger can be further along — another process
@@ -253,7 +267,7 @@ class Spotify:
         # mid-tick and pause the run for a human. Read-only, and cheap: both
         # reads hit the same small on-disk file, lock-free (AccountLedger.read
         # tolerates a missing file as an empty ledger, i.e. "go").
-        if self.ledger.app_spent_today() >= DAILY_CAP - BULK_RESERVE:
+        if self.ledger.app_spent_today() >= floor:
             return ("reserve", _next_local_midnight(now))
         # Account-cap analog: the account-wide ceiling can be reached by the
         # siblings alone even while sortify's own share is untouched (the same
@@ -265,7 +279,8 @@ class Spotify:
             return ("reserve", _next_local_midnight(now))
         return None
 
-    def _spend_budget(self, background: bool = False, bulk: bool = False) -> None:
+    def _spend_budget(self, background: bool = False, bulk: bool = False,
+                      spend_reserve: bool = False) -> None:
         """One API call's worth of budget; blocks briefly to honor the rolling
         window, raises if the applicable cap is spent."""
         with self._budget_lock:
@@ -284,7 +299,7 @@ class Spotify:
                     429,
                     f"background budget ({BACKGROUND_DAILY_CAP} calls) spent — resting until midnight",
                 )
-            if bulk and usage["count"] >= DAILY_CAP - BULK_RESERVE:
+            if bulk and not spend_reserve and usage["count"] >= DAILY_CAP - BULK_RESERVE:
                 raise SpotifyError(
                     429,
                     f"bulk budget: interactive reserve ({BULK_RESERVE} calls) "
@@ -408,13 +423,13 @@ class Spotify:
     # ---- request plumbing -------------------------------------------------
 
     def request(self, method: str, path: str, background: bool = False, bulk: bool = False,
-                **kwargs) -> dict | None:
+                spend_reserve: bool = False, **kwargs) -> dict | None:
         if time.time() < self.effective_cooldown_until():
             mins = int(self.cooldown_until - time.time()) // 60 + 1
             raise SpotifyError(429, f"in Spotify rate-limit cooldown — try again in ~{mins} min")
         url = path if path.startswith("http") else API + path
         for attempt in range(3):
-            self._spend_budget(background=background, bulk=bulk)
+            self._spend_budget(background=background, bulk=bulk, spend_reserve=spend_reserve)
             # Mild throttle: bulk fetches shouldn't burst the rolling window.
             wait = self._last_call + 0.2 - time.time()
             if wait > 0:
@@ -680,9 +695,10 @@ class Spotify:
 
     # ---- mutations --------------------------------------------------------
 
-    def add_to_playlist(self, playlist_id: str, uri: str, bulk: bool = False) -> str | None:
+    def add_to_playlist(self, playlist_id: str, uri: str, bulk: bool = False,
+                        spend_reserve: bool = False) -> str | None:
         resp = self.request("POST", f"/playlists/{playlist_id}/items",
-                            json={"uris": [uri]}, bulk=bulk)
+                            json={"uris": [uri]}, bulk=bulk, spend_reserve=spend_reserve)
         return (resp or {}).get("snapshot_id")
 
     def remove_from_playlist(self, playlist_id: str, uri: str) -> str | None:
@@ -698,12 +714,13 @@ class Spotify:
     def save_to_liked(self, uri: str) -> None:
         self.request("PUT", "/me/library", json={"uris": [uri]})
 
-    def create_playlist(self, name: str, description: str = "", bulk: bool = False) -> str:
+    def create_playlist(self, name: str, description: str = "", bulk: bool = False,
+                        spend_reserve: bool = False) -> str:
         """Create a playlist and return its id. One call."""
         resp = self.request(
             "POST", "/me/playlists",
             json={"name": name, "description": description, "public": False},
-            bulk=bulk,
+            bulk=bulk, spend_reserve=spend_reserve,
         )
         playlist_id = (resp or {}).get("id")
         if not playlist_id:

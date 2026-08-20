@@ -35,10 +35,10 @@ TINY = [f"spotify:track:t{i}" for i in range(1)]
 def worker_env(monkeypatch):
     calls = []
     monkeypatch.setattr(appmod.sp, "create_playlist",
-                        lambda name, description="", bulk=False: calls.append(("create", name)) or f"NEW-{name}")
+                        lambda name, description="", bulk=False, spend_reserve=False: calls.append(("create", name)) or f"NEW-{name}")
     monkeypatch.setattr(appmod.sp, "add_to_playlist",
-                        lambda pid, uri, bulk=False: calls.append(("add", pid, uri)) or "snap")
-    monkeypatch.setattr(appmod.sp, "bulk_block_reason", lambda: None)
+                        lambda pid, uri, bulk=False, spend_reserve=False: calls.append(("add", pid, uri)) or "snap")
+    monkeypatch.setattr(appmod.sp, "bulk_block_reason", lambda spend_reserve=False: None)
     monkeypatch.setattr(pacing.Governor, "interval", lambda self: 0.0)
     s = Store()
     originals = {f: getattr(s, f)() for f in ("splits", "queue", "pacing")}
@@ -156,7 +156,7 @@ def test_quota_trip_stops_permanently_with_reason(worker_env, monkeypatch):
     calls, s = worker_env
     invocations = {"n": 0}
 
-    def quota_create(name, description="", bulk=False):
+    def quota_create(name, description="", bulk=False, spend_reserve=False):
         invocations["n"] += 1
         # Minor 3 (fix round 2): this closure runs ON THE WORKER THREAD
         # (invoked from _materialise_tick inside _drain_queue), so it uses
@@ -188,7 +188,7 @@ def test_rate_429_halves_and_keeps_going(worker_env, monkeypatch):
     calls, s = worker_env
     first = {"burned": False}
 
-    def flaky_add(pid, uri, bulk=False):
+    def flaky_add(pid, uri, bulk=False, spend_reserve=False):
         if not first["burned"]:
             first["burned"] = True
             # Minor 3 (fix round 2): this closure runs ON THE WORKER THREAD
@@ -240,7 +240,7 @@ def test_block_reason_sleeps_with_the_labelled_state(worker_env, monkeypatch):
     calls, s = worker_env
     blocked = {"on": True}
     monkeypatch.setattr(appmod.sp, "bulk_block_reason",
-                        lambda: ("reserve", time.time() + 60) if blocked["on"] else None)
+                        lambda spend_reserve=False: ("reserve", time.time() + 60) if blocked["on"] else None)
     start_queue(s, pending=("p2",))
     deadline = time.time() + 5
     while time.time() < deadline and s.queue()["state"] != "sleeping":
@@ -316,7 +316,7 @@ def test_sleep_loop_does_not_rewrite_queue_json_for_an_unchanged_block(worker_en
 
     unblock = {"on": False}
 
-    def block_reason():
+    def block_reason(spend_reserve=False):
         return None if unblock["on"] else ("reserve", time.time() + 0.3)
     monkeypatch.setattr(appmod.sp, "bulk_block_reason", block_reason)
 
@@ -342,4 +342,42 @@ def test_progress_snapshot_is_written_for_boxdash(worker_env):
     wait_done(s)
     prog = s.queue()["progress"]
     assert prog["pile_count"] == 2 and prog["spent_today"] >= 0
-    assert prog["daily_cap"] == 600 and prog["reserve"] == 150
+    assert prog["daily_cap"] == 1000 and prog["reserve"] == 150
+
+
+def test_the_worker_consults_the_block_with_the_runs_spend_reserve_flag(worker_env, monkeypatch):
+    """A run enqueued with spend_reserve=True must ask bulk_block_reason with
+    that flag — otherwise the whole feature is a stored bool nothing reads."""
+    calls, s = worker_env
+    seen = []
+    monkeypatch.setattr(appmod.sp, "bulk_block_reason",
+                        lambda spend_reserve=False: seen.append(spend_reserve) or None)
+    q = s.queue()
+    q["spend_reserve"] = True
+    s.save_queue(q)
+    start_queue(s, pending=("p2",))
+    q = wait_done(s)
+    assert q["state"] == "done"
+    assert seen and all(seen), seen
+
+
+def test_the_tick_spends_with_the_runs_spend_reserve_flag(worker_env, monkeypatch):
+    """The flag has to ride all the way into the Spotify calls, where
+    _spend_budget's reserve guard actually lives."""
+    calls, s = worker_env
+    seen = []
+    monkeypatch.setattr(
+        appmod.sp, "create_playlist",
+        lambda name, description="", bulk=False, spend_reserve=False:
+            seen.append(("create", spend_reserve)) or f"NEW-{name}")
+    monkeypatch.setattr(
+        appmod.sp, "add_to_playlist",
+        lambda pid, uri, bulk=False, spend_reserve=False:
+            seen.append(("add", spend_reserve)) or "snap")
+    q = s.queue()
+    q["spend_reserve"] = True
+    s.save_queue(q)
+    start_queue(s, pending=("p2",))
+    q = wait_done(s)
+    assert q["state"] == "done"
+    assert seen and all(flag for _, flag in seen), seen

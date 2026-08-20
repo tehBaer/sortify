@@ -1503,7 +1503,8 @@ async function queuePiles(pileIds, expectedCalls) {
   renderPiles();
   try {
     const data = await api(`/api/split/${splitId}/queue`,
-                           { pile_ids: pileIds, expected_calls: expectedCalls });
+                           { pile_ids: pileIds, expected_calls: expectedCalls,
+                             spend_reserve: $("chk-spend-reserve").checked });
     toast(data.total_calls === 0
       ? "already saved — nothing queued"
       : `queued ${data.queued.length} pile${data.queued.length === 1 ? "" : "s"} — ` +
