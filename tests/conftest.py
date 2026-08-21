@@ -31,3 +31,28 @@ def isolated_account_ledger(tmp_path, monkeypatch):
     the cap tests begin failing in whatever order pytest happens to run them.
     """
     monkeypatch.setenv("SPOTIFY_ACCOUNT_LEDGER", str(tmp_path / "account-ledger.json"))
+
+
+@pytest.fixture(autouse=True)
+def no_real_deezer(monkeypatch):
+    """No test may reach the real Deezer API through the app's client factory.
+
+    `?force=1` on /api/now runs `_fetch_missing_now_bpm`, and any route test
+    that forces without faking `_deezer_client` used to construct a real
+    `Deezer()` and hit api.deezer.com for the fixture track — the search came
+    back empty and a `{"miss": True}` record for ("A", "X") landed in the
+    session-shared deezer.json, which is exactly what made test_deezer.py
+    fail in reverse file ordering (its floor/failure tests found the track
+    already "known" and never fetched). The factory raising here is swallowed
+    by that path's broad `except` — the force poll still succeeds, records
+    nothing, and stays off the network. Tests that need a working client
+    monkeypatch `_deezer_client` themselves, which overrides this guard;
+    tests of the `Deezer` class itself construct it directly with a fake
+    transport and never touch the factory.
+    """
+    import sortify.app as appmod
+
+    def _blocked():
+        raise AssertionError("test reached the real Deezer client — fake appmod._deezer_client")
+
+    monkeypatch.setattr(appmod, "_deezer_client", _blocked)
