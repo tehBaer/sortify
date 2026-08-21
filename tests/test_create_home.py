@@ -199,3 +199,125 @@ def test_switching_home_off_also_drops_sticky_so_ingest_cannot_resurrect(client,
     monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: LISTING)
     client.post("/api/folders", json=TREE)
     assert appmod.store.config()["home_ids"] == ["tree1"]
+
+
+# ---- POST /api/playlists/create (Task 4) -----------------------------------
+
+
+def _wire_create(monkeypatch, snapshot="snap-new"):
+    """Fake the two client methods the endpoint spends/uses; count creates."""
+    calls = {"create": 0}
+    def fake_full(name, description="", bulk=False, spend_reserve=False):
+        calls["create"] += 1
+        return "made1", snapshot
+    monkeypatch.setattr(appmod.sp, "create_playlist_full", fake_full)
+    monkeypatch.setattr(appmod.sp, "my_playlists",
+                        lambda refresh=False: list(LISTING[:1]))
+    return calls
+
+
+def _seed_cache_with_listing():
+    appmod.store.save_cache({
+        "playlists": {}, "artists": {}, "me": {"id": "me"},
+        "playlist_list": {"fetched_at": 1.0, "items": list(LISTING[:1])},
+    })
+
+
+def test_create_refuses_bad_names_before_spending(client, monkeypatch):
+    _seed_config()
+    calls = _wire_create(monkeypatch)
+    for bad in ("[Foo]", "{x}", "🐾 sub", "  "):
+        res = client.post("/api/playlists/create", json={"name": bad, "role": "home"})
+        assert res.status_code == 400, bad
+    assert calls["create"] == 0
+
+
+def test_create_refuses_non_home_roles(client, monkeypatch):
+    _seed_config()
+    calls = _wire_create(monkeypatch)
+    res = client.post("/api/playlists/create", json={"name": "Ok", "role": "input"})
+    assert res.status_code == 400
+    assert calls["create"] == 0
+
+
+def test_create_marks_home_and_sticky_and_seeds_the_track_cache(client, monkeypatch):
+    _seed_config()
+    _seed_cache_with_listing()
+    _wire_create(monkeypatch, snapshot="snap-new")
+    res = client.post("/api/playlists/create", json={"name": "Late Night", "role": "home"})
+    assert res.status_code == 200
+    cfg = appmod.store.config()
+    assert "made1" in cfg["home_ids"] and "made1" in cfg["sticky_home_ids"]
+    entry = appmod.store.cache()["playlists"]["made1"]
+    assert entry["tracks"] == [] and entry["snapshot_id"] == "snap-new"
+    # And the listing entry carries the same snapshot — the equality is the
+    # whole point (spec §3).
+    listed = next(p for p in appmod.store.cache()["playlist_list"]["items"]
+                  if p["id"] == "made1")
+    assert listed["snapshot_id"] == "snap-new"
+    assert res.json()["playlist"]["role"] == "home"
+
+
+def test_create_without_a_response_snapshot_seeds_the_sentinel(client, monkeypatch):
+    _seed_config()
+    _seed_cache_with_listing()
+    _wire_create(monkeypatch, snapshot=None)
+    client.post("/api/playlists/create", json={"name": "Late Night", "role": "home"})
+    entry = appmod.store.cache()["playlists"]["made1"]
+    listed = next(p for p in appmod.store.cache()["playlist_list"]["items"]
+                  if p["id"] == "made1")
+    assert entry["snapshot_id"] == listed["snapshot_id"] == "created:made1"
+
+
+def test_duplicate_names_are_allowed_with_a_note(client, monkeypatch):
+    _seed_config()
+    _seed_cache_with_listing()
+    _wire_create(monkeypatch)
+    res = client.post("/api/playlists/create", json={"name": "Hazy", "role": "home"})
+    assert res.status_code == 200
+    assert res.json()["note"]  # "already exists" note, creation not refused
+
+
+def test_create_clears_the_profile_cache(client, monkeypatch):
+    _seed_config()
+    _seed_cache_with_listing()
+    _wire_create(monkeypatch)
+    appmod._profile_state.update(built_at=9e12, profiles={"stale": None})
+    client.post("/api/playlists/create", json={"name": "Late Night", "role": "home"})
+    assert appmod._profile_state.get("built_at") == 0.0
+    assert "profiles" not in appmod._profile_state
+
+
+def test_leak_guard_created_home_costs_exactly_one_call_ever(client, monkeypatch):
+    """THE test for the snapshot trap (spec §3, §6): create a home, then
+    build profiles twice; total upstream spend is exactly the 1 create call.
+    A falsy or mismatched seeded snapshot makes _cached_tracks refetch the
+    empty playlist on every rebuild — 1 call per 10 minutes, forever."""
+    _seed_config()
+    _seed_cache_with_listing()
+    calls = {"n": 0}
+
+    class Resp:
+        status_code = 201
+        content = b"{}"
+        headers = {}
+        text = ""
+        @staticmethod
+        def json():
+            return {"id": "made1"}  # deliberately NO snapshot_id → sentinel path
+
+    def fake_request(method, url, **kwargs):
+        calls["n"] += 1
+        assert method == "POST" and url.endswith("/me/playlists"), (
+            f"unexpected upstream call: {method} {url}")
+        return Resp()
+
+    monkeypatch.setattr(appmod.sp, "_access_token", lambda: "token")
+    monkeypatch.setattr(appmod.sp, "_last_call", 0.0)
+    monkeypatch.setattr(appmod.sp.http, "request", fake_request)
+
+    res = client.post("/api/playlists/create", json={"name": "Late Night", "role": "home"})
+    assert res.status_code == 200
+    appmod._ensure_profiles(force=True)
+    appmod._ensure_profiles(force=True)
+    assert calls["n"] == 1
