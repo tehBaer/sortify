@@ -262,12 +262,19 @@ def ingest_folders(tree: Any = Body(...)):
         }
         rule += ", minus marker/derived names"
     home_ids = sorted((chosen & editable) - inputs)
+    # Homes created inside sortify have no folder path yet, so the tree
+    # cannot see them. Union them back in (through the same editable/input
+    # filters) — the tree keeps authority over playlists it can see, it just
+    # stops deleting knowledge it never had. (Spec §2.)
+    sticky = {s for s in (cfg.get("sticky_home_ids") or [])
+              if s in editable and s not in inputs}
+    home_ids = sorted(set(home_ids) | sticky)
     store.update_config(home_ids=home_ids)
     return {
         "playlists_in_folders": len(mapping),
         "homes_marked": len(home_ids),
         "rule": rule,
-        "home_folders": sorted({mapping[pid]["path"] for pid in home_ids}),
+        "home_folders": sorted({mapping[pid]["path"] for pid in home_ids if pid in mapping}),
     }
 
 
@@ -313,6 +320,12 @@ def set_config(body: ConfigIn):
     store.update_config(
         input_ids=body.input_ids, home_ids=body.home_ids,
         home_hints={k: v.strip() for k, v in body.home_hints.items() if v.strip()},
+        # A sticky role must still be revocable: Home toggled off in the
+        # Playlists view drops the id here too, or the next folder ingest
+        # would resurrect it. (Spec §2.)
+        sticky_home_ids=sorted(
+            set(store.config().get("sticky_home_ids") or []) & set(body.home_ids)
+        ),
     )
     # Hints feed the tag profiles, which otherwise sit cached for PROFILE_TTL —
     # a save should be visible on the very next suggestion, not 10 min later.

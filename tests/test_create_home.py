@@ -136,3 +136,66 @@ def test_create_playlist_still_returns_bare_id(sp, monkeypatch):
     monkeypatch.setattr(sp.http, "request",
                         lambda *a, **k: FakeResponse({"id": "fresh"}, status=201))
     assert sp.create_playlist("Late Night") == "fresh"
+
+
+# ---- sticky home ids (Task 3) ----------------------------------------------
+
+from fastapi.testclient import TestClient
+
+from sortify import app as appmod
+
+
+@pytest.fixture
+def client(monkeypatch):
+    return TestClient(appmod.app, raise_server_exceptions=False)
+
+
+LISTING = [
+    {"id": "tree1", "name": "Hazy", "owner": "me", "editable": True,
+     "total": 3, "snapshot_id": "s1", "image": None, "description": ""},
+    {"id": "made1", "name": "Late Night", "owner": "me", "editable": True,
+     "total": 0, "snapshot_id": "created:made1", "image": None, "description": ""},
+]
+
+TREE = {"type": "folder", "children": [
+    {"type": "folder", "name": "ROOT", "children": [
+        {"type": "playlist", "uri": "spotify:playlist:tree1"}]},
+]}
+
+
+def _seed_config(**extra):
+    appmod.store.save_config({
+        "client_id": "x", "input_ids": [], "home_ids": [],
+        "home_folder_prefixes": ["ROOT"], "home_folder_exclude": [],
+        "input_name_pattern": r"^\[.+\]$",
+        "home_exclude_emoji_names": True,
+        "home_name_exclude_patterns": [r"^__.+__$", r"^\{.*\}$", r"^<.*>$"],
+        **extra,
+    })
+
+
+def test_folder_ingest_keeps_sticky_homes_the_tree_never_saw(client, monkeypatch):
+    _seed_config(home_ids=["made1"], sticky_home_ids=["made1"])
+    monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: LISTING)
+    res = client.post("/api/folders", json=TREE)
+    assert res.status_code == 200
+    assert sorted(appmod.store.config()["home_ids"]) == ["made1", "tree1"]
+
+
+def test_folder_ingest_still_filters_sticky_by_editable_and_inputs(client, monkeypatch):
+    _seed_config(sticky_home_ids=["ghost", "made1"], input_ids=["made1"])
+    monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: LISTING)
+    client.post("/api/folders", json=TREE)
+    # "ghost" is not in the listing (not editable), "made1" is an input now.
+    assert appmod.store.config()["home_ids"] == ["tree1"]
+
+
+def test_switching_home_off_also_drops_sticky_so_ingest_cannot_resurrect(client, monkeypatch):
+    _seed_config(home_ids=["made1", "tree1"], sticky_home_ids=["made1"])
+    res = client.post("/api/config", json={
+        "input_ids": [], "home_ids": ["tree1"], "home_hints": {}})
+    assert res.status_code == 200
+    assert appmod.store.config()["sticky_home_ids"] == []
+    monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: LISTING)
+    client.post("/api/folders", json=TREE)
+    assert appmod.store.config()["home_ids"] == ["tree1"]
