@@ -375,8 +375,7 @@ async function createHome(name) {
   const p = res.playlist;
   playlistData.unshift(p);
   roles[p.id] = "home";
-  if (res.note) toast(res.note, 4000);
-  return p;
+  return { p, note: res.note };
 }
 
 $("btn-new-home").onclick = async () => {
@@ -385,10 +384,10 @@ $("btn-new-home").onclick = async () => {
   const btn = $("btn-new-home");
   btn.disabled = true;
   try {
-    const p = await createHome(name);
+    const { p, note } = await createHome(name);
     $("new-home-name").value = "";
     renderLists();
-    toast(`created home "${p.name}"`);
+    toast(note ? `created home "${p.name}" — ${note}` : `created home "${p.name}"`, note ? 5000 : undefined);
   } catch (e) { toast(e.message); } finally { btn.disabled = false; }
 };
 
@@ -937,9 +936,11 @@ function renderNow() {
     const more = $("btn-now-more");
     if (more) more.onclick = () => openPicker(nowState.homes, nowFile, async (name) => {
       try {
-        const p = await createHome(name);
+        const { p } = await createHome(name);
         nowState.homes.set(p.id, { id: p.id, name: p.name, image: null, total: 0, folder: null });
-        await nowFile(p.id);  // lands the card in its ordinary ✓ filed state
+        await nowFile(p.id);  // lands the card in its ordinary ✓ filed state; nowFile's
+        // own toast covers this action (behaviour here is unchanged by the Task 5 fix —
+        // only the Playlists-view path's clobbered note needed composing).
       } catch (e) { toast(e.message); }
     });
     const rem = $("btn-now-remove");
