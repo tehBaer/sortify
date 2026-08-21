@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import os
 import secrets
 import threading
@@ -27,6 +28,8 @@ from .account_ledger import (ACCOUNT_DAILY_CAP, AccountLedger, InCooldown,
 from .account_ledger import quota_cooldown_until
 from .account_ledger import next_local_midnight as _next_local_midnight
 from .store import Store
+
+log = logging.getLogger(__name__)
 
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
@@ -559,6 +562,30 @@ class Spotify:
             entry["items"] = kept
             self.store.save_cache(cache)
 
+    def remember_playlist(self, item: dict) -> None:
+        """Insert a just-created playlist into the cached listing.
+
+        The inverse of forget_playlists, and for the inverse reason: the
+        listing is only re-read on an explicit Refresh (~21 calls), so
+        without this a playlist created app-side is invisible — and
+        unusable — until the user pays for one. Costs nothing and touches
+        no network. `item` must be shaped exactly as _fetch_my_playlists
+        produces it, so nothing downstream can tell the difference.
+
+        Same lock and same loser as forget_playlists: a refresh landing
+        between this read and write wins, and correctly so — it has just
+        asked Spotify what actually exists.
+        """
+        with _LIST_LOCK:
+            cache = self.store.cache()
+            entry = cache.get("playlist_list")
+            if not entry or entry.get("items") is None:
+                return  # nothing cached to keep current
+            if any(p.get("id") == item["id"] for p in entry["items"]):
+                return
+            entry["items"].insert(0, item)
+            self.store.save_cache(cache)
+
     def rename_playlist(self, playlist_id: str, name: str) -> None:
         """One PUT, then patch the cached listing so the new name is visible
         without a paid Refresh. Same lock as the refresh path; a refresh
@@ -714,6 +741,31 @@ class Spotify:
     def save_to_liked(self, uri: str) -> None:
         self.request("PUT", "/me/library", json={"uris": [uri]})
 
+    def create_playlist_full(
+        self, name: str, description: str = "", bulk: bool = False
+    ) -> tuple[str, str | None]:
+        """Create a playlist; return (id, snapshot_id or None). One call.
+
+        snapshot_id's presence in the Feb-2026 create response is unverified
+        (spec §3) — callers that get None seed a sentinel instead. The full
+        key list is logged so the first real creation settles the question
+        without ever probing for it.
+        """
+        resp = self.request(
+            "POST", "/me/playlists",
+            json={"name": name, "description": description, "public": False},
+            bulk=bulk,
+        )
+        playlist_id = (resp or {}).get("id")
+        if not playlist_id:
+            # A 200/201 with no id would otherwise flow straight into
+            # add_to_playlist as f"/playlists/{None}/items" — a confusing
+            # 404 far from the actual problem. The call already happened and
+            # spent budget either way; fail loudly at the source instead.
+            raise SpotifyError(502, "playlist creation returned no id")
+        log.info("create response keys: %s", sorted(resp))
+        return playlist_id, resp.get("snapshot_id")
+
     def create_playlist(self, name: str, description: str = "", bulk: bool = False,
                         spend_reserve: bool = False) -> str:
         """Create a playlist and return its id. One call."""
@@ -724,10 +776,6 @@ class Spotify:
         )
         playlist_id = (resp or {}).get("id")
         if not playlist_id:
-            # A 200/201 with no id would otherwise flow straight into
-            # add_to_playlist as f"/playlists/{None}/items" — a confusing
-            # 404 far from the actual problem. The call already happened and
-            # spent budget either way; fail loudly at the source instead.
             raise SpotifyError(502, "playlist creation returned no id")
         return playlist_id
 
