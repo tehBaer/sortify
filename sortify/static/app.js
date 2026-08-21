@@ -367,6 +367,31 @@ $("btn-save-config").onclick = async () => {
   try { await saveConfig(); toast("saved"); } catch (e) { toast(e.message); }
 };
 
+// Creating a home from here is 1 call; the row appears in place, already
+// marked Home, with no Refresh. The folder path stays blank until the next
+// desktop-client folder export — not an error, homes work without one.
+async function createHome(name) {
+  const res = await api("/api/playlists/create", { name, role: "home" });
+  const p = res.playlist;
+  playlistData.unshift(p);
+  roles[p.id] = "home";
+  if (res.note) toast(res.note, 4000);
+  return p;
+}
+
+$("btn-new-home").onclick = async () => {
+  const name = $("new-home-name").value.trim();
+  if (!name) return;
+  const btn = $("btn-new-home");
+  btn.disabled = true;
+  try {
+    const p = await createHome(name);
+    $("new-home-name").value = "";
+    renderLists();
+    toast(`created home "${p.name}"`);
+  } catch (e) { toast(e.message); } finally { btn.disabled = false; }
+};
+
 // ---- triage ----------------------------------------------------------------
 
 async function startTriage(id, name) {
@@ -910,7 +935,13 @@ function renderNow() {
       b.onclick = () => nowFile(b.dataset.to);
     });
     const more = $("btn-now-more");
-    if (more) more.onclick = () => openPicker(nowState.homes, nowFile);
+    if (more) more.onclick = () => openPicker(nowState.homes, nowFile, async (name) => {
+      try {
+        const p = await createHome(name);
+        nowState.homes.set(p.id, { id: p.id, name: p.name, image: null, total: 0, folder: null });
+        await nowFile(p.id);  // lands the card in its ordinary ✓ filed state
+      } catch (e) { toast(e.message); }
+    });
     const rem = $("btn-now-remove");
     if (rem) rem.onclick = nowRemove;
     $("now-card").querySelectorAll(".in-chip").forEach((b) => {
@@ -999,14 +1030,16 @@ $("btn-undo-now").onclick = async () => {
 
 // ---- picker ----------------------------------------------------------------
 
-function openPicker(homesMap, onPick) {
+function openPicker(homesMap, onPick, onCreate) {
   const list = $("picker-list");
   const paint = (filter) => {
     list.innerHTML = "";
     const homes = [...homesMap.values()].sort((a, b) =>
       (a.folder || "").localeCompare(b.folder || "") || a.name.localeCompare(b.name));
+    let shown = 0;
     for (const h of homes) {
       if (filter && !(h.name + " " + (h.folder || "")).toLowerCase().includes(filter)) continue;
+      shown++;
       const b = document.createElement("button");
       b.className = "picker-row";
       // Name first and bold; the folder path demoted to a small second line —
@@ -1015,6 +1048,16 @@ function openPicker(homesMap, onPick) {
       b.innerHTML = `<span class="p-name">${esc(h.name)}</span>` +
         (sub ? `<span class="p-sub">${esc(sub)}</span>` : "");
       b.onclick = () => { closePicker(); onPick(h.id); };
+      list.appendChild(b);
+    }
+    // The moment of need: the right playlist doesn't exist yet. Create it
+    // and file in one gesture — create + add, priced as such. (Spec §5.)
+    if (!shown && filter && onCreate) {
+      const b = document.createElement("button");
+      b.className = "picker-row picker-create";
+      b.innerHTML = `<span class="p-name">Create home “${esc(filter)}” and file this track there</span>` +
+        `<span class="p-sub">2 calls</span>`;
+      b.onclick = () => { closePicker(); onCreate($("picker-filter").value.trim()); };
       list.appendChild(b);
     }
   };
