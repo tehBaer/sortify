@@ -476,7 +476,7 @@ $("btn-undo").onclick = async () => {
   const t = triage;
   if (!t || !t.history.length) return;
   try {
-    await api("/api/undo");
+    await api("/api/undo", {});
     const last = t.history.pop();
     t.tracks.splice(Math.min(last.idx, t.tracks.length), 0, last.track);
     t.idx = Math.min(last.idx, t.tracks.length - 1);
@@ -988,7 +988,7 @@ async function nowRemove() {
 $("btn-undo-now").onclick = async () => {
   if (!nowActions) return;
   try {
-    const res = await api("/api/undo");
+    const res = await api("/api/undo", {});
     nowActions--;
     const uri = Object.keys(filedUris).pop();
     if (uri) delete filedUris[uri];
