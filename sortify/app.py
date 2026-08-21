@@ -369,8 +369,14 @@ def create_playlist_api(body: CreatePlaylistIn):
         raise HTTPException(400, problem)
     name = body.name.strip()
 
+    # Cached-only: my_playlists() would silently pay ~21 paginated calls on a
+    # cold/absent playlist_list cache. When there is nothing cached, skip the
+    # note rather than fetch to produce one — the same coupling remember_playlist
+    # has: with no cached listing, it is a no-op and the new home stays
+    # invisible until the next Refresh (degraded, not corrupt).
+    cached_items = (store.cache().get("playlist_list") or {}).get("items") or []
     note = None
-    if any(p["name"].strip() == name for p in sp.my_playlists()):
+    if any(p["name"].strip() == name for p in cached_items):
         note = "a playlist with this name already exists — Spotify allows duplicates, so now there are two"
 
     new_id, snapshot = sp.create_playlist_full(name)
@@ -382,16 +388,9 @@ def create_playlist_api(body: CreatePlaylistIn):
         "editable": True, "total": 0, "snapshot_id": snapshot,
         "image": None, "description": "",
     }
+    # Also seeds the track cache atomically under the same lock (spec §3's
+    # snapshot trap) — see Spotify.remember_playlist.
     sp.remember_playlist(item)
-
-    # Seed, don't fetch: we created it, it is empty by construction, and the
-    # matching snapshot is what makes _cached_tracks serve this entry instead
-    # of paying a call per profile rebuild to re-learn "empty".
-    cache = store.cache()
-    cache["playlists"][new_id] = {
-        "snapshot_id": snapshot, "tracks": [], "fetched_at": time.time(),
-    }
-    store.save_cache(cache)
 
     cfg = store.config()
     store.update_config(

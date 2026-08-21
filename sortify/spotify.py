@@ -563,14 +563,21 @@ class Spotify:
             self.store.save_cache(cache)
 
     def remember_playlist(self, item: dict) -> None:
-        """Insert a just-created playlist into the cached listing.
+        """Insert a just-created playlist into the cached listing, and seed
+        its (empty, by construction) track cache — atomically, same lock.
 
-        The inverse of forget_playlists, and for the inverse reason: the
-        listing is only re-read on an explicit Refresh (~21 calls), so
-        without this a playlist created app-side is invisible — and
-        unusable — until the user pays for one. Costs nothing and touches
-        no network. `item` must be shaped exactly as _fetch_my_playlists
-        produces it, so nothing downstream can tell the difference.
+        The listing half is the inverse of forget_playlists, and for the
+        inverse reason: the listing is only re-read on an explicit Refresh
+        (~21 calls), so without this a playlist created app-side is
+        invisible — and unusable — until the user pays for one. Costs
+        nothing and touches no network. `item` must be shaped exactly as
+        _fetch_my_playlists produces it, so nothing downstream can tell the
+        difference.
+
+        The track-cache half always runs, even when there is no cached
+        listing to insert into: it is what keeps profile rebuilds at zero
+        calls for this playlist either way (spec §3's snapshot trap) — a
+        cold listing cache must not skip it.
 
         Same lock and same loser as forget_playlists: a refresh landing
         between this read and write wins, and correctly so — it has just
@@ -579,11 +586,13 @@ class Spotify:
         with _LIST_LOCK:
             cache = self.store.cache()
             entry = cache.get("playlist_list")
-            if not entry or entry.get("items") is None:
-                return  # nothing cached to keep current
-            if any(p.get("id") == item["id"] for p in entry["items"]):
-                return
-            entry["items"].insert(0, item)
+            if entry and entry.get("items") is not None and not any(
+                p.get("id") == item["id"] for p in entry["items"]
+            ):
+                entry["items"].insert(0, item)
+            cache["playlists"][item["id"]] = {
+                "snapshot_id": item["snapshot_id"], "tracks": [], "fetched_at": time.time(),
+            }
             self.store.save_cache(cache)
 
     def rename_playlist(self, playlist_id: str, name: str) -> None:

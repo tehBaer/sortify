@@ -934,15 +934,7 @@ function renderNow() {
       b.onclick = () => nowFile(b.dataset.to);
     });
     const more = $("btn-now-more");
-    if (more) more.onclick = () => openPicker(nowState.homes, nowFile, async (name) => {
-      try {
-        const { p } = await createHome(name);
-        nowState.homes.set(p.id, { id: p.id, name: p.name, image: null, total: 0, folder: null });
-        await nowFile(p.id);  // lands the card in its ordinary ✓ filed state; nowFile's
-        // own toast covers this action (behaviour here is unchanged by the Task 5 fix —
-        // only the Playlists-view path's clobbered note needed composing).
-      } catch (e) { toast(e.message); }
-    });
+    if (more) more.onclick = () => openPicker(nowState.homes, nowFile, nowCreateAndFile);
     const rem = $("btn-now-remove");
     if (rem) rem.onclick = nowRemove;
     $("now-card").querySelectorAll(".in-chip").forEach((b) => {
@@ -1005,6 +997,19 @@ async function nowFile(toId) {
   } catch (e) { toast(e.message); }
 }
 
+// Picker's no-match create row, hoisted so both the "Add to…" button and the
+// `m` keyboard shortcut get the create row (previously only the button did).
+async function nowCreateAndFile(name) {
+  try {
+    const { p, note } = await createHome(name);
+    nowState.homes.set(p.id, { id: p.id, name: p.name, image: null, total: 0, folder: null });
+    await nowFile(p.id);  // lands the card in its ordinary ✓ filed state; nowFile's
+    // own toast covers that. The server's duplicate-name note is separate and
+    // would otherwise be silently dropped, so surface it too.
+    if (note) toast(note, 5000);
+  } catch (e) { toast(e.message); }
+}
+
 async function nowRemove() {
   const d = nowState, tr = d.track;
   if (!d.context?.is_input) return;
@@ -1054,11 +1059,15 @@ function openPicker(homesMap, onPick, onCreate) {
     // The moment of need: the right playlist doesn't exist yet. Create it
     // and file in one gesture — create + add, priced as such. (Spec §5.)
     if (!shown && filter && onCreate) {
+      const typed = $("picker-filter").value.trim();
+      // nowFile sends a remove too when filing from an input: create + add +
+      // remove = 3 calls, not 2 — the label must state the true cost.
+      const price = nowState.context?.is_input ? "3 calls" : "2 calls";
       const b = document.createElement("button");
       b.className = "picker-row picker-create";
-      b.innerHTML = `<span class="p-name">Create home “${esc(filter)}” and file this track there</span>` +
-        `<span class="p-sub">2 calls</span>`;
-      b.onclick = () => { closePicker(); onCreate($("picker-filter").value.trim()); };
+      b.innerHTML = `<span class="p-name">Create home “${esc(typed)}” and file this track there</span>` +
+        `<span class="p-sub">${price}</span>`;
+      b.onclick = () => { closePicker(); onCreate(typed); };
       list.appendChild(b);
     }
   };
@@ -2102,7 +2111,7 @@ document.addEventListener("keydown", (e) => {
     if (["1", "2", "3"].includes(e.key)) {
       const s = nowState.suggestions[Number(e.key) - 1];
       if (s) nowFile(s.playlist_id);
-    } else if (e.key === "m" && nowState.track.sortable) openPicker(nowState.homes, nowFile);
+    } else if (e.key === "m" && nowState.track.sortable) openPicker(nowState.homes, nowFile, nowCreateAndFile);
     else if (e.key === "r") nowRemove();
     else if (e.key === "u") $("btn-undo-now").click();
   }

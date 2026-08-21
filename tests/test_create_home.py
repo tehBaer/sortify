@@ -109,11 +109,17 @@ def test_remember_is_idempotent(sp, monkeypatch):
     assert [p["id"] for p in sp.my_playlists()].count("new1") == 1
 
 
-def test_remember_without_a_cached_listing_is_a_noop(tmp_path, monkeypatch):
+def test_remember_without_a_cached_listing_still_seeds_the_track_cache(tmp_path, monkeypatch):
     client = Spotify(Store(tmp_path))
+    monkeypatch.setattr(client.http, "request",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError))
     client.remember_playlist(item("new1"))  # must not raise, must not fetch
-    assert (client.store.cache().get("playlist_list") or {}) in ({}, None) or \
-        client.store.cache()["playlist_list"] is None
+    # The listing half stays a no-op: nothing cached to keep current.
+    assert (client.store.cache().get("playlist_list") or {}).get("items") is None
+    # The track-cache seed always runs — that's what keeps profile rebuilds
+    # at zero calls whether or not a listing was cached (spec §3).
+    entry = client.store.cache()["playlists"]["new1"]
+    assert entry["tracks"] == [] and entry["snapshot_id"] == "created:new1"
 
 
 def test_create_playlist_full_returns_id_and_snapshot(sp, monkeypatch):
@@ -148,6 +154,16 @@ from sortify import app as appmod
 @pytest.fixture
 def client(monkeypatch):
     return TestClient(appmod.app, raise_server_exceptions=False)
+
+
+@pytest.fixture(autouse=True)
+def _clean_profile_state():
+    """The leak-guard and profile-clear tests mutate module globals
+    (_profile_state) directly; reset them after every test so a run order
+    can't leak stale profile state into an unrelated test."""
+    yield
+    appmod._profile_state.clear()
+    appmod._profile_state["built_at"] = 0.0
 
 
 LISTING = [
