@@ -17,9 +17,11 @@ from fastapi.testclient import TestClient
 from sortify import app as appmod
 from sortify.app import (
     NOW_FETCH_MAX_ARTISTS,
+    NOW_FETCH_MAX_SIMILAR_ARTISTS,
     NOW_FETCH_MIN_INTERVAL,
     NOW_FETCH_TIMEOUT,
     _fetch_missing_now_tags,
+    _merge_save_lastfm_artists,
     _merge_save_lastfm_tracks,
     _merge_save_tag_artists,
 )
@@ -75,6 +77,16 @@ def _isolate_lastfm_tracks_json():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_lastfm_artists_json():
+    """Same isolation, for lastfm_artists.json — the piggyback's
+    artist-similar step (Task 4) writes it too, and it shares this file's
+    module-wide data dir."""
+    original = Store().lastfm_artists()
+    yield
+    Store().save_lastfm_artists(original)
+
+
+@pytest.fixture(autouse=True)
 def _reset_now_fetch_floor():
     """`_now_fetch_last_attempt` is process-global state guarding
     NOW_FETCH_MIN_INTERVAL. Without a reset, one test's real-clock fetch
@@ -106,6 +118,11 @@ class RaisingFm:
             f"Last.fm must not be called for the passive poll (getTopTags {artist!r}/{title!r})"
         )
 
+    def artist_similar(self, name):
+        raise AssertionError(
+            f"Last.fm must not be called for the passive poll (getSimilar artist {name!r})"
+        )
+
 
 class FakeFm:
     """Records every artist name it was asked about."""
@@ -128,19 +145,27 @@ class FakeFm:
 
 class FakeFmFull(FakeFm):
     """`FakeFm` plus the track-level pair (`track_similar`, `track_top_tags`)
-    the piggyback's track-record step calls. Both are keyed by
+    the piggyback's track-record step calls, and `artist_similar` for the
+    artist-similar step (Task 4). Track methods are keyed by
     `(artist, title)`; `track_error_by_key` simulates a non-"not found"
     Last.fm failure on either call — matching `fetch_track`'s own contract
-    that neither call wraps a raised exception before it propagates."""
+    that neither call wraps a raised exception before it propagates.
+    `artist_similar` is keyed by artist name, mirroring `FakeFm.top_tags`;
+    `similar_error_by_name` simulates a failure — `LastFm.artist_similar`
+    also never wraps a raised exception, matching the track pair."""
 
     def __init__(self, tags_by_name=None, error_by_name=None,
                  track_similar_by_key=None, track_tags_by_key=None,
-                 track_error_by_key=None):
+                 track_error_by_key=None,
+                 similar_by_name=None, similar_error_by_name=None):
         super().__init__(tags_by_name=tags_by_name, error_by_name=error_by_name)
         self.track_similar_by_key = track_similar_by_key or {}
         self.track_tags_by_key = track_tags_by_key or {}
         self.track_error_by_key = track_error_by_key or {}
         self.track_calls = []
+        self.similar_by_name = similar_by_name or {}
+        self.similar_error_by_name = similar_error_by_name or {}
+        self.similar_calls = []
 
     def track_similar(self, artist, title):
         self.track_calls.append(("similar", artist, title))
@@ -155,6 +180,12 @@ class FakeFmFull(FakeFm):
         if key in self.track_error_by_key:
             raise self.track_error_by_key[key]
         return self.track_tags_by_key.get(key)
+
+    def artist_similar(self, name):
+        self.similar_calls.append(name)
+        if name in self.similar_error_by_name:
+            raise self.similar_error_by_name[name]
+        return self.similar_by_name.get(name)
 
 
 @pytest.fixture
@@ -173,6 +204,7 @@ def isolated_now(monkeypatch):
                    "input_name_pattern": r"^\[.+\]$"})
     s.save_tag_artists({})
     s.save_lastfm_tracks({"version": 1, "tracks": {}})
+    s.save_lastfm_artists({"version": 1, "artists": {}})
     appmod._profile_state.clear()
     appmod._profile_state["built_at"] = 0.0
 
@@ -308,6 +340,7 @@ def test_passive_poll_never_touches_last_fm(isolated_now, monkeypatch):
     assert r.status_code == 200
     assert r.json()["playing"] is True
     assert fm.calls == []
+    assert fm.similar_calls == []
     assert fm.track_calls == []
 
 
@@ -766,6 +799,8 @@ def test_passive_poll_never_fetches_the_track_record(isolated_now, monkeypatch):
     assert Store().lastfm_track_map() == {}
     assert fm.calls == []
     assert fm.track_calls == []
+    assert fm.similar_calls == []
+    assert Store().lastfm_artist_map() == {}
 
 
 def test_floor_is_shared_between_artist_and_track_fetch(monkeypatch):
@@ -803,14 +838,17 @@ def test_floor_is_shared_between_artist_and_track_fetch(monkeypatch):
 
 
 def test_no_attempt_at_all_does_not_touch_the_floor(monkeypatch):
-    """When everything (artist tags AND the track record) is already known,
-    nothing was attempted — the floor timestamp must not move, matching the
-    pre-piggyback rule that a fully-known request costs nothing and imposes
-    no wait on the next one."""
+    """When everything (artist tags, track record, AND artist-similar) is
+    already known, nothing was attempted — the floor timestamp must not
+    move, matching the pre-piggyback rule that a fully-known request costs
+    nothing and imposes no wait on the next one."""
     key = track_key("Artist a1", "X")
     Store().save_tag_artists({"a1": _known_artist()})
     Store().save_lastfm_tracks({"version": 1, "tracks": {
         key: {"similar": [], "tags": [], "fetched_at": "t0", "miss": False},
+    }})
+    Store().save_lastfm_artists({"version": 1, "artists": {
+        "a1": {"name": "Artist a1", "similar": [], "fetched_at": "t0", "miss": False},
     }})
     fm = FakeFmFull()
     monkeypatch.setattr(appmod, "_lastfm_client", lambda: fm)
@@ -897,4 +935,248 @@ def test_merge_save_lastfm_tracks_refuses_a_shrunk_reread(monkeypatch):
     _merge_save_lastfm_tracks({"k6": {"similar": [], "tags": [], "fetched_at": "t1", "miss": False}})
 
     on_disk = json.loads((appmod.store.dir / "lastfm_tracks.json").read_text())["tracks"]
+    assert on_disk == seed  # untouched — the guard tripped before any save
+
+
+# ---- piggyback: the lastfm_artists.json artist-similar record (Task 4) ----
+#
+# `_fetch_missing_now_tags` extends past the track-record step to also fetch
+# up to `NOW_FETCH_MAX_SIMILAR_ARTISTS` credited artists' OWN
+# `lastfm_artists.json` record (getSimilar) when they have none — same lock,
+# same 60s floor, same bounded client, never on the passive poll, never
+# blocking the response on failure.
+
+
+def test_absent_similar_artist_record_is_fetched_on_force(monkeypatch):
+    """Artist tags and the track record already known (so only the
+    artist-similar step has anything to do) — its record must appear under
+    the artist's OWN Spotify id, not the track key convention the other two
+    steps use."""
+    Store().save_tag_artists({"a1": _known_artist()})
+    key = track_key("Artist a1", "X")
+    Store().save_lastfm_tracks({"version": 1, "tracks": {
+        key: {"similar": [], "tags": [], "fetched_at": "t0", "miss": False},
+    }})
+    Store().save_lastfm_artists({"version": 1, "artists": {}})
+    fm = FakeFmFull(similar_by_name={"Artist a1": [{"artist": "Neighbour", "match": 0.8}]})
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: fm)
+
+    _fetch_missing_now_tags(track_with_artists(["a1"]))
+
+    assert fm.similar_calls == ["Artist a1"]
+    saved = Store().lastfm_artist_map()["a1"]
+    assert saved["miss"] is False
+    assert saved["similar"] == [{"artist": "Neighbour", "match": 0.8}]
+    assert saved["name"] == "Artist a1"
+
+
+def test_present_hit_similar_artist_is_not_refetched(monkeypatch):
+    Store().save_tag_artists({"a1": _known_artist()})
+    Store().save_lastfm_tracks({"version": 1, "tracks": {
+        track_key("Artist a1", "X"): {"similar": [], "tags": [], "fetched_at": "t0", "miss": False},
+    }})
+    Store().save_lastfm_artists({"version": 1, "artists": {
+        "a1": {"name": "Artist a1", "similar": [{"artist": "X", "match": 0.1}],
+               "fetched_at": "original", "miss": False},
+    }})
+    fm = FakeFmFull()
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: fm)
+
+    _fetch_missing_now_tags(track_with_artists(["a1"]))
+
+    assert fm.similar_calls == []
+    assert Store().lastfm_artist_map()["a1"]["fetched_at"] == "original"
+
+
+def test_present_miss_similar_artist_is_not_refetched(monkeypatch):
+    """The piggyback has no `--refetch-misses` equivalent — a cached
+    `miss: true` counts as known, same as a hit."""
+    Store().save_tag_artists({"a1": _known_artist()})
+    Store().save_lastfm_tracks({"version": 1, "tracks": {
+        track_key("Artist a1", "X"): {"similar": [], "tags": [], "fetched_at": "t0", "miss": False},
+    }})
+    Store().save_lastfm_artists({"version": 1, "artists": {
+        "a1": {"name": "Artist a1", "similar": [], "fetched_at": "t0", "miss": True},
+    }})
+    fm = FakeFmFull()
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: fm)
+
+    _fetch_missing_now_tags(track_with_artists(["a1"]))
+
+    assert fm.similar_calls == []
+
+
+def test_similar_fetch_takes_first_credited_artists_not_first_unknown(monkeypatch):
+    """Unlike the artist-tags step (which scans every credited artist and
+    stops once NOW_FETCH_MAX_SIMILAR_ARTISTS UNKNOWNS are found), this step
+    slices `track["artists"][:NOW_FETCH_MAX_SIMILAR_ARTISTS]` outright, THEN
+    skips whichever of those are already known. a1 (already known) still
+    occupies a slot in the first-3 slice, so a4 — unknown, but past the
+    slice — is never reached at all."""
+    Store().save_tag_artists({aid: _known_artist(f"Artist {aid}") for aid in ("a1", "a2", "a3", "a4")})
+    for aid in ("a1", "a2", "a3", "a4"):
+        Store().save_lastfm_tracks({"version": 1, "tracks": {}})
+    Store().save_lastfm_artists({"version": 1, "artists": {
+        "a1": {"name": "Artist a1", "similar": [], "fetched_at": "t0", "miss": False},
+    }})
+    fm = FakeFmFull(similar_by_name={
+        f"Artist {aid}": [] for aid in ("a2", "a3", "a4")
+    })
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: fm)
+
+    _fetch_missing_now_tags(track_with_artists(["a1", "a2", "a3", "a4"]))
+
+    assert NOW_FETCH_MAX_SIMILAR_ARTISTS == 3
+    assert sorted(fm.similar_calls) == ["Artist a2", "Artist a3"]  # a4 outside the first-3 slice
+    saved = Store().lastfm_artist_map()
+    assert "a4" not in saved
+
+
+def test_similar_fetch_failure_leaves_absent_and_never_raises(monkeypatch):
+    Store().save_tag_artists({"a1": _known_artist()})
+    Store().save_lastfm_tracks({"version": 1, "tracks": {
+        track_key("Artist a1", "X"): {"similar": [], "tags": [], "fetched_at": "t0", "miss": False},
+    }})
+    Store().save_lastfm_artists({"version": 1, "artists": {}})
+    fm = FakeFmFull(similar_error_by_name={"Artist a1": LastFmError("Last.fm error 29: rate limited")})
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: fm)
+
+    _fetch_missing_now_tags(track_with_artists(["a1"]))  # must not raise
+
+    assert "a1" not in Store().lastfm_artist_map()
+
+
+def test_a_partial_similar_batch_persists_what_succeeded_before_the_error(monkeypatch):
+    """A failure on one credited artist must not lose an already-fetched
+    sibling in the same batch."""
+    Store().save_tag_artists({aid: _known_artist(f"Artist {aid}") for aid in ("a1", "a2")})
+    Store().save_lastfm_tracks({"version": 1, "tracks": {
+        track_key("Artist a1", "X"): {"similar": [], "tags": [], "fetched_at": "t0", "miss": False},
+    }})
+    Store().save_lastfm_artists({"version": 1, "artists": {}})
+    fm = FakeFmFull(
+        similar_by_name={"Artist a1": [{"artist": "Y", "match": 0.2}]},
+        similar_error_by_name={"Artist a2": LastFmError("Last.fm error 8: service offline")},
+    )
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: fm)
+
+    _fetch_missing_now_tags(track_with_artists(["a1", "a2"]))
+
+    saved = Store().lastfm_artist_map()
+    assert "a1" in saved
+    assert "a2" not in saved
+
+
+def test_forced_poll_fetches_similar_artists_too(isolated_now, monkeypatch):
+    fm = FakeFmFull(
+        tags_by_name={n: [{"name": "rock", "count": 50}] for n in ("A", "B", "C", "D")},
+        track_similar_by_key={("A", "X"): []},
+        track_tags_by_key={("A", "X"): ["ballad"]},
+        similar_by_name={n: [] for n in ("A", "B", "C")},
+    )
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: fm)
+
+    r = isolated_now.get("/api/now?force=1")
+
+    assert r.status_code == 200
+    saved = Store().lastfm_artist_map()
+    assert {"a1", "a2", "a3"} <= set(saved)
+    assert "a4" not in saved
+
+
+def test_forced_poll_similar_fetch_failure_still_returns_200(isolated_now, monkeypatch):
+    fm = FakeFmFull(
+        tags_by_name={n: [] for n in ("A", "B", "C", "D")},
+        similar_error_by_name={n: LastFmError("Last.fm error 29: rate limited") for n in ("A", "B", "C")},
+    )
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: fm)
+
+    r = isolated_now.get("/api/now?force=1")
+
+    assert r.status_code == 200
+    assert Store().lastfm_artist_map() == {}
+
+
+def test_passive_poll_never_fetches_similar_artists(isolated_now, monkeypatch):
+    fm = FakeFmFull()
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: fm)
+    r = isolated_now.get("/api/now")
+    assert r.status_code == 200
+    assert Store().lastfm_artist_map() == {}
+    assert fm.similar_calls == []
+
+
+def test_floor_is_shared_with_the_similar_artist_fetch(monkeypatch):
+    """The single `NOW_FETCH_MIN_INTERVAL` floor covers this third step too —
+    no third clock. Artist tags and the track record are seeded already-known
+    so only the artist-similar step has anything to do this call: the
+    earlier two steps share ONE try block ending at the first uncaught
+    exception (see `_fetch_missing_now_tags`'s track-record step, which lets
+    a `fetch_track` failure propagate to the function's own outer catch), so
+    a track-step failure here would abort before ever reaching this step —
+    this isolates the floor check to the step under test instead."""
+    Store().save_tag_artists({"a1": _known_artist()})
+    Store().save_lastfm_tracks({"version": 1, "tracks": {
+        track_key("Artist a1", "X"): {"similar": [], "tags": [], "fetched_at": "t0", "miss": False},
+    }})
+    Store().save_lastfm_artists({"version": 1, "artists": {}})
+    fm = FakeFmFull(similar_error_by_name={"Artist a1": LastFmError("Last.fm error 29: rate limited")})
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: fm)
+    clock = {"t": 1_000.0}
+
+    _fetch_missing_now_tags(track_with_artists(["a1"]), clock=lambda: clock["t"])
+    assert fm.similar_calls == ["Artist a1"]
+
+    clock["t"] += NOW_FETCH_MIN_INTERVAL - 1  # still inside the floor
+    fm.similar_calls.clear()
+    _fetch_missing_now_tags(track_with_artists(["a1"]), clock=lambda: clock["t"])
+
+    assert fm.similar_calls == []  # not attempted again — the floor held
+
+    clock["t"] += 2  # past the floor
+    _fetch_missing_now_tags(track_with_artists(["a1"]), clock=lambda: clock["t"])
+
+    assert fm.similar_calls == ["Artist a1"]  # retried once the floor elapses
+
+
+# ---- _merge_save_lastfm_artists: same guarantees as _merge_save_lastfm_tracks -
+
+
+def test_merge_save_lastfm_artists_never_overwrites_an_existing_entry():
+    Store().save_lastfm_artists({"version": 1, "artists": {
+        "a1": {"name": "Artist a1", "similar": [{"artist": "X", "match": 0.9}],
+               "fetched_at": "t0", "miss": False},
+    }})
+
+    _merge_save_lastfm_artists({"a1": {"name": "Artist a1", "similar": [], "fetched_at": "t1",
+                                        "miss": True}})
+
+    saved = Store().lastfm_artist_map()["a1"]
+    assert saved["fetched_at"] == "t0"
+    assert saved["similar"] == [{"artist": "X", "match": 0.9}]
+
+
+def test_merge_save_lastfm_artists_refuses_a_shrunk_reread(monkeypatch):
+    seed = {
+        f"a{i}": {"name": f"Artist {i}", "similar": [], "fetched_at": "t0", "miss": False}
+        for i in range(1, 6)
+    }
+    appmod.store.save_lastfm_artists({"version": 1, "artists": seed})
+
+    calls = {"n": 0}
+    real_artist_map = appmod.store.lastfm_artist_map
+
+    def flaky_artist_map():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_artist_map()  # baseline: all 5
+        truncated = real_artist_map()
+        return {k: truncated[k] for k in list(truncated)[:2]}  # re-read: only 2
+
+    monkeypatch.setattr(appmod.store, "lastfm_artist_map", flaky_artist_map)
+
+    _merge_save_lastfm_artists({"a6": {"name": "Artist 6", "similar": [], "fetched_at": "t1",
+                                        "miss": False}})
+
+    on_disk = json.loads((appmod.store.dir / "lastfm_artists.json").read_text())["artists"]
     assert on_disk == seed  # untouched — the guard tripped before any save

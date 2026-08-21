@@ -624,3 +624,87 @@ def test_hints_weigh_like_the_strongest_organic_tag():
     )
     assert prof["tag_counts"]["ambient"] == 2
     assert prof["hints"] == {"ambient"}
+
+
+def artist_record(*similar, miss=False):
+    return {"name": "X", "similar": [{"artist": a, "match": m} for a, m in similar],
+            "fetched_at": 1.0, "miss": miss}
+
+
+def test_build_profile_collects_normalized_artist_names():
+    prof = build_profile([track("d1", ["beach-house"])], ARTISTS)
+    assert prof["artist_names"] == {"beach house"}
+
+
+def test_artist_sim_scores_home_present_similar_artists_only():
+    prof = build_profile([track("h1", ["slowdive"])], ARTISTS)
+    amap = {"seedless": artist_record(("Slowdive", 0.8), ("Nowhere Band", 0.9))}
+    seed = {"uri": "n", "name": "S", "artists": [{"id": "seedless", "name": "Seedless"}]}
+    total, count, names = suggest_mod._artist_sim_score(seed, prof, amap)
+    assert (total, count, names) == (0.8, 1, ["Slowdive"])
+
+
+def test_artist_sim_excludes_seed_artists_and_counts_collab_neighbour_once():
+    # Binding, same pin as _neighbour_score: a similar artist matching ANY
+    # seed artist scores nothing; a neighbour listed by BOTH credited
+    # artists is counted once at its best match.
+    prof = build_profile([track("h1", ["slowdive"]), track("h2", ["beach-house"])], ARTISTS)
+    amap = {
+        "a1": artist_record(("Beach  House", 0.9), ("Slowdive", 0.4)),  # internal double space
+        "a2": artist_record(("Slowdive", 0.7)),
+    }
+    seed = {"uri": "n", "name": "S", "artists": [
+        {"id": "a1", "name": "Beach House"}, {"id": "a2", "name": "Other"},
+    ]}
+    total, count, names = suggest_mod._artist_sim_score(seed, prof, amap)
+    assert (total, count, names) == (0.7, 1, ["Slowdive"])
+
+
+def test_artist_sim_miss_or_absent_records_contribute_nothing():
+    prof = build_profile([track("h1", ["slowdive"])], ARTISTS)
+    seed = {"uri": "n", "name": "S", "artists": [{"id": "seedless", "name": "Seedless"}]}
+    assert suggest_mod._artist_sim_score(seed, prof, {}) == (0.0, 0, [])
+    amap = {"seedless": artist_record(("Slowdive", 0.8), miss=True)}
+    assert suggest_mod._artist_sim_score(seed, prof, amap) == (0.0, 0, [])
+
+
+def test_artist_sim_creates_a_guess_from_a_zero_score_home():
+    # The coverage win: no tags, no track record, artist unknown to every
+    # home — but Last.fm knows the artist's neighbours live in H.
+    prof = build_profile([track("h1", ["slowdive"])], ARTISTS)
+    seed = {"uri": "n", "name": "S", "artists": [{"id": "seedless", "name": "Seedless"}]}
+    amap = {"seedless": artist_record(("Slowdive", 0.8))}
+    res = suggest(seed, {"H": prof}, ARTISTS, {}, amap)
+    assert len(res) == 1 and res[0]["weak"] is True
+    assert res[0]["reasons"] == ["similar artists: Slowdive"]
+    assert res[0]["score"] == round(suggest_mod.ARTIST_SIM_WEIGHT * 0.8, 2)
+
+
+def test_artist_sim_never_reaches_the_confident_tier():
+    # Containment pin (spec §Scoring): even a maxed signal must neither
+    # produce an unflagged entry nor appear beside a confident one.
+    ten = [(f"N{i}", 1.0) for i in range(10)]
+    sim_home = build_profile(
+        [track(f"h{i}", ["unknown"], title=f"T{i}") for i in range(10)], ARTISTS)
+    sim_home["artist_names"] = {f"n{i}" for i in range(10)}  # force 10 hits
+    owns = build_profile([track("d1", ["beach-house"])], ARTISTS)
+    amap = {"seedless": artist_record(*ten)}
+    lone = {"uri": "n", "name": "S", "artists": [{"id": "seedless", "name": "Seedless"}]}
+    res = suggest(lone, {"SIM": sim_home}, ARTISTS, {}, amap)
+    assert res and res[0]["weak"] is True  # capped, flagged, never confident
+    both = {"uri": "n", "name": "S", "artists": [
+        {"id": "beach-house", "name": "Beach House"}, {"id": "seedless", "name": "Seedless"}]}
+    res2 = suggest(both, {"SIM": sim_home, "owns": owns}, ARTISTS, {}, amap)
+    assert [r["playlist_id"] for r in res2] == ["owns"]
+    assert all("weak" not in r for r in res2)
+
+
+def test_artist_sim_weight_read_at_call_time(monkeypatch):
+    # Same contract TAG_WEIGHT pins — the eval harness varies it per run.
+    prof = build_profile([track("h1", ["slowdive"])], ARTISTS)
+    seed = {"uri": "n", "name": "S", "artists": [{"id": "seedless", "name": "Seedless"}]}
+    amap = {"seedless": artist_record(("Slowdive", 0.5))}
+    monkeypatch.setattr(suggest_mod, "ARTIST_SIM_WEIGHT", 1.0)
+    single = suggest(seed, {"H": prof}, ARTISTS, {}, amap)[0]["score"]
+    monkeypatch.setattr(suggest_mod, "ARTIST_SIM_WEIGHT", 2.0)
+    assert suggest(seed, {"H": prof}, ARTISTS, {}, amap)[0]["score"] == round(single * 2, 2)

@@ -448,6 +448,66 @@ class LastFm:
             out.append({"artist": similar_artist, "track": name, "match": match})
         return out
 
+    def artist_similar(self, artist_name: str) -> list[dict] | None:
+        """Similar artists for an artist, or None if Last.fm has no such artist.
+
+        Mirrors `track_similar`' request/error/pacing structure exactly. Entries are
+        slimmed to `{"artist", "match"}` — Last.fm's own shape carries fields this
+        design has no use for.
+        """
+        if not isinstance(artist_name, str) or not artist_name.strip():
+            raise LastFmError(f"artist name must be a non-empty string, got {artist_name!r}")
+        self._sleep(MIN_INTERVAL)
+        resp = self._client.get(
+            API,
+            params={
+                "method": "artist.getSimilar",
+                "artist": artist_name,
+                "api_key": self.key,
+                "format": "json",
+                "limit": 20,
+            },
+            timeout=self._timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise LastFmError(f"Last.fm returned a non-object body: {type(data).__name__}")
+        if "error" in data:
+            error_code = data.get("error")
+            error_msg = data.get("message", "")
+            try:
+                code = int(error_code)
+            except (TypeError, ValueError):
+                code = None
+            if code == NOT_FOUND_CODE and _looks_like_not_found(error_msg):
+                return None
+            raise LastFmError(f"Last.fm error {error_code}: {error_msg}")
+        similarartists = data.get("similarartists")
+        if not isinstance(similarartists, dict):
+            raise LastFmError(
+                f"Last.fm response for {artist_name!r} has no usable "
+                "'similarartists' object"
+            )
+        artists = similarartists.get("artist", [])
+        if isinstance(artists, dict):
+            artists = [artists]
+        if not isinstance(artists, list):
+            raise LastFmError(
+                f"Last.fm returned a non-list 'artist' for {artist_name!r}"
+            )
+        out = []
+        for a in artists:
+            if not isinstance(a, dict):
+                continue
+            name = a.get("name")
+            try:
+                match = float(a.get("match", 0))
+            except (TypeError, ValueError):
+                match = 0.0
+            out.append({"artist": name, "match": match})
+        return out
+
     def track_top_tags(self, artist_name: str, track_name: str) -> list[str] | None:
         """Top tags for (artist, title), or None if Last.fm has no such track.
 

@@ -85,3 +85,22 @@ def test_lastfm_tracks_default_map_is_not_shared_across_reads(tmp_path):
     t1["tracks"]["poison"] = {}
     t2 = s.lastfm_tracks()  # a fresh default read must not see the first read's mutation
     assert t2["tracks"] == {}
+
+
+def test_lastfm_artists_default_to_empty(tmp_path):
+    assert Store(tmp_path).lastfm_artists() == {"version": 1, "artists": {}}
+
+
+def test_lastfm_artists_round_trip_and_map(tmp_path):
+    s = Store(tmp_path)
+    s.save_lastfm_artists({"version": 1, "artists": {
+        "id1": {"name": "Slowdive", "similar": [{"artist": "Ride", "match": 0.9}],
+                "fetched_at": 1.0, "miss": False},
+    }})
+    assert s.lastfm_artist_map()["id1"]["similar"][0]["artist"] == "Ride"
+
+
+def test_lastfm_artist_map_guards_malformed_payloads(tmp_path):
+    s = Store(tmp_path)
+    (tmp_path / "lastfm_artists.json").write_text('{"version": 99, "artists": []}')
+    assert s.lastfm_artist_map() == {}

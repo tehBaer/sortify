@@ -605,6 +605,58 @@ def test_fetch_track_propagates_errors():
     fm = LastFm("k", sleep=lambda s: None, client=client)
     with pytest.raises(LastFmError, match="error 29"):
         fetch_track(fm, "A", "B", now=1.0)
+
+
+# ---- artist_similar --------------------------------------------------------
+
+
+class FakeArtistClient:
+    """Stands in for httpx.Client for artist.getSimilar."""
+
+    def __init__(self, response=None):
+        self.response = response or {}
+        self.calls = []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append(params["artist"])
+        return FakeResponse(self.response)
+
+
+def test_artist_similar_slims_entries_and_floats_match():
+    client = FakeArtistClient({"similarartists": {"artist": [
+        {"name": "Ride", "match": "0.87", "url": "ignored"},
+        {"name": "Lush", "match": 0.5},
+    ]}})
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    assert fm.artist_similar("Slowdive") == [
+        {"artist": "Ride", "match": 0.87}, {"artist": "Lush", "match": 0.5},
+    ]
+
+
+def test_artist_similar_wraps_single_dict_result():
+    client = FakeArtistClient({"similarartists": {"artist": {"name": "Ride", "match": "1"}}})
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    assert fm.artist_similar("Slowdive") == [{"artist": "Ride", "match": 1.0}]
+
+
+def test_artist_similar_code_6_is_none_other_errors_raise():
+    client1 = FakeArtistClient({"error": 6, "message": "Artist not found"})
+    fm1 = LastFm("k", sleep=lambda s: None, client=client1)
+    assert fm1.artist_similar("X") is None
+
+    client2 = FakeArtistClient({"error": 29, "message": "Rate limit exceeded"})
+    fm2 = LastFm("k", sleep=lambda s: None, client=client2)
+    with pytest.raises(LastFmError):
+        fm2.artist_similar("X")
+
+
+def test_artist_similar_rejects_blank_name():
+    client = FakeArtistClient({})
+    fm = LastFm("k", sleep=lambda s: None, client=client)
+    with pytest.raises(LastFmError):
+        fm.artist_similar("   ")
+
+
 # ---- progress reporting ----------------------------------------------------
 #
 # `enrich` is the slow phase of a split (~700 artists at MIN_INTERVAL = 0.25s,

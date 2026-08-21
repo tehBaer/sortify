@@ -316,3 +316,25 @@ def test_grid_search_covers_every_cell_and_restores_weights():
         assert "top1" in results[cell] and "top3" in results[cell]
     # weight ends up restored after the search, not left on the last cell
     assert ev.suggest_mod.TAG_WEIGHT == original
+
+
+def test_evaluate_pair_rebuilds_artist_names_without_the_held_out_track(monkeypatch):
+    # Mutation pin, same family as the track_keys hold-out pin: if the
+    # held-out track's artist were still in its home's artist_names, the
+    # track's own artist-similar list could match it back to itself.
+    held = {"uri": "u1", "name": "T1", "artists": [{"id": "a1", "name": "Lone Artist"}]}
+    other = {"uri": "u2", "name": "T2", "artists": [{"id": "a2", "name": "Other"}]}
+    home_tracks = {"H": [held, other]}
+    profiles = ev.build_all_profiles(home_tracks, {})
+    assert "lone artist" in profiles["H"]["artist_names"]  # present before hold-out
+    seen = {}
+    monkeypatch.setattr(ev, "suggest", lambda t, profs, *a, **k: seen.update(profs) or [])
+    ev.evaluate_pair("H", held, home_tracks, profiles, {}, ev.uri_home_index(home_tracks))
+    assert "lone artist" not in seen["H"]["artist_names"]
+    assert "other" in seen["H"]["artist_names"]
+
+
+def test_weights_can_vary_artist_sim_weight():
+    with ev.weights(artist_sim_weight=2.0):
+        assert ev.suggest_mod.ARTIST_SIM_WEIGHT == 2.0
+    assert ev.suggest_mod.ARTIST_SIM_WEIGHT == 1.0  # restored

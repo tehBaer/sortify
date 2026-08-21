@@ -201,3 +201,27 @@ class Store:
     def deezer_map(self) -> dict:
         tracks = self.deezer_tracks().get("tracks")
         return tracks if isinstance(tracks, dict) else {}
+
+    # lastfm_artists.json: rebuildable Last.fm artist-level cache (getSimilar),
+    # keyed by Spotify artist ID. Deliberately separate from tags.json (the
+    # artist-level cache, owned by the splitting workstream) and from
+    # descriptions.json/user_tags.json (precious, user-typed data) — see the
+    # design doc's Storage section. Safe to delete at any time; a missing or
+    # malformed file is just an empty cache.
+    LASTFM_ARTISTS_DEFAULT = {"version": 1, "artists": {}}
+
+    def lastfm_artists(self) -> dict:
+        """The whole envelope. Consumers almost always want `lastfm_artist_map()`."""
+        return self._versioned("lastfm_artists.json", self.LASTFM_ARTISTS_DEFAULT)
+
+    def save_lastfm_artists(self, payload: dict) -> None:
+        self._save("lastfm_artists.json", payload)
+
+    def lastfm_artist_map(self) -> dict:
+        """The inner `{artist_id: record}` map — the analog of `lastfm_track_map()`.
+
+        {} on anything malformed, so a corrupt or hand-edited file degrades to
+        "nothing cached yet" instead of raising mid-fetch.
+        """
+        artists = self.lastfm_artists().get("artists")
+        return artists if isinstance(artists, dict) else {}

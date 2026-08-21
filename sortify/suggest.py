@@ -88,6 +88,36 @@ TOP_N = 3
 NEIGHBOUR_WEIGHT = 0.3
 NEIGHBOUR_SUM_CAP = 1.0
 
+# Artist-similar (Last.fm artist.getSimilar): guess-tier-only by construction
+# (see suggest()'s gate) — this signal is only ever consulted after a home
+# has already failed to clear MIN_SCORE, so it can never itself promote a
+# home into the confident tier no matter how high it scores, and sweeping
+# ARTIST_SIM_WEIGHT therefore cannot touch a primacy invariant the way
+# NEIGHBOUR_WEIGHT can - there is no confident-tier row to break.
+#
+# Measured 2026-08-21 by scripts/eval_suggest.py after the artist-similar
+# backfill (scripts/backfill_artist_similar.py: 1449/1449 home artists
+# attempted, 1438 tagged (10 misses, 1 error left absent)):
+#   .venv/bin/python scripts/eval_suggest.py --n 500 --seed 7
+#   .venv/bin/python scripts/eval_suggest.py --n 500 --seed 7 --search-artist-sim
+#   OFF (ARTIST_SIM_WEIGHT=0, signal disabled): top1 0.312 top3 0.524 | artist-absent n=161 top1 0.155 top3 0.317
+#   (OFF row produced by pinning artist_sim_weight=0 via the harness's weights() context)
+#   ARTIST_SIM_WEIGHT=0.25 .. 3.0 (every swept value): top1 0.314 top3 0.530 | artist-absent top1 0.161 top3 0.335
+# Every non-zero weight from 0.25 to 3.0 produced IDENTICAL numbers - the
+# signal either fires (any weight > 0, sim_sum capped by ARTIST_SIM_CAP
+# below scales the guess-tier score but never reorders which home wins for
+# this sample) or it doesn't (weight 0). Verified the self-check this
+# implies (spec Evaluation 4): the non-absent-subset counts are bit-
+# identical across the OFF row and every swept weight (n=339, top1=131,
+# top3=211 in all seven runs) - the signal cannot reach the confident tier
+# by construction, and it didn't. All weights tie, so per the task-5
+# assignment ("if every weight ties, keep 1.0 and record the tie") this
+# stays at the placeholder value, now a measured one: on the artist-absent
+# subset it lifts top1 0.155 to 0.161 and top3 0.317 to 0.335 versus OFF,
+# at any positive weight.
+ARTIST_SIM_WEIGHT = 1.0
+ARTIST_SIM_CAP = 1.0
+
 
 def _cleaned_tags(entry: dict) -> list[str]:
     """Hygiene-filtered tag names for one `tag_artists()` record.
@@ -138,10 +168,13 @@ def build_profile(
     tag_counts: Counter = Counter()
     uris = set()
     track_keys: set[str] = set()
+    artist_names: set[str] = set()
     for t in tracks:
         uris.add(t["uri"])
         for a in t["artists"]:
             track_keys.add(track_key(a.get("name") or "", t.get("name") or ""))
+            if a.get("name"):
+                artist_names.add(_norm_name(a["name"]))
             if not a.get("id"):
                 continue
             artist_counts[a["id"]] += 1
@@ -158,6 +191,7 @@ def build_profile(
         "uris": uris,
         "track_keys": track_keys,
         "hints": hint_set,
+        "artist_names": artist_names,
     }
 
 
@@ -277,17 +311,50 @@ def _neighbour_score(
     return total, count
 
 
+def _artist_sim_score(
+    track: dict, prof: dict, artist_map: dict[str, dict]
+) -> tuple[float, int, list[str]]:
+    """Sum of best `match` per distinct home-present similar artist.
+
+    Same binding exclusion as `_neighbour_score`, via the same normalizer:
+    a similar artist matching ANY seed artist scores nothing. A neighbour
+    listed by several credited artists counts once, at its best match —
+    a collab must not double-spend one neighbour.
+    """
+    seed_names = {_norm_name(a.get("name")) for a in (track.get("artists") or [])}
+    best: dict[str, tuple[float, str]] = {}
+    for a in track.get("artists") or []:
+        record = artist_map.get(a.get("id"))
+        if not isinstance(record, dict) or record.get("miss"):
+            continue
+        for s in record.get("similar") or []:
+            name = s.get("artist") or ""
+            norm = _norm_name(name)
+            if not norm or norm in seed_names or norm not in prof["artist_names"]:
+                continue
+            try:
+                match = float(s.get("match", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if match > best.get(norm, (0.0, ""))[0]:
+                best[norm] = (match, name)
+    ranked = sorted(best.values(), key=lambda p: -p[0])
+    return sum(m for m, _ in ranked), len(ranked), [n for _, n in ranked]
+
+
 def suggest(
     track: dict,
     profiles: dict[str, dict],
     tag_artists: dict[str, dict],
     track_map: dict[str, dict] | None = None,
+    artist_map: dict[str, dict] | None = None,
 ) -> list[dict]:
     """Rank home playlists for one track. Returns [{playlist_id, score, already, reasons}].
 
-    `track_map` is optional ({} when omitted) so callers that haven't been
-    updated to pass `store.lastfm_track_map()` yet keep working — see
-    app.py's call sites, which all pass a fresh one.
+    `track_map` and `artist_map` are optional ({} when omitted) so callers
+    that haven't been updated to pass `store.lastfm_track_map()` /
+    `store.lastfm_artist_map()` yet keep working — see app.py's call sites,
+    which all pass fresh ones.
 
     When no home clears MIN_SCORE and the track is filed nowhere, the
     sub-threshold ranking is returned instead — up to TOP_N homes with
@@ -295,9 +362,13 @@ def suggest(
     so the frontend can present them as guesses, not confidence. A track
     with an `already` home never gets guesses (the list wasn't empty), and
     confident entries never carry the key at all, so the confident payload
-    stays byte-identical to before this tier existed.
+    stays byte-identical to before this tier existed. `_artist_sim_score`
+    is consulted only inside this else-branch, after the MIN_SCORE gate has
+    already failed on the other three signals — it can rank the weak pool
+    but can never itself lift a home into the confident tier.
     """
     track_map = track_map or {}
+    artist_map = artist_map or {}
     track_tags, tag_level = _resolve_tags(track, tag_artists, track_map)
     tag_reason_prefix = "tags: " if tag_level == "track" else "artist tags: "
     results = []
@@ -347,17 +418,22 @@ def suggest(
                     "reasons": reasons,
                 }
             )
-        elif score > 0:
-            weak_pool.append(
-                {
-                    "playlist_id": pid,
-                    "score": round(score, 2),
-                    "pct": min(round(score * 10), 100),
-                    "already": False,
-                    "reasons": reasons,
-                    "weak": True,
-                }
-            )
+        else:
+            sim_sum, sim_count, sim_names = _artist_sim_score(track, prof, artist_map)
+            if sim_count:
+                score += ARTIST_SIM_WEIGHT * min(sim_sum, ARTIST_SIM_CAP)
+                reasons.append("similar artists: " + ", ".join(sim_names[:2]))
+            if score > 0:
+                weak_pool.append(
+                    {
+                        "playlist_id": pid,
+                        "score": round(score, 2),
+                        "pct": min(round(score * 10), 100),
+                        "already": False,
+                        "reasons": reasons,
+                        "weak": True,
+                    }
+                )
 
     if not results and weak_pool:
         weak_pool.sort(key=lambda r: -r["score"])
