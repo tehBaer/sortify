@@ -10,6 +10,10 @@ import pytest
 
 from sortify import app as appmod
 
+from liveguard import assert_not_live_data
+
+assert_not_live_data(appmod.store.dir)
+
 
 def test_reconnecting_reuses_the_stored_client_id():
     """Re-auth is not first-time setup: the client ID is already known, and

@@ -19,6 +19,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from sortify import app as appmod
+
+from liveguard import assert_not_live_data
+
+assert_not_live_data(appmod.store.dir)
 from sortify.app import (
     NOW_FORCE_MIN_INTERVAL,
     NOW_TTL_IDLE,

@@ -9,6 +9,10 @@ import httpx
 import pytest
 
 from sortify import app as appmod
+
+from liveguard import assert_not_live_data
+
+assert_not_live_data(appmod.store.dir)
 from sortify.deezer import Deezer, DeezerError
 from sortify.store import Store
 from sortify.tags import track_key

@@ -14,6 +14,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 import sortify.app as appmod
+
+from liveguard import assert_not_live_data
+
+assert_not_live_data(appmod.store.dir)
 from sortify.spotify import SpotifyError
 from sortify.split import pick_sitting
 from sortify.store import Store

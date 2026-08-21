@@ -22,6 +22,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 import sortify.app as appmod
+
+from liveguard import assert_not_live_data
+
+assert_not_live_data(appmod.store.dir)
 from sortify.store import TAGS_VERSION, Store
 from sortify.tags import LastFmError
 

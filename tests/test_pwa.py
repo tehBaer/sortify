@@ -12,6 +12,10 @@ import struct
 
 from sortify import app as appmod
 
+from liveguard import assert_not_live_data
+
+assert_not_live_data(appmod.store.dir)
+
 STATIC = appmod.STATIC
 
 

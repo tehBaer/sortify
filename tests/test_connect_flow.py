@@ -13,6 +13,10 @@ import pytest
 
 from sortify import app as appmod
 
+from liveguard import assert_not_live_data
+
+assert_not_live_data(appmod.store.dir)
+
 VALID_ID = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"  # 32 alnum
 OTHER_ID = "ffffffffffffffffffffffffffffffff"
 

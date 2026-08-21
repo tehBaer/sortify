@@ -150,6 +150,10 @@ from fastapi.testclient import TestClient
 
 from sortify import app as appmod
 
+from liveguard import assert_not_live_data
+
+assert_not_live_data(appmod.store.dir)
+
 
 @pytest.fixture
 def client(monkeypatch):

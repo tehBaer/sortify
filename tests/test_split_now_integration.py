@@ -16,6 +16,10 @@ doesn't look untouched in the picker — also a local read.
 import pytest
 
 import sortify.app as appmod
+
+from liveguard import assert_not_live_data
+
+assert_not_live_data(appmod.store.dir)
 from sortify.store import Store
 
 

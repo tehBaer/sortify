@@ -8,6 +8,10 @@ import time
 import pytest
 
 import sortify.app as appmod
+
+from liveguard import assert_not_live_data
+
+assert_not_live_data(appmod.store.dir)
 import sortify.pacing as pacing
 from sortify.spotify import QUIET_AFTER_COOLDOWN, Spotify, SpotifyError
 from sortify.store import Store

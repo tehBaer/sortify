@@ -15,6 +15,10 @@ call sortify now makes is one the user asked for.
 
 from sortify import app as appmod
 
+from liveguard import assert_not_live_data
+
+assert_not_live_data(appmod.store.dir)
+
 
 def test_no_background_job_exists():
     """A resurrection should have to be deliberate, not a merge accident."""

@@ -10,6 +10,10 @@ import re
 
 from sortify import app as appmod
 
+from liveguard import assert_not_live_data
+
+assert_not_live_data(appmod.store.dir)
+
 
 def body(resp) -> str:
     return resp.body.decode()

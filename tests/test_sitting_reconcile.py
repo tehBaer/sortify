@@ -128,6 +128,10 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 import sortify.app as appmod  # noqa: E402
+
+from liveguard import assert_not_live_data
+
+assert_not_live_data(appmod.store.dir)
 from sortify.spotify import SpotifyError  # noqa: E402
 from sortify.store import Store  # noqa: E402
 

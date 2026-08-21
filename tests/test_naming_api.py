@@ -10,6 +10,10 @@ from fastapi.testclient import TestClient
 
 import sortify.app as appmod
 
+from liveguard import assert_not_live_data
+
+assert_not_live_data(appmod.store.dir)
+
 LISTING = [
     {"id": "h1", "name": "beach vibes", "owner": "me", "editable": True,
      "total": 40, "snapshot_id": "s-h1", "image": None},
