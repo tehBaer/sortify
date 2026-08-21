@@ -263,6 +263,8 @@ kbd {
 .picker-row { padding: .55rem .8rem; }
 .picker-row .p-name { display: block; font-weight: 600; }
 .picker-row .p-sub { display: block; color: var(--muted); font-size: .78rem; margin-top: .1rem; }
+#pl-new-home input { flex: 1; }
+.picker-create .p-name { color: var(--accent); }
 
 #toast {
   position: fixed; left: 50%; bottom: 1.2rem; transform: translateX(-50%);

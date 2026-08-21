@@ -31,6 +31,32 @@ def home_name_excluded(name: str, patterns: list[str], emoji: bool) -> bool:
     return any(re.fullmatch(p, s) for p in patterns)
 
 
+def creatable_home_name_problem(
+    name: str, input_pattern: str | None, exclude_patterns: list[str], exclude_emoji: bool
+) -> str | None:
+    """Why `name` cannot become a home playlist, or None if it can.
+
+    Checked before the create call is spent: an input-shaped name would be
+    re-read as an input by the pattern union on the very next request, and a
+    home-excluded shape would be dropped from homes by every folder ingest —
+    both would silently produce something other than what was asked for.
+    """
+    s = name.strip()
+    if not s:
+        return "the name is empty"
+    if input_pattern and re.fullmatch(input_pattern, s):
+        return (
+            f"{s!r} matches the input name pattern — it would become an "
+            "input, not a home"
+        )
+    if home_name_excluded(s, exclude_patterns, exclude_emoji):
+        return (
+            f"{s!r} has a shape that is excluded from homes "
+            "(emoji prefix, or a marker like {…}, <…>, __…__)"
+        )
+    return None
+
+
 def _is_caps(name: str) -> bool:
     return name == name.upper() and any(c.isalpha() for c in name)
 

@@ -367,6 +367,30 @@ $("btn-save-config").onclick = async () => {
   try { await saveConfig(); toast("saved"); } catch (e) { toast(e.message); }
 };
 
+// Creating a home from here is 1 call; the row appears in place, already
+// marked Home, with no Refresh. The folder path stays blank until the next
+// desktop-client folder export — not an error, homes work without one.
+async function createHome(name) {
+  const res = await api("/api/playlists/create", { name, role: "home" });
+  const p = res.playlist;
+  playlistData.unshift(p);
+  roles[p.id] = "home";
+  return { p, note: res.note };
+}
+
+$("btn-new-home").onclick = async () => {
+  const name = $("new-home-name").value.trim();
+  if (!name) return;
+  const btn = $("btn-new-home");
+  btn.disabled = true;
+  try {
+    const { p, note } = await createHome(name);
+    $("new-home-name").value = "";
+    renderLists();
+    toast(note ? `created home "${p.name}" — ${note}` : `created home "${p.name}"`, note ? 5000 : undefined);
+  } catch (e) { toast(e.message); } finally { btn.disabled = false; }
+};
+
 // ---- triage ----------------------------------------------------------------
 
 async function startTriage(id, name) {
@@ -910,7 +934,7 @@ function renderNow() {
       b.onclick = () => nowFile(b.dataset.to);
     });
     const more = $("btn-now-more");
-    if (more) more.onclick = () => openPicker(nowState.homes, nowFile);
+    if (more) more.onclick = () => openPicker(nowState.homes, nowFile, nowCreateAndFile);
     const rem = $("btn-now-remove");
     if (rem) rem.onclick = nowRemove;
     $("now-card").querySelectorAll(".in-chip").forEach((b) => {
@@ -973,6 +997,19 @@ async function nowFile(toId) {
   } catch (e) { toast(e.message); }
 }
 
+// Picker's no-match create row, hoisted so both the "Add to…" button and the
+// `m` keyboard shortcut get the create row (previously only the button did).
+async function nowCreateAndFile(name) {
+  try {
+    const { p, note } = await createHome(name);
+    nowState.homes.set(p.id, { id: p.id, name: p.name, image: null, total: 0, folder: null });
+    await nowFile(p.id);  // lands the card in its ordinary ✓ filed state; nowFile's
+    // own toast covers that. The server's duplicate-name note is separate and
+    // would otherwise be silently dropped, so surface it too.
+    if (note) toast(note, 5000);
+  } catch (e) { toast(e.message); }
+}
+
 async function nowRemove() {
   const d = nowState, tr = d.track;
   if (!d.context?.is_input) return;
@@ -999,14 +1036,16 @@ $("btn-undo-now").onclick = async () => {
 
 // ---- picker ----------------------------------------------------------------
 
-function openPicker(homesMap, onPick) {
+function openPicker(homesMap, onPick, onCreate) {
   const list = $("picker-list");
   const paint = (filter) => {
     list.innerHTML = "";
     const homes = [...homesMap.values()].sort((a, b) =>
       (a.folder || "").localeCompare(b.folder || "") || a.name.localeCompare(b.name));
+    let shown = 0;
     for (const h of homes) {
       if (filter && !(h.name + " " + (h.folder || "")).toLowerCase().includes(filter)) continue;
+      shown++;
       const b = document.createElement("button");
       b.className = "picker-row";
       // Name first and bold; the folder path demoted to a small second line —
@@ -1015,6 +1054,20 @@ function openPicker(homesMap, onPick) {
       b.innerHTML = `<span class="p-name">${esc(h.name)}</span>` +
         (sub ? `<span class="p-sub">${esc(sub)}</span>` : "");
       b.onclick = () => { closePicker(); onPick(h.id); };
+      list.appendChild(b);
+    }
+    // The moment of need: the right playlist doesn't exist yet. Create it
+    // and file in one gesture — create + add, priced as such. (Spec §5.)
+    if (!shown && filter && onCreate) {
+      const typed = $("picker-filter").value.trim();
+      // nowFile sends a remove too when filing from an input: create + add +
+      // remove = 3 calls, not 2 — the label must state the true cost.
+      const price = nowState.context?.is_input ? "3 calls" : "2 calls";
+      const b = document.createElement("button");
+      b.className = "picker-row picker-create";
+      b.innerHTML = `<span class="p-name">Create home “${esc(typed)}” and file this track there</span>` +
+        `<span class="p-sub">${price}</span>`;
+      b.onclick = () => { closePicker(); onCreate(typed); };
       list.appendChild(b);
     }
   };
@@ -2058,7 +2111,7 @@ document.addEventListener("keydown", (e) => {
     if (["1", "2", "3"].includes(e.key)) {
       const s = nowState.suggestions[Number(e.key) - 1];
       if (s) nowFile(s.playlist_id);
-    } else if (e.key === "m" && nowState.track.sortable) openPicker(nowState.homes, nowFile);
+    } else if (e.key === "m" && nowState.track.sortable) openPicker(nowState.homes, nowFile, nowCreateAndFile);
     else if (e.key === "r") nowRemove();
     else if (e.key === "u") $("btn-undo-now").click();
   }

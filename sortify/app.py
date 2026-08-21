@@ -23,7 +23,12 @@ from pydantic import BaseModel, Field
 
 from . import suggest as sugg
 from .deezer import Deezer
-from .folders import extract_folder_map, home_name_excluded, select_home_ids
+from .folders import (
+    creatable_home_name_problem,
+    extract_folder_map,
+    home_name_excluded,
+    select_home_ids,
+)
 from .naming import violations as naming_violations
 from .pacing import Governor
 from .spotify import (
@@ -71,6 +76,13 @@ class ConfigIn(BaseModel):
     # {playlist_id: "ambient, piano"} — the user's own matching hints per
     # home, free text split on commas at profile-build time.
     home_hints: dict[str, str] = {}
+
+
+class CreatePlaylistIn(BaseModel):
+    name: str
+    # Only "home" exists today; explicit rather than implied because the two
+    # deferred roles (inputs, subsets) differ in exactly this field. (Spec §1.)
+    role: str = "home"
 
 
 class PlayIn(BaseModel):
@@ -262,12 +274,19 @@ def ingest_folders(tree: Any = Body(...)):
         }
         rule += ", minus marker/derived names"
     home_ids = sorted((chosen & editable) - inputs)
+    # Homes created inside sortify have no folder path yet, so the tree
+    # cannot see them. Union them back in (through the same editable/input
+    # filters) — the tree keeps authority over playlists it can see, it just
+    # stops deleting knowledge it never had. (Spec §2.)
+    sticky = {s for s in (cfg.get("sticky_home_ids") or [])
+              if s in editable and s not in inputs}
+    home_ids = sorted(set(home_ids) | sticky)
     store.update_config(home_ids=home_ids)
     return {
         "playlists_in_folders": len(mapping),
         "homes_marked": len(home_ids),
         "rule": rule,
-        "home_folders": sorted({mapping[pid]["path"] for pid in home_ids}),
+        "home_folders": sorted({mapping[pid]["path"] for pid in home_ids if pid in mapping}),
     }
 
 
@@ -313,12 +332,81 @@ def set_config(body: ConfigIn):
     store.update_config(
         input_ids=body.input_ids, home_ids=body.home_ids,
         home_hints={k: v.strip() for k, v in body.home_hints.items() if v.strip()},
+        # A sticky role must still be revocable: Home toggled off in the
+        # Playlists view drops the id here too, or the next folder ingest
+        # would resurrect it. (Spec §2.)
+        sticky_home_ids=sorted(
+            set(store.config().get("sticky_home_ids") or []) & set(body.home_ids)
+        ),
     )
     # Hints feed the tag profiles, which otherwise sit cached for PROFILE_TTL —
     # a save should be visible on the very next suggestion, not 10 min later.
     _profile_state.clear()
     _profile_state["built_at"] = 0.0
     return {"ok": True}
+
+
+@app.post("/api/playlists/create")
+def create_playlist_api(body: CreatePlaylistIn):
+    """Create a home playlist from inside sortify. One Spotify call.
+
+    Everything around the call is local bookkeeping: the listing entry
+    (remember_playlist), a seeded empty track cache whose snapshot_id
+    matches the listing's (else every profile rebuild refetches a playlist
+    we know is empty — spec §3), the home + sticky role, and a profile
+    cache clear so the new home is usable now, not in PROFILE_TTL.
+    """
+    if body.role != "home":
+        raise HTTPException(400, f"unsupported role {body.role!r} — only homes can be created yet")
+    cfg = store.config()
+    problem = creatable_home_name_problem(
+        body.name,
+        input_pattern=cfg.get("input_name_pattern"),
+        exclude_patterns=cfg.get("home_name_exclude_patterns") or [],
+        exclude_emoji=bool(cfg.get("home_exclude_emoji_names")),
+    )
+    if problem:
+        raise HTTPException(400, problem)
+    name = body.name.strip()
+
+    # Cached-only: my_playlists() would silently pay ~21 paginated calls on a
+    # cold/absent playlist_list cache. When there is nothing cached, skip the
+    # note rather than fetch to produce one — the same coupling remember_playlist
+    # has: with no cached listing, it is a no-op and the new home stays
+    # invisible until the next Refresh (degraded, not corrupt).
+    cached_items = (store.cache().get("playlist_list") or {}).get("items") or []
+    note = None
+    if any(p["name"].strip() == name for p in cached_items):
+        note = "a playlist with this name already exists — Spotify allows duplicates, so now there are two"
+
+    new_id, snapshot = sp.create_playlist_full(name)
+    snapshot = snapshot or f"created:{new_id}"  # sentinel: only has to equal itself
+
+    item = {
+        "id": new_id, "name": name,
+        "owner": (store.cache().get("me") or {}).get("id"),
+        "editable": True, "total": 0, "snapshot_id": snapshot,
+        "image": None, "description": "",
+    }
+    # Also seeds the track cache atomically under the same lock (spec §3's
+    # snapshot trap) — see Spotify.remember_playlist.
+    sp.remember_playlist(item)
+
+    cfg = store.config()
+    store.update_config(
+        home_ids=sorted(set(cfg.get("home_ids") or []) | {new_id}),
+        sticky_home_ids=sorted(set(cfg.get("sticky_home_ids") or []) | {new_id}),
+    )
+
+    # Same move as set_config after a hints save, same reason: usable on the
+    # next request, not up to PROFILE_TTL later.
+    _profile_state.clear()
+    _profile_state["built_at"] = 0.0
+
+    return {
+        "playlist": {**item, "role": "home", "folder": None, "split": None, "hints": ""},
+        "note": note,
+    }
 
 
 def _parse_hints(cfg: dict) -> dict[str, list[str]]:
