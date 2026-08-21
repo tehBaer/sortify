@@ -742,7 +742,7 @@ class Spotify:
         self.request("PUT", "/me/library", json={"uris": [uri]})
 
     def create_playlist_full(
-        self, name: str, description: str = "", bulk: bool = False
+        self, name: str, description: str = "", bulk: bool = False, spend_reserve: bool = False
     ) -> tuple[str, str | None]:
         """Create a playlist; return (id, snapshot_id or None). One call.
 
@@ -754,7 +754,7 @@ class Spotify:
         resp = self.request(
             "POST", "/me/playlists",
             json={"name": name, "description": description, "public": False},
-            bulk=bulk,
+            bulk=bulk, spend_reserve=spend_reserve,
         )
         playlist_id = (resp or {}).get("id")
         if not playlist_id:
@@ -769,15 +769,7 @@ class Spotify:
     def create_playlist(self, name: str, description: str = "", bulk: bool = False,
                         spend_reserve: bool = False) -> str:
         """Create a playlist and return its id. One call."""
-        resp = self.request(
-            "POST", "/me/playlists",
-            json={"name": name, "description": description, "public": False},
-            bulk=bulk, spend_reserve=spend_reserve,
-        )
-        playlist_id = (resp or {}).get("id")
-        if not playlist_id:
-            raise SpotifyError(502, "playlist creation returned no id")
-        return playlist_id
+        return self.create_playlist_full(name, description, bulk=bulk, spend_reserve=spend_reserve)[0]
 
     def unfollow_playlist(self, playlist_id: str) -> None:
         """Discard a whole playlist in one call.
