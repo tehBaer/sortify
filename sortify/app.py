@@ -507,6 +507,17 @@ def _ensure_profiles_locked(force: bool) -> dict:
         for h in homes
     }
 
+    # Co-occurrence corpus: EVERY cached playlist (homes, inputs, and
+    # anything else already on disk) — a pure cache.json read, zero API
+    # calls, refreshed on the same PROFILE_TTL cadence as the profiles and
+    # with the same accepted staleness (see the freshness-asymmetry pin in
+    # tests/test_suggest.py).
+    playlist_artists = sugg.playlist_artist_index(
+        {pid: p.get("tracks") or []
+         for pid, p in store.cache().get("playlists", {}).items()
+         if isinstance(p, dict)}
+    )
+
     # Input contents too, so the capture chips can show membership.
     by_id = {p["id"]: p for p in all_playlists}
     inputs = []
@@ -520,15 +531,30 @@ def _ensure_profiles_locked(force: bool) -> dict:
     _profile_state.update(
         built_at=now, profiles=profiles, homes=homes, inputs=inputs,
         playlists=all_playlists, input_ids=input_ids,
+        playlist_artists=playlist_artists,
+        last_added={hid: _last_added_at(tracks) for hid, tracks in home_tracks.items()},
     )
     return _profile_state
 
 
+def _last_added_at(tracks: list[dict]) -> str | None:
+    """Latest `added_at` among a home's cached tracks, or None.
+
+    ISO-8601 Zulu strings compare correctly as strings, so max() needs no
+    parsing. Powers the picker's recency sort — pure cache read, zero API
+    cost, and exactly as fresh as the cache itself (which refetches a home
+    whenever its snapshot moves, i.e. whenever something was added)."""
+    stamps = [t["added_at"] for t in tracks if t.get("added_at")]
+    return max(stamps) if stamps else None
+
+
 def _homes_payload(state: dict, exclude: str = "") -> list[dict]:
     folders = store.folders()
+    last_added = state.get("last_added") or {}
     return [
         {"id": h["id"], "name": h["name"], "image": h["image"], "total": h["total"],
-         "folder": (folders.get(h["id"]) or {}).get("path")}
+         "folder": (folders.get(h["id"]) or {}).get("path"),
+         "last_added_at": last_added.get(h["id"])}
         for h in state["homes"] if h["id"] != exclude
     ]
 
@@ -582,7 +608,10 @@ def triage(playlist_id: str):
             {
                 **t,
                 "sortable": bool(sortable),
-                "suggestions": sugg.suggest(t, state["profiles"], tag_artists, track_map, artist_map) if sortable else [],
+                "suggestions": sugg.suggest(
+                    t, state["profiles"], tag_artists, track_map, artist_map,
+                    state.get("playlist_artists"),
+                ) if sortable else [],
             }
         )
 
@@ -3118,7 +3147,10 @@ def now_playing(force: bool = False):
             if ctx_id else None
         ),
         "sitting": _sitting_for_context(ctx_id),
-        "suggestions": sugg.suggest(track, state["profiles"], tag_artists, track_map, artist_map) if sortable else [],
+        "suggestions": sugg.suggest(
+            track, state["profiles"], tag_artists, track_map, artist_map,
+            state.get("playlist_artists"),
+        ) if sortable else [],
         "homes": _homes_payload(state),
         "inputs": [
             {"id": l["id"], "name": l["name"], "has_track": track["uri"] in l["uris"]}

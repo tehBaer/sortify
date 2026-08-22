@@ -338,3 +338,85 @@ def test_weights_can_vary_artist_sim_weight():
     with ev.weights(artist_sim_weight=2.0):
         assert ev.suggest_mod.ARTIST_SIM_WEIGHT == 2.0
     assert ev.suggest_mod.ARTIST_SIM_WEIGHT == 1.0  # restored
+
+
+def test_evaluate_pair_rebuilds_cooc_corpus_without_the_held_out_track():
+    # Leak pin for the co-occurrence signal: the held-out track's artist
+    # must leave its homes' corpus entries too. Fixture: the held track
+    # (artist "beach-house") sits in BOTH homes, each alongside a
+    # "slowdive" track. With an honestly rebuilt corpus neither home entry
+    # still contains beach-house, so co-occurrence has no shared playlist to
+    # find and nothing ranks. A no-op rebuild leaks beach-house via the
+    # sibling home's entry and hands each home a weak guess.
+    home_tracks = {
+        "H1": [track("spotify:track:held", "beach-house"), track("spotify:track:x1", "slowdive")],
+        "H2": [track("spotify:track:held", "beach-house"), track("spotify:track:x2", "slowdive")],
+    }
+    # beach-house deliberately tagless here: no tag signal, only cooc could fire.
+    tagless = {"beach-house": tag_entry(name="Beach House"), "slowdive": tag_entry(name="Slowdive")}
+    profiles = ev.build_all_profiles(home_tracks, tagless)
+    idx = ev.uri_home_index(home_tracks)
+    corpus = ev.playlist_artist_index(home_tracks)
+    held = track("spotify:track:held", "beach-house")
+
+    top1_hit, top3_hit, _ = ev.evaluate_pair(
+        "H1", held, home_tracks, profiles, tagless, idx, top_k=3,
+        playlist_artists=corpus,
+    )
+    assert top1_hit is False
+    assert top3_hit is False
+
+
+def test_evaluate_pair_cooc_corpus_leak_mutation_check():
+    # The other half: rank the same fixture against the UNREBUILT corpus
+    # (what a no-op rebuild would pass to suggest) and confirm the leak
+    # would produce a hit — proving the pin above is not vacuous.
+    home_tracks = {
+        "H1": [track("spotify:track:held", "beach-house"), track("spotify:track:x1", "slowdive")],
+        "H2": [track("spotify:track:held", "beach-house"), track("spotify:track:x2", "slowdive")],
+    }
+    tagless = {"beach-house": tag_entry(name="Beach House"), "slowdive": tag_entry(name="Slowdive")}
+    held = track("spotify:track:held", "beach-house")
+    held_out = {
+        hid: [t for t in tracks if t["uri"] != held["uri"]]
+        for hid, tracks in home_tracks.items()
+    }
+    profiles = ev.build_all_profiles(held_out, tagless)
+    leaky_corpus = ev.playlist_artist_index(home_tracks)  # held track still inside
+
+    results = raw_suggest(held, profiles, tagless, {}, {}, leaky_corpus)
+    assert results  # the leak DOES rank something when not plugged
+    assert any(r["playlist_id"] in ("H1", "H2") for r in results)
+
+
+def test_playlist_artist_index_maps_ids_to_names():
+    idx = ev.playlist_artist_index(fake_home_tracks())
+    assert idx["dreamy"] == {"beach-house": "beach-house", "slowdive": "slowdive"}
+    assert idx["heavy"] == {"kvelertak": "kvelertak"}
+
+
+def test_weights_can_vary_cooc_weight():
+    import sortify.suggest as suggest_mod
+    before = suggest_mod.COOC_WEIGHT
+    with ev.weights(cooc_weight=0.0):
+        assert suggest_mod.COOC_WEIGHT == 0.0
+    assert suggest_mod.COOC_WEIGHT == before
+
+
+def test_run_eval_threads_playlist_artists_through_to_suggest():
+    # A cooc-only fixture: held track's artist is tagless and unknown to the
+    # rebuilt home profile, but still sits next to a home artist in an input
+    # playlist. Only if run_eval passes the corpus through can the guess
+    # tier rank the home at all.
+    home_tracks = {
+        "H": [track("spotify:track:held", "tagless-a"), track("spotify:track:x1", "slowdive")],
+    }
+    ta = {"tagless-a": tag_entry(name="A"), "slowdive": tag_entry(name="Slowdive")}
+    corpus = ev.playlist_artist_index(home_tracks)
+    corpus["inp"] = {"tagless-a": "A", "slowdive": "Slowdive"}
+    pairs = [("H", track("spotify:track:held", "tagless-a"))]
+
+    without = ev.run_eval(home_tracks, ta, pairs)
+    with_corpus = ev.run_eval(home_tracks, ta, pairs, playlist_artists=corpus)
+    assert without["top1"] == 0.0
+    assert with_corpus["top1"] == 1.0

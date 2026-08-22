@@ -40,7 +40,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import sortify.suggest as suggest_mod  # noqa: E402
 from sortify.store import Store  # noqa: E402
-from sortify.suggest import build_profile, suggest  # noqa: E402
+from sortify.suggest import (  # noqa: E402
+    _artists_of,
+    build_profile,
+    playlist_artist_index,
+    suggest,
+)
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DEFAULT_N = 500
@@ -135,6 +140,24 @@ def load_artist_map(data_dir: Path = DATA_DIR) -> dict[str, dict]:
     return Store(data_dir).lastfm_artist_map()
 
 
+def load_playlist_artists(data_dir: Path = DATA_DIR) -> dict[str, dict]:
+    """{playlist_id: {artist_id: name}} over EVERY cached playlist — homes
+    and inputs alike, because an input playlist is exactly where "the user
+    added A alongside B" co-occurrence evidence lives. Same degrade-to-empty
+    contract as the other loaders: a missing or malformed cache yields {}."""
+    try:
+        with open(data_dir / "cache.json") as f:
+            cache = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    playlists = cache.get("playlists") if isinstance(cache, dict) else None
+    if not isinstance(playlists, dict):
+        return {}
+    return playlist_artist_index(
+        {pid: p.get("tracks") or [] for pid, p in playlists.items() if isinstance(p, dict)}
+    )
+
+
 # ---- pure harness logic (unit-tested against hand-built fixtures) ----------
 
 
@@ -220,6 +243,7 @@ def evaluate_pair(
     top_k: int = DEFAULT_TOP_K,
     track_map: dict[str, dict] | None = None,
     artist_map: dict[str, dict] | None = None,
+    playlist_artists: dict[str, dict] | None = None,
 ) -> tuple[bool, bool, bool]:
     """Rank `track` with EVERY true home's profile rebuilt minus `track`
     itself — not just `home_id`. A multi-home track's sibling homes must
@@ -252,11 +276,22 @@ def evaluate_pair(
     true_homes = uri_homes.get(track["uri"], {home_id})
 
     profiles_for_pair = dict(profiles)
+    cooc_for_pair = dict(playlist_artists or {})
     for hid in true_homes:
         held_out_tracks = [t for t in home_tracks[hid] if t["uri"] != track["uri"]]
         profiles_for_pair[hid] = build_profile(held_out_tracks, tag_artists)
+        if cooc_for_pair:
+            # Leak pin (see test_evaluate_pair_rebuilds_cooc_corpus_...):
+            # the held-out track's artist must leave its homes' corpus
+            # entries too, or a multi-home track hands itself co-occurrence
+            # evidence via a sibling home's entry. Same shared helper as the
+            # loader so the two cannot drift.
+            cooc_for_pair[hid] = _artists_of(held_out_tracks)
 
-    results = suggest(track, profiles_for_pair, tag_artists, track_map or {}, artist_map or {})
+    results = suggest(
+        track, profiles_for_pair, tag_artists, track_map or {}, artist_map or {},
+        cooc_for_pair,
+    )
     ranked_ids = [r["playlist_id"] for r in results]
 
     top1_hit = bool(true_homes & set(ranked_ids[:1]))
@@ -271,6 +306,7 @@ def run_eval(
     top_k: int = DEFAULT_TOP_K,
     track_map: dict[str, dict] | None = None,
     artist_map: dict[str, dict] | None = None,
+    playlist_artists: dict[str, dict] | None = None,
 ) -> dict:
     """Evaluate a fixed, pre-sampled set of pairs under whatever weight
     `sortify.suggest` currently holds. Takes the sample as an argument
@@ -292,7 +328,8 @@ def run_eval(
     absent_n = absent_top1 = absent_top3 = 0
     for home_id, track in sampled_pairs:
         hit1, hit3, absent = evaluate_pair(
-            home_id, track, home_tracks, profiles, tag_artists, uri_homes, top_k, track_map, artist_map
+            home_id, track, home_tracks, profiles, tag_artists, uri_homes, top_k,
+            track_map, artist_map, playlist_artists,
         )
         top1 += hit1
         top3 += hit3
@@ -317,6 +354,7 @@ def weights(
     tag_weight: float | None = None,
     neighbour_weight: float | None = None,
     artist_sim_weight: float | None = None,
+    cooc_weight: float | None = None,
 ):
     """Temporarily override sortify.suggest's TAG_WEIGHT, NEIGHBOUR_WEIGHT,
     and/or ARTIST_SIM_WEIGHT constants. `suggest()` reads all three as
@@ -332,6 +370,9 @@ def weights(
     orig_tag_weight = suggest_mod.TAG_WEIGHT
     orig_neighbour_weight = suggest_mod.NEIGHBOUR_WEIGHT
     orig_artist_sim_weight = suggest_mod.ARTIST_SIM_WEIGHT
+    orig_cooc_weight = suggest_mod.COOC_WEIGHT
+    if cooc_weight is not None:
+        suggest_mod.COOC_WEIGHT = cooc_weight
     if tag_weight is not None:
         suggest_mod.TAG_WEIGHT = tag_weight
     if neighbour_weight is not None:
@@ -344,6 +385,7 @@ def weights(
         suggest_mod.TAG_WEIGHT = orig_tag_weight
         suggest_mod.NEIGHBOUR_WEIGHT = orig_neighbour_weight
         suggest_mod.ARTIST_SIM_WEIGHT = orig_artist_sim_weight
+        suggest_mod.COOC_WEIGHT = orig_cooc_weight
 
 
 def grid_search(
@@ -421,6 +463,7 @@ def main() -> None:
     parser.add_argument("--baseline", action="store_true", help="force TAG_WEIGHT=0, NEIGHBOUR_WEIGHT=0, and ARTIST_SIM_WEIGHT=0 (artist-overlap-only)")
     parser.add_argument("--search", action="store_true", help="1-D sweep over NEIGHBOUR_WEIGHT, TAG_WEIGHT fixed")
     parser.add_argument("--search-artist-sim", action="store_true", help="1-D sweep over ARTIST_SIM_WEIGHT, everything else fixed")
+    parser.add_argument("--search-cooc", action="store_true", help="1-D sweep over COOC_WEIGHT, everything else fixed")
     args = parser.parse_args()
 
     top_k = args.top_k
@@ -433,17 +476,25 @@ def main() -> None:
     tag_artists = load_tag_artists()
     track_map = load_track_map()
     artist_map = load_artist_map()
+    playlist_artists = load_playlist_artists()
     pairs = collect_pairs(home_tracks)
     sampled = sample_pairs(pairs, args.n, args.seed)
 
     print(f"homes={len(home_tracks)} pairs_available={len(pairs)} sampled={len(sampled)} seed={args.seed}")
 
     if args.baseline:
-        with weights(tag_weight=0.0, neighbour_weight=0.0, artist_sim_weight=0.0):
+        with weights(tag_weight=0.0, neighbour_weight=0.0, artist_sim_weight=0.0, cooc_weight=0.0):
             _print_result(
-                "artist-overlap-only baseline (TAG_WEIGHT=0, NEIGHBOUR_WEIGHT=0, ARTIST_SIM_WEIGHT=0)",
-                run_eval(home_tracks, tag_artists, sampled, top_k, track_map, artist_map),
+                "artist-overlap-only baseline (TAG_WEIGHT=0, NEIGHBOUR_WEIGHT=0, ARTIST_SIM_WEIGHT=0, COOC_WEIGHT=0)",
+                run_eval(home_tracks, tag_artists, sampled, top_k, track_map, artist_map, playlist_artists),
             )
+        return
+
+    if args.search_cooc:
+        for w in (0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0):
+            with weights(cooc_weight=w):
+                _print_result(f"COOC_WEIGHT={w}", run_eval(
+                    home_tracks, tag_artists, sampled, top_k, track_map, artist_map, playlist_artists))
         return
 
     if args.search_artist_sim:
@@ -487,8 +538,8 @@ def main() -> None:
 
     _print_result(
         f"current weights (TAG_WEIGHT={suggest_mod.TAG_WEIGHT}, NEIGHBOUR_WEIGHT={suggest_mod.NEIGHBOUR_WEIGHT}, "
-        f"ARTIST_SIM_WEIGHT={suggest_mod.ARTIST_SIM_WEIGHT})",
-        run_eval(home_tracks, tag_artists, sampled, top_k, track_map, artist_map),
+        f"ARTIST_SIM_WEIGHT={suggest_mod.ARTIST_SIM_WEIGHT}, COOC_WEIGHT={suggest_mod.COOC_WEIGHT})",
+        run_eval(home_tracks, tag_artists, sampled, top_k, track_map, artist_map, playlist_artists),
     )
 
 

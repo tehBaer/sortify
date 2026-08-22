@@ -349,3 +349,33 @@ def test_the_sitting_lookup_on_the_poll_path_is_free(route_client):
     assert body["sitting"]["decided"] == {
         "spotify:track:x": {"action": "keep", "to_id": "H1", "at": "t"}}
     assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]
+
+
+# ---- picker recency: last_added_at on the homes payload ---------------------
+
+
+def test_last_added_at_is_the_latest_added_at_or_none():
+    import sortify.app as appmod
+    tracks = [
+        {"uri": "a", "added_at": "2026-01-05T10:00:00Z"},
+        {"uri": "b", "added_at": "2026-08-20T09:30:00Z"},
+        {"uri": "c"},  # local/odd entries carry no added_at
+    ]
+    assert appmod._last_added_at(tracks) == "2026-08-20T09:30:00Z"
+    assert appmod._last_added_at([]) is None
+    assert appmod._last_added_at([{"uri": "c"}]) is None
+
+
+def test_homes_payload_carries_last_added_at():
+    import sortify.app as appmod
+    state = {
+        "homes": [
+            {"id": "h1", "name": "One", "image": None, "total": 3, "snapshot_id": "s1"},
+            {"id": "h2", "name": "Two", "image": None, "total": 0, "snapshot_id": "s2"},
+        ],
+        "last_added": {"h1": "2026-08-20T09:30:00Z"},
+    }
+    payload = appmod._homes_payload(state)
+    by_id = {h["id"]: h for h in payload}
+    assert by_id["h1"]["last_added_at"] == "2026-08-20T09:30:00Z"
+    assert by_id["h2"]["last_added_at"] is None

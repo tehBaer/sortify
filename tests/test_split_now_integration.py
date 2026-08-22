@@ -269,3 +269,64 @@ def test_playlists_reads_splits_json_once_not_per_playlist(splits_store, monkeyp
 
     assert len(out["playlists"]) == 51  # 50 + Liked Songs
     assert len(calls) == 1, f"store.splits() called {len(calls)} times for 51 playlists"
+
+
+def test_now_suggestions_use_cooc_evidence_from_cached_playlists(monkeypatch):
+    """The co-occurrence corpus is every cached playlist, read straight from
+    cache.json by _ensure_profiles — a playing track whose artist is tagless
+    and unknown to every home can still surface a weak guess because the
+    user already files that artist next to a home artist in some other
+    cached playlist (here: an inbox playlist that is neither home nor listed
+    input)."""
+    s = Store()
+    original_cache, original_config, original_tags = s.cache(), s.config(), s.tags()
+
+    cache = s.cache()
+    cache["playlist_list"] = {"fetched_at": 0.0, "items": NOW_TAGS_LISTING}
+    cache["playlists"]["home1"] = {
+        "snapshot_id": "snap-home1",
+        "tracks": [{"uri": "spotify:track:h1", "type": "track", "is_local": False,
+                    "id": "h1", "artists": [{"id": "ha", "name": "Home Artist"}]}],
+        "fetched_at": 0.0,
+    }
+    cache["playlists"]["inbox"] = {
+        "snapshot_id": "snap-inbox",
+        "tracks": [
+            {"uri": "spotify:track:i1", "type": "track", "is_local": False,
+             "id": "i1", "artists": [{"id": "seed-a", "name": "Seed Artist"}]},
+            {"uri": "spotify:track:i2", "type": "track", "is_local": False,
+             "id": "i2", "artists": [{"id": "ha", "name": "Home Artist"}]},
+        ],
+        "fetched_at": 0.0,
+    }
+    s.save_cache(cache)
+    s.save_config({**original_config, "input_ids": [], "home_ids": []})
+    s.save_tags({"version": 2, "artists": {}})
+    appmod._profile_state.clear()
+    appmod._profile_state["built_at"] = 0.0
+
+    for name in ("currently_playing", "my_playlists", "playlist_tracks"):
+        if name in vars(appmod.sp):
+            monkeypatch.delattr(appmod.sp, name)
+
+    new_track = {"uri": "spotify:track:new", "type": "track", "is_local": False,
+                 "id": "new", "artists": [{"id": "seed-a", "name": "Seed Artist"}]}
+    monkeypatch.setattr(appmod.sp, "currently_playing", lambda: {
+        "track": new_track, "is_playing": True, "progress_ms": 1000,
+        "context_playlist_id": None,
+    })
+    appmod._now_cache.update(at=0.0, value=None, ttl=appmod.NOW_TTL_IDLE)
+
+    try:
+        resp = appmod.now_playing()
+    finally:
+        s.save_cache(original_cache)
+        s.save_config(original_config)
+        s.save_tags(original_tags)
+        appmod._profile_state.clear()
+        appmod._profile_state["built_at"] = 0.0
+
+    suggestions = resp["suggestions"]
+    assert suggestions and suggestions[0]["playlist_id"] == "home1"
+    assert suggestions[0]["weak"] is True
+    assert "filed alongside: Home Artist" in suggestions[0]["reasons"]

@@ -106,7 +106,7 @@ QUIET_AFTER_COOLDOWN = 6 * 3600
 # (the old "tracks"/"track" naming is gone for apps created after 2026-02-11).
 ITEM_FIELDS = (
     "items(added_at,is_local,item(uri,id,type,name,duration_ms,"
-    "artists(id,name),album(name,images))),next"
+    "artists(id,name),album(name,images,release_date))),next"
 )
 
 
@@ -658,6 +658,7 @@ class Spotify:
                 {"id": a.get("id"), "name": a.get("name")} for a in t.get("artists", [])
             ],
             "album": (t.get("album") or {}).get("name"),
+            "release_date": (t.get("album") or {}).get("release_date"),
             "image": ((t.get("album") or {}).get("images") or [{}])[-1].get("url"),
             "added_at": item.get("added_at"),
         }

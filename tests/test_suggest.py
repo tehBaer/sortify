@@ -708,3 +708,135 @@ def test_artist_sim_weight_read_at_call_time(monkeypatch):
     single = suggest(seed, {"H": prof}, ARTISTS, {}, amap)[0]["score"]
     monkeypatch.setattr(suggest_mod, "ARTIST_SIM_WEIGHT", 2.0)
     assert suggest(seed, {"H": prof}, ARTISTS, {}, amap)[0]["score"] == round(single * 2, 2)
+
+
+# ---- co-occurrence: "you already file this artist next to these" -----------
+#
+# Corpus is {playlist_id: {artist_id: name}} over ALL cached playlists —
+# inputs included, because an input playlist is exactly where "added A
+# alongside B" evidence lives. Guess-tier only, like artist_sim: the
+# confident tier's primacy headroom (3.4 - 3.3 = 0.1) has no room for a
+# fourth signal, and the artist-sim precedent shows a guess-tier signal
+# still lifts the artist-absent subset.
+
+
+def cooc_corpus(**playlists):
+    return {pid: dict(artists) for pid, artists in playlists.items()}
+
+
+def test_cooc_counts_home_artist_shared_via_another_playlist():
+    # Seed artist "seedless" sits next to Slowdive in input playlist "inp";
+    # the home "H" contains Slowdive -> one partner, named.
+    prof = build_profile([track("h1", ["slowdive"])], ARTISTS)
+    corpus = cooc_corpus(
+        inp={"seedless": "Seedless", "slowdive": "Slowdive"},
+        H={"slowdive": "Slowdive"},
+    )
+    seed = {"uri": "n", "name": "S", "artists": [{"id": "seedless", "name": "Seedless"}]}
+    count, names = suggest_mod._cooc_score(seed, "H", prof, corpus)
+    assert (count, names) == (1, ["Slowdive"])
+
+
+def test_cooc_excludes_the_scored_home_itself():
+    # The ONLY shared playlist is the scored home itself — no evidence.
+    # Without this exclusion the signal re-derives artist overlap.
+    prof = build_profile(
+        [track("h1", ["slowdive"]), track("h2", ["seedless"])], ARTISTS
+    )
+    corpus = cooc_corpus(H={"slowdive": "Slowdive", "seedless": "Seedless"})
+    seed = {"uri": "n", "name": "S", "artists": [{"id": "seedless", "name": "Seedless"}]}
+    assert suggest_mod._cooc_score(seed, "H", prof, corpus) == (0, [])
+
+
+def test_cooc_excludes_seed_artists_from_partners():
+    # The seed artist co-occurring with ITSELF in another playlist must not
+    # count — same binding same-artist pin as _neighbour_score.
+    prof = build_profile([track("h1", ["seedless"])], {**ARTISTS, "seedless": tag_entry(name="Seedless")})
+    corpus = cooc_corpus(inp={"seedless": "Seedless"})
+    seed = {"uri": "n", "name": "S", "artists": [{"id": "seedless", "name": "Seedless"}]}
+    assert suggest_mod._cooc_score(seed, "H", prof, corpus) == (0, [])
+
+
+def test_cooc_partner_must_be_in_the_home_profile():
+    # Seed shares a playlist with Kvelertak, but the home holds only
+    # Slowdive — co-occurrence elsewhere with a non-home artist is nothing.
+    prof = build_profile([track("h1", ["slowdive"])], ARTISTS)
+    corpus = cooc_corpus(inp={"seedless": "Seedless", "kvelertak": "Kvelertak"})
+    seed = {"uri": "n", "name": "S", "artists": [{"id": "seedless", "name": "Seedless"}]}
+    assert suggest_mod._cooc_score(seed, "H", prof, corpus) == (0, [])
+
+
+def test_cooc_partner_counted_once_across_many_shared_playlists():
+    # Slowdive shares TWO playlists with the seed artist; one partner, once.
+    prof = build_profile([track("h1", ["slowdive"])], ARTISTS)
+    corpus = cooc_corpus(
+        inp1={"seedless": "Seedless", "slowdive": "Slowdive"},
+        inp2={"seedless": "Seedless", "slowdive": "Slowdive"},
+    )
+    seed = {"uri": "n", "name": "S", "artists": [{"id": "seedless", "name": "Seedless"}]}
+    count, names = suggest_mod._cooc_score(seed, "H", prof, corpus)
+    assert (count, names) == (1, ["Slowdive"])
+
+
+def test_cooc_creates_a_guess_from_a_zero_score_home():
+    # No tags, no Last.fm records at all — but the user already files this
+    # artist next to Slowdive in an input playlist, and H holds Slowdive.
+    prof = build_profile([track("h1", ["slowdive"])], ARTISTS)
+    corpus = cooc_corpus(
+        inp={"seedless": "Seedless", "slowdive": "Slowdive"},
+        H={"slowdive": "Slowdive"},
+    )
+    seed = {"uri": "n", "name": "S", "artists": [{"id": "seedless", "name": "Seedless"}]}
+    res = suggest(seed, {"H": prof}, ARTISTS, {}, {}, corpus)
+    assert len(res) == 1 and res[0]["weak"] is True
+    assert res[0]["reasons"] == ["filed alongside: Slowdive"]
+    assert res[0]["score"] == round(
+        suggest_mod.COOC_WEIGHT * min(1, suggest_mod.COOC_CAP), 2
+    )
+
+
+def test_cooc_never_reaches_the_confident_tier():
+    # Containment, same pin as artist_sim: a maxed co-occurrence signal must
+    # neither produce an unflagged entry nor appear beside a confident one.
+    prof = build_profile(
+        [track(f"h{i}", [f"m{i}"]) for i in range(10)],
+        {f"m{i}": tag_entry(name=f"M{i}") for i in range(10)},
+    )
+    corpus = {
+        "inp": {"seedless": "Seedless", **{f"m{i}": f"M{i}" for i in range(10)}},
+    }
+    lone = {"uri": "n", "name": "S", "artists": [{"id": "seedless", "name": "Seedless"}]}
+    res = suggest(lone, {"COOC": prof}, ARTISTS, {}, {}, corpus)
+    assert res and res[0]["weak"] is True
+    owns = build_profile([track("d1", ["beach-house"])], ARTISTS)
+    both = {"uri": "n", "name": "S", "artists": [
+        {"id": "beach-house", "name": "Beach House"}, {"id": "seedless", "name": "Seedless"}]}
+    res2 = suggest(both, {"COOC": prof, "owns": owns}, ARTISTS, {}, {}, corpus)
+    assert [r["playlist_id"] for r in res2] == ["owns"]
+    assert all("weak" not in r for r in res2)
+
+
+def test_cooc_weight_read_at_call_time(monkeypatch):
+    # Same contract TAG_WEIGHT pins — the eval harness varies it per run.
+    prof = build_profile([track("h1", ["slowdive"])], ARTISTS)
+    corpus = cooc_corpus(inp={"seedless": "Seedless", "slowdive": "Slowdive"})
+    seed = {"uri": "n", "name": "S", "artists": [{"id": "seedless", "name": "Seedless"}]}
+    monkeypatch.setattr(suggest_mod, "COOC_WEIGHT", 0.5)
+    single = suggest(seed, {"H": prof}, ARTISTS, {}, {}, corpus)[0]["score"]
+    monkeypatch.setattr(suggest_mod, "COOC_WEIGHT", 1.0)
+    assert suggest(seed, {"H": prof}, ARTISTS, {}, {}, corpus)[0]["score"] == round(single * 2, 2)
+
+
+def test_cooc_reason_caps_listed_names_at_two():
+    prof = build_profile(
+        [track("h1", ["slowdive"]), track("h2", ["beach-house"]), track("h3", ["kvelertak"])],
+        ARTISTS,
+    )
+    corpus = cooc_corpus(inp={
+        "seedless": "Seedless", "slowdive": "Slowdive",
+        "beach-house": "Beach House", "kvelertak": "Kvelertak",
+    })
+    seed = {"uri": "n", "name": "S", "artists": [{"id": "seedless", "name": "Seedless"}]}
+    res = suggest(seed, {"H": prof}, ARTISTS, {}, {}, corpus)
+    cooc_reasons = [r for r in res[0]["reasons"] if r.startswith("filed alongside:")]
+    assert cooc_reasons == ["filed alongside: Beach House, Kvelertak"]

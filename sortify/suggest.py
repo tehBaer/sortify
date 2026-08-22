@@ -12,6 +12,12 @@ Three signals, all explainable to the user:
     for the binding same-artist exclusion this signal depends on to avoid
     just re-deriving artist overlap under a new name.
 
+Two more signals join in the guess tier only (consulted after a home has
+already failed MIN_SCORE, so neither can promote a home into the confident
+tier): artist-similar (Last.fm `artist.getSimilar`) and co-occurrence
+(`_cooc_score` — home artists the user already files next to this track's
+artist in their other cached playlists; no external service at all).
+
 Spotify's audio-features endpoint is deprecated for new apps, and Spotify no
 longer returns artist genres at all in development mode — tags come from
 Last.fm instead (see `sortify/tags.py`). Artist-level tags describe the
@@ -117,6 +123,25 @@ NEIGHBOUR_SUM_CAP = 1.0
 # at any positive weight.
 ARTIST_SIM_WEIGHT = 1.0
 ARTIST_SIM_CAP = 1.0
+
+# Co-occurrence (the user's own playlists as evidence): guess-tier-only by
+# construction, same gate as artist-similar — consulted only after a home has
+# failed MIN_SCORE, so it can never promote a home into the confident tier
+# and the primacy invariant needs no new analysis. The score is a COUNT of
+# distinct home artists that share another cached playlist with the seed's
+# artists, capped at COOC_CAP partners before weighting (a big hub input
+# playlist must not swamp the guess ranking).
+#
+# Measured 2026-08-21 by scripts/eval_suggest.py --n 500 --seed 7 --search-cooc
+# (corpus: all 79 cached playlists, hold-out applied to home entries):
+#   COOC_WEIGHT=0.0:          top1 0.334 top3 0.560 | artist-absent n=166 top1 0.163 top3 0.319
+#   COOC_WEIGHT=0.25 .. 3.0:  top1 0.334 top3 0.562 | artist-absent top1 0.163 top3 0.325 (all identical)
+# Same fires-or-not shape as ARTIST_SIM_WEIGHT (the signal scales guess-tier
+# scores but rarely reorders which home wins), so per that constant's
+# recorded precedent — "if every weight ties, keep 1.0 and record the tie" —
+# this stays at 1.0, now a measured value.
+COOC_WEIGHT = 1.0
+COOC_CAP = 3.0
 
 
 def _cleaned_tags(entry: dict) -> list[str]:
@@ -342,19 +367,68 @@ def _artist_sim_score(
     return sum(m for m, _ in ranked), len(ranked), [n for _, n in ranked]
 
 
+def _artists_of(tracks: list[dict]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for t in tracks:
+        for a in t.get("artists") or []:
+            if a.get("id"):
+                out.setdefault(a["id"], a.get("name") or a["id"])
+    return out
+
+
+def playlist_artist_index(tracks_by_playlist: dict[str, list[dict]]) -> dict[str, dict]:
+    """{playlist_id: {artist_id: name}} — the co-occurrence corpus.
+
+    Canonical builder, shared by app.py (from cache.json's playlists) and
+    scripts/eval_suggest.py (loader AND the hold-out rebuild) so the three
+    can't drift on what a corpus entry looks like.
+    """
+    return {pid: _artists_of(tracks or []) for pid, tracks in tracks_by_playlist.items()}
+
+
+def _cooc_score(
+    track: dict, pid: str, prof: dict, playlist_artists: dict[str, dict]
+) -> tuple[int, list[str]]:
+    """Distinct home artists that share another playlist with the seed's.
+
+    `playlist_artists` is {playlist_id: {artist_id: name}} over ALL cached
+    playlists — inputs included, because an input playlist is exactly where
+    "the user added A alongside B" evidence lives. Two binding exclusions:
+    the scored home `pid` itself never counts (co-occurrence inside the home
+    would just re-derive artist overlap), and the seed's own artists are
+    never partners (the same same-artist pin `_neighbour_score` carries).
+    Partners are counted once each no matter how many playlists they share.
+    """
+    seed_ids = {a.get("id") for a in (track.get("artists") or []) if a.get("id")}
+    if not seed_ids:
+        return 0, []
+    home_ids = set(prof["artist_counts"]) - seed_ids
+    partners: dict[str, str] = {}
+    for opid, members in playlist_artists.items():
+        if opid == pid or not isinstance(members, dict):
+            continue
+        if seed_ids.isdisjoint(members):
+            continue
+        for aid in home_ids & set(members):
+            partners.setdefault(aid, members[aid])
+    names = sorted(partners.values())
+    return len(partners), names
+
+
 def suggest(
     track: dict,
     profiles: dict[str, dict],
     tag_artists: dict[str, dict],
     track_map: dict[str, dict] | None = None,
     artist_map: dict[str, dict] | None = None,
+    playlist_artists: dict[str, dict] | None = None,
 ) -> list[dict]:
     """Rank home playlists for one track. Returns [{playlist_id, score, already, reasons}].
 
-    `track_map` and `artist_map` are optional ({} when omitted) so callers
-    that haven't been updated to pass `store.lastfm_track_map()` /
-    `store.lastfm_artist_map()` yet keep working — see app.py's call sites,
-    which all pass fresh ones.
+    `track_map`, `artist_map`, and `playlist_artists` (the co-occurrence
+    corpus, see `playlist_artist_index`) are optional ({} when omitted) so
+    callers that haven't been updated yet keep working — see app.py's call
+    sites, which all pass fresh ones.
 
     When no home clears MIN_SCORE and the track is filed nowhere, the
     sub-threshold ranking is returned instead — up to TOP_N homes with
@@ -369,6 +443,7 @@ def suggest(
     """
     track_map = track_map or {}
     artist_map = artist_map or {}
+    playlist_artists = playlist_artists or {}
     track_tags, tag_level = _resolve_tags(track, tag_artists, track_map)
     tag_reason_prefix = "tags: " if tag_level == "track" else "artist tags: "
     results = []
@@ -423,6 +498,10 @@ def suggest(
             if sim_count:
                 score += ARTIST_SIM_WEIGHT * min(sim_sum, ARTIST_SIM_CAP)
                 reasons.append("similar artists: " + ", ".join(sim_names[:2]))
+            cooc_count, cooc_names = _cooc_score(track, pid, prof, playlist_artists)
+            if cooc_count:
+                score += COOC_WEIGHT * min(cooc_count, COOC_CAP)
+                reasons.append("filed alongside: " + ", ".join(cooc_names[:2]))
             if score > 0:
                 weak_pool.append(
                     {

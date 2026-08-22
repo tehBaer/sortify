@@ -1002,7 +1002,10 @@ async function nowFile(toId) {
 async function nowCreateAndFile(name) {
   try {
     const { p, note } = await createHome(name);
-    nowState.homes.set(p.id, { id: p.id, name: p.name, image: null, total: 0, folder: null });
+    // Stamped now: it just received this track, so the recency sort keeps it
+    // on top until the next profile rebuild reports the real value.
+    nowState.homes.set(p.id, { id: p.id, name: p.name, image: null, total: 0, folder: null,
+      last_added_at: new Date().toISOString() });
     await nowFile(p.id);  // lands the card in its ordinary ✓ filed state; nowFile's
     // own toast covers that. The server's duplicate-name note is separate and
     // would otherwise be silently dropped, so surface it too.
@@ -1040,7 +1043,11 @@ function openPicker(homesMap, onPick, onCreate) {
   const list = $("picker-list");
   const paint = (filter) => {
     list.innerHTML = "";
+    // Recency first: the home you filed into most recently is the likeliest
+    // target again (ISO Zulu stamps compare fine as strings; homes never
+    // added to sink to the bottom in the old folder → name order).
     const homes = [...homesMap.values()].sort((a, b) =>
+      (b.last_added_at || "").localeCompare(a.last_added_at || "") ||
       (a.folder || "").localeCompare(b.folder || "") || a.name.localeCompare(b.name));
     let shown = 0;
     for (const h of homes) {
