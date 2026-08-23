@@ -90,11 +90,14 @@ escalating penalties. Therefore:
   `.p-sub` line, and filter matching); an empty `folders.json` is why they'd
   vanish. It was wiped to `{}` by the 2026-08-21 live-data clobber and
   restored 2026-08-23.
-- **Source**: [mikez/spotify-folders](https://github.com/mikez/spotify-folders)
-  run on a machine with the Spotify **desktop client** (not this box), piped
-  into `POST /api/folders`. That endpoint also **re-marks homes** from the
-  tree (`home_folder_prefixes` minus excludes, union `sticky_home_ids`), so
-  don't POST casually.
+- **Source**: the box's own Spotify snap client (installed + logged in
+  2026-08-23). The "Re-import folder tree" button (`POST /api/folders/refresh`)
+  runs it headless (Xvfb `:93`, ~45s) to sync, then parses its LevelDB
+  rootlist via `sortify/rootlist.py` + the vendored
+  [mikez/spotify-folders](https://github.com/mikez/spotify-folders) parser.
+  `POST /api/folders` still accepts a tree exported on another machine.
+  Both endpoints **re-mark homes** from the tree (`home_folder_prefixes`
+  minus excludes, union `sticky_home_ids`), so don't trigger them casually.
 - **Known-good extract**: `~/kode/spotify-library/folders.json` (Aug 2026) is
   already in the stored mapping shape — copying it straight into
   `data/folders.json` restores paths without touching home marking or Spotify.
