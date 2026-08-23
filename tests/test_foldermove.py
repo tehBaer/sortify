@@ -106,3 +106,61 @@ def test_verify_move_checks_tree_truth():
     assert verify_move(TREE, "pl_lite", None) is False
     assert verify_move(TREE, "pl_loose", None) is True
     assert verify_move(TREE, "pl_loose", "ROOT") is False
+
+
+from sortify.foldermove import execute_move
+
+
+class FakeSession:
+    entered = 0
+    def __enter__(self):
+        FakeSession.entered += 1
+        return self
+    def __exit__(self, *a):
+        return False
+
+
+def _tree_with(pid_path):
+    """Minimal tree putting pl_haze at the given path (or top level)."""
+    node = {"type": "playlist", "uri": "spotify:playlist:pl_haze"}
+    if pid_path is None:
+        return {"type": "folder", "children": [node]}
+    return {"type": "folder", "children": [
+        {"name": pid_path, "type": "folder", "uri": "spotify:user:u:folder:ff",
+         "children": [node]}]}
+
+
+def test_execute_move_verifies_against_fresh_tree():
+    plan = MovePlan("pl_haze", "HAZE", None, "DEST")
+    moved = []
+    execute_move(
+        plan, session_cls=FakeSession,
+        mover=lambda s, p: moved.append(p),
+        extractor=lambda: _tree_with("DEST"),
+    )
+    assert moved == [plan]
+
+
+def test_execute_move_retries_whole_move_once_then_fails():
+    plan = MovePlan("pl_haze", "HAZE", None, "DEST")
+    attempts = []
+    with pytest.raises(RuntimeError, match="not verified"):
+        execute_move(
+            plan, session_cls=FakeSession,
+            mover=lambda s, p: attempts.append(p),
+            extractor=lambda: _tree_with(None),   # never lands
+            settle_seconds=0,
+        )
+    assert len(attempts) == 2  # one retry of the whole move
+
+
+def test_execute_move_skips_ui_if_already_done():
+    plan = MovePlan("pl_haze", "HAZE", None, "DEST")
+    moved = []
+    execute_move(
+        plan, session_cls=FakeSession,
+        mover=lambda s, p: moved.append(p),
+        extractor=lambda: _tree_with("DEST"),
+        precheck=True,
+    )
+    assert moved == []  # slow-flush guard: verified done before re-driving

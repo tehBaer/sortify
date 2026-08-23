@@ -42,6 +42,7 @@ timeout_method = "thread"
 [project.scripts]
 sortify = "sortify.app:main"
 spx = "sortify.cli:main"
+spfolders = "sortify.foldermove:main"
 
 [tool.setuptools.packages.find]
 include = ["sortify*"]
