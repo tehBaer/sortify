@@ -378,6 +378,7 @@ DEFAULT_FOLDER_NAME = "New Folder"  # what "Create folder" births
 NAME_DETAILS = "Name & details"     # button on a fresh playlist's view
 DIALOG_EDIT_DETAILS = "Edit details"
 DIALOG_SAVE = "Save"
+DIALOG_RENAME = "Rename"            # folder-rename dialog's title
 DEFAULT_PLAYLIST_PREFIX = "My Playlist"  # fresh playlists are "My Playlist #N"
 CONFIRM_CANCEL = "Cancel"
 CONFIRM_DELETE_OFFSET = (97, 0)     # "Delete" button sits right of "Cancel"
@@ -387,6 +388,26 @@ def _clear_and_type(display: str, s: str) -> None:
     key(display, "ctrl+a")
     key(display, "BackSpace")
     type_text(display, s)
+    time.sleep(SETTLE)
+
+
+def _type_in_dialog(display: str, s: str, title: str) -> None:
+    """Type into a dialog's text field, then dismiss CEF's autofill.
+
+    Once a value has been typed into a field, CEF offers it back as an
+    autofill suggestion on every later run, and that dropdown renders OVER
+    the dialog's Save button — invisible to OCR and unclickable. This is
+    why an acceptance run can pass the first time and fail from the second
+    on.
+
+    Blur by clicking the dialog's own TITLE (a non-interactive heading):
+    that dismisses the suggestion list without closing the dialog, which
+    Escape would do. Tab also dismisses it but moves focus ONTO Save, and
+    the focus ring around that white pill defeats every OCR pass we have
+    (tesseract reads it as "[sw J") — measured, not guessed.
+    """
+    _clear_and_type(display, s)
+    click(display, *wait_for_text(display, title))
     time.sleep(SETTLE)
 
 
@@ -501,6 +522,24 @@ def _confirm_delete(session: "ClientSession") -> None:
     time.sleep(SETTLE)
 
 
+def _save_dialog(display: str, title: str) -> None:
+    """Click a dialog's Save button and prove the dialog actually closed.
+
+    Clicking is not evidence: the dialog going away is. If the title is
+    still on screen afterwards the save did not take, and we abort rather
+    than let the caller believe a rename happened.
+    """
+    click(display, *wait_for_text(display, DIALOG_SAVE))
+    time.sleep(SETTLE)
+    for _ in range(4):
+        try:
+            wait_for_text(display, title, tries=1)
+        except UiStepError:
+            return  # title gone: the dialog closed
+        time.sleep(1.5)
+    raise UiStepError(f"{title!r} dialog did not close after clicking Save")
+
+
 def create_folder_ui(session: "ClientSession", name: str) -> None:
     d = session.display
     _clear_library_filter(session)
@@ -513,9 +552,8 @@ def create_folder_ui(session: "ClientSession", name: str) -> None:
     time.sleep(SETTLE)
     click(d, *wait_for_text(d, FOLDER_MENU_RENAME))
     wait_for_text(d, DIALOG_SAVE, tries=6)  # dialog is up before we type
-    _clear_and_type(d, name)
-    click(d, *wait_for_text(d, DIALOG_SAVE))
-    time.sleep(SETTLE)
+    _type_in_dialog(d, name, DIALOG_RENAME)
+    _save_dialog(d, DIALOG_RENAME)
     back_to_library(d)
 
 
@@ -526,9 +564,8 @@ def create_playlist_ui(session: "ClientSession", name: str) -> None:
     click(d, *wait_for_text(d, NAME_DETAILS, tries=6))
     wait_for_text(d, DIALOG_EDIT_DETAILS)  # dialog-open assertion
     click(d, *wait_for_text(d, DEFAULT_PLAYLIST_PREFIX))  # name field
-    _clear_and_type(d, name)
-    click(d, *wait_for_text(d, DIALOG_SAVE))
-    time.sleep(SETTLE)
+    _type_in_dialog(d, name, DIALOG_EDIT_DETAILS)
+    _save_dialog(d, DIALOG_EDIT_DETAILS)
     back_to_library(d)
 
 
