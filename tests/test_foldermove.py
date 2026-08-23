@@ -75,3 +75,34 @@ def test_resolve_folder_by_unique_leaf_name():
 def test_resolve_folder_unknown():
     with pytest.raises(ResolveError):
         resolve_folder(TREE, "NOPE / NOWHERE")
+
+
+from sortify.foldermove import MovePlan, plan_move, verify_move
+
+
+def test_plan_move_into_folder():
+    p = plan_move(ITEMS, TREE, "HAZE", "Y'no")
+    assert p == MovePlan("pl_haze", "HAZE", "ROOT", "ROOT / Y'no")
+
+
+def test_plan_move_out_to_top_level():
+    p = plan_move(ITEMS, TREE, "LITE", None)
+    assert p == MovePlan("pl_lite", "LITE", "ROOT / Y'no", None)
+
+
+def test_plan_move_noop_refused():
+    with pytest.raises(ResolveError) as e:
+        plan_move(ITEMS, TREE, "LITE", "Y'no")
+    assert "already" in str(e.value)
+
+
+def test_plan_move_out_when_already_loose_refused():
+    with pytest.raises(ResolveError):
+        plan_move(ITEMS, TREE, "Loose One", None)
+
+
+def test_verify_move_checks_tree_truth():
+    assert verify_move(TREE, "pl_lite", "ROOT / Y'no") is True
+    assert verify_move(TREE, "pl_lite", None) is False
+    assert verify_move(TREE, "pl_loose", None) is True
+    assert verify_move(TREE, "pl_loose", "ROOT") is False

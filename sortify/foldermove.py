@@ -11,6 +11,8 @@ docs/superpowers/specs/2026-08-23-spfolders-folder-moves-design.md.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from .folders import extract_folder_map
 
 
@@ -80,3 +82,28 @@ def resolve_folder(tree: dict, path_query: str) -> str:
     raise ResolveError(
         f"no folder matches {path_query!r}; known folders:\n  " + "\n  ".join(paths)
     )
+
+
+@dataclass(frozen=True)
+class MovePlan:
+    playlist_id: str
+    playlist_name: str
+    from_path: str | None   # None = top level
+    to_path: str | None     # None = top level (--out)
+
+
+def plan_move(
+    items: list[dict], tree: dict, playlist_query: str, dest_query: str | None
+) -> MovePlan:
+    mapping = extract_folder_map(tree)
+    pid, name, current = resolve_playlist(items, mapping, playlist_query)
+    dest = resolve_folder(tree, dest_query) if dest_query is not None else None
+    if current == dest:
+        where = f"in {dest!r}" if dest else "at the top level"
+        raise ResolveError(f"{name} is already {where}")
+    return MovePlan(pid, name, current, dest)
+
+
+def verify_move(tree: dict, playlist_id: str, expected_path: str | None) -> bool:
+    actual = (extract_folder_map(tree).get(playlist_id) or {}).get("path")
+    return actual == expected_path
