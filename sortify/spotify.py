@@ -504,13 +504,13 @@ class Spotify:
         """A GET that draws on the small proactive allowance, not the user's."""
         return self.request("GET", path, background=True, **kwargs)
 
-    def _paginate(self, path: str, params: dict | None = None) -> Iterator[dict]:
-        page = self.get(path, params=params or {})
+    def _paginate(self, path: str, params: dict | None = None, **kw) -> Iterator[dict]:
+        page = self.get(path, params=params or {}, **kw)
         while True:
             yield from page.get("items", [])
             if not page.get("next"):
                 return
-            page = self.get(page["next"])
+            page = self.get(page["next"], **kw)
 
     # ---- playlists --------------------------------------------------------
 
@@ -663,22 +663,25 @@ class Spotify:
             "added_at": item.get("added_at"),
         }
 
-    def playlist_tracks(self, playlist_id: str) -> list[dict]:
+    def playlist_tracks(self, playlist_id: str, bulk: bool = False,
+                        spend_reserve: bool = False) -> list[dict]:
+        kw = {"bulk": bulk, "spend_reserve": spend_reserve}
         if playlist_id == LIKED_ID:
-            items = list(self._paginate("/me/tracks", {"limit": 50}))
+            items = list(self._paginate("/me/tracks", {"limit": 50}, **kw))
         else:
             try:
                 items = list(
                     self._paginate(
                         f"/playlists/{playlist_id}/items",
-                        {"limit": 100, "fields": ITEM_FIELDS},
+                        {"limit": 100, "fields": ITEM_FIELDS}, **kw,
                     )
                 )
             except SpotifyError as e:
                 # If the fields filter is rejected, refetch unfiltered.
                 if e.status != 400:
                     raise
-                items = list(self._paginate(f"/playlists/{playlist_id}/items", {"limit": 100}))
+                items = list(self._paginate(f"/playlists/{playlist_id}/items",
+                                            {"limit": 100}, **kw))
         return [t for t in (self._slim_track(i) for i in items) if t and t["uri"]]
 
     # ---- playback control -------------------------------------------------
@@ -732,10 +735,16 @@ class Spotify:
 
     # ---- mutations --------------------------------------------------------
 
-    def add_to_playlist(self, playlist_id: str, uri: str, bulk: bool = False,
-                        spend_reserve: bool = False) -> str | None:
+    def add_to_playlist(self, playlist_id: str, uris: str | list[str],
+                        bulk: bool = False, spend_reserve: bool = False) -> str | None:
+        """Add up to 100 tracks in ONE call — the batch limit probed
+        2026-08-23 (150 uris → 400 "Too many ids requested"). A single uri
+        is accepted for the interactive one-track callers."""
+        batch = [uris] if isinstance(uris, str) else list(uris)
+        if len(batch) > 100:
+            raise ValueError(f"{len(batch)} uris — the batch add limit is 100")
         resp = self.request("POST", f"/playlists/{playlist_id}/items",
-                            json={"uris": [uri]}, bulk=bulk, spend_reserve=spend_reserve)
+                            json={"uris": batch}, bulk=bulk, spend_reserve=spend_reserve)
         return (resp or {}).get("snapshot_id")
 
     def remove_from_playlist(self, playlist_id: str, uri: str) -> str | None:
