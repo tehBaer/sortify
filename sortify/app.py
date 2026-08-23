@@ -2457,6 +2457,54 @@ def enqueue_piles(playlist_id: str, body: QueueIn):
     return {"ok": True, "queued": order, "total_calls": total, "complete": False}
 
 
+class RenameOutputsIn(BaseModel):
+    # The echo, not a flag — the caller states the price it was shown (I1).
+    expected_calls: int = Field(..., ge=0)
+
+
+@app.post("/api/split/{playlist_id}/rename_outputs")
+def rename_outputs(playlist_id: str, body: RenameOutputsIn):
+    """Rename this split's materialised playlists to `{source} · pile` form.
+
+    Explicit and priced, never automatic (design §3): outputs created before
+    the naming rule keep their bare pile names until the user asks. One
+    rename call per playlist, interactive budget — this is a user click.
+    """
+    with _split_lock:
+        payload = store.splits()
+        split = payload["splits"].get(playlist_id)
+        if not split:
+            raise HTTPException(404, "no split for that playlist")
+        source = _source_playlist_name(playlist_id)
+        if not source:
+            raise HTTPException(
+                409, "the source playlist's name isn't in the cached listing — "
+                     "Refresh the Playlists view first (free if unchanged)")
+        todo = []
+        for pid, rec in (split.get("materialised") or {}).items():
+            if not rec.get("playlist_id"):
+                continue
+            cur = rec.get("name") or ""
+            if cur.startswith(f"{source} · "):
+                continue
+            todo.append((pid, rec["playlist_id"], rec.get("claim"),
+                         split_output_name(source, cur)))
+    if body.expected_calls != len(todo):
+        raise HTTPException(
+            409, f"cost has changed: renaming now spends {len(todo)} Spotify "
+                 f"calls, not the {body.expected_calls} you confirmed. "
+                 "Nothing was spent.")
+    renamed = []
+    for pid, spotify_id, claim, target in todo:
+        sp.rename_playlist(spotify_id, target)
+        # CAS so a concurrent re-cluster's fresh record isn't stamped with a
+        # stale name; a refused write just means the record moved on — the
+        # playlist itself is renamed either way, which is what was asked.
+        _claim_materialisation(playlist_id, pid, claim, name=target)
+        renamed.append({"pile_id": pid, "name": target})
+    return {"ok": True, "renamed": renamed}
+
+
 @app.get("/api/split/{playlist_id}/queue")
 def queue_status(playlist_id: str):
     # M4 (review round 1): GET stays global on purpose — it's the read path

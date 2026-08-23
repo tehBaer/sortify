@@ -1158,6 +1158,10 @@ async function openSplit(id, name) {
   queueStatus = null;
   $("queue-panel").hidden = true;
   $("queue-panel").innerHTML = "";
+  // A previous split's rename offer must not survive into a view that then
+  // fails to load below (404-that-isn't-"not split yet", 5xx, network) —
+  // otherwise the button's onclick still points at the old split's id.
+  $("btn-rename-outputs").hidden = true;
   split = { id, name, piles: [], decided: {}, active_sitting: null };
   show("split");
   $("split-title").textContent = name;
@@ -1167,6 +1171,7 @@ async function openSplit(id, name) {
   try {
     const data = await api(`/api/split/${id}`);
     applySplitData(data);
+    renderRenameOffer(data);
     pollQueueStatus();
   } catch (e) {
     if (e.message === "auth needed") return;
@@ -1199,6 +1204,35 @@ async function openSplit(id, name) {
        <button id="btn-do-split" class="primary">Split it (0–${warm} calls)</button>`;
     $("btn-do-split").onclick = doSplit;
   }
+}
+
+// Understated by design (design §2 judgement): shown only when this split
+// has saved playlists still carrying bare pile names. The count is computed
+// client-side from record names; the server re-derives it and 409s if they
+// disagree — same echo contract as every other priced action.
+function renderRenameOffer(data) {
+  const btn = $("btn-rename-outputs");
+  const prefix = split.name + " · ";
+  const todo = (data.piles || []).filter(
+    (p) => p.materialised?.playlist_id && p.materialised.name
+           && !p.materialised.name.startsWith(prefix));
+  btn.hidden = !todo.length;
+  if (!todo.length) return;
+  btn.textContent =
+    `Rename ${todo.length} saved playlist${todo.length === 1 ? "" : "s"} to “${split.name} · …” (${todo.length} calls)`;
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try {
+      await api(`/api/split/${split.id}/rename_outputs`,
+                { expected_calls: todo.length });
+      toast("Renamed");
+      btn.hidden = true;
+    } catch (e) {
+      if (e.message !== "auth needed") toast(e.message);
+    } finally {
+      btn.disabled = false;
+    }
+  };
 }
 
 // `#split-loading` is an in-flow spinner, not an overlay, and the paid offer
