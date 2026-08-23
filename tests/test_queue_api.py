@@ -2,7 +2,7 @@
 effective-state read, and the no-self-start thread lifecycle.
 
 Reuses test_queue_worker.py's fixture data (PLQ with a 3-track "big" pile and
-a 1-track "tiny" pile — 4 tracks + 2 creates = 6 calls) and its `wait_done`
+a 1-track "tiny" pile — 2 creates + 2 batched adds = 4 calls) and its `wait_done`
 helper, copied here rather than imported: pytest test modules are not import
 targets in this repo. Governor.interval() is forced to 0 so a full drain
 happens in milliseconds; individual tests that need a LIVE worker to still be
@@ -50,6 +50,15 @@ def client(monkeypatch):
     monkeypatch.setattr(appmod.sp, "add_to_playlist",
                         lambda pid, uri, bulk=False, spend_reserve=False: calls.append(("add", pid, uri)) or "snap")
     monkeypatch.setattr(appmod.sp, "bulk_block_reason", lambda spend_reserve=False: None)
+    # No queue test should ever reach the reconcile read — every pile here
+    # starts fresh — but the fake is mandatory anyway: an unstubbed
+    # `playlist_tracks` on a widened reconcile predicate would put a REAL
+    # Spotify call inside the test suite, which is this project's hardest
+    # rule (CLAUDE.md). It records so a stray read shows up in `calls`
+    # rather than passing silently.
+    monkeypatch.setattr(appmod.sp, "playlist_tracks",
+                        lambda pid, bulk=False, spend_reserve=False:
+                            calls.append(("read", pid)) or [])
     monkeypatch.setattr(pacing.Governor, "interval", lambda self: 0.0)
     s = Store()
     originals = {f: getattr(s, f)() for f in ("splits", "queue", "pacing")}
@@ -73,6 +82,7 @@ def client(monkeypatch):
             worker.join(timeout=5)
         appmod._queue_worker = None
         appmod._queue_wake.clear()
+        appmod._reconciled.clear()   # process-global, like _pending_materialise
         s.save_splits(originals["splits"])
         s.save_queue(originals["queue"])
         s.save_pacing(originals["pacing"])
@@ -97,14 +107,37 @@ def wait_done(s, timeout=5.0):
 
 def test_enqueue_requires_the_exact_echoed_price(client):
     """Same contract the one-shot endpoint had (finding I1): the number on
-    the button is the number the server verifies. 4 tracks + 2 creates = 6."""
+    the button is the number the server verifies. 2 creates + 2 batched
+    adds (100 tracks per call) = 4."""
     r = client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 3})
-    assert r.status_code == 409 and "6" in r.json()["detail"]
+    assert r.status_code == 409 and "4" in r.json()["detail"]
     assert Store().queue()["state"] == "stopped" and client.calls == []
 
 
 def test_enqueue_orders_smallest_first_and_starts_the_worker(client):
-    r = client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 6})
+    # Batching collapses the fixture's 3-track and 1-track piles to the same
+    # price (a create plus one batch each), so "smallest first" only has
+    # something to order once a pile needs more than one batch. Grow "big"
+    # past 100 tracks here — 1 create + 2 batches = 3, against tiny's 2.
+    s = Store()
+    payload = s.splits()
+    payload["splits"]["PLQ"]["piles"][0]["uris"] = [
+        f"spotify:track:m{i}" for i in range(150)]
+    s.save_splits(payload)
+    r = client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 5})
+    assert r.status_code == 200 and r.json()["queued"] == ["p2", "p1"]
+    q = wait_done(Store())
+    assert q["state"] == "done"
+
+
+def test_enqueue_ties_on_calls_order_by_missing_track_count(client):
+    """Task 4: batching collapsed 'big' (3 tracks) and 'tiny' (1 track) to
+    the identical 2-call price (1 create + 1 batch each), which would have
+    left them in split-storage order — big, then tiny — losing the
+    2026-08-18 "smallest piles first" intent to a silent tie. The
+    (calls, missing-count) tie-break restores it: tiny (1 missing) sorts
+    ahead of big (3 missing) even though their `calls` are equal."""
+    r = client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 4})
     assert r.status_code == 200 and r.json()["queued"] == ["p2", "p1"]
     q = wait_done(Store())
     assert q["state"] == "done"
@@ -159,7 +192,7 @@ def test_enqueue_is_free(client, monkeypatch):
         return original_note_interruption(self)
 
     monkeypatch.setattr(pacing.Governor, "note_interruption", gated_note_interruption)
-    r = client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 6})
+    r = client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 4})
     assert r.status_code == 200
     assert client.calls == []
     gate.set()
@@ -167,7 +200,7 @@ def test_enqueue_is_free(client, monkeypatch):
 
 def test_second_enqueue_while_active_is_refused(client, monkeypatch):
     monkeypatch.setattr(pacing.Governor, "interval", lambda self: 30.0)
-    client.post("/api/split/PLQ/queue", json={"pile_ids": ["p1"], "expected_calls": 4})
+    client.post("/api/split/PLQ/queue", json={"pile_ids": ["p1"], "expected_calls": 2})
     r = client.post("/api/split/PLQ/queue", json={"pile_ids": ["p2"], "expected_calls": 2})
     assert r.status_code == 409
     # Cancel rather than leave a 30s-paced worker for teardown to wait out —
@@ -183,7 +216,7 @@ def test_pause_resume_round_trip(client, monkeypatch):
     # drains to completion in milliseconds like the rest of this file.
     speed = {"v": 30.0}
     monkeypatch.setattr(pacing.Governor, "interval", lambda self: speed["v"])
-    client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 6})
+    client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 4})
     assert client.post("/api/split/PLQ/queue/pause").status_code == 200
     q = Store().queue()
     assert q["state"] == "paused"
@@ -191,14 +224,14 @@ def test_pause_resume_round_trip(client, monkeypatch):
     r = client.post("/api/split/PLQ/queue/resume")
     assert r.status_code == 200
     assert wait_done(Store())["state"] == "done"
-    assert len(client.calls) == 6        # pause+resume cost nothing extra
+    assert len(client.calls) == 4        # pause+resume cost nothing extra
 
 
 def test_cancel_clears_pending_but_keeps_records(client, monkeypatch):
     # Ruling P1: force the interval large so the worker is still alive (and
     # pending has more than "current" left) when pause/cancel act on it.
     monkeypatch.setattr(pacing.Governor, "interval", lambda self: 30.0)
-    client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 6})
+    client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 4})
     # M2 (review round 1): wait for the first tick to actually land before
     # pausing — a create call stamps split["materialised"][pile_id] BEFORE
     # the Spotify call itself (see _materialise_tick), so once `client.calls`
@@ -225,7 +258,7 @@ def test_enqueue_over_a_paused_run_with_pending_is_refused(client, monkeypatch):
     `state` says. The old guard only looked at state (running/sleeping/
     quiet) and let a second enqueue silently clobber a paused run's plan."""
     monkeypatch.setattr(pacing.Governor, "interval", lambda self: 30.0)
-    client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 6})
+    client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 4})
     assert client.post("/api/split/PLQ/queue/pause").status_code == 200
     # A call already in flight when /pause landed is allowed to finish and
     # write its own "progress" snapshot afterwards (same allowance
@@ -234,7 +267,7 @@ def test_enqueue_over_a_paused_run_with_pending_is_refused(client, monkeypatch):
     # not `progress`/`updated_at`, which can legitimately still move.
     before = Store().queue()
     assert before["state"] == "paused" and before["pending"]
-    r = client.post("/api/split/PLQ/queue", json={"pile_ids": ["p1"], "expected_calls": 4})
+    r = client.post("/api/split/PLQ/queue", json={"pile_ids": ["p1"], "expected_calls": 2})
     assert r.status_code == 409
     after = Store().queue()
     assert (after["state"], after["pending"], after["current"], after["playlist_id"]) == \
@@ -245,7 +278,7 @@ def test_enqueue_over_a_paused_run_with_pending_is_refused(client, monkeypatch):
 def test_pause_after_full_drain_is_refused(client):
     """I3 (review round 1): pausing a queue that already finished must not
     resurrect it into "paused" — and must answer 409, not {"ok": true}."""
-    client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 6})
+    client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 4})
     assert wait_done(Store())["state"] == "done"
     r = client.post("/api/split/PLQ/queue/pause")
     assert r.status_code == 409
@@ -256,7 +289,7 @@ def test_pause_of_a_cancelled_queue_is_refused(client, monkeypatch):
     """I3 (review round 1): same guard, for a cancel instead of a full
     drain — a cancelled queue must stay "stopped", not flip to "paused"."""
     monkeypatch.setattr(pacing.Governor, "interval", lambda self: 30.0)
-    client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 6})
+    client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 4})
     assert client.delete("/api/split/PLQ/queue").status_code == 200
     r = client.post("/api/split/PLQ/queue/pause")
     assert r.status_code == 409
@@ -277,7 +310,7 @@ def test_pause_resume_cancel_require_the_matching_playlist_id(client, monkeypatc
     playlist must not be able to pause/resume/cancel PLQ's queue. GET is
     deliberately exempt (it's the global read path boxdash polls)."""
     monkeypatch.setattr(pacing.Governor, "interval", lambda self: 30.0)
-    client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 6})
+    client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 4})
     assert client.post("/api/split/OTHER/queue/pause").status_code == 409
     assert client.post("/api/split/OTHER/queue/resume").status_code == 409
     assert client.delete("/api/split/OTHER/queue").status_code == 409
@@ -333,7 +366,7 @@ def test_resume_after_a_full_exit_starts_a_fresh_worker(client, monkeypatch):
     """
     speed = {"v": 30.0}
     monkeypatch.setattr(pacing.Governor, "interval", lambda self: speed["v"])
-    client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 6})
+    client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 4})
     assert client.post("/api/split/PLQ/queue/pause").status_code == 200
     old_worker = appmod._queue_worker
     if old_worker:
@@ -384,7 +417,7 @@ def test_worker_may_stop_keeps_the_same_worker_running_when_a_resume_races_in(cl
     # continuation still drains in milliseconds.
     speed = {"v": 30.0}
     monkeypatch.setattr(pacing.Governor, "interval", lambda self: speed["v"])
-    r = client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 6})
+    r = client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 4})
     assert r.status_code == 200
 
     # Let the first tick land for real (same pattern as

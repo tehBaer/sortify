@@ -64,3 +64,27 @@ def violations(playlists: list[dict], input_ids: set[str], home_ids: set[str],
                          else "homes are ALL CAPS"),
             })
     return out
+
+
+MAX_PLAYLIST_NAME = 100   # Spotify's name cap
+_SEP = " · "
+
+
+def split_output_name(source_name: str | None, pile_name: str) -> str:
+    """The title for a materialised pile: `{source} · pile`, ≤100 chars.
+
+    The source name is what groups a split's outputs in the client, so under
+    truncation it survives whole and the pile half gives way (design §3).
+    Fixed at create time — a later rename of the source does not ripple.
+    """
+    pile = pile_name.strip()
+    src = (source_name or "").strip()
+    if not src:
+        return pile[:MAX_PLAYLIST_NAME]
+    title = f"{src}{_SEP}{pile}"
+    if len(title) <= MAX_PLAYLIST_NAME:
+        return title
+    room = MAX_PLAYLIST_NAME - len(src) - len(_SEP) - 1   # -1 for the ellipsis
+    if room < 1:
+        return src[:MAX_PLAYLIST_NAME]
+    return f"{src}{_SEP}{pile[:room]}…"

@@ -1,5 +1,15 @@
 # Queued materialiser — "save all piles" as one paced, unattended job
 
+> **Correction (2026-08-23):** this spec's premise that the Feb-2026
+> dev-mode API has no batch add is **wrong** — a probe on 2026-08-23
+> confirmed POST `/playlists/{id}/items` accepts up to 100 uris per call
+> (150 is refused with a 400). The ~1240-call cost model, the ~3-day
+> arithmetic, and the "one legitimate chance to measure the ban band"
+> framing all rest on that false premise. The machinery decisions below
+> (claim tokens, record-before-create, no self-start, bulk budget class,
+> boxdash surfacing) still stand. See
+> `2026-08-23-faster-splits-design.md`.
+
 Design, 2026-08-18. Regenerated from the decisions approved in the
 2026-08-17/18 session (see `.superpowers/sdd/HANDOFF-2026-08-18.md` and the
 SDD ledger in `.superpowers/sdd/2026-08-17-playlist-splitting/progress.md`).

@@ -2,10 +2,10 @@
 
 The counterpart to tests/test_sittings.py: same hazard (create-then-record is
 not atomic), opposite lifecycle (permanent, uncapped, never auto-unfollowed).
-Almost every assertion here is about a number of Spotify calls — the Feb-2026
-API has no batch add, so a 309-track pile is 310 calls, over half the day's
-DAILY_CAP, and a misclick that spends them silently is the failure this
-machinery is shaped around.
+Almost every assertion here is about a number of Spotify calls — batch add
+moves 100 tracks per call (probed 2026-08-23), so a 309-track pile is 4 calls
+— and reconciliation on resume is what keeps a retried batch from duplicating
+tracks.
 
 data/splits.json and data/cache.json are shared for the whole test session
 (see conftest.py), and "PLM" here is deliberately not an id any other module
@@ -53,6 +53,11 @@ def _split(piles=None):
 @pytest.fixture
 def client(monkeypatch):
     calls = []
+    remote: dict[str, list[str]] = {}   # playlist_id -> uris "actually on Spotify"
+    monkeypatch.setattr(appmod.sp, "playlist_tracks",
+                        lambda pid, bulk=False, spend_reserve=False:
+                            calls.append(("read", pid)) or
+                            [{"uri": u} for u in remote.get(pid, [])])
     monkeypatch.setattr(appmod.sp, "create_playlist",
                         lambda name, description="", bulk=False, spend_reserve=False:
                             calls.append(("create", name)) or "NEWP")
@@ -68,13 +73,16 @@ def client(monkeypatch):
     cache["playlists"]["PLM"] = {"tracks": [
         {"uri": u, "duration_ms": 300000, "artists": [{"id": "a", "name": "A"}]}
         for u in PILE_URIS + BIG_URIS]}
+    cache["playlist_list"] = {"items": [{"id": "PLM", "name": "{src}"}]}
     s.save_cache(cache)
     c = TestClient(appmod.app)
     c.calls = calls
+    c.remote = remote
     try:
         yield c
     finally:
         appmod._pending_materialise.clear()
+        appmod._reconciled.clear()
         Store().save_splits(original_splits)
         Store().save_cache(original_cache)
 
@@ -93,27 +101,35 @@ def tick(pile_id="p1"):
 def test_first_tick_stamps_record_then_creates_only(client):
     out = tick()
     assert out == {"spent": 1, "done": False, "gone": False}
-    assert client.calls == [("create", "cumbia · latin · salsa")]
+    assert client.calls == [("create", "{src} · cumbia · latin · salsa")]
     rec = record()
     assert rec["playlist_id"] == "NEWP" and rec["added"] == []
     assert rec["fingerprint"] and rec["claim"]
 
 
-def test_each_following_tick_adds_exactly_one_track_in_order(client):
+def test_the_add_tick_moves_the_whole_batch_in_pile_order(client):
+    """Order still matters — the batch POST carries the pile's uris in the
+    pile's own order — but a 5-track pile is now one add call, not five."""
     tick()
-    for i, uri in enumerate(PILE_URIS):
-        out = tick()
-        assert out["spent"] == 1
-        assert client.calls[-1] == ("add", "NEWP", uri)
-        assert record()["added"] == PILE_URIS[: i + 1]
+    out = tick()
+    assert out == {"spent": 1, "done": True, "gone": False}
+    assert client.calls[-1] == ("add", "NEWP", PILE_URIS)
+    assert record()["added"] == PILE_URIS
     assert tick() == {"spent": 0, "done": True, "gone": False}
-    assert len(client.calls) == len(PILE_URIS) + 1   # cost identical to the old loop
+    assert len(client.calls) == 2                    # create + one batch
 
 
 def test_tick_resumes_a_partial_record_without_a_second_create(client):
-    tick(); tick(); tick()                    # create + 2 adds
+    tick()                                    # create
+    # Half the pile already landed and was recorded under this process's own
+    # CAS — so the resume is trusted and costs no reconcile read.
+    s = Store(); payload = s.splits()
+    payload["splits"]["PLM"]["materialised"]["p1"]["added"] = PILE_URIS[:2]
+    s.save_splits(payload)
     out = tick()
-    assert out["spent"] == 1 and client.calls.count(("create", "cumbia · latin · salsa")) == 1
+    assert out["spent"] == 1
+    assert client.calls.count(("create", "{src} · cumbia · latin · salsa")) == 1
+    assert client.calls[-1] == ("add", "NEWP", PILE_URIS[2:])
 
 
 def test_tick_on_a_stale_record_sweeps_it_and_starts_fresh(client):
@@ -173,7 +189,7 @@ def test_advertised_calls_equals_calls_actually_spent_via_ticks(client):
     of spending it one call at a time."""
     pile = next(p for p in client.get("/api/split/PLM").json()["piles"] if p["id"] == "p1")
     advertised = pile["materialise_calls"]
-    assert advertised == len(PILE_URIS) + 1
+    assert advertised == 2                     # 1 create + ceil(5/100)
     for _ in range(advertised):
         out = tick()
         assert out["spent"] == 1
@@ -199,12 +215,23 @@ def test_a_create_failure_still_leaves_a_record_pointing_at_the_pile(client, mon
     assert rec is not None and rec["playlist_id"] is None and rec["added"] == []
 
 
-def test_tick_resumes_after_a_spotify_error_mid_pile_without_a_second_create(client, monkeypatch):
-    """A 429 cooldown partway through is the realistic failure. The next tick
-    must cost what is left, re-use the same playlist, and add nothing
-    twice."""
+def test_tick_resumes_after_a_spotify_error_mid_pile_by_reconciling_first(client, monkeypatch):
+    """A 429 cooldown partway through is the realistic failure, and the retry
+    must reconcile before it re-POSTs.
+
+    A failed add is not proof the add failed: an httpx read timeout or a reset
+    mid-response raises after the batch has already landed, and Spotify stores
+    duplicates without complaint. So the in-flight window counts as an
+    interruption exactly like process death does (review I1) — the next tick
+    reads the destination first, then costs only what is genuinely missing,
+    on the same playlist, with nothing added twice and no second create."""
     tick()   # create
-    tick()   # add PILE_URIS[0]
+    # One track already landed and was recorded, so the failing tick below is
+    # a genuine mid-pile interruption rather than the very first add.
+    client.remote["NEWP"] = PILE_URIS[:1]
+    s = Store(); payload = s.splits()
+    payload["splits"]["PLM"]["materialised"]["p1"]["added"] = PILE_URIS[:1]
+    s.save_splits(payload)
 
     monkeypatch.setattr(appmod.sp, "add_to_playlist",
                         lambda pid, uri, bulk=False, spend_reserve=False: (_ for _ in ()).throw(
@@ -217,9 +244,15 @@ def test_tick_resumes_after_a_spotify_error_mid_pile_without_a_second_create(cli
                         lambda pid, uri, bulk=False, spend_reserve=False: client.calls.append(("add", pid, uri))
                         or "snap")
     out = tick()
+    assert out["spent"] >= 1
+    assert client.calls[-1] == ("read", "NEWP")   # reconcile, not a blind re-POST
+    assert record()["added"] == PILE_URIS[:1]     # and it matches what is there
+
+    out = tick()
     assert out["spent"] == 1
-    assert client.calls[-1] == ("add", "NEWP", PILE_URIS[1])
-    assert client.calls.count(("create", "cumbia · latin · salsa")) == 1
+    assert client.calls[-1] == ("add", "NEWP", PILE_URIS[1:])   # only what is left
+    assert client.calls.count(("create", "{src} · cumbia · latin · salsa")) == 1
+    assert [c for c in client.calls if c[0] == "add"] == [("add", "NEWP", PILE_URIS[1:])]
 
 
 def test_a_repeated_pile_uri_is_added_once_across_ticks(client):
@@ -232,11 +265,12 @@ def test_a_repeated_pile_uri_is_added_once_across_ticks(client):
     payload["splits"]["PLM"]["piles"][0]["uris"] = PILE_URIS + [PILE_URIS[0]]
     s.save_splits(payload)
     pile = next(p for p in client.get("/api/split/PLM").json()["piles"] if p["id"] == "p1")
-    assert pile["materialise_calls"] == len(PILE_URIS) + 1
+    assert pile["materialise_calls"] == 2       # 1 create + one batch of 5
 
-    for _ in range(len(PILE_URIS) + 1):
+    for _ in range(2):
         assert tick()["spent"] == 1
-    assert sum(1 for c in client.calls if c[0] == "add") == len(PILE_URIS)
+    add = next(c for c in client.calls if c[0] == "add")
+    assert add[2] == PILE_URIS                  # the duplicate never reaches Spotify
     assert tick() == {"spent": 0, "done": True, "gone": False}
 
 
@@ -244,7 +278,7 @@ def test_ticking_a_pile_to_completion_touches_neither_sitting_nor_decisions(clie
     """Materialising is not a sitting and not a triage decision. It must
     neither block a sitting nor mark a single track decided, no matter how
     many ticks it takes."""
-    for _ in range(len(PILE_URIS) + 1):
+    for _ in range(2):
         tick()
     split = Store().splits()["splits"]["PLM"]
     assert split["active_sitting"] is None
@@ -291,7 +325,8 @@ def test_tick_create_race_unfollows_the_orphan_and_raises_spotify_error(client, 
     with pytest.raises(SpotifyError) as exc:
         tick()
     assert exc.value.status == 409
-    assert client.calls == [("create", "cumbia · latin · salsa"), ("unfollow", "NEWP")]
+    assert client.calls == [("create", "{src} · cumbia · latin · salsa"),
+                            ("unfollow", "NEWP")]
     assert record() == _foreign_record()
 
 
@@ -371,3 +406,169 @@ def test_recluster_sweeps_records_for_vanished_pile_ids_to_history(client, monke
     hist = split["materialised_history"]
     assert hist and hist[-1]["playlist_id"] == "OLD9" and hist[-1]["swept"] == "recluster"
     assert client.calls == []                       # free, like every re-cluster
+
+
+# ---- batched adds and reconcile-on-pickup ---------------------------------
+
+
+def _tick(pid="PLM", pile="p2"):
+    return appmod._materialise_tick(pid, pile)
+
+
+def test_plan_prices_batched_adds():
+    payload = _split()
+    split = payload["splits"]["PLM"]
+    pile = split["piles"][1]                       # 60 uris, no record
+    plan = appmod._materialise_plan(split, pile)
+    assert plan["calls"] == 2                      # 1 create + ceil(60/100)
+    assert plan["reconcile_calls"] == 0
+
+
+def test_plan_prices_reconciliation_for_a_resumed_partial_pile():
+    payload = _split()
+    split = payload["splits"]["PLM"]
+    pile = split["piles"][1]
+    split["materialised"] = {"p2": {
+        "playlist_id": "OLDP", "pile_id": "p2", "name": "big one",
+        "fingerprint": appmod._pile_fingerprint(pile),
+        "track_count": 60, "added": BIG_URIS[:30], "claim": "c1",
+        "created_at": "x", "updated_at": "x"}}
+    plan = appmod._materialise_plan(split, pile)
+    assert plan["reconcile_calls"] == 1            # ceil(30/100)
+    assert plan["calls"] == 2                      # reconcile + 1 add batch
+    assert appmod._materialise_plan(split, pile, reconciled=True)["calls"] == 1
+
+
+def test_claim_added_uris_appends_without_duplicates(client):
+    s = Store()
+    payload = s.splits()
+    payload["splits"]["PLM"]["materialised"] = {"p1": {
+        "playlist_id": "NEWP", "pile_id": "p1", "name": "n",
+        "fingerprint": "f", "track_count": 5,
+        "added": [PILE_URIS[0]], "claim": "c9",
+        "created_at": "x", "updated_at": "x"}}
+    s.save_splits(payload)
+    assert appmod._claim_materialisation("PLM", "p1", "c9",
+                                         added_uris=[PILE_URIS[0], PILE_URIS[1]])
+    added = Store().splits()["splits"]["PLM"]["materialised"]["p1"]["added"]
+    assert added == [PILE_URIS[0], PILE_URIS[1]]
+
+
+def test_fresh_pile_drains_in_create_plus_batches_and_never_reads(client):
+    r1 = _tick()                                   # create
+    assert (r1["spent"], r1["done"]) == (1, False)
+    r2 = _tick()                                   # all 60 in one batch
+    assert (r2["spent"], r2["done"]) == (1, True)
+    kinds = [c[0] for c in client.calls]
+    assert kinds == ["create", "add"]              # no ("read", ...) ever
+    add = next(c for c in client.calls if c[0] == "add")
+    assert add[2] == BIG_URIS                      # the whole batch, one call
+    rec = Store().splits()["splits"]["PLM"]["materialised"]["p2"]
+    assert rec["added"] == BIG_URIS
+
+
+def test_created_playlist_is_named_source_dot_pile(client):
+    _tick(pile="p1")
+    create = next(c for c in client.calls if c[0] == "create")
+    assert create[1] == "{src} · cumbia · latin · salsa"
+    rec = Store().splits()["splits"]["PLM"]["materialised"]["p1"]
+    assert rec["name"] == "{src} · cumbia · latin · salsa"
+
+
+def test_resumed_pile_reconciles_before_adding(client):
+    # Record says 30 landed; reality says 40 (a batch landed unrecorded).
+    s = Store()
+    payload = s.splits()
+    pile = payload["splits"]["PLM"]["piles"][1]
+    payload["splits"]["PLM"]["materialised"] = {"p2": {
+        "playlist_id": "OLDP", "pile_id": "p2", "name": "big one",
+        "fingerprint": appmod._pile_fingerprint(pile),
+        "track_count": 60, "added": BIG_URIS[:30], "claim": "c1",
+        "created_at": "x", "updated_at": "x"}}
+    s.save_splits(payload)
+    client.remote["OLDP"] = BIG_URIS[:40]
+
+    r1 = _tick()                                   # the reconcile read
+    assert (r1["spent"], r1["done"]) == (1, False)
+    assert client.calls == [("read", "OLDP")]
+    rec = Store().splits()["splits"]["PLM"]["materialised"]["p2"]
+    assert rec["added"] == BIG_URIS[:40]           # truth, not the record
+
+    r2 = _tick()                                   # the remaining 20, one call
+    assert (r2["spent"], r2["done"]) == (1, True)
+    add = client.calls[-1]
+    assert add[0] == "add" and add[2] == BIG_URIS[40:]
+    assert not any(u in add[2] for u in BIG_URIS[:40])   # no re-adds
+
+    r3 = _tick()
+    assert (r3["spent"], r3["done"]) == (0, True)  # complete, free
+
+
+def test_reconcile_ignores_foreign_tracks_in_the_destination(client):
+    s = Store()
+    payload = s.splits()
+    pile = payload["splits"]["PLM"]["piles"][1]
+    payload["splits"]["PLM"]["materialised"] = {"p2": {
+        "playlist_id": "OLDP", "pile_id": "p2", "name": "big one",
+        "fingerprint": appmod._pile_fingerprint(pile),
+        "track_count": 60, "added": BIG_URIS[:10], "claim": "c1",
+        "created_at": "x", "updated_at": "x"}}
+    s.save_splits(payload)
+    # The user dropped two of their own tracks into the output by hand.
+    client.remote["OLDP"] = BIG_URIS[:10] + ["spotify:track:foreign1",
+                                             "spotify:track:foreign2"]
+    _tick()
+    rec = Store().splits()["splits"]["PLM"]["materialised"]["p2"]
+    assert rec["added"] == BIG_URIS[:10]           # foreign uris not adopted
+
+
+def test_reconcile_runs_once_per_process_pickup(client):
+    s = Store()
+    payload = s.splits()
+    pile = payload["splits"]["PLM"]["piles"][1]
+    payload["splits"]["PLM"]["materialised"] = {"p2": {
+        "playlist_id": "OLDP", "pile_id": "p2", "name": "big one",
+        "fingerprint": appmod._pile_fingerprint(pile),
+        "track_count": 60, "added": BIG_URIS[:30], "claim": "c1",
+        "created_at": "x", "updated_at": "x"}}
+    s.save_splits(payload)
+    client.remote["OLDP"] = BIG_URIS[:30]
+    _tick(); _tick(); _tick()
+    assert [c[0] for c in client.calls].count("read") == 1
+
+
+def test_a_record_with_an_empty_added_still_reconciles_before_adding(client):
+    """The likeliest crash window in the whole batched path, and the one an
+    earlier draft of `_materialise_plan` exempted: the create CAS records a
+    `playlist_id` with `added: []`, the next tick POSTs 100 tracks, and the
+    process dies between that POST returning and its CAS. The record still
+    says `added: []` while up to 100 tracks are already on Spotify — which
+    permits duplicates, so re-posting the batch genuinely doubles them. A
+    record with a playlist_id this process has not verified must be read
+    first, empty `added` or not."""
+    s = Store()
+    payload = s.splits()
+    pile = payload["splits"]["PLM"]["piles"][1]
+    payload["splits"]["PLM"]["materialised"] = {"p2": {
+        "playlist_id": "OLDP", "pile_id": "p2", "name": "big one",
+        "fingerprint": appmod._pile_fingerprint(pile),
+        "track_count": 60, "added": [], "claim": "c1",
+        "created_at": "x", "updated_at": "x"}}
+    s.save_splits(payload)
+    client.remote["OLDP"] = BIG_URIS[:40]      # a batch landed, unrecorded
+
+    plan = appmod._materialise_plan(
+        Store().splits()["splits"]["PLM"], pile)
+    assert plan["reconcile_calls"] == 1        # floored at 1, not skipped
+
+    r1 = _tick()
+    assert (r1["spent"], r1["done"]) == (1, False)
+    assert [c[0] for c in client.calls] == ["read"]   # read, never a blind add
+    rec = Store().splits()["splits"]["PLM"]["materialised"]["p2"]
+    assert rec["added"] == BIG_URIS[:40]
+
+    r2 = _tick()
+    assert (r2["spent"], r2["done"]) == (1, True)
+    add = client.calls[-1]
+    assert add[0] == "add" and add[2] == BIG_URIS[40:]
+    assert not any(u in add[2] for u in BIG_URIS[:40])   # nothing doubled

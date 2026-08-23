@@ -1,12 +1,18 @@
-"""Rate governor for the queued materialiser — the measuring instrument.
+"""Rate governor for the queued materialiser.
 
-Evidence base (spec §Evidence): 678 calls @ 9.7/min earned a ~23h quota ban;
-1208 @ 1.8/min was penalty-free. The band between is unmeasured, and this
-job's ~1240 calls of real traffic are the one legitimate chance to measure
-it. So: start at the known-good 1.8/min, and after every 15 CLEAN minutes
-shrink the interval 15% — 1.8, 2.1, 2.5, 2.9, 3.4, 4.0, 4.7, 5.5, 6.5 —
-capped at 7.0/min, 28% under known-bad: a probe allowed to touch the
-boundary has learned nothing and paid full price.
+Historical note: this module was built as a measuring instrument — 678
+calls @ 9.7/min earned a ~23h quota ban, 1208 @ 1.8/min was penalty-free,
+and the ~1240 calls of one-track-per-POST materialisation traffic were
+meant to map the band between. Batched adds (2026-08-23: 100 uris per
+POST) removed that traffic — a ~24-call split never survives the 15 clean
+minutes a single escalation rung needs — so the measuring ambition is
+retired. `data/pacing.json`'s max_clean_rate (4.0) stands as what WAS
+measured before every new pile's worker reset the ladder to START_RATE.
+
+What remains is what it also always was: a rate limiter. Start at the
+known-good 1.8/min, escalate 15% per 15 clean minutes, cap at 7.0/min
+(28% under known-bad), halve on any 429. All still enforced, all still
+correct for the calls that remain.
 
 Pure logic: injected clocks, no I/O, no imports from the rest of sortify.
 The worker owns persistence (store.save_pacing) and all actual sleeping.

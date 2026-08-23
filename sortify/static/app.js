@@ -1,7 +1,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const views = ["setup", "lists", "triage", "now", "split"];
+const views = ["setup", "lists", "triage", "now", "split", "splitpick"];
 
 let statusData = null;
 let playlistData = [];   // lists view
@@ -46,10 +46,13 @@ async function api(path, body, method) {
 
 function show(view) {
   for (const v of views) $("view-" + v).hidden = v !== view;
-  // Triage and split are reached from (and exit back to) the Playlists view,
-  // so they keep that link lit rather than leaving the nav dark.
+  // Triage is reached from (and exits back to) the Playlists view, so it
+  // keeps that link lit. Split has its own top-level tab now, and the
+  // split view itself counts as part of it (opened from the picker or, still,
+  // the per-row button).
   $("nav-now").classList.toggle("active", view === "now");
-  $("nav-lists").classList.toggle("active", view === "lists" || view === "triage" || view === "split");
+  $("nav-lists").classList.toggle("active", view === "lists" || view === "triage");
+  $("nav-split").classList.toggle("active", view === "split" || view === "splitpick");
   $("nav-reconnect").classList.toggle("active", view === "setup");
 }
 
@@ -528,6 +531,7 @@ $("nav-reconnect").onclick = () => {
 
 $("nav-now").onclick = showNow;
 $("nav-lists").onclick = () => { stopNowPolling(); stopNowTicker(); triage = null; loadLists(); };
+$("nav-split").onclick = showSplitPicker;
 
 // ---- now playing -----------------------------------------------------------
 
@@ -1101,11 +1105,63 @@ $("picker").onclick = (e) => { if (e.target.id === "picker") closePicker(); };
 // Keep/reject decisions live in the Now view, not here — see decideKeep below
 // for why.
 
+// The Split tab opens on a picker (design §2): same eligibility rule as the
+// per-row button (not Liked, 100+ tracks — splitDisabledReason handles
+// not-owned), any in-progress split pinned first. Both reads are free:
+// /api/playlists serves the cached listing and GET queue reads queue.json.
+async function showSplitPicker() {
+  stopQueuePolling();
+  stopNowPolling();
+  stopNowTicker();
+  split = null;
+  show("splitpick");
+  const wrap = $("splitpick-list");
+  wrap.innerHTML = '<p class="hint">Loading playlists…</p>';
+  try {
+    const data = await api("/api/playlists");
+    // "_" is fine: GET queue is deliberately global regardless of path id.
+    const qs = await api("/api/split/_/queue").catch(() => null);
+    const q = qs?.queue;
+    const activeId = q && (q.pending?.length || q.current) ? q.playlist_id : null;
+    const eligible = data.playlists.filter(
+      (p) => p.id !== "liked" && (p.total ?? 0) >= 100);
+    eligible.sort((a, b) => (b.id === activeId) - (a.id === activeId));
+    wrap.innerHTML = "";
+    if (!eligible.length) {
+      wrap.innerHTML = '<p class="hint">No playlist here has 100+ tracks — nothing needs splitting.</p>';
+      return;
+    }
+    for (const p of eligible) {
+      const row = document.createElement("div");
+      row.className = "pl-row";
+      const reason = splitDisabledReason(p);
+      const sub = [p.folder, `${p.total} tracks`,
+                   p.id === activeId ? "split in progress" :
+                     p.split ? `split into ${p.split.piles} pile${p.split.piles === 1 ? "" : "s"}` : null,
+                   reason]
+        .filter(Boolean).join(" · ");
+      row.innerHTML = `<div class="pl-meta"><div class="name">${esc(p.name)}</div>
+        <div class="sub">${esc(sub)}</div></div>`;
+      if (!reason) row.onclick = () => openSplit(p.id, p.name);
+      wrap.appendChild(row);
+    }
+  } catch (e) {
+    if (e.message === "auth needed") return;
+    wrap.innerHTML = `<p class="hint">Couldn't load playlists: ${esc(e.message)}</p>
+       <button id="btn-retry-splitpick">Retry</button>`;
+    $("btn-retry-splitpick").onclick = showSplitPicker;
+  }
+}
+
 async function openSplit(id, name) {
   stopQueuePolling();
   queueStatus = null;
   $("queue-panel").hidden = true;
   $("queue-panel").innerHTML = "";
+  // A previous split's rename offer must not survive into a view that then
+  // fails to load below (404-that-isn't-"not split yet", 5xx, network) —
+  // otherwise the button's onclick still points at the old split's id.
+  $("btn-rename-outputs").hidden = true;
   split = { id, name, piles: [], decided: {}, active_sitting: null };
   show("split");
   $("split-title").textContent = name;
@@ -1115,6 +1171,7 @@ async function openSplit(id, name) {
   try {
     const data = await api(`/api/split/${id}`);
     applySplitData(data);
+    renderRenameOffer(data);
     pollQueueStatus();
   } catch (e) {
     if (e.message === "auth needed") return;
@@ -1147,6 +1204,35 @@ async function openSplit(id, name) {
        <button id="btn-do-split" class="primary">Split it (0–${warm} calls)</button>`;
     $("btn-do-split").onclick = doSplit;
   }
+}
+
+// Understated by design (design §2 judgement): shown only when this split
+// has saved playlists still carrying bare pile names. The count is computed
+// client-side from record names; the server re-derives it and 409s if they
+// disagree — same echo contract as every other priced action.
+function renderRenameOffer(data) {
+  const btn = $("btn-rename-outputs");
+  const prefix = split.name + " · ";
+  const todo = (data.piles || []).filter(
+    (p) => p.materialised?.playlist_id && p.materialised.name
+           && !p.materialised.name.startsWith(prefix));
+  btn.hidden = !todo.length;
+  if (!todo.length) return;
+  btn.textContent =
+    `Rename ${todo.length} saved playlist${todo.length === 1 ? "" : "s"} to “${split.name} · …” (${todo.length} calls)`;
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try {
+      await api(`/api/split/${split.id}/rename_outputs`,
+                { expected_calls: todo.length });
+      toast("Renamed");
+      btn.hidden = true;
+    } catch (e) {
+      if (e.message !== "auth needed") toast(e.message);
+    } finally {
+      btn.disabled = false;
+    }
+  };
 }
 
 // `#split-loading` is an in-flow spinner, not an overlay, and the paid offer
@@ -1907,7 +1993,7 @@ async function finishSitting(targetSplitId) {
   }
 }
 
-$("btn-split-back").onclick = () => { stopQueuePolling(); split = null; loadLists(); };
+$("btn-split-back").onclick = () => { stopQueuePolling(); split = null; showSplitPicker(); };
 $("btn-split-finish-sitting").onclick = () => finishSitting(split?.id);
 $("btn-save-all").onclick = () => queuePiles(null, saveAllTotal);
 $("btn-recluster").onclick = async () => {

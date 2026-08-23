@@ -43,6 +43,15 @@ def worker_env(monkeypatch):
     monkeypatch.setattr(appmod.sp, "add_to_playlist",
                         lambda pid, uri, bulk=False, spend_reserve=False: calls.append(("add", pid, uri)) or "snap")
     monkeypatch.setattr(appmod.sp, "bulk_block_reason", lambda spend_reserve=False: None)
+    # No queue test should ever reach the reconcile read — every pile here
+    # starts fresh — but the fake is mandatory anyway: an unstubbed
+    # `playlist_tracks` on a widened reconcile predicate would put a REAL
+    # Spotify call inside the test suite, which is this project's hardest
+    # rule (CLAUDE.md). It records so a stray read shows up in `calls`
+    # rather than passing silently.
+    monkeypatch.setattr(appmod.sp, "playlist_tracks",
+                        lambda pid, bulk=False, spend_reserve=False:
+                            calls.append(("read", pid)) or [])
     monkeypatch.setattr(pacing.Governor, "interval", lambda self: 0.0)
     s = Store()
     originals = {f: getattr(s, f)() for f in ("splits", "queue", "pacing")}
@@ -62,6 +71,7 @@ def worker_env(monkeypatch):
         worker.join(timeout=5)
     appmod._queue_worker = None
     appmod._queue_wake.clear()
+    appmod._reconciled.clear()   # process-global, like _pending_materialise
     # Minor 2 (fix round 2): restore the shared data dir BEFORE asserting on
     # the join below — a failed/hung-thread assertion must not skip these
     # and leave splits/queue/pacing poisoned for whatever test runs next.
@@ -115,10 +125,10 @@ def test_drains_every_pending_pile_in_order_one_call_per_tick(worker_env):
     q = wait_done(s)
     assert q["state"] == "done"
     assert calls[0] == ("create", "tiny")               # first in the given pending order
-    assert calls[1] == ("add", "NEW-tiny", TINY[0])
+    assert calls[1] == ("add", "NEW-tiny", TINY)
     assert calls[2] == ("create", "big")
-    assert [c[2] for c in calls[3:]] == PILE_URIS
-    assert len(calls) == len(TINY) + len(PILE_URIS) + 2  # exact total, no probes
+    assert calls[3] == ("add", "NEW-big", PILE_URIS)   # one batch, not one call each
+    assert len(calls) == 4                             # 2 creates + 2 batches, no probes
 
 
 def test_pause_is_instant_and_the_thread_exits(worker_env, monkeypatch):
@@ -332,7 +342,7 @@ def test_sleep_loop_does_not_rewrite_queue_json_for_an_unchanged_block(worker_en
     appmod._queue_wake.set(); appmod._queue_wake.clear()
     q = wait_done(s)
     assert q["state"] == "done"
-    assert calls == [("create", "tiny"), ("add", "NEW-tiny", TINY[0])]
+    assert calls == [("create", "tiny"), ("add", "NEW-tiny", TINY)]
     # "running" also gets written by the two ticks' own progress saves
     # (legitimate — progress actually changes each tick), so this only pins
     # the thing M-4 is actually about: the block itself was one write in,
@@ -385,3 +395,23 @@ def test_the_tick_spends_with_the_runs_spend_reserve_flag(worker_env, monkeypatc
     q = wait_done(s)
     assert q["state"] == "done"
     assert seen and all(flag for _, flag in seen), seen
+
+
+def test_queue_drains_a_250_track_pile_in_four_calls(worker_env):
+    # 250 uris: 1 create + 3 batches. The whole run must cost 4 Spotify
+    # calls — the headline number of the 2026-08-23 design.
+    calls, s = worker_env
+    big = [f"spotify:track:q{i}" for i in range(250)]
+    payload = s.splits()
+    payload["splits"]["PLQ"]["piles"] = [
+        {"id": "p1", "name": "big", "tags": [], "uris": big}]
+    s.save_splits(payload)
+    split = s.splits()["splits"]["PLQ"]
+    assert appmod._materialise_plan(split, split["piles"][0])["calls"] == 4
+    start_queue(s, pending=("p1",))
+    q = wait_done(s)
+    assert q["state"] == "done"
+    assert [c[0] for c in calls] == ["create", "add", "add", "add"]
+    assert [len(c[2]) for c in calls[1:]] == [100, 100, 50]
+    added = s.splits()["splits"]["PLQ"]["materialised"]["p1"]["added"]
+    assert added == big
