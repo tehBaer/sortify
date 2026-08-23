@@ -39,6 +39,7 @@ def test_session_composes_commands_and_tears_down(monkeypatch, tmp_path):
     monkeypatch.setattr(clientui.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(clientui.subprocess, "run", lambda *a, **k: None)
     monkeypatch.setattr(clientui, "_wait_for_window", lambda display, timeout: None)
+    monkeypatch.setattr(clientui, "back_to_library", lambda *a, **k: None)
     monkeypatch.setattr(clientui.shutil, "which", lambda name: "/usr/bin/" + name)
 
     with ClientSession() as s:
@@ -54,12 +55,13 @@ def test_move_sequence_aborts_on_missing_menu(monkeypatch):
 
     calls = []
     monkeypatch.setattr(clientui, "screenshot", lambda d: "IMG")
+    monkeypatch.setattr(clientui, "_wait_sidebar_stable", lambda *a, **k: None)
     monkeypatch.setattr(clientui, "click", lambda d, x, y: calls.append(("click", x, y)))
     monkeypatch.setattr(clientui, "right_click", lambda d, x, y: calls.append(("right_click", x, y)))
     monkeypatch.setattr(clientui, "key", lambda d, k: calls.append(("key", k)))
     monkeypatch.setattr(clientui, "type_text", lambda d, s: calls.append(("type", s)))
 
-    def fake_find(img, text):
+    def fake_find(img, text, below=None):
         calls.append(("find", text))
         if text == clientui.MENU_MOVE_TO_FOLDER:
             raise UiStepError(f"text {text!r} not found on screen")
@@ -73,8 +75,11 @@ def test_move_sequence_aborts_on_missing_menu(monkeypatch):
     plan = MovePlan("pl_x", "SOME LIST", "ROOT", "ROOT / Y'no")
     with pytest.raises(UiStepError):
         clientui.move_playlist_ui(session, plan)
-    # Aborted at the menu step: no clicks after the failed find.
-    assert calls[-1] == ("find", clientui.MENU_MOVE_TO_FOLDER)
+    # Aborted at the menu step: the row menu never yielded "Move to
+    # folder", and nothing was CLICKED after the last failed find — the
+    # only later actions are the retry loop's Escape cleanups.
+    last_find = max(i for i, c in enumerate(calls) if c == ("find", clientui.MENU_MOVE_TO_FOLDER))
+    assert not any(c[0] in ("click", "right_click") for c in calls[last_find + 1 :])
 
 
 def test_session_requires_tools(monkeypatch, tmp_path):

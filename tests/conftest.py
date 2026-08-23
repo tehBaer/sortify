@@ -17,6 +17,12 @@ os.environ["SORTIFY_DATA_DIR"] = tempfile.mkdtemp(prefix="sortify-tests-")
 os.environ["SPOTIFY_ACCOUNT_LEDGER"] = os.path.join(
     tempfile.mkdtemp(prefix="sortify-ledger-"), "account-ledger.json"
 )
+# clientui's find_text saves the screen it failed on — real forensics for a
+# live UI run. Unit tests exercise that failure path with toy images, which
+# must not clobber a real run's saved evidence.
+os.environ["SORTIFY_CLIENTUI_FAIL_SHOT"] = os.path.join(
+    tempfile.mkdtemp(prefix="sortify-failshot-"), "fail.png"
+)
 
 import pytest  # noqa: E402  (must follow the env binding above)
 

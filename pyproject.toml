@@ -41,6 +41,12 @@ timeout = 60
 # point — a hang should read as a failure with a traceback, not as a run
 # that is still going.
 timeout_method = "thread"
+# The clientui marker gates tests that drive the real desktop client
+# (minutes of Xvfb + OCR, and they create/delete scratch objects on the
+# account). Deselected by default so `pytest -q` stays a zero-API,
+# zero-client run; opt in with `pytest -m clientui`.
+markers = ["clientui: drives the real desktop client (excluded by default)"]
+addopts = "-m 'not clientui'"
 
 [project.scripts]
 sortify = "sortify.app:main"
