@@ -1849,8 +1849,17 @@ def _rerecord_materialisation(split_playlist_id: str, pile_id: str, record: dict
 
 def _materialise_tick(playlist_id: str, pile_id: str, spend_reserve: bool = False) -> dict:
     """Advance one pile's materialisation by ONE Spotify call — a create, a
-    reconcile read (one call per 100 tracks in the destination, reported in
-    `spent`), or a batch add of up to 100 tracks.
+    reconcile read (one call per 100 tracks in the destination, *approximated*
+    in `spent`), or a batch add of up to 100 tracks.
+
+    "Approximated" is deliberate and load-bearing: `spent` for a reconcile is
+    `_batches(len(actual))` over the tracks `playlist_tracks` handed back
+    after slimming, so local/null items the read paid for are already gone,
+    and `_paginate` costs one extra call on an exact multiple of 100. The
+    number is only ever consumed as `>= 1` by the pacing governor's
+    clean-credit and never reaches the dashboard, so the arithmetic is left
+    alone rather than made exact at the cost of threading a count back out of
+    the client.
 
     The one-shot endpoint this replaces spent a whole pile in a blocking
     loop — measured at 12.4 calls/min for 25 minutes, above the rate that
@@ -1916,8 +1925,24 @@ def _materialise_tick(playlist_id: str, pile_id: str, spend_reserve: bool = Fals
         with _split_lock:
             _reconciled.add((playlist_id, pile_id))
 
+    def _unverify():
+        # The gap between "the write left this process" and "the CAS recorded
+        # it" is an interruption in exactly the sense design §1 means, and it
+        # does not need the process to die: an httpx read timeout or a
+        # connection reset mid-response raises after the POST has already
+        # landed. Leaving the pair in `_reconciled` across that would let a
+        # resume IN THIS PROCESS re-POST up to 100 uris that are already on
+        # the playlist — and Spotify stores duplicates without complaint.
+        # So the rule is applied as stated: any record with a playlist_id
+        # this process has not itself verified gets reconciled. A spurious
+        # discard costs one read; a missed one costs up to 100 duplicated
+        # tracks.
+        with _split_lock:
+            _reconciled.discard((playlist_id, pile_id))
+
     try:
         if need_create:
+            _unverify()
             new_name = split_output_name(_source_playlist_name(playlist_id),
                                          pile["name"])
             new_id = sp.create_playlist(new_name, MATERIALISE_DESCRIPTION, bulk=True,
@@ -1946,6 +1971,7 @@ def _materialise_tick(playlist_id: str, pile_id: str, spend_reserve: bool = Fals
                 _mark_reconciled()
             return {"spent": max(1, _batches(len(actual))), "done": False,
                     "gone": False}
+        _unverify()
         sp.add_to_playlist(record["playlist_id"], batch, bulk=True,
                            spend_reserve=spend_reserve)
         if _claim_materialisation(playlist_id, pile_id, claim, added_uris=batch):
@@ -2457,6 +2483,36 @@ def enqueue_piles(playlist_id: str, body: QueueIn):
     return {"ok": True, "queued": order, "total_calls": total, "complete": False}
 
 
+def _strip_source_prefix(current: str, pile_name: str) -> str:
+    """The bare pile half of an output's current title.
+
+    Design §3 fixes an output's name at create time: a later rename of the
+    source does not ripple. This action deliberately does ripple — it is the
+    user asking for it — but must not COMPOUND. Composing straight from the
+    record's current name turns `oldsrc · pile` into `newsrc · oldsrc · pile`
+    (and `newer · newsrc · oldsrc · pile` the time after that), because the
+    skip test only recognises the source's *present* name.
+
+    The prefix is stripped only when what remains is exactly this pile's own
+    name. Pile names are themselves ` · `-joined tag lists
+    ("cumbia · latin · salsa"), so an unconditional split on the first
+    separator would eat a real tag off an output that never carried a source
+    prefix at all. A title truncated at 100 chars won't match and keeps its
+    old behaviour — one compounded rename, not a growing one.
+    """
+    head, sep, tail = current.partition(" · ")
+    return tail if sep and tail == pile_name else current
+
+
+# One rename per output, all inside a single request, all on the interactive
+# budget. Past WINDOW_CAP (12/60s) `_spend_budget` sleeps *while holding
+# `_budget_lock`* (sortify/spotify.py) — which stalls every other Spotify call
+# in the process behind it, the now-playing poll included, for the best part
+# of a minute. The realistic split has 8 outputs, so a cap here costs nothing
+# real and keeps one click from parking the whole app.
+RENAME_OUTPUTS_MAX = 12
+
+
 class RenameOutputsIn(BaseModel):
     # The echo, not a flag — the caller states the price it was shown (I1).
     expected_calls: int = Field(..., ge=0)
@@ -2480,15 +2536,33 @@ def rename_outputs(playlist_id: str, body: RenameOutputsIn):
             raise HTTPException(
                 409, "the source playlist's name isn't in the cached listing — "
                      "Refresh the Playlists view first (free if unchanged)")
+        mats = split.get("materialised") or {}
         todo = []
-        for pid, rec in (split.get("materialised") or {}).items():
-            if not rec.get("playlist_id"):
+        # Walk the CURRENT piles, not every materialisation record: /recluster
+        # carries records forward without sweeping orphans (only create_split
+        # does), so a record whose pile id is gone is invisible to the client
+        # — counting it here would quote N in the button and validate against
+        # N+k, 409ing the rename permanently with no route out of the UI.
+        # Price and display have to be computed from one collection, and the
+        # client's is `data.piles`. The falsy-name skip matches it too.
+        for pile in split.get("piles") or []:
+            rec = mats.get(pile["id"])
+            if not rec or not rec.get("playlist_id"):
                 continue
             cur = rec.get("name") or ""
-            if cur.startswith(f"{source} · "):
+            if not cur or cur.startswith(f"{source} · "):
                 continue
-            todo.append((pid, rec["playlist_id"], rec.get("claim"),
-                         split_output_name(source, cur)))
+            todo.append((pile["id"], rec["playlist_id"], rec.get("claim"),
+                         split_output_name(source, _strip_source_prefix(cur, pile["name"]))))
+    if len(todo) > RENAME_OUTPUTS_MAX:
+        raise HTTPException(
+            409, f"renaming {len(todo)} saved playlists in one request would "
+                 f"spend {len(todo)} interactive Spotify calls back to back; "
+                 f"past {RENAME_OUTPUTS_MAX} the client sleeps holding the "
+                 "budget lock and stalls everything else, the now-playing poll "
+                 "included. Nothing was spent — re-run once fewer than "
+                 f"{RENAME_OUTPUTS_MAX + 1} outputs still need it (piles "
+                 "materialised from here on are already named correctly).")
     if body.expected_calls != len(todo):
         raise HTTPException(
             409, f"cost has changed: renaming now spends {len(todo)} Spotify "

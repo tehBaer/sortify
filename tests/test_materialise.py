@@ -215,13 +215,20 @@ def test_a_create_failure_still_leaves_a_record_pointing_at_the_pile(client, mon
     assert rec is not None and rec["playlist_id"] is None and rec["added"] == []
 
 
-def test_tick_resumes_after_a_spotify_error_mid_pile_without_a_second_create(client, monkeypatch):
-    """A 429 cooldown partway through is the realistic failure. The next tick
-    must cost what is left, re-use the same playlist, and add nothing
-    twice."""
+def test_tick_resumes_after_a_spotify_error_mid_pile_by_reconciling_first(client, monkeypatch):
+    """A 429 cooldown partway through is the realistic failure, and the retry
+    must reconcile before it re-POSTs.
+
+    A failed add is not proof the add failed: an httpx read timeout or a reset
+    mid-response raises after the batch has already landed, and Spotify stores
+    duplicates without complaint. So the in-flight window counts as an
+    interruption exactly like process death does (review I1) — the next tick
+    reads the destination first, then costs only what is genuinely missing,
+    on the same playlist, with nothing added twice and no second create."""
     tick()   # create
     # One track already landed and was recorded, so the failing tick below is
     # a genuine mid-pile interruption rather than the very first add.
+    client.remote["NEWP"] = PILE_URIS[:1]
     s = Store(); payload = s.splits()
     payload["splits"]["PLM"]["materialised"]["p1"]["added"] = PILE_URIS[:1]
     s.save_splits(payload)
@@ -237,9 +244,15 @@ def test_tick_resumes_after_a_spotify_error_mid_pile_without_a_second_create(cli
                         lambda pid, uri, bulk=False, spend_reserve=False: client.calls.append(("add", pid, uri))
                         or "snap")
     out = tick()
+    assert out["spent"] >= 1
+    assert client.calls[-1] == ("read", "NEWP")   # reconcile, not a blind re-POST
+    assert record()["added"] == PILE_URIS[:1]     # and it matches what is there
+
+    out = tick()
     assert out["spent"] == 1
     assert client.calls[-1] == ("add", "NEWP", PILE_URIS[1:])   # only what is left
     assert client.calls.count(("create", "{src} · cumbia · latin · salsa")) == 1
+    assert [c for c in client.calls if c[0] == "add"] == [("add", "NEWP", PILE_URIS[1:])]
 
 
 def test_a_repeated_pile_uri_is_added_once_across_ticks(client):

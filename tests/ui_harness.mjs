@@ -1105,6 +1105,64 @@ run("stopNowPolling()");
         $$("view-splitpick").hidden === false && $$("view-lists").hidden === true);
 }
 
+// ============================================================================
+// RN — the rename offer: the only price this branch computes client-side
+// ============================================================================
+// The server re-derives this number and 409s if it disagrees, so the two
+// computations have to walk the same collection. Nothing covered the offer at
+// all until review finding I2 — which was exactly a mismatch between them —
+// so the count, the quoted price, and the number the POST carries are all
+// pinned here.
+{
+  const matPiles = (names) => names.map((n, i) => ({
+    id: `p${i}`, name: n.replace(/^\{src\} · /, ""), tags: ["a"], uris: ["u1"],
+    decided: 0, total: 1, materialise_calls: 2,
+    materialised: { playlist_id: `SP${i}`, name: n, pile_id: `p${i}` },
+  }));
+  const renameBody = (names) => ({
+    piles: matPiles(names), decided: {}, active_sitting: null,
+    params: { resolution: 1, min_pile: 15 },
+  });
+
+  resetLog();
+  routes["GET /api/split/PRN"] = { status: 200, body: renameBody(
+    ["jazz · funk", "{src} · already done", "dub · techno"]) };
+  await run(`openSplit("PRN", "{src}")`);
+  await tick();
+  const btn = $$("btn-rename-outputs");
+  check("RN the offer appears when outputs still carry bare pile names",
+        btn.hidden === false, `hidden=${btn.hidden}`);
+  check("RN it counts only the ones missing the prefix, and prices them 1:1",
+        /Rename 2 saved playlists/.test(btn.textContent)
+        && /\(2 calls\)/.test(btn.textContent),
+        JSON.stringify(btn.textContent));
+
+  routes["POST /api/split/PRN/rename_outputs"] = { ok: true, renamed: [] };
+  resetLog();
+  await run(`$("btn-rename-outputs").onclick()`);
+  await tick();
+  check("RN pressing it POSTs exactly once",
+        posts("/api/split/PRN/rename_outputs") === 1,
+        `${posts("/api/split/PRN/rename_outputs")} POST(s)`);
+  // The echo the server validates against. If the button ever displays one
+  // number and sends another, the action 409s and nothing is renamed.
+  check("RN the POST echoes the same number the button displayed",
+        bodies("/api/split/PRN/rename_outputs")[0]?.expected_calls === 2,
+        JSON.stringify(bodies("/api/split/PRN/rename_outputs")[0]));
+  check("RN the offer is withdrawn once it succeeds",
+        $$("btn-rename-outputs").hidden === true,
+        `hidden=${$$("btn-rename-outputs").hidden}`);
+
+  // Nothing to do must not advertise a paid action that would rename nothing.
+  routes["GET /api/split/PRN2"] = { status: 200, body: renameBody(
+    ["{src} · jazz · funk", "{src} · dub · techno"]) };
+  await run(`openSplit("PRN2", "{src}")`);
+  await tick();
+  check("RN no offer when every output already carries the prefix",
+        $$("btn-rename-outputs").hidden === true,
+        `hidden=${$$("btn-rename-outputs").hidden}`);
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

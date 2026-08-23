@@ -87,3 +87,72 @@ def test_rename_refuses_when_the_source_name_is_unknown(client):
     r = client.post("/api/split/PLR/rename_outputs", json={"expected_calls": 1})
     assert r.status_code == 409
     assert client.renames == []
+
+
+def test_an_orphan_record_is_neither_priced_nor_renamed(client):
+    """Review I2: /recluster carries materialisation records forward without
+    sweeping the ones whose pile id is gone (only create_split sweeps). The
+    client prices from `data.piles`, so an orphan it cannot see must not be
+    counted here either — otherwise the button quotes N, the server computes
+    N+1, and the rename 409s forever with no route out of the UI."""
+    _seed()
+    s = Store()
+    payload = s.splits()
+    payload["splits"]["PLR"]["materialised"]["gone"] = {
+        "playlist_id": "SPX", "pile_id": "gone", "name": "orphaned pile",
+        "fingerprint": "f", "track_count": 1, "added": [], "claim": "cx",
+        "created_at": "x", "updated_at": "x"}
+    s.save_splits(payload)
+
+    r = client.post("/api/split/PLR/rename_outputs", json={"expected_calls": 1})
+    assert r.status_code == 200                       # the price the client saw
+    assert client.renames == [("SP1", "{src} · jazz · funk")]   # SPX untouched
+
+
+def test_a_renamed_source_does_not_compound_the_output_name(client):
+    """Design §3: a source rename doesn't ripple into existing outputs. This
+    action is the user asking for the ripple — but composing from the record's
+    current name would give `newsrc · oldsrc · pile`, growing another segment
+    on every later source rename."""
+    _seed()
+    s = Store()
+    payload = s.splits()
+    payload["splits"]["PLR"]["materialised"]["p1"]["name"] = "{oldsrc} · jazz · funk"
+    s.save_splits(payload)
+    cache = s.cache()
+    cache["playlist_list"] = {"items": [{"id": "PLR", "name": "{newsrc}"}]}
+    s.save_cache(cache)
+
+    r = client.post("/api/split/PLR/rename_outputs", json={"expected_calls": 1})
+    assert r.status_code == 200
+    assert client.renames == [("SP1", "{newsrc} · jazz · funk")]
+
+    # And a second run finds nothing left to do — no call, no cost.
+    client.renames.clear()
+    r = client.post("/api/split/PLR/rename_outputs", json={"expected_calls": 0})
+    assert r.status_code == 200
+    assert client.renames == []
+
+
+def test_rename_refuses_more_outputs_than_it_can_spend_without_stalling(client):
+    """Minor 4: N interactive calls in one request means the client sleeps
+    holding `_budget_lock` past WINDOW_CAP, stalling every other Spotify call
+    — the now-playing poll included. Refuse above the cap, spend nothing."""
+    _seed()
+    s = Store()
+    payload = s.splits()
+    split = payload["splits"]["PLR"]
+    n = appmod.RENAME_OUTPUTS_MAX + 1
+    split["piles"] = [{"id": f"p{i}", "name": f"pile {i}", "tags": [], "uris": URIS}
+                      for i in range(n)]
+    split["materialised"] = {
+        f"p{i}": {"playlist_id": f"SP{i}", "pile_id": f"p{i}", "name": f"pile {i}",
+                  "fingerprint": "f", "track_count": 3, "added": list(URIS),
+                  "claim": f"c{i}", "created_at": "x", "updated_at": "x"}
+        for i in range(n)}
+    s.save_splits(payload)
+
+    r = client.post("/api/split/PLR/rename_outputs", json={"expected_calls": n})
+    assert r.status_code == 409
+    assert "Nothing was spent" in r.json()["detail"]
+    assert client.renames == []

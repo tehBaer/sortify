@@ -113,10 +113,11 @@ def test_split_output_name_degenerate_source_survives_alone():
 
 
 def test_split_output_titles_trip_no_naming_rules():
-    # Design §3: split outputs are created unmarked, and the title shape
-    # must not fullmatch the input pattern. violations() must stay empty
-    # even if someone marks one as input by hand? No — unmarked is the
-    # contract; marked-as-home just gets the ordinary caps proposal.
+    # Design §3: split outputs are created unmarked, and the title shape must
+    # not fullmatch the input pattern — so an unmarked output draws no
+    # proposal at all. Marking one by hand puts it outside that contract: it
+    # then gets whatever its role ordinarily gets, because nothing
+    # special-cases the ` · ` shape once the user has claimed the playlist.
     playlists = [{"id": "X1", "name": "{teh bomb} · jazz · funk", "editable": True}]
     assert violations(playlists, input_ids=set(), home_ids=set()) == []
     # And the input pattern does not swallow it either:
