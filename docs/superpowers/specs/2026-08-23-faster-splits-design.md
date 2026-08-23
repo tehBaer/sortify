@@ -77,8 +77,8 @@ was ever in flight, and the CAS wrote it down the moment it landed. A
 the CAS, up to 100 landed tracks are unrecorded — and Spotify permits
 duplicate tracks, so a naive retry really would double them up. The
 mitigation: when the worker picks up a pile whose record has a
-`playlist_id` **and** a non-empty `added`, its first act is to read the
-destination playlist (`Spotify.playlist_tracks`, `spotify.py:666` —
+`playlist_id` that **this process has not itself verified**, its first act
+is to read the destination playlist (`Spotify.playlist_tracks`, `spotify.py:666` —
 paginated at 100, so `ceil(n/100)` calls) and set `added` to what is
 *actually there*. Only then is `missing` computed. A crash mid-batch can
 then neither duplicate nor skip: the record is never trusted across an
@@ -91,8 +91,19 @@ Details of the reconcile step:
   CAS), so ticks after the first proceed on the record alone.
 - Its reads are budgeted calls like any other (`bulk=True`), and the
   displayed price for resuming a partial pile includes them.
-- A fresh pile (no `playlist_id`, empty `added`) skips it — there is
-  nothing to reconcile and nothing to duplicate.
+- A fresh pile (no `playlist_id` at all) skips it — nothing has been
+  created, so there is nothing to reconcile and nothing to duplicate.
+- **An empty `added` does NOT exempt a record that has a `playlist_id`.**
+  An earlier draft of this section said the trigger was a `playlist_id`
+  *and* a non-empty `added`; that was wrong, and wrong on exactly the crash
+  this whole section exists for. The create CAS records `playlist_id` with
+  `added: []`; the very next tick POSTs up to 100 tracks; a death between
+  that POST returning and its CAS leaves a record that reads as empty while
+  100 tracks are already on Spotify. Skipping the read there re-posts the
+  whole batch and doubles it. The rule has no exception: any record with a
+  `playlist_id` this process has not verified is read before anything is
+  added. (Corrected 2026-08-23, fix round 1 of Task 3; the implementation
+  in `_materialise_plan` follows this text, not the earlier one.)
 - Reconciliation intersects with the pile's uris: tracks in the destination
   that the pile never contained (the user edited the playlist by hand) are
   left alone and not counted as `added`.
@@ -258,10 +269,10 @@ none are worth extending:
 - Zero live Spotify calls during development; tests pin behaviour at the
   `Spotify.request` wire level, no method-level fakes.
 - Batch tests to pin: a 250-missing pile costs 3 add calls; a resumed pile
-  with non-empty `added` reconciles from the wire-level playlist read
-  before computing `missing`; a reconcile that finds landed-but-unrecorded
-  tracks does not re-add them; a fresh pile skips reconciliation; `spent`
-  counts calls, not tracks.
+  reconciles from the wire-level playlist read before computing `missing`
+  — with an empty `added` as much as a partial one; a reconcile that finds
+  landed-but-unrecorded tracks does not re-add them; a pile with no
+  `playlist_id` skips reconciliation; `spent` counts calls, not tracks.
 - Naming tests to pin: `{source} · pile` titles produce zero
   `naming.violations` rows unmarked; truncation preserves the source name
   whole; the existing-outputs rename action is priced at one call each and

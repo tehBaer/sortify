@@ -522,3 +522,40 @@ def test_reconcile_runs_once_per_process_pickup(client):
     client.remote["OLDP"] = BIG_URIS[:30]
     _tick(); _tick(); _tick()
     assert [c[0] for c in client.calls].count("read") == 1
+
+
+def test_a_record_with_an_empty_added_still_reconciles_before_adding(client):
+    """The likeliest crash window in the whole batched path, and the one an
+    earlier draft of `_materialise_plan` exempted: the create CAS records a
+    `playlist_id` with `added: []`, the next tick POSTs 100 tracks, and the
+    process dies between that POST returning and its CAS. The record still
+    says `added: []` while up to 100 tracks are already on Spotify — which
+    permits duplicates, so re-posting the batch genuinely doubles them. A
+    record with a playlist_id this process has not verified must be read
+    first, empty `added` or not."""
+    s = Store()
+    payload = s.splits()
+    pile = payload["splits"]["PLM"]["piles"][1]
+    payload["splits"]["PLM"]["materialised"] = {"p2": {
+        "playlist_id": "OLDP", "pile_id": "p2", "name": "big one",
+        "fingerprint": appmod._pile_fingerprint(pile),
+        "track_count": 60, "added": [], "claim": "c1",
+        "created_at": "x", "updated_at": "x"}}
+    s.save_splits(payload)
+    client.remote["OLDP"] = BIG_URIS[:40]      # a batch landed, unrecorded
+
+    plan = appmod._materialise_plan(
+        Store().splits()["splits"]["PLM"], pile)
+    assert plan["reconcile_calls"] == 1        # floored at 1, not skipped
+
+    r1 = _tick()
+    assert (r1["spent"], r1["done"]) == (1, False)
+    assert [c[0] for c in client.calls] == ["read"]   # read, never a blind add
+    rec = Store().splits()["splits"]["PLM"]["materialised"]["p2"]
+    assert rec["added"] == BIG_URIS[:40]
+
+    r2 = _tick()
+    assert (r2["spent"], r2["done"]) == (1, True)
+    add = client.calls[-1]
+    assert add[0] == "add" and add[2] == BIG_URIS[40:]
+    assert not any(u in add[2] for u in BIG_URIS[:40])   # nothing doubled

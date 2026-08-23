@@ -43,6 +43,15 @@ def worker_env(monkeypatch):
     monkeypatch.setattr(appmod.sp, "add_to_playlist",
                         lambda pid, uri, bulk=False, spend_reserve=False: calls.append(("add", pid, uri)) or "snap")
     monkeypatch.setattr(appmod.sp, "bulk_block_reason", lambda spend_reserve=False: None)
+    # No queue test should ever reach the reconcile read — every pile here
+    # starts fresh — but the fake is mandatory anyway: an unstubbed
+    # `playlist_tracks` on a widened reconcile predicate would put a REAL
+    # Spotify call inside the test suite, which is this project's hardest
+    # rule (CLAUDE.md). It records so a stray read shows up in `calls`
+    # rather than passing silently.
+    monkeypatch.setattr(appmod.sp, "playlist_tracks",
+                        lambda pid, bulk=False, spend_reserve=False:
+                            calls.append(("read", pid)) or [])
     monkeypatch.setattr(pacing.Governor, "interval", lambda self: 0.0)
     s = Store()
     originals = {f: getattr(s, f)() for f in ("splits", "queue", "pacing")}
@@ -62,6 +71,7 @@ def worker_env(monkeypatch):
         worker.join(timeout=5)
     appmod._queue_worker = None
     appmod._queue_wake.clear()
+    appmod._reconciled.clear()   # process-global, like _pending_materialise
     # Minor 2 (fix round 2): restore the shared data dir BEFORE asserting on
     # the join below — a failed/hung-thread assertion must not skip these
     # and leave splits/queue/pacing poisoned for whatever test runs next.

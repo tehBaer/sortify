@@ -1653,9 +1653,11 @@ _pending_materialise: set[tuple[str, str]] = set()
 # the reconcile read below. Batching is what makes this necessary: a crash
 # between a 100-track POST landing and the CAS recording it leaves up to 100
 # landed tracks unrecorded, and Spotify permits duplicates, so a blind retry
-# would double them (design §1). A pair NOT in this set whose record has
-# tracks in `added` is treated as untrustworthy and re-read before anything
-# is added. Mutated only under `_split_lock`; a fresh process starts empty,
+# would double them (design §1). A pair NOT in this set whose record has a
+# playlist_id is treated as untrustworthy and re-read before anything is
+# added — an EMPTY `added` included, because "created, then one batch landed
+# unrecorded" is precisely the record that looks empty and is not.
+# Mutated only under `_split_lock`; a fresh process starts empty,
 # which is exactly the "never trust the record across an interruption" rule.
 _reconciled: set[tuple[str, str]] = set()
 
@@ -1724,11 +1726,21 @@ def _materialise_plan(split: dict, pile: dict, reconciled: bool = False) -> dict
     fresh playlist, at full price, which the caller sees before clicking.
 
     `reconciled` is whether THIS process has already verified the record
-    against the account (`_reconciled`). A resumable record (playlist_id
-    set, some `added`, some missing) that hasn't been verified prices in a
-    read of the destination first — ceil(len(added)/100) calls, a floor
-    since the real playlist can hold more (duplicates from an earlier
-    crash). Reconciliation is what makes a 100-track batch safe to retry.
+    against the account (`_reconciled`). ANY resumable record (playlist_id
+    set, something still missing) that hasn't been verified prices in a read
+    of the destination first — ceil(len(added)/100) calls, floored at 1, and
+    a floor in the other sense too since the real playlist can hold more than
+    the record claims (that is the whole reason for the read). Reconciliation
+    is what makes a 100-track batch safe to retry.
+
+    An EMPTY `added` earns the read just as much as a partial one, and is in
+    fact the likeliest case to need it: the create CAS records `playlist_id`
+    with `added: []`, and a death between the next tick's 100-track POST
+    returning and its CAS leaves exactly that record with up to 100 tracks
+    already on Spotify. Exempting it — which an earlier draft of this
+    function did — re-posts the whole batch and doubles them, since Spotify
+    permits duplicates. The rule is the design's, without an exception: the
+    record is never trusted across an interruption.
     """
     record = (split.get("materialised") or {}).get(pile["id"])
     stale = bool(record) and record.get("fingerprint") != _pile_fingerprint(pile)
@@ -1739,8 +1751,7 @@ def _materialise_plan(split: dict, pile: dict, reconciled: bool = False) -> dict
     added_list = usable.get("added", []) if usable else []
     reconcile_calls = (
         _batches(max(len(added_list), 1))
-        if (usable and usable.get("playlist_id") and added_list and missing
-            and not reconciled)
+        if (usable and usable.get("playlist_id") and missing and not reconciled)
         else 0
     )
     return {
