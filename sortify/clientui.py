@@ -52,11 +52,7 @@ LIBRARY_FILTER_OFFSET = (-21, 42)        # icon center relative to the chip's
 MENU_MOVE_TO_FOLDER = "Move to folder"
 FOLDER_SEARCH_HINT = "Find a folder"     # submenu's own search box
 MENU_REMOVE_FROM_FOLDER = "Remove from folders"
-MENU_CREATE_FOLDER = "Create folder"     # row menu AND folder submenu
-MENU_CREATE_PLAYLIST = "Create playlist"
 MENU_DELETE = "Delete"
-CONFIRM_DELETE = "Delete"                # confirm-dialog button; verified live
-                                         # at the Task 8 acceptance run
 SETTLE = 2.0                             # seconds; see map note 5
 
 
@@ -222,7 +218,6 @@ def right_click(display: str, x: int, y: int) -> None:
 
 
 LIBRARY_TOGGLE_POS = (284, 199)  # collapsed sidebar's expand toggle (t5-01/02)
-UI_READY_TIMEOUT = 45            # cold-start paint can trail the window by ~20s
 
 
 def wait_for_text(
@@ -341,6 +336,11 @@ def move_playlist_ui(session: "ClientSession", plan) -> None:
         click(d, *wait_for_text(d, MENU_REMOVE_FROM_FOLDER))
     else:
         fx, fy = wait_for_text(d, FOLDER_SEARCH_HINT)
+        # Leaf-only typing is safe here ONLY because plan_move() refuses
+        # any destination whose leaf name isn't unique across the whole
+        # tree (see foldermove._check_leaf_unique) — this box has no way
+        # to disambiguate on the parent path, so uniqueness must already
+        # be guaranteed by the time we get here.
         leaf = plan.to_path.split(" / ")[-1]
         for _ in range(3):
             click(d, fx, fy)

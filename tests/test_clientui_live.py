@@ -23,22 +23,16 @@ import pytest
 
 from sortify import clientui, rootlist
 from sortify.clientui import UiStepError
-from sortify.folders import extract_folder_map
-from sortify.foldermove import MovePlan, verify_move
+from sortify.foldermove import MovePlan, all_tree_ids, verify_move
 
 SCRATCH_FOLDER = "zz spfolders scratch"
 SCRATCH_LIST = "zz spfolders test list"
 
 pytestmark = [pytest.mark.clientui, pytest.mark.timeout(900)]
 
-
-def _all_tree_ids(tree) -> set[str]:
-    ids = set(extract_folder_map(tree))
-    for c in tree.get("children") or []:
-        uri = c.get("uri") or ""
-        if ":playlist:" in uri:
-            ids.add(uri.rsplit(":", 1)[-1])
-    return ids
+# all_tree_ids lives in foldermove.py now — it's the same walk verify_move
+# uses to tell "top level" from "not in the tree at all".
+_all_tree_ids = all_tree_ids
 
 
 def _folder_names(tree) -> set[str]:

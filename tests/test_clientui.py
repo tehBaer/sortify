@@ -1,6 +1,7 @@
 """Lock and session-composition tests. No real client: subprocess and
 xdotool are monkeypatched; only the lock uses the real filesystem."""
 import os
+import shutil
 
 import pytest
 
@@ -102,6 +103,15 @@ from PIL import Image, ImageDraw, ImageFont
 
 from sortify.clientui import find_text
 
+# pillow/pytesseract are pip-installable (now in the dev extra — see
+# Finding 5), but tesseract itself is a system binary pytesseract shells
+# out to. It's present on this box but not guaranteed on a fresh checkout
+# elsewhere, so these OCR-dependent tests skip rather than error when it's
+# missing.
+_needs_tesseract = pytest.mark.skipif(
+    shutil.which("tesseract") is None, reason="tesseract binary not installed"
+)
+
 
 def _img_with_text(lines):
     img = Image.new("RGB", (400, 40 * (len(lines) + 1)), "white")
@@ -117,6 +127,7 @@ def _img_with_text(lines):
     return img
 
 
+@_needs_tesseract
 def test_find_text_locates_line():
     img = _img_with_text(["Create playlist", "Move to folder", "Delete"])
     x, y = find_text(img, "Move to folder")
@@ -124,11 +135,13 @@ def test_find_text_locates_line():
     assert 40 < y < 90  # second line's band
 
 
+@_needs_tesseract
 def test_find_text_case_insensitive():
     img = _img_with_text(["Move to folder"])
     assert find_text(img, "move TO Folder")
 
 
+@_needs_tesseract
 def test_find_text_absent_raises():
     img = _img_with_text(["Delete"])
     with pytest.raises(UiStepError, match="Move to folder"):

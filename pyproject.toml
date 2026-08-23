@@ -22,7 +22,15 @@ dependencies = [
 # settle logic; `_split_lock` held across a network call, which deadlocks).
 # Untimed, both look like a stalled run: nothing is reported, and the failure
 # is invisible rather than red.
-dev = ["pytest>=8", "pytest-timeout>=2.4"]
+#
+# pillow/pytesseract are also here (not just in clientui below): tests
+# import them at module scope, so a plain `pip install -e '.[dev]'` needs
+# them present just to COLLECT the suite, even though the OCR tests that
+# use them are excluded by default (see the clientui marker below). The
+# tesseract BINARY is still a separate system dependency, not installable
+# via pip — tests that call it are skipped when it's missing (see
+# tests/test_clientui.py).
+dev = ["pytest>=8", "pytest-timeout>=2.4", "pytesseract>=0.3.10", "pillow>=10"]
 # Drives the desktop client's UI (spfolders); OCR locates menu items on a
 # virtual display. Not needed to run the server.
 clientui = ["pytesseract>=0.3.10", "pillow>=10"]

@@ -12,7 +12,14 @@ TREE = {
             {"name": "Y'no", "type": "folder",
              "uri": "spotify:user:u:folder:bb", "children": [
                 {"type": "playlist", "uri": "spotify:playlist:pl_lite"},
+                # A second folder sharing a leaf name with one below —
+                # covers Finding 1's ambiguous-leaf refusal without
+                # disturbing the "y'no" unique-leaf test.
+                {"name": "Vault", "type": "folder",
+                 "uri": "spotify:user:u:folder:cc", "children": []},
             ]},
+            {"name": "Vault", "type": "folder",
+             "uri": "spotify:user:u:folder:dd", "children": []},
             {"type": "playlist", "uri": "spotify:playlist:pl_haze"},
         ]},
         {"type": "playlist", "uri": "spotify:playlist:pl_loose"},
@@ -103,11 +110,40 @@ def test_plan_move_out_when_already_loose_refused():
         plan_move(ITEMS, TREE, "Loose One", None)
 
 
+def test_plan_move_unique_leaf_destination_still_resolves():
+    # "Y'no" is a unique leaf in TREE — planning into it must still work.
+    p = plan_move(ITEMS, TREE, "HAZE", "Y'no")
+    assert p.to_path == "ROOT / Y'no"
+
+
+def test_plan_move_ambiguous_leaf_destination_refused():
+    # Two folders are both named "Vault" (ROOT / Vault and
+    # ROOT / Y'no / Vault) — the desktop client's folder search can only
+    # match on the leaf name, so sortify must refuse rather than gamble.
+    with pytest.raises(ResolveError) as e:
+        plan_move(ITEMS, TREE, "HAZE", "ROOT / Vault")
+    msg = str(e.value)
+    assert "Vault" in msg
+    assert "ROOT / Vault" in msg
+    assert "ROOT / Y'no / Vault" in msg
+
+
 def test_verify_move_checks_tree_truth():
     assert verify_move(TREE, "pl_lite", "ROOT / Y'no") is True
     assert verify_move(TREE, "pl_lite", None) is False
     assert verify_move(TREE, "pl_loose", None) is True
     assert verify_move(TREE, "pl_loose", "ROOT") is False
+
+
+def test_verify_move_none_true_for_top_level_playlist():
+    assert verify_move(TREE, "pl_loose", None) is True
+
+
+def test_verify_move_none_false_for_id_absent_from_tree():
+    # A path of None is what BOTH "top level" and "not in the tree at
+    # all" look like from extract_folder_map alone — verify_move must
+    # not treat a vanished playlist as a successful move-to-top-level.
+    assert verify_move(TREE, "pl_never_existed", None) is False
 
 
 from sortify.foldermove import execute_move
@@ -168,6 +204,45 @@ def test_execute_move_skips_ui_if_already_done():
     assert moved == []  # slow-flush guard: verified done before re-driving
 
 
+def test_execute_move_aborted_mid_move_reports_actual_still_at_source():
+    from sortify.clientui import UiStepError
+
+    plan = MovePlan("pl_haze", "HAZE", "SRC", "DEST")
+
+    def boom(s, p):
+        raise UiStepError("text 'Find a folder' not found on screen")
+
+    with pytest.raises(RuntimeError) as e:
+        execute_move(
+            plan, session_cls=FakeSession,
+            mover=boom,
+            extractor=lambda: _tree_with("SRC"),  # never budged
+        )
+    msg = str(e.value)
+    assert "still at SRC" in msg
+
+
+def test_execute_move_aborted_mid_move_reports_actual_new_location():
+    from sortify.clientui import UiStepError
+
+    plan = MovePlan("pl_haze", "HAZE", "SRC", "DEST")
+
+    def boom(s, p):
+        raise UiStepError("text 'Find a folder' not found on screen")
+
+    with pytest.raises(RuntimeError) as e:
+        execute_move(
+            plan, session_cls=FakeSession,
+            mover=boom,
+            # A click landed the playlist somewhere unplanned before the
+            # abort — neither the source nor the intended destination.
+            extractor=lambda: _tree_with("SOMEWHERE_ELSE"),
+        )
+    msg = str(e.value)
+    assert "now at SOMEWHERE_ELSE" in msg
+    assert "not DEST" in msg
+
+
 def test_cli_move_rejects_folder_and_out_together(monkeypatch, capsys):
     # "<folder>" and "--out" are mutually exclusive destinations; giving both
     # must be a usage error, not a silent pick of one over the other.
@@ -180,3 +255,28 @@ def test_cli_move_rejects_folder_and_out_together(monkeypatch, capsys):
         main()
     assert exc.value.code == 2
     assert "usage: spfolders move" in capsys.readouterr().out
+
+
+def test_cli_move_rejects_unknown_flag(monkeypatch, capsys):
+    # A typo'd flag (e.g. --dryrun instead of --dry-run) must be a usage
+    # error, never silently ignored — an ignored --dry-run would drive a
+    # real move for a caller who explicitly asked for nothing to happen.
+    from sortify.foldermove import main
+
+    monkeypatch.setattr(
+        sys, "argv", ["spfolders", "move", "HAZE", "Y'no", "--dryrun"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    assert "unknown flag" in capsys.readouterr().out
+
+
+def test_cli_tree_rejects_unknown_flag(monkeypatch, capsys):
+    from sortify.foldermove import main
+
+    monkeypatch.setattr(sys, "argv", ["spfolders", "tree", "--sunc"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    assert "unknown flag" in capsys.readouterr().out

@@ -86,6 +86,27 @@ def resolve_folder(tree: dict, path_query: str) -> str:
     )
 
 
+def _check_leaf_unique(tree: dict, dest_path: str) -> None:
+    """Refuse a destination whose leaf folder name is not unique.
+
+    The desktop client's "Move to folder" search box (clientui.py) types
+    only the destination's LEAF name and clicks the first match — it has
+    no way to disambiguate on the parent path. If two or more folders in
+    the tree share a leaf, sortify cannot tell the client which one to
+    target, so the move is refused at plan time rather than risking a
+    silent misfile into the wrong one.
+    """
+    leaf = dest_path.split(" / ")[-1]
+    competitors = [p for p in _folder_paths(tree) if p.split(" / ")[-1].lower() == leaf.lower()]
+    if len(competitors) > 1:
+        listing = "\n  ".join(competitors)
+        raise ResolveError(
+            f"folder name {leaf!r} is not unique — the desktop client's "
+            "folder search matches on leaf name only, so sortify cannot "
+            f"safely target one of:\n  {listing}"
+        )
+
+
 @dataclass(frozen=True)
 class MovePlan:
     playlist_id: str
@@ -100,15 +121,40 @@ def plan_move(
     mapping = extract_folder_map(tree)
     pid, name, current = resolve_playlist(items, mapping, playlist_query)
     dest = resolve_folder(tree, dest_query) if dest_query is not None else None
+    if dest is not None:
+        _check_leaf_unique(tree, dest)
     if current == dest:
         where = f"in {dest!r}" if dest else "at the top level"
         raise ResolveError(f"{name} is already {where}")
     return MovePlan(pid, name, current, dest)
 
 
+def all_tree_ids(tree) -> set[str]:
+    """Every playlist id anywhere in the tree — inside folders or at the
+    top level.
+
+    extract_folder_map only covers ids that sit inside a folder; top-level
+    playlists need walking the tree's own top-level children too. This is
+    what lets verify_move tell "top level" apart from "not in the tree at
+    all" when the caller expects None.
+    """
+    ids = set(extract_folder_map(tree))
+    for c in tree.get("children") or []:
+        uri = c.get("uri") or ""
+        if ":playlist:" in uri:
+            ids.add(uri.rsplit(":", 1)[-1])
+    return ids
+
+
 def verify_move(tree: dict, playlist_id: str, expected_path: str | None) -> bool:
     actual = (extract_folder_map(tree).get(playlist_id) or {}).get("path")
-    return actual == expected_path
+    if actual != expected_path:
+        return False
+    if expected_path is None:
+        # A None path is also what a vanished/unknown id looks like —
+        # require the id to actually be present somewhere in the tree.
+        return playlist_id in all_tree_ids(tree)
+    return True
 
 
 def execute_move(
@@ -138,6 +184,10 @@ def execute_move(
             _time.sleep(settle_seconds)
         return False
 
+    def actual_path_desc() -> str:
+        actual = (extract_folder_map(extractor()).get(plan.playlist_id) or {}).get("path")
+        return actual or "the top level"
+
     with session_cls() as session:
         for attempt in (1, 2):
             # Slow-flush guard: never re-drive a move that already landed.
@@ -145,13 +195,30 @@ def execute_move(
                 extractor(), plan.playlist_id, plan.to_path
             ):
                 return
-            mover(session, plan)
+            try:
+                mover(session, plan)
+            except clientui.UiStepError as e:
+                # An abort mid-sequence may have already committed a
+                # click that changed the tree — re-extract so the caller
+                # always learns the real state, never just "it failed".
+                where = actual_path_desc()
+                frm = plan.from_path or "the top level"
+                if where == frm:
+                    raise RuntimeError(
+                        f"aborted mid-move driving {plan.playlist_name!r}: {e} "
+                        f"— the playlist is still at {where}."
+                    ) from e
+                raise RuntimeError(
+                    f"aborted mid-move driving {plan.playlist_name!r}: {e} "
+                    f"— the playlist is now at {where}, not "
+                    f"{plan.to_path or 'the top level'}."
+                ) from e
             if verified():
                 return
     raise RuntimeError(
         f"move not verified: {plan.playlist_name} did not land at "
-        f"{plan.to_path or 'top level'} — the tree still shows otherwise. "
-        "Nothing further was attempted."
+        f"{plan.to_path or 'top level'} — the tree currently shows it at "
+        f"{actual_path_desc()}."
     )
 
 
@@ -186,7 +253,13 @@ def main() -> None:
               "spfolders move <playlist> (<folder> | --out) [--dry-run]")
         sys.exit(0 if args and args[0] in ("-h", "--help") else 2)
 
+    flags = {a for a in args[1:] if a.startswith("--")}
+
     if args[0] == "tree":
+        unknown = flags - {"--sync"}
+        if unknown:
+            print(f"unknown flag(s) for 'tree': {', '.join(sorted(unknown))}")
+            sys.exit(2)
         if "--sync" in args:
             print("waking the client to sync (~45s)…")
             rootlist.sync_client()
@@ -195,8 +268,11 @@ def main() -> None:
         return
 
     # move
+    unknown = flags - {"--out", "--dry-run"}
+    if unknown:
+        print(f"unknown flag(s) for 'move': {', '.join(sorted(unknown))}")
+        sys.exit(2)
     rest = [a for a in args[1:] if not a.startswith("--")]
-    flags = {a for a in args[1:] if a.startswith("--")}
     if (
         not rest
         or (len(rest) == 1 and "--out" not in flags)
