@@ -74,8 +74,10 @@ escalating penalties. Therefore:
 - Homes: playlists under the `ROOT` folder tree minus ARCHIVED/OLD segments,
   emoji-prefixed names (🐾/🧸 derived super/subsets), and `__x__`/`{x}`/`<x>`
   marker names.
-- The client speaks the Feb-2026 dev-mode API (`items`/`item`, `/me/library`,
-  no batch endpoints) — do not "fix" it back to pre-2026 shapes.
+- The client speaks the Feb-2026 dev-mode API (`items`/`item`, `/me/library`)
+  — do not "fix" it back to pre-2026 shapes. Batch ADD exists: up to 100 uris
+  per playlist-items POST (probed 2026-08-23; 150 → 400). There is still no
+  batch delete.
 
 ## Playlist folders (how folder paths work — costs zero API calls)
 
