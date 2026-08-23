@@ -45,6 +45,60 @@ def client_lock():
         os.close(fd)  # releases the flock
 
 
+def screenshot(display: str):
+    """Grab the virtual display as a PIL image (ImageMagick `import`)."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    env = dict(os.environ, DISPLAY=display)
+    r = subprocess.run(
+        ["import", "-window", "root", "png:-"],
+        env=env, capture_output=True,
+    )
+    if r.returncode != 0 or not r.stdout:
+        raise UiStepError(f"screenshot of {display} failed: {r.stderr[:200]!r}")
+    return Image.open(BytesIO(r.stdout)).convert("RGB")
+
+
+def find_text(img, text: str) -> tuple[int, int]:
+    """Center of `text` in the image, by OCR word sequence, case-insensitive."""
+    import pytesseract
+
+    data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    words = [w.strip().lower() for w in data["text"]]
+    want = [w for w in text.lower().split() if w]
+    n = len(data["text"])
+    for i in range(n - len(want) + 1):
+        if words[i : i + len(want)] == want:
+            xs = [data["left"][j] for j in range(i, i + len(want))]
+            x2 = [data["left"][j] + data["width"][j] for j in range(i, i + len(want))]
+            ys = [data["top"][j] for j in range(i, i + len(want))]
+            y2 = [data["top"][j] + data["height"][j] for j in range(i, i + len(want))]
+            return (min(xs) + max(x2)) // 2, (min(ys) + max(y2)) // 2
+    raise UiStepError(f"text {text!r} not found on screen")
+
+
+def _xdo(display: str, *args: str) -> None:
+    env = dict(os.environ, DISPLAY=display)
+    r = subprocess.run(["xdotool", *args], env=env, capture_output=True)
+    if r.returncode != 0:
+        raise UiStepError(f"xdotool {' '.join(args)} failed: {r.stderr[:200]!r}")
+
+
+def key(display: str, keys: str) -> None:
+    _xdo(display, "key", "--clearmodifiers", keys)
+
+
+def type_text(display: str, s: str) -> None:
+    _xdo(display, "type", "--delay", "60", s)
+
+
+def click(display: str, x: int, y: int) -> None:
+    _xdo(display, "mousemove", str(x), str(y))
+    _xdo(display, "click", "1")
+
+
 def _wait_for_window(display: str, timeout: int) -> None:
     """Poll xdotool until the client's main window exists."""
     deadline = time.time() + timeout

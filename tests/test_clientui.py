@@ -62,3 +62,41 @@ def test_sync_client_respects_ui_lock(tmp_path, monkeypatch):
     with client_lock():
         with pytest.raises(UiStepError, match="another client-UI session"):
             rootlist.sync_client(seconds=0)
+
+
+# Screenshot + OCR primitives (Task 4)
+from PIL import Image, ImageDraw, ImageFont
+
+from sortify.clientui import find_text
+
+
+def _img_with_text(lines):
+    img = Image.new("RGB", (400, 40 * (len(lines) + 1)), "white")
+    d = ImageDraw.Draw(img)
+    # Use DejaVu truetype font at 24px for tesseract reliability (R2 ruling).
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+    except OSError:
+        # Fallback to default bitmap font if DejaVu is not available
+        font = ImageFont.load_default()
+    for i, line in enumerate(lines):
+        d.text((10, 10 + 40 * i), line, fill="black", font=font)
+    return img
+
+
+def test_find_text_locates_line():
+    img = _img_with_text(["Create playlist", "Move to folder", "Delete"])
+    x, y = find_text(img, "Move to folder")
+    assert 0 < x < 400
+    assert 40 < y < 90  # second line's band
+
+
+def test_find_text_case_insensitive():
+    img = _img_with_text(["Move to folder"])
+    assert find_text(img, "move TO Folder")
+
+
+def test_find_text_absent_raises():
+    img = _img_with_text(["Delete"])
+    with pytest.raises(UiStepError, match="Move to folder"):
+        find_text(img, "Move to folder")

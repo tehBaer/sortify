@@ -23,6 +23,9 @@ dependencies = [
 # Untimed, both look like a stalled run: nothing is reported, and the failure
 # is invisible rather than red.
 dev = ["pytest>=8", "pytest-timeout>=2.4"]
+# Drives the desktop client's UI (spfolders); OCR locates menu items on a
+# virtual display. Not needed to run the server.
+clientui = ["pytesseract>=0.3.10", "pillow>=10"]
 
 [tool.pytest.ini_options]
 # Per test, not per run. Generous on purpose: the slowest real test here is a
