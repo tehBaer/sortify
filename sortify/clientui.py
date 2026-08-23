@@ -7,6 +7,11 @@ deterministic planning/verification around this lives in foldermove.py.
 Display :93 belongs to rootlist.sync_client's folder refresh; this module
 uses :94 and a file lock so the two can never fight over the
 single-instance snap client.
+
+a11y tree: not pursued (probed 2026-08-23 — pyatspi is not installable
+without system packages, and CEF's AT-SPI export is typically hollow).
+The OCR path below is the driver; the interaction map documents the UI
+facts it relies on.
 """
 
 from __future__ import annotations
@@ -21,6 +26,38 @@ from contextlib import contextmanager
 LOCK_PATH = "~/state/spotify/client-ui.lock"
 DISPLAY = ":94"
 WINDOW_TIMEOUT = 60
+
+# UI interaction map, established live against snap client 1.2.95 on
+# 2026-08-23 (Xvfb :94, 1280x800). Every entry is a fact about the UI,
+# re-checkable by screenshot; when a redesign breaks one, find_text raises
+# UiStepError and the run aborts instead of clicking blind.
+#
+# Mapped flow (t5-01..t5-14 screenshots, see the Task 5 ledger entry):
+#   1. Expanded sidebar shows "Your Library"; collapsed shows icons only.
+#      The library filter is a magnifier ICON (no OCR-able text): it sits
+#      at FILTER_OFFSET from the "Playlists" chip's OCR center.
+#   2. Typing in the filter finds playlists nested in folders too. Rows
+#      show the name; right-click (button 3) on the name opens the menu.
+#   3. "Move to folder" submenu carries its own "Find a folder" box:
+#      click it, ctrl+a, type the folder's LEAF name, wait, click the
+#      filtered row. Result rows show the parent path under the leaf name
+#      (e.g. "Y'no" over "ROOT") — OCR both to disambiguate duplicates.
+#   4. "Remove from folders" appears in that submenu only when the
+#      playlist currently sits in a folder.
+#   5. CEF under Xvfb lags input→paint by up to ~2s: wait SETTLE after
+#      every input and verify by screenshot before acting on the result.
+LIBRARY_HINT = "Your Library"            # sidebar-is-expanded marker
+LIBRARY_FILTER_ANCHOR = "Playlists"      # chip the filter icon hangs under
+LIBRARY_FILTER_OFFSET = (-21, 42)        # icon center relative to the chip's
+MENU_MOVE_TO_FOLDER = "Move to folder"
+FOLDER_SEARCH_HINT = "Find a folder"     # submenu's own search box
+MENU_REMOVE_FROM_FOLDER = "Remove from folders"
+MENU_CREATE_FOLDER = "Create folder"     # row menu AND folder submenu
+MENU_CREATE_PLAYLIST = "Create playlist"
+MENU_DELETE = "Delete"
+CONFIRM_DELETE = "Delete"                # confirm-dialog button; verified live
+                                         # at the Task 8 acceptance run
+SETTLE = 2.0                             # seconds; see map note 5
 
 
 class UiStepError(Exception):
