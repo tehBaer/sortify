@@ -76,3 +76,23 @@ escalating penalties. Therefore:
   marker names.
 - The client speaks the Feb-2026 dev-mode API (`items`/`item`, `/me/library`,
   no batch endpoints) — do not "fix" it back to pre-2026 shapes.
+
+## Playlist folders (how folder paths work — costs zero API calls)
+
+- **The Web API has no folders.** The hierarchy lives only in
+  `data/folders.json`, shape `{playlist_id: {"path": "ROOT / Sub", "caps": bool}}`
+  (`caps` = any ALL-CAPS segment on the path). It is never fetched from
+  Spotify and never refreshed automatically — if it looks stale or empty,
+  that's a data problem, not a code problem. The UI already renders paths
+  everywhere (Lists sub-lines, suggestion reasons, the More… picker's grey
+  `.p-sub` line, and filter matching); an empty `folders.json` is why they'd
+  vanish. It was wiped to `{}` by the 2026-08-21 live-data clobber and
+  restored 2026-08-23.
+- **Source**: [mikez/spotify-folders](https://github.com/mikez/spotify-folders)
+  run on a machine with the Spotify **desktop client** (not this box), piped
+  into `POST /api/folders`. That endpoint also **re-marks homes** from the
+  tree (`home_folder_prefixes` minus excludes, union `sticky_home_ids`), so
+  don't POST casually.
+- **Known-good extract**: `~/kode/spotify-library/folders.json` (Aug 2026) is
+  already in the stored mapping shape — copying it straight into
+  `data/folders.json` restores paths without touching home marking or Spotify.
