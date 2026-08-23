@@ -1064,6 +1064,47 @@ run("stopNowPolling()");
         JSON.stringify($$("toast").textContent));
 }
 
+// ============================================================================
+// C-tab — the Split tab: picker lists eligible playlists, Back returns here
+// ============================================================================
+{
+  resetLog();
+  routes["GET /api/playlists"] = { playlists: [
+    { id: "liked", name: "Liked Songs", total: 900, editable: false, role: null },
+    { id: "PB", name: "big", total: 250, editable: true, role: null },
+    { id: "PS", name: "small", total: 30, editable: true, role: null },
+    { id: "PB2", name: "bigger", total: 400, editable: true, role: null },
+  ], fetched_at: 0 };
+  // GET queue is deliberately global regardless of the path id (M4).
+  routes["GET /api/split/_/queue"] = {
+    queue: { state: "paused", playlist_id: "PB2", pending: ["p2"], current: null },
+    pacing: {} };
+  run("showSplitPicker()");
+  await tick();
+  const rows = $$("splitpick-list").children;
+  check("C-tab picker shows only 100+-track, non-Liked playlists",
+        rows.length === 2, `${rows.length} rows`);
+  check("C-tab the in-progress split is pinned first",
+        /bigger/.test(rows[0]?.innerHTML || ""),
+        (rows[0]?.innerHTML || "").slice(0, 60));
+  check("C-tab the picker view is the visible one",
+        $$("view-splitpick").hidden === false);
+  check("C-tab opening the picker costs zero Spotify-priced POSTs",
+        log.every((c) => c.method === "GET"), JSON.stringify(log));
+
+  routes["GET /api/split/PB2"] = { status: 200, body: splitBody(null) };
+  routes["GET /api/split/PB2/queue"] = { queue: { state: "done", playlist_id: "PB2",
+    pending: [], current: null }, pacing: {} };
+  rows[0].onclick();
+  await tick();
+  check("C-tab clicking a row opens the split view",
+        $$("view-split").hidden === false);
+  run(`$("btn-split-back").onclick()`);
+  await tick();
+  check("C-tab Back returns to the picker, not Playlists",
+        $$("view-splitpick").hidden === false && $$("view-lists").hidden === true);
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

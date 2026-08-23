@@ -23,6 +23,7 @@
   <nav>
     <a id="nav-now">Now</a>
     <a id="nav-lists">Playlists</a>
+    <a id="nav-split">Split</a>
     <a id="nav-reconnect" title="Log in again — needed after sortify asks for a new permission">Reconnect</a>
   </nav>
   <span id="whoami"></span>
@@ -117,6 +118,14 @@
     </div>
     <div id="triage-loading" hidden><div class="spinner"></div><p id="loading-msg"></p></div>
     <div id="card"></div>
+  </section>
+
+  <section id="view-splitpick" hidden>
+    <h2>Split a playlist</h2>
+    <p class="hint">Playlists with at least 100 tracks can be split into piles.
+       A split reads the playlist once, tags it via Last.fm, and saving piles
+       now takes a couple of minutes.</p>
+    <div id="splitpick-list"></div>
   </section>
 
   <section id="view-split" hidden>
