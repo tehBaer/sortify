@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import vendor_spotify_folders as vendored
+from .clientui import client_lock
 
 DEFAULT_CACHE = "~/snap/spotify/common/.cache/spotify/Users"
 
@@ -85,38 +86,39 @@ def sync_client(seconds: int | None = None) -> None:
     already (one-time VNC setup, 2026-08-23); an unattended run is enough
     for it to pull the current rootlist.
     """
-    seconds = SYNC_SECONDS if seconds is None else seconds
-    if not shutil.which("Xvfb"):
-        raise RuntimeError("Xvfb is not installed — cannot run the client headless")
-    if not shutil.which("snap"):
-        raise RuntimeError("snap is not available — cannot launch the Spotify client")
-    xvfb = subprocess.Popen(
-        ["Xvfb", _XVFB_DISPLAY, "-screen", "0", "1280x800x24"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    try:
-        env = dict(os.environ, DISPLAY=_XVFB_DISPLAY)
-        client = subprocess.Popen(
-            ["snap", "run", "spotify", "--disable-gpu"],
-            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    with client_lock():
+        seconds = SYNC_SECONDS if seconds is None else seconds
+        if not shutil.which("Xvfb"):
+            raise RuntimeError("Xvfb is not installed — cannot run the client headless")
+        if not shutil.which("snap"):
+            raise RuntimeError("snap is not available — cannot launch the Spotify client")
+        xvfb = subprocess.Popen(
+            ["Xvfb", _XVFB_DISPLAY, "-screen", "0", "1280x800x24"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         try:
-            time.sleep(seconds)
-        finally:
-            client.terminate()
-            try:
-                client.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                client.kill()
-            # The snap wrapper forks; make sure no renderer outlives the run.
-            subprocess.run(
-                ["pkill", "-f", "/snap/spotify"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env = dict(os.environ, DISPLAY=_XVFB_DISPLAY)
+            client = subprocess.Popen(
+                ["snap", "run", "spotify", "--disable-gpu"],
+                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-            time.sleep(1)
-    finally:
-        xvfb.terminate()
-        try:
-            xvfb.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            xvfb.kill()
+            try:
+                time.sleep(seconds)
+            finally:
+                client.terminate()
+                try:
+                    client.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    client.kill()
+                # The snap wrapper forks; make sure no renderer outlives the run.
+                subprocess.run(
+                    ["pkill", "-f", "/snap/spotify"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                time.sleep(1)
+        finally:
+            xvfb.terminate()
+            try:
+                xvfb.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                xvfb.kill()

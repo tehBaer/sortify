@@ -54,3 +54,11 @@ def test_session_requires_tools(monkeypatch, tmp_path):
     monkeypatch.setattr(clientui.shutil, "which", lambda name: None)
     with pytest.raises(RuntimeError, match="xdotool"):
         ClientSession().__enter__()
+
+
+def test_sync_client_respects_ui_lock(tmp_path, monkeypatch):
+    from sortify import rootlist
+    monkeypatch.setattr(clientui, "LOCK_PATH", str(tmp_path / "ui.lock"))
+    with client_lock():
+        with pytest.raises(UiStepError, match="another client-UI session"):
+            rootlist.sync_client(seconds=0)

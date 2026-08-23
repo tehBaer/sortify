@@ -101,3 +101,8 @@ escalating penalties. Therefore:
 - **Known-good extract**: `~/kode/spotify-library/folders.json` (Aug 2026) is
   already in the stored mapping shape — copying it straight into
   `data/folders.json` restores paths without touching home marking or Spotify.
+- **Moving playlists between folders**: `.venv/bin/spfolders move "<name>"
+  ("<folder>" | --out)` drives the box's own client UI (display `:94`,
+  OCR-guided, zero API calls) and verifies against the rootlist; `--dry-run`
+  to preview. It shares a lock with the refresh button. After moves, re-run
+  the folder re-import to update `data/folders.json`.
