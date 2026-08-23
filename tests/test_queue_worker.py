@@ -395,3 +395,23 @@ def test_the_tick_spends_with_the_runs_spend_reserve_flag(worker_env, monkeypatc
     q = wait_done(s)
     assert q["state"] == "done"
     assert seen and all(flag for _, flag in seen), seen
+
+
+def test_queue_drains_a_250_track_pile_in_four_calls(worker_env):
+    # 250 uris: 1 create + 3 batches. The whole run must cost 4 Spotify
+    # calls — the headline number of the 2026-08-23 design.
+    calls, s = worker_env
+    big = [f"spotify:track:q{i}" for i in range(250)]
+    payload = s.splits()
+    payload["splits"]["PLQ"]["piles"] = [
+        {"id": "p1", "name": "big", "tags": [], "uris": big}]
+    s.save_splits(payload)
+    split = s.splits()["splits"]["PLQ"]
+    assert appmod._materialise_plan(split, split["piles"][0])["calls"] == 4
+    start_queue(s, pending=("p1",))
+    q = wait_done(s)
+    assert q["state"] == "done"
+    assert [c[0] for c in calls] == ["create", "add", "add", "add"]
+    assert [len(c[2]) for c in calls[1:]] == [100, 100, 50]
+    added = s.splits()["splits"]["PLQ"]["materialised"]["p1"]["added"]
+    assert added == big

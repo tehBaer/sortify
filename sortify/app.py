@@ -838,11 +838,12 @@ def _split_summary(playlist_id: str, splits: dict | None = None) -> dict | None:
     return {"piles": len(split["piles"]), "remaining": _remaining(split)}
 
 
-def _pile_progress(split: dict) -> list[dict]:
+def _pile_progress(split: dict, playlist_id: str) -> list[dict]:
     decided = split.get("decided", {})
     out = []
     for p in split["piles"]:
-        plan = _materialise_plan(split, p)
+        plan = _materialise_plan(
+            split, p, reconciled=(playlist_id, p["id"]) in _reconciled)
         out.append({**p, "decided": sum(1 for u in p["uris"] if u in decided),
                     "total": len(p["uris"]),
                     # What materialising this pile would spend RIGHT NOW, and
@@ -1144,7 +1145,7 @@ def get_split(playlist_id: str):
     split = store.splits()["splits"].get(playlist_id)
     if not split:
         raise HTTPException(404, "no split for that playlist")
-    return {**split, "piles": _pile_progress(split)}
+    return {**split, "piles": _pile_progress(split, playlist_id)}
 
 
 @app.post("/api/split/{playlist_id}/recluster")
@@ -1180,7 +1181,7 @@ def recluster(playlist_id: str, params: SplitParams = SplitParams()):
         split["piles"] = new_piles
         split["params"] = params.model_dump()
         store.save_splits(payload)
-    return {"piles": _pile_progress(split)}
+    return {"piles": _pile_progress(split, playlist_id)}
 
 
 # Structural ceilings on a sitting, independent of each other:
@@ -2136,7 +2137,9 @@ def _queue_next_action(now: float) -> tuple:
                 continue
             split = store.splits()["splits"].get(q["playlist_id"], {})
             pile = next((p for p in split.get("piles", []) if p["id"] == pid), None)
-            if pile is None or _materialise_plan(split, pile)["calls"] == 0:
+            if pile is None or _materialise_plan(
+                    split, pile,
+                    reconciled=(q["playlist_id"], pid) in _reconciled)["calls"] == 0:
                 q["current"] = None          # vanished or finished: next pile
                 store.save_queue(q)
                 continue
@@ -2406,7 +2409,9 @@ def enqueue_piles(playlist_id: str, body: QueueIn):
         piles = [p for p in split["piles"] if p["id"] in wanted]
         if len(piles) != len(set(wanted)):
             raise HTTPException(404, "unknown pile id in the request")
-        plans = {p["id"]: _materialise_plan(split, p) for p in piles}
+        plans = {p["id"]: _materialise_plan(
+            split, p, reconciled=(playlist_id, p["id"]) in _reconciled)
+            for p in piles}
         total = sum(pl["calls"] for pl in plans.values())
         if body.expected_calls != total:
             raise HTTPException(
@@ -2415,8 +2420,15 @@ def enqueue_piles(playlist_id: str, body: QueueIn):
                 f"Spotify calls, not the {body.expected_calls} you confirmed. "
                 "Nothing was spent. Re-open the pile list and confirm the new "
                 "number.")
+        missing_count = {p["id"]: len(plans[p["id"]]["missing"]) for p in piles}
+        # Batching means every pile under 100 tracks now costs the same 2
+        # calls (1 create/lookup + 1 add), so `calls` alone no longer orders
+        # small piles ahead of large ones within that tie. Break ties by how
+        # many tracks are actually missing, so the 2026-08-18 intent —
+        # smallest piles first, so finished playlists appear early — survives
+        # batching instead of degrading into enqueue order.
         order = sorted((pid for pid in plans if plans[pid]["calls"] > 0),
-                       key=lambda pid: plans[pid]["calls"])
+                       key=lambda pid: (plans[pid]["calls"], missing_count[pid]))
     if total == 0:
         return {"ok": True, "queued": [], "total_calls": 0, "complete": True}
     with _queue_lock:

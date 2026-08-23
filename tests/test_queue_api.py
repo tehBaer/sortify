@@ -130,6 +130,19 @@ def test_enqueue_orders_smallest_first_and_starts_the_worker(client):
     assert q["state"] == "done"
 
 
+def test_enqueue_ties_on_calls_order_by_missing_track_count(client):
+    """Task 4: batching collapsed 'big' (3 tracks) and 'tiny' (1 track) to
+    the identical 2-call price (1 create + 1 batch each), which would have
+    left them in split-storage order — big, then tiny — losing the
+    2026-08-18 "smallest piles first" intent to a silent tie. The
+    (calls, missing-count) tie-break restores it: tiny (1 missing) sorts
+    ahead of big (3 missing) even though their `calls` are equal."""
+    r = client.post("/api/split/PLQ/queue", json={"pile_ids": None, "expected_calls": 4})
+    assert r.status_code == 200 and r.json()["queued"] == ["p2", "p1"]
+    q = wait_done(Store())
+    assert q["state"] == "done"
+
+
 def test_enqueue_records_the_spend_reserve_flag(client):
     """The per-run override: spend_reserve rides the enqueue into queue.json,
     where the worker (and a later resume) reads it."""
