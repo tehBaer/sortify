@@ -29,7 +29,7 @@ from .folders import (
     home_name_excluded,
     select_home_ids,
 )
-from .naming import violations as naming_violations
+from .naming import split_output_name, violations as naming_violations
 from .pacing import Governor
 from .spotify import (
     BACKGROUND_DAILY_CAP,
@@ -1648,6 +1648,31 @@ MATERIALISE_DESCRIPTION = (
 # makes every pre-existing partial record correctly resumable after a restart.
 _pending_materialise: set[tuple[str, str]] = set()
 
+# (split playlist id, pile id) pairs whose record THIS process has verified
+# against the account — either by creating/adding under its own CAS, or by
+# the reconcile read below. Batching is what makes this necessary: a crash
+# between a 100-track POST landing and the CAS recording it leaves up to 100
+# landed tracks unrecorded, and Spotify permits duplicates, so a blind retry
+# would double them (design §1). A pair NOT in this set whose record has
+# tracks in `added` is treated as untrustworthy and re-read before anything
+# is added. Mutated only under `_split_lock`; a fresh process starts empty,
+# which is exactly the "never trust the record across an interruption" rule.
+_reconciled: set[tuple[str, str]] = set()
+
+
+def _batches(n: int) -> int:
+    """Calls needed to move n tracks at the 100-per-call batch limit."""
+    return -(-n // 100)
+
+
+def _source_playlist_name(playlist_id: str) -> str | None:
+    """The source playlist's display name, from the cached listing only —
+    zero Spotify calls; None when the cache doesn't know it. The output
+    title is fixed at create time (design §3): a later rename of the
+    source does not ripple into existing outputs."""
+    items = (store.cache().get("playlist_list") or {}).get("items") or []
+    return next((p.get("name") for p in items if p.get("id") == playlist_id), None)
+
 
 def _unique(uris: list[str]) -> list[str]:
     """Order-preserving dedupe.
@@ -1684,7 +1709,7 @@ def _pile_fingerprint(pile: dict) -> str:
     return h.hexdigest()
 
 
-def _materialise_plan(split: dict, pile: dict) -> dict:
+def _materialise_plan(split: dict, pile: dict, reconciled: bool = False) -> dict:
     """What materialising `pile` would do right now. Pure; no I/O, no calls.
 
     The single place the call cost is computed, shared by the GET (which shows
@@ -1697,6 +1722,13 @@ def _materialise_plan(split: dict, pile: dict) -> dict:
     playlist was named after. Resuming into it would pour the new pile's
     tracks into the old pile's playlist, so it counts as no record at all: a
     fresh playlist, at full price, which the caller sees before clicking.
+
+    `reconciled` is whether THIS process has already verified the record
+    against the account (`_reconciled`). A resumable record (playlist_id
+    set, some `added`, some missing) that hasn't been verified prices in a
+    read of the destination first — ceil(len(added)/100) calls, a floor
+    since the real playlist can hold more (duplicates from an earlier
+    crash). Reconciliation is what makes a 100-track batch safe to retry.
     """
     record = (split.get("materialised") or {}).get(pile["id"])
     stale = bool(record) and record.get("fingerprint") != _pile_fingerprint(pile)
@@ -1704,12 +1736,20 @@ def _materialise_plan(split: dict, pile: dict) -> dict:
     added = set(usable.get("added", [])) if usable else set()
     missing = [u for u in _unique(pile["uris"]) if u not in added]
     need_create = not (usable and usable.get("playlist_id"))
+    added_list = usable.get("added", []) if usable else []
+    reconcile_calls = (
+        _batches(max(len(added_list), 1))
+        if (usable and usable.get("playlist_id") and added_list and missing
+            and not reconciled)
+        else 0
+    )
     return {
         "record": usable,
         "stale": stale,
         "missing": missing,
         "need_create": need_create,
-        "calls": len(missing) + (1 if need_create else 0),
+        "reconcile_calls": reconcile_calls,
+        "calls": reconcile_calls + _batches(len(missing)) + (1 if need_create else 0),
         "record_view": (
             {"playlist_id": record.get("playlist_id"),
              "added": len(record.get("added", [])),
@@ -1721,7 +1761,8 @@ def _materialise_plan(split: dict, pile: dict) -> dict:
 
 
 def _claim_materialisation(
-    split_playlist_id: str, pile_id: str, claim: str, added_uri: str | None = None, **fields: Any
+    split_playlist_id: str, pile_id: str, claim: str, added_uri: str | None = None,
+    added_uris: list[str] | None = None, **fields: Any
 ) -> bool:
     """Update this pile's materialisation record, iff it is still ours.
 
@@ -1762,6 +1803,9 @@ def _claim_materialisation(
             return False
         if added_uri is not None and added_uri not in record["added"]:
             record["added"].append(added_uri)
+        for u in added_uris or []:
+            if u not in record["added"]:
+                record["added"].append(u)
         record.update(fields)
         record["updated_at"] = _now_iso()
         store.save_splits(payload)
@@ -1792,7 +1836,9 @@ def _rerecord_materialisation(split_playlist_id: str, pile_id: str, record: dict
 
 
 def _materialise_tick(playlist_id: str, pile_id: str, spend_reserve: bool = False) -> dict:
-    """Advance one pile's materialisation by at most ONE Spotify call.
+    """Advance one pile's materialisation by ONE Spotify call — a create, a
+    reconcile read (one call per 100 tracks in the destination, reported in
+    `spent`), or a batch add of up to 100 tracks.
 
     The one-shot endpoint this replaces spent a whole pile in a blocking
     loop — measured at 12.4 calls/min for 25 minutes, above the rate that
@@ -1820,7 +1866,8 @@ def _materialise_tick(playlist_id: str, pile_id: str, spend_reserve: bool = Fals
             return {"spent": 0, "done": True, "gone": True}
         if (playlist_id, pile_id) in _pending_materialise:
             return {"spent": 0, "done": False, "gone": False}
-        plan = _materialise_plan(split, pile)
+        plan = _materialise_plan(split, pile,
+                                 reconciled=(playlist_id, pile_id) in _reconciled)
         if plan["calls"] == 0:
             return {"spent": 0, "done": True, "gone": False}
         if plan["stale"]:
@@ -1846,35 +1893,61 @@ def _materialise_tick(playlist_id: str, pile_id: str, spend_reserve: bool = Fals
             store.save_splits(payload)
         claim = record["claim"]
         need_create = not record.get("playlist_id")
-        next_uri = None if need_create else plan["missing"][0]
+        need_reconcile = not need_create and plan["reconcile_calls"] > 0
+        batch = [] if (need_create or need_reconcile) else plan["missing"][:100]
         _pending_materialise.add((playlist_id, pile_id))
+
+    def _mark_reconciled():
+        # Every successful CAS proves this process owns the record and its
+        # `added` list is truth — creates and adds included, so a pile this
+        # process started never pays for a read it doesn't need.
+        with _split_lock:
+            _reconciled.add((playlist_id, pile_id))
 
     try:
         if need_create:
-            new_id = sp.create_playlist(pile["name"], MATERIALISE_DESCRIPTION, bulk=True,
+            new_name = split_output_name(_source_playlist_name(playlist_id),
+                                         pile["name"])
+            new_id = sp.create_playlist(new_name, MATERIALISE_DESCRIPTION, bulk=True,
                                         spend_reserve=spend_reserve)
-            if not _claim_materialisation(playlist_id, pile_id, claim, playlist_id=new_id):
+            if _claim_materialisation(playlist_id, pile_id, claim,
+                                      playlist_id=new_id, name=new_name):
+                _mark_reconciled()
+            else:
                 try:
                     _abandon_unrecorded_playlist(playlist_id, pile_id, new_id, record)
                 except HTTPException as exc:
                     raise SpotifyError(exc.status_code, exc.detail) from exc
             # A create call never finishes a pile on its own — every pile
-            # has at least one track still to add afterwards — so "done" is
-            # always False here; no need to recompute it from `plan`.
+            # has at least one track still to add afterwards.
             return {"spent": 1, "done": False, "gone": False}
+        if need_reconcile:
+            # First act on picking up a resumable pile: one read of the
+            # destination, and `added` becomes what is ACTUALLY there. A
+            # crash mid-batch can then neither duplicate nor skip (design
+            # §1) — the record is never trusted across an interruption.
+            actual = sp.playlist_tracks(record["playlist_id"], bulk=True,
+                                        spend_reserve=spend_reserve)
+            actual_uris = {t["uri"] for t in actual}
+            landed = [u for u in _unique(pile["uris"]) if u in actual_uris]
+            if _claim_materialisation(playlist_id, pile_id, claim, added=landed):
+                _mark_reconciled()
+            return {"spent": max(1, _batches(len(actual))), "done": False,
+                    "gone": False}
+        sp.add_to_playlist(record["playlist_id"], batch, bulk=True,
+                           spend_reserve=spend_reserve)
+        if _claim_materialisation(playlist_id, pile_id, claim, added_uris=batch):
+            _mark_reconciled()
         else:
-            sp.add_to_playlist(record["playlist_id"], next_uri, bulk=True,
-                               spend_reserve=spend_reserve)
-            if not _claim_materialisation(playlist_id, pile_id, claim, added_uri=next_uri):
-                try:
-                    _readopt_materialisation(playlist_id, pile_id, record,
-                                             record["playlist_id"], [next_uri])
-                except HTTPException as exc:
-                    raise SpotifyError(exc.status_code, exc.detail) from exc
+            try:
+                _readopt_materialisation(playlist_id, pile_id, record,
+                                         record["playlist_id"], batch)
+            except HTTPException as exc:
+                raise SpotifyError(exc.status_code, exc.detail) from exc
     finally:
         with _split_lock:
             _pending_materialise.discard((playlist_id, pile_id))
-    remaining = len(plan["missing"]) - 1
+    remaining = len(plan["missing"]) - len(batch)
     return {"spent": 1, "done": remaining == 0, "gone": False}
 
 
@@ -2242,7 +2315,7 @@ def _drain_queue_body() -> None:
         fresh = info.get("ts", 0) >= tick_started
         if fresh:
             gov.note_429(info["kind"], info.get("retry_after", 60), time.time())
-        elif result.get("spent") == 1:
+        elif result.get("spent", 0) >= 1:
             # Only a tick that actually spent a call earns clean-time
             # credit (I3) — a vanished-split or in-flight-backoff tick
             # spends nothing and must not count toward escalation.

@@ -115,10 +115,10 @@ def test_drains_every_pending_pile_in_order_one_call_per_tick(worker_env):
     q = wait_done(s)
     assert q["state"] == "done"
     assert calls[0] == ("create", "tiny")               # first in the given pending order
-    assert calls[1] == ("add", "NEW-tiny", TINY[0])
+    assert calls[1] == ("add", "NEW-tiny", TINY)
     assert calls[2] == ("create", "big")
-    assert [c[2] for c in calls[3:]] == PILE_URIS
-    assert len(calls) == len(TINY) + len(PILE_URIS) + 2  # exact total, no probes
+    assert calls[3] == ("add", "NEW-big", PILE_URIS)   # one batch, not one call each
+    assert len(calls) == 4                             # 2 creates + 2 batches, no probes
 
 
 def test_pause_is_instant_and_the_thread_exits(worker_env, monkeypatch):
@@ -332,7 +332,7 @@ def test_sleep_loop_does_not_rewrite_queue_json_for_an_unchanged_block(worker_en
     appmod._queue_wake.set(); appmod._queue_wake.clear()
     q = wait_done(s)
     assert q["state"] == "done"
-    assert calls == [("create", "tiny"), ("add", "NEW-tiny", TINY[0])]
+    assert calls == [("create", "tiny"), ("add", "NEW-tiny", TINY)]
     # "running" also gets written by the two ticks' own progress saves
     # (legitimate — progress actually changes each tick), so this only pins
     # the thing M-4 is actually about: the block itself was one write in,
