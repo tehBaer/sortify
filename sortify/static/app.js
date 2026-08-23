@@ -360,6 +360,34 @@ $("btn-refresh-lists").onclick = async () => {
   }
 };
 
+// Folder tree re-import: the box's own Spotify client, run headless, is the
+// source — no file to export, no other machine. Slow (the sync step runs
+// the client for ~a minute) but free: zero Web API calls.
+$("btn-folders-refresh").onclick = async () => {
+  const btn = $("btn-folders-refresh");
+  const status = $("folders-refresh-status");
+  btn.disabled = true;
+  btn.textContent = "Re-importing…";
+  status.textContent = "syncing the client's cache — about a minute";
+  try {
+    const res = await api("/api/folders/refresh", {});
+    await loadLists();
+    const changes = [];
+    if (res.added) changes.push(`${res.added} added`);
+    if (res.moved) changes.push(`${res.moved} moved`);
+    if (res.dropped) changes.push(`${res.dropped} dropped`);
+    status.textContent =
+      `tree as of ${res.tree_as_of || "?"} — ${changes.join(", ") || "no changes"}; ` +
+      `${res.homes_marked} homes marked`;
+  } catch (e) {
+    toast(e.message);
+    status.textContent = "";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Re-import folder tree";
+  }
+};
+
 async function saveConfig() {
   const input_ids = Object.keys(roles).filter((k) => roles[k] === "input");
   const home_ids = Object.keys(roles).filter((k) => roles[k] === "home");

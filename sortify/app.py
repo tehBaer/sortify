@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from . import rootlist
 from . import suggest as sugg
 from .deezer import Deezer
 from .folders import (
@@ -252,6 +253,16 @@ def ingest_folders(tree: Any = Body(...)):
     mapping = extract_folder_map(tree)
     if not mapping:
         raise HTTPException(400, "no playlists found in that JSON — is it spotify-folders output?")
+    return _apply_folder_mapping(mapping)
+
+
+def _apply_folder_mapping(mapping: dict) -> dict:
+    """Store a folder mapping and re-mark homes from it.
+
+    Shared tail of `POST /api/folders` (tree pasted from another machine)
+    and `POST /api/folders/refresh` (tree extracted from this box's client
+    cache). Reads the cached playlist listing — zero Spotify calls.
+    """
     store.save_folders(mapping)
     cfg = store.config()
     all_playlists = sp.my_playlists()
@@ -288,6 +299,45 @@ def ingest_folders(tree: Any = Body(...)):
         "rule": rule,
         "home_folders": sorted({mapping[pid]["path"] for pid in home_ids if pid in mapping}),
     }
+
+
+# One refresh at a time: the sync step runs the desktop client for
+# ~SYNC_SECONDS, and two concurrent clients fighting over one cache would
+# help nobody. Non-blocking so the second click gets a clear answer.
+_folders_refresh_lock = threading.Lock()
+
+
+@app.post("/api/folders/refresh")
+def refresh_folders(body: dict = Body(default={})):
+    """Re-import the folder tree from this box's own Spotify client.
+
+    Runs the client headless so its cache catches up (skippable with
+    {"sync": false}), extracts the rootlist, and applies it through the
+    same path as POST /api/folders. Zero Web API calls — the client sync
+    is Spotify's desktop protocol, outside the dev-mode quota.
+    """
+    if not _folders_refresh_lock.acquire(blocking=False):
+        raise HTTPException(409, "a folder refresh is already running")
+    try:
+        before = store.folders()
+        if body.get("sync", True):
+            rootlist.sync_client()
+        try:
+            tree = rootlist.extract_tree()
+        except RuntimeError as e:
+            raise HTTPException(503, str(e))
+        mapping = extract_folder_map(tree)
+        if not mapping:
+            raise HTTPException(503, "the client cache produced an empty tree — not applied")
+        result = _apply_folder_mapping(mapping)
+        result["tree_as_of"] = rootlist.cache_mtime()
+        result["added"] = sum(1 for k in mapping if k not in before)
+        result["moved"] = sum(
+            1 for k in mapping if k in before and mapping[k]["path"] != before[k]["path"])
+        result["dropped"] = sum(1 for k in before if k not in mapping)
+        return result
+    finally:
+        _folders_refresh_lock.release()
 
 
 @app.get("/api/naming")

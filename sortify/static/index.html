@@ -92,8 +92,12 @@
       <input id="new-home-name" placeholder="New home playlist…" autocomplete="off">
       <button id="btn-new-home" title="Created in your Spotify account and marked Home here — no Refresh needed">Create (1 call)</button>
     </div>
-    <p class="hint">Created homes have no folder until you re-export the folder tree from the
-    desktop client — they work as homes either way.</p>
+    <p class="hint">Created homes have no folder until the folder tree is re-imported —
+    they work as homes either way.</p>
+    <div class="row">
+      <button id="btn-folders-refresh" title="Runs the box's Spotify client headless for ~1 minute to sync, then re-imports the folder tree. Re-marks homes. 0 API calls.">Re-import folder tree</button>
+      <span id="folders-refresh-status" class="hint"></span>
+    </div>
     <p id="pl-age" class="hint"></p>
     <div id="pl-orphan-bar" class="row sitting-banner" hidden>
       <span id="pl-orphan-status" class="hint"></span>
