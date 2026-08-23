@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 
+from . import inputsets
 from .folders import _is_caps, starts_with_emoji
 
 
@@ -34,12 +35,38 @@ def propose(name: str, role: str, input_pattern: str | None = None) -> str | Non
         pattern = input_pattern or r"^\[.+\]$"
         if re.fullmatch(pattern, s):
             return None
-        return f"[{s}]"
+        return _wrap(s, pattern)
     return None
 
 
+# Candidate wrappers, tried in order. The proposed fix is derived by
+# WRAPPING and re-testing against the set's own pattern, never by assuming
+# a shape: a set that declares ^<.+>$ must be offered <name>, and offering
+# [name] there would propose a "fix" that still violates the rule.
+_WRAPPER_PAIRS = (("[", "]"), ("<", ">"), ("{", "}"))
+
+
+def _wrap(s: str, pattern: str) -> str | None:
+    for open_c, close_c in _WRAPPER_PAIRS:
+        candidate = f"{open_c}{s}{close_c}"
+        if re.fullmatch(pattern, candidate):
+            return candidate
+    # No wrapper satisfies this pattern; flagging a violation we cannot
+    # describe a fix for would be worse than staying silent.
+    return None
+
+
+def _describe(pattern: str) -> str:
+    """Human phrasing of a set's convention, for the violation message."""
+    for open_c, close_c in _WRAPPER_PAIRS:
+        if re.fullmatch(pattern, f"{open_c}x{close_c}"):
+            return f"{open_c}wrapped{close_c}"
+    return "named to the set's convention"
+
+
 def violations(playlists: list[dict], input_ids: set[str], home_ids: set[str],
-               input_pattern: str | None = None) -> list[dict]:
+               input_pattern: str | None = None, sets: list[dict] | None = None,
+               folders: dict | None = None) -> list[dict]:
     """Naming violations among the user's own marked playlists.
 
     Input beats home when both are marked — the same precedence
@@ -54,14 +81,31 @@ def violations(playlists: list[dict], input_ids: set[str], home_ids: set[str],
                 else None)
         if role is None:
             continue
-        proposed = propose(p["name"], role, input_pattern)
+        pattern, set_label = input_pattern, None
+        if role == "input" and sets:
+            path = ((folders or {}).get(p["id"]) or {}).get("path")
+            key = inputsets.set_of(p["name"], path, sets)
+            if key is None:
+                # Explicitly marked but matching no set: judge it by the
+                # default set's convention rather than skipping silently.
+                key = inputsets.DEFAULT_KEY
+            pattern = inputsets.pattern_for(key, sets)
+            set_label = key
+            if pattern is None:
+                # Folder-defined set — its names carry no convention.
+                continue
+        proposed = propose(p["name"], role, pattern)
         if proposed is not None:
+            if role == "input":
+                rule = ("%s inputs are %s" % (set_label, _describe(pattern))
+                        if set_label else "inputs are [bracketed]")
+            else:
+                rule = "homes are ALL CAPS"
             out.append({
                 "playlist_id": p["id"],
                 "current": p["name"],
                 "proposed": proposed,
-                "rule": ("inputs are [bracketed]" if role == "input"
-                         else "homes are ALL CAPS"),
+                "rule": rule,
             })
     return out
 

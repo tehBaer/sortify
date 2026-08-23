@@ -169,6 +169,66 @@ function splitDisabledReason(p) {
   return p.editable ? null : "Not yours to split — make your own copy in Spotify first, then split that copy";
 }
 
+function makeListRow(p) {
+  const row = document.createElement("div");
+  row.className = "pl-row";
+  const img = p.image
+    ? `<img src="${esc(p.image)}" alt="" loading="lazy">`
+    : '<div class="noimg"></div>';
+  const splitNote = p.split ? `split into ${p.split.piles} pile${p.split.piles === 1 ? "" : "s"}, ${p.split.remaining} left` : null;
+  const sub = [p.folder, p.total != null ? `${p.total} tracks` : null, p.editable ? null : p.id === "liked" ? "library" : "not yours", splitNote]
+    .filter(Boolean).join(" · ");
+  row.innerHTML = `${img}
+    <div class="pl-meta"><div class="name">${esc(p.name)}</div><div class="sub">${esc(sub)}</div></div>
+    <div class="pl-roles">
+      <button class="chip r-input">In</button>
+      <button class="chip r-home">Home</button>
+      <button class="pl-sort" title="Sort this input">▶</button>
+      <button class="pl-split" title="Split into piles">⑃</button>
+    </div>
+    <input class="pl-hints" placeholder="matching hints, e.g. ambient, piano"
+           title="Your own words about what belongs here — they join this home's tag profile (docs/matching.md)">`;
+  const [bIn, bHome, bSort, bSplit] = row.querySelectorAll("button");
+  const hintsEl = row.querySelector(".pl-hints");
+  hintsEl.value = hintTexts[p.id] || "";
+  hintsEl.oninput = () => {
+    if (hintsEl.value.trim()) hintTexts[p.id] = hintsEl.value;
+    else delete hintTexts[p.id];
+  };
+  const paint = () => {
+    bIn.classList.toggle("on-input", roles[p.id] === "input");
+    bHome.classList.toggle("on-home", roles[p.id] === "home");
+    bHome.hidden = p.id === "liked" || !p.editable;
+    bSort.hidden = roles[p.id] !== "input";
+    // The hints field only makes sense for a home — it feeds that home's
+    // matching profile. Kept visible if it has leftover text so the user
+    // can still see (and clear) hints on a demoted playlist.
+    hintsEl.hidden = roles[p.id] !== "home" && !hintsEl.value.trim();
+    // Splitting only earns its keep on a playlist too long to work through
+    // as-is — a 30-track input doesn't need piles.
+    bSplit.hidden = p.id === "liked" || (p.total ?? 0) < 100;
+    // Disabled rather than hidden when it's not owned: hiding leaves a
+    // 1372-track playlist with no visible split button and no
+    // explanation, where disabling teaches the actual fix on hover
+    // instead of just hiding the dead end.
+    const reason = splitDisabledReason(p);
+    bSplit.disabled = !!reason;
+    bSplit.title = reason || "Split into piles";
+  };
+  bIn.onclick = () => { roles[p.id] = roles[p.id] === "input" ? null : "input"; paint(); };
+  bHome.onclick = () => { roles[p.id] = roles[p.id] === "home" ? null : "home"; paint(); };
+  bSort.onclick = () => { saveConfig().then(() => startTriage(p.id, p.name)); };
+  bSplit.onclick = () => openSplit(p.id, p.name);
+  paint();
+  return row;
+}
+
+// Which input sets the user has expanded in the Lists view. The buffer set
+// is the day-to-day one and stays open; the rest fold, so 26 inputs don't
+// bury the playlists below them.
+let listSetsOpen = {};
+try { listSetsOpen = JSON.parse(localStorage.getItem("sortify-listsets") || "{}"); } catch (_) {}
+
 function renderLists() {
   const wrap = $("playlists");
   wrap.innerHTML = "";
@@ -179,59 +239,38 @@ function renderLists() {
   if (q) shown = shown.filter((p) => (p.name + " " + (p.folder || "")).toLowerCase().includes(q));
   const CAP = 200;
   const overflow = Math.max(shown.length - CAP, 0);
-  for (const p of shown.slice(0, CAP)) {
-    const row = document.createElement("div");
-    row.className = "pl-row";
-    const img = p.image
-      ? `<img src="${esc(p.image)}" alt="" loading="lazy">`
-      : '<div class="noimg"></div>';
-    const splitNote = p.split ? `split into ${p.split.piles} pile${p.split.piles === 1 ? "" : "s"}, ${p.split.remaining} left` : null;
-    const sub = [p.folder, p.total != null ? `${p.total} tracks` : null, p.editable ? null : p.id === "liked" ? "library" : "not yours", splitNote]
-      .filter(Boolean).join(" · ");
-    row.innerHTML = `${img}
-      <div class="pl-meta"><div class="name">${esc(p.name)}</div><div class="sub">${esc(sub)}</div></div>
-      <div class="pl-roles">
-        <button class="chip r-input">In</button>
-        <button class="chip r-home">Home</button>
-        <button class="pl-sort" title="Sort this input">▶</button>
-        <button class="pl-split" title="Split into piles">⑃</button>
-      </div>
-      <input class="pl-hints" placeholder="matching hints, e.g. ambient, piano"
-             title="Your own words about what belongs here — they join this home's tag profile (docs/matching.md)">`;
-    const [bIn, bHome, bSort, bSplit] = row.querySelectorAll("button");
-    const hintsEl = row.querySelector(".pl-hints");
-    hintsEl.value = hintTexts[p.id] || "";
-    hintsEl.oninput = () => {
-      if (hintsEl.value.trim()) hintTexts[p.id] = hintsEl.value;
-      else delete hintTexts[p.id];
-    };
-    const paint = () => {
-      bIn.classList.toggle("on-input", roles[p.id] === "input");
-      bHome.classList.toggle("on-home", roles[p.id] === "home");
-      bHome.hidden = p.id === "liked" || !p.editable;
-      bSort.hidden = roles[p.id] !== "input";
-      // The hints field only makes sense for a home — it feeds that home's
-      // matching profile. Kept visible if it has leftover text so the user
-      // can still see (and clear) hints on a demoted playlist.
-      hintsEl.hidden = roles[p.id] !== "home" && !hintsEl.value.trim();
-      // Splitting only earns its keep on a playlist too long to work through
-      // as-is — a 30-track input doesn't need piles.
-      bSplit.hidden = p.id === "liked" || (p.total ?? 0) < 100;
-      // Disabled rather than hidden when it's not owned: hiding leaves a
-      // 1372-track playlist with no visible split button and no
-      // explanation, where disabling teaches the actual fix on hover
-      // instead of just hiding the dead end.
-      const reason = splitDisabledReason(p);
-      bSplit.disabled = !!reason;
-      bSplit.title = reason || "Split into piles";
-    };
-    bIn.onclick = () => { roles[p.id] = roles[p.id] === "input" ? null : "input"; paint(); };
-    bHome.onclick = () => { roles[p.id] = roles[p.id] === "home" ? null : "home"; paint(); };
-    bSort.onclick = () => { saveConfig().then(() => startTriage(p.id, p.name)); };
-    bSplit.onclick = () => openSplit(p.id, p.name);
-    paint();
-    wrap.appendChild(row);
+  shown = shown.slice(0, CAP);
+
+  // Inputs group into their sets; everything else keeps the flat listing.
+  const bySet = new Map();
+  const flat = [];
+  for (const p of shown) {
+    if (roles[p.id] === "input") {
+      const k = p.input_set || NOW_BUFFER_SET;
+      if (!bySet.has(k)) bySet.set(k, []);
+      bySet.get(k).push(p);
+    } else flat.push(p);
   }
+
+  for (const [key, ps] of bySet) {
+    const d = document.createElement("details");
+    d.className = "pl-set";
+    // Buffer open by default; a filter that matched inside a folded set
+    // opens it too, so a search never hides its own results.
+    d.open = key === NOW_BUFFER_SET ? listSetsOpen[key] !== false
+                                    : (!!listSetsOpen[key] || !!q);
+    const sum = document.createElement("summary");
+    sum.textContent = `${setLabel(key)} · ${ps.length}`;
+    d.appendChild(sum);
+    for (const p of ps) d.appendChild(makeListRow(p));
+    d.ontoggle = () => {
+      listSetsOpen[key] = d.open;
+      try { localStorage.setItem("sortify-listsets", JSON.stringify(listSetsOpen)); } catch (_) {}
+    };
+    wrap.appendChild(d);
+  }
+  for (const p of flat) wrap.appendChild(makeListRow(p));
+
   if (overflow) {
     const p = document.createElement("p");
     p.className = "hint";
@@ -737,18 +776,61 @@ function renderNowProblem(msg) {
 // It now stays up as the empty state's call to action; only the error-ish
 // states (cooldown, reauth) hide it, since starting playback there would
 // just bounce off the same wall.
+// The buffer set is the day-to-day one and stays open; every other set
+// folds, because 26 inputs in one flat <select> is a list you hunt through
+// rather than scan. A folded set still shows any playlist that CONTAINS the
+// playing track — "peeking" — so you always learn the track is already
+// filed there without expanding anything.
+const NOW_BUFFER_SET = "buffer";
+let nowSetsExpanded = false;
+try { nowSetsExpanded = localStorage.getItem("sortify-sets-open") === "1"; } catch (_) {}
+
+function setLabel(key) { return (key || NOW_BUFFER_SET).replace(/-/g, " "); }
+
 function paintNowControls(d) {
   const playable = (d.inputs || []).filter((l) => l.id !== "liked");
   if (!playable.length || d.needs_reauth || d.cooldown) { $("now-controls").hidden = true; return; }
   const sel = $("now-input-switch");
   const current = d.playing ? d.context?.id : null;
-  sel.innerHTML =
-    `<option value="">${d.playing ? "— switch to another input —" : "▶ start an input…"}</option>` +
-    playable.map((l) =>
-      `<option value="${esc(l.id)}"${l.id === current ? " selected" : ""}>${esc(l.name)}</option>`
-    ).join("");
+
+  const bySet = new Map();
+  for (const l of playable) {
+    const k = l.set || NOW_BUFFER_SET;
+    if (!bySet.has(k)) bySet.set(k, []);
+    bySet.get(k).push(l);
+  }
+  const opt = (l) =>
+    `<option value="${esc(l.id)}"${l.id === current ? " selected" : ""}>` +
+    `${l.has_track ? "• " : ""}${esc(l.name)}</option>`;
+
+  let html = `<option value="">${d.playing ? "— switch to another input —" : "▶ start an input…"}</option>`;
+  let hidden = 0;
+  for (const [key, lists] of bySet) {
+    const open = key === NOW_BUFFER_SET || nowSetsExpanded;
+    // A folded set is never fully silent: the playing track's own lists,
+    // and whatever is currently playing, still surface.
+    const shown = open ? lists : lists.filter((l) => l.has_track || l.id === current);
+    hidden += lists.length - shown.length;
+    if (!shown.length) continue;
+    const note = open || shown.length === lists.length
+      ? "" : ` (${shown.length} of ${lists.length})`;
+    html += key === NOW_BUFFER_SET && bySet.size === 1
+      ? shown.map(opt).join("")
+      : `<optgroup label="${esc(setLabel(key) + note)}">${shown.map(opt).join("")}</optgroup>`;
+  }
+  sel.innerHTML = html;
+
+  const btn = $("btn-now-sets");
+  btn.hidden = !hidden && !nowSetsExpanded;
+  btn.textContent = nowSetsExpanded ? "fewer" : `+${hidden} more`;
   $("now-controls").hidden = false;
 }
+
+$("btn-now-sets").onclick = () => {
+  nowSetsExpanded = !nowSetsExpanded;
+  try { localStorage.setItem("sortify-sets-open", nowSetsExpanded ? "1" : "0"); } catch (_) {}
+  if (nowState) paintNowControls(nowState);
+};
 
 // Spotify needs a moment to settle after a skip before it reports the new
 // track; the server has already dropped its cached answer, so this poll is
@@ -972,6 +1054,14 @@ function renderNow() {
     $("now-card").querySelectorAll(".in-chip").forEach((b) => {
       b.onclick = () => nowCapture(b.dataset.in);
     });
+    $("now-card").querySelectorAll(".set-chip").forEach((b) => {
+      b.onclick = () => {
+        const k = b.dataset.set;
+        captureSetsOpen[k] = !captureSetsOpen[k];
+        try { localStorage.setItem("sortify-capsets", JSON.stringify(captureSetsOpen)); } catch (_) {}
+        renderNow();
+      };
+    });
   }
 }
 
@@ -998,11 +1088,46 @@ function ordinaryCardBody(d, tr, ctx) {
     <button id="btn-now-more"><kbd>m</kbd> Add to…</button>
     ${ctx?.is_input ? '<button id="btn-now-remove" class="danger"><kbd>r</kbd> Remove from input</button>' : ""}
   </div>`;
-  const chips = (d.inputs || []).map((l) =>
-    `<button class="chip in-chip${l.has_track ? " has" : ""}" data-in="${esc(l.id)}"${l.has_track ? " disabled" : ""}>${l.has_track ? "✓" : "+"} ${esc(l.name)}</button>`
-  ).join("");
+  const chips = captureChips(d.inputs || []);
   if (chips) body += `<div class="capture"><span class="hint">capture to input:</span>${chips}</div>`;
   return body;
+}
+
+// Capture chips, grouped by input set. 26 chips in one wall is a thing you
+// scan rather than use, so only the buffer set is always laid out; the rest
+// collapse behind a per-set chip you tap to open.
+//
+// The exception that makes folding safe: a chip whose playlist ALREADY holds
+// the playing track always shows, folded set or not. That is the whole point
+// of these chips — telling you where the track already lives — and hiding
+// that would make a folded set actively misleading rather than merely terse.
+let captureSetsOpen = {};
+try { captureSetsOpen = JSON.parse(localStorage.getItem("sortify-capsets") || "{}"); } catch (_) {}
+
+function captureChip(l) {
+  return `<button class="chip in-chip${l.has_track ? " has" : ""}" data-in="${esc(l.id)}"` +
+    `${l.has_track ? " disabled" : ""}>${l.has_track ? "✓" : "+"} ${esc(l.name)}</button>`;
+}
+
+function captureChips(inputs) {
+  const bySet = new Map();
+  for (const l of inputs) {
+    const k = l.set || NOW_BUFFER_SET;
+    if (!bySet.has(k)) bySet.set(k, []);
+    bySet.get(k).push(l);
+  }
+  let out = "";
+  for (const [key, lists] of bySet) {
+    const open = key === NOW_BUFFER_SET || !!captureSetsOpen[key];
+    const shown = open ? lists : lists.filter((l) => l.has_track);
+    const folded = lists.length - shown.length;
+    if (key !== NOW_BUFFER_SET && (folded || open)) {
+      out += `<button class="chip set-chip" data-set="${esc(key)}">` +
+        `${open ? "−" : "+"} ${esc(setLabel(key))}${folded ? ` ${folded}` : ""}</button>`;
+    }
+    out += shown.map(captureChip).join("");
+  }
+  return out;
 }
 
 async function nowCapture(inId) {

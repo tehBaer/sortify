@@ -365,3 +365,25 @@ kbd {
                   height: .5rem; overflow: hidden; margin: .35rem 0; }
 .progress-fill { background: var(--accent); height: 100%; border-radius: 999px;
                  transition: width .3s ease; }
+
+/* Input sets in the Playlists view. The buffer set carries day-to-day work
+   and stays open; "other" and "the bomb" fold, so 26 inputs cannot bury the
+   playlists below them. A filter match force-opens its set (see renderLists)
+   — a search must never hide its own results. */
+.pl-set { margin-bottom: .35rem; }
+.pl-set > summary {
+  cursor: pointer; padding: .35rem .5rem; border-radius: 6px;
+  color: var(--muted); font-size: .82rem; letter-spacing: .02em;
+  background: var(--card2); border: 1px solid var(--border);
+  user-select: none;
+}
+.pl-set > summary:hover { color: var(--fg); }
+.pl-set[open] > summary { margin-bottom: .3rem; color: var(--fg); }
+
+/* Set toggles among the capture chips: visually a chip, but it opens a
+   folded set rather than filing the track — muted and dashed so it never
+   reads as a destination you might hit by mistake. */
+.in-chip.set-chip, .set-chip {
+  border-style: dashed; color: var(--muted); opacity: .9;
+}
+.set-chip:hover { color: var(--fg); }

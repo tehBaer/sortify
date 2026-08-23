@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from . import rootlist
 from . import suggest as sugg
 from .deezer import Deezer
+from . import inputsets
 from .folders import (
     creatable_home_name_problem,
     extract_folder_map,
@@ -216,6 +217,7 @@ def playlists():
              "total": None, "image": None}
     out = [liked] + items
     inputs = _effective_input_ids(cfg, items)
+    _sets = inputsets.resolve_sets(cfg)
     # One disk read + JSON parse for the whole listing, not one per playlist.
     # Against a real ~1000-playlist account with a splits.json that has grown
     # to hundreds of KB, calling `_split_summary` inside this loop (each call
@@ -232,6 +234,9 @@ def playlists():
             else "home" if p["id"] in cfg.get("home_ids", [])
             else None
         )
+        p["input_set"] = (
+            inputsets.set_of(p["name"], p.get("folder"), _sets) or inputsets.DEFAULT_KEY
+        ) if p["role"] == "input" else None
         p["split"] = _split_summary(p["id"], splits)
         p["hints"] = hints.get(p["id"], "")
     entry = store.cache().get("playlist_list") or {}
@@ -351,6 +356,7 @@ def naming():
     return {"violations": naming_violations(
         items, inputs, set(cfg.get("home_ids") or []),
         cfg.get("input_name_pattern"),
+        sets=inputsets.resolve_sets(cfg), folders=store.folders(),
     )}
 
 
@@ -366,7 +372,8 @@ def apply_naming_rename(playlist_id: str):
     items = sp.my_playlists()
     inputs = _effective_input_ids(cfg, items)
     rows = naming_violations(items, inputs, set(cfg.get("home_ids") or []),
-                             cfg.get("input_name_pattern"))
+                             cfg.get("input_name_pattern"),
+                             sets=inputsets.resolve_sets(cfg), folders=store.folders())
     row = next((r for r in rows if r["playlist_id"] == playlist_id), None)
     if row is None:
         raise HTTPException(
@@ -470,17 +477,14 @@ def _parse_hints(cfg: dict) -> dict[str, list[str]]:
 
 
 def _effective_input_ids(cfg: dict, playlists: list[dict]) -> set[str]:
-    """Explicitly marked inputs plus everything matching the name convention.
+    """Explicitly marked inputs plus everything matching any input SET.
 
-    The pattern (e.g. ^\\[.+\\]$ for bracketed names) lives in config so a
-    stale browser tab saving roles can never un-mark the real inputs.
+    Set rules (name patterns like ^\\[.+\\]$, or a folder segment such as
+    THE BOMB) live in config so a stale browser tab saving roles can never
+    un-mark the real inputs. See sortify/inputsets.py.
     """
     ids = set(cfg.get("input_ids", []))
-    pat = cfg.get("input_name_pattern")
-    if pat:
-        rx = re.compile(pat)
-        ids |= {p["id"] for p in playlists if rx.fullmatch(p["name"].strip())}
-    return ids
+    return ids | inputsets.matched_ids(playlists, store.folders(), cfg)
 
 
 # ---- cache helpers ---------------------------------------------------------
@@ -576,7 +580,12 @@ def _ensure_profiles_locked(force: bool) -> dict:
             continue
         name = "Liked Songs" if iid == LIKED_ID else by_id[iid]["name"]
         tracks = _cached_tracks(iid, by_id.get(iid, {}).get("snapshot_id"))
-        inputs.append({"id": iid, "name": name, "uris": {t["uri"] for t in tracks}})
+        inputs.append({
+            "id": iid, "name": name, "uris": {t["uri"] for t in tracks},
+            "set": (inputsets.set_of(name, (store.folders().get(iid) or {}).get("path"),
+                                     inputsets.resolve_sets(cfg))
+                    or inputsets.DEFAULT_KEY),
+        })
 
     _profile_state.update(
         built_at=now, profiles=profiles, homes=homes, inputs=inputs,
@@ -3421,7 +3430,8 @@ def now_playing(force: bool = False):
         ) if sortable else [],
         "homes": _homes_payload(state),
         "inputs": [
-            {"id": l["id"], "name": l["name"], "has_track": track["uri"] in l["uris"]}
+            {"id": l["id"], "name": l["name"], "has_track": track["uri"] in l["uris"],
+             "set": l.get("set", inputsets.DEFAULT_KEY)}
             for l in state["inputs"]
         ],
     }

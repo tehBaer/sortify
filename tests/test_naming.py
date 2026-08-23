@@ -41,7 +41,9 @@ def test_input_already_bracketed_conforms():
 def test_input_conformance_uses_configured_pattern_when_given():
     # config's input_name_pattern is the convention's source of truth.
     assert propose("<new finds>", "input", input_pattern=r"^<.+>$") is None
-    assert propose("new finds", "input", input_pattern=r"^<.+>$") == "[new finds]"
+    # The proposed fix must SATISFY the configured pattern. This previously
+    # returned "[new finds]" — a fix that still violates ^<.+>$.
+    assert propose("new finds", "input", input_pattern=r"^<.+>$") == "<new finds>"
 
 def test_input_emoji_prefix_is_exempt():
     assert propose("🧸 inbox", "input") is None
