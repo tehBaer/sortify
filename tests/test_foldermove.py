@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 
 from sortify.foldermove import ResolveError, resolve_folder, resolve_playlist
@@ -164,3 +166,17 @@ def test_execute_move_skips_ui_if_already_done():
         precheck=True,
     )
     assert moved == []  # slow-flush guard: verified done before re-driving
+
+
+def test_cli_move_rejects_folder_and_out_together(monkeypatch, capsys):
+    # "<folder>" and "--out" are mutually exclusive destinations; giving both
+    # must be a usage error, not a silent pick of one over the other.
+    from sortify.foldermove import main
+
+    monkeypatch.setattr(
+        sys, "argv", ["spfolders", "move", "HAZE", "Y'no", "--out"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+    assert "usage: spfolders move" in capsys.readouterr().out

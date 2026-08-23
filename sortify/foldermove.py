@@ -197,7 +197,12 @@ def main() -> None:
     # move
     rest = [a for a in args[1:] if not a.startswith("--")]
     flags = {a for a in args[1:] if a.startswith("--")}
-    if not rest or (len(rest) == 1 and "--out" not in flags) or len(rest) > 2:
+    if (
+        not rest
+        or (len(rest) == 1 and "--out" not in flags)
+        or len(rest) > 2
+        or (len(rest) == 2 and "--out" in flags)
+    ):
         print('usage: spfolders move "<playlist>" ("<folder>" | --out) [--dry-run]')
         sys.exit(2)
     dest = None if "--out" in flags else rest[1]
