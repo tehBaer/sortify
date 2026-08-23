@@ -49,6 +49,34 @@ def test_session_composes_commands_and_tears_down(monkeypatch, tmp_path):
     assert killed == ["snap", "Xvfb"]  # client down before the display
 
 
+def test_move_sequence_aborts_on_missing_menu(monkeypatch):
+    from sortify.foldermove import MovePlan
+
+    calls = []
+    monkeypatch.setattr(clientui, "screenshot", lambda d: "IMG")
+    monkeypatch.setattr(clientui, "click", lambda d, x, y: calls.append(("click", x, y)))
+    monkeypatch.setattr(clientui, "right_click", lambda d, x, y: calls.append(("right_click", x, y)))
+    monkeypatch.setattr(clientui, "key", lambda d, k: calls.append(("key", k)))
+    monkeypatch.setattr(clientui, "type_text", lambda d, s: calls.append(("type", s)))
+
+    def fake_find(img, text):
+        calls.append(("find", text))
+        if text == clientui.MENU_MOVE_TO_FOLDER:
+            raise UiStepError(f"text {text!r} not found on screen")
+        return (10, 10)
+
+    monkeypatch.setattr(clientui, "find_text", fake_find)
+    monkeypatch.setattr(clientui.time, "sleep", lambda s: None)
+
+    session = ClientSession.__new__(ClientSession)  # no real __enter__
+    session.display = ":94"
+    plan = MovePlan("pl_x", "SOME LIST", "ROOT", "ROOT / Y'no")
+    with pytest.raises(UiStepError):
+        clientui.move_playlist_ui(session, plan)
+    # Aborted at the menu step: no clicks after the failed find.
+    assert calls[-1] == ("find", clientui.MENU_MOVE_TO_FOLDER)
+
+
 def test_session_requires_tools(monkeypatch, tmp_path):
     monkeypatch.setattr(clientui, "LOCK_PATH", str(tmp_path / "ui.lock"))
     monkeypatch.setattr(clientui.shutil, "which", lambda name: None)

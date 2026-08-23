@@ -136,6 +136,11 @@ def click(display: str, x: int, y: int) -> None:
     _xdo(display, "click", "1")
 
 
+def right_click(display: str, x: int, y: int) -> None:
+    _xdo(display, "mousemove", str(x), str(y))
+    _xdo(display, "click", "3")
+
+
 def _wait_for_window(display: str, timeout: int) -> None:
     """Poll xdotool until the client's main window exists."""
     deadline = time.time() + timeout
@@ -204,3 +209,48 @@ class ClientSession:
         if self._lock is not None:
             self._lock.__exit__(None, None, None)
             self._lock = None
+
+
+def move_playlist_ui(session: "ClientSession", plan) -> None:
+    """Drive one move through the client UI. Verification is the caller's
+    job (rootlist extraction) — this function only acts and asserts UI
+    state step by step, aborting on the first surprise."""
+    d = session.display
+
+    # 1. Locate and open the library filter (icon, no OCR-able text).
+    img = screenshot(d)
+    find_text(img, LIBRARY_HINT)  # asserts sidebar is expanded (raises otherwise)
+    ax, ay = find_text(img, LIBRARY_FILTER_ANCHOR)
+    ox, oy = LIBRARY_FILTER_OFFSET
+    click(d, ax + ox, ay + oy)
+
+    # 2. Clear any prior filter text, then type the playlist name.
+    key(d, "ctrl+a")
+    key(d, "BackSpace")
+    type_text(d, plan.playlist_name)
+    time.sleep(SETTLE)
+
+    # 3. Find the playlist row and right-click it to open its context menu.
+    img = screenshot(d)
+    x, y = find_text(img, plan.playlist_name)
+    right_click(d, x, y)
+
+    # 4. Context menu: "Move to folder" opens the folder submenu.
+    img = screenshot(d)
+    click(d, *find_text(img, MENU_MOVE_TO_FOLDER))
+
+    if plan.to_path is None:
+        img = screenshot(d)
+        click(d, *find_text(img, MENU_REMOVE_FROM_FOLDER))
+    else:
+        img = screenshot(d)
+        click(d, *find_text(img, FOLDER_SEARCH_HINT))
+        key(d, "ctrl+a")
+        key(d, "BackSpace")
+        leaf = plan.to_path.split(" / ")[-1]
+        type_text(d, leaf)
+        time.sleep(SETTLE)
+        img = screenshot(d)
+        click(d, *find_text(img, leaf))
+
+    time.sleep(SETTLE)  # let the client commit before the caller extracts
