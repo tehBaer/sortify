@@ -65,7 +65,12 @@ escalating penalties. Therefore:
 ## Run
 
 - Server: systemd user unit `sortify.service` (`systemctl --user restart sortify`),
-  serves 0.0.0.0:8800. Do not run ad-hoc `sortify` processes alongside it.
+  bound to **127.0.0.1:8800** — loopback only, NOT 0.0.0.0. The LAN address
+  refuses connections; reach it from other machines over Tailscale at
+  `https://mbp.tail916fc5.ts.net:9800` (tailscaled owns the :9800 listener).
+  A browser check against `192.168.1.109:8800` will fail and the failure
+  looks like the app being down, which it is not. Do not run ad-hoc
+  `sortify` processes alongside the unit.
 - Tests: `.venv/bin/pytest -q` — keep them green; they cost zero API calls.
 
 ## Conventions (encoded in data/config.json — don't re-derive)
