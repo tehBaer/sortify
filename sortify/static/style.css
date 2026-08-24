@@ -273,6 +273,15 @@ kbd {
   background: var(--bg); border-radius: 12px; box-shadow: var(--shadow-card);
   padding: .55rem .8rem; font-size: .85rem;
 }
+#share-pop {
+  position: fixed; left: 50%; bottom: 4.2rem; transform: translateX(-50%);
+  width: calc(100% - 2.4rem); max-width: 560px; z-index: 21;
+  background: var(--bg); border-radius: 12px; box-shadow: var(--shadow-card);
+  padding: .75rem .9rem; font-size: .85rem;
+}
+#share-pop .share-targets { display: flex; flex-wrap: wrap; gap: .5rem; margin: .6rem 0; }
+#share-pop .share-target { border-radius: 999px; padding: .35rem .8rem; }
+#share-pop input { flex: 1; min-width: 0; }
 #preview-pop { padding: .75rem .9rem; }
 #preview-pop .pv-now { font-weight: 600; font-size: 1.05rem; margin-top: .35rem; }
 #preview-pop .pv-line { color: var(--muted); }

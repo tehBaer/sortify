@@ -36,6 +36,9 @@
       <span class="now-top-actions">
         <button id="btn-undo-now" disabled hidden>Undo</button>
         <button id="btn-now-manual" class="mode-chip">auto</button>
+        <button id="btn-share" class="icon-btn" hidden title="Send this song to a friend — Spotify Messages, via the tablet">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>
+        </button>
         <button id="btn-blind" class="icon-btn" title="Blind mode — hide what's playing so the name can't bias the filing">
           <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/><line class="eye-slash" x1="3" y1="3" x2="21" y2="21"/></svg>
         </button>
@@ -174,6 +177,7 @@
 </div>
 
 <div id="preview-pop" aria-live="polite" hidden></div>
+<div id="share-pop" hidden></div>
 <div id="toast" hidden></div>
 
 <script src="/static/app.js"></script>

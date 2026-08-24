@@ -1171,6 +1171,45 @@ run("stopNowPolling()");
         `hidden=${$$("btn-rename-outputs").hidden}`);
 }
 
+// ============================================================================
+// S1 — tablet share: one GET for targets, one POST per send, right body
+// ============================================================================
+{
+  check("S1 openSharePop exists", run(`typeof openSharePop`) === "function",
+        run(`typeof openSharePop`));
+  routes["GET /api/share/targets"] =
+    { targets: ["Alice Example", "bob99"], updated: 123 };
+  let release;
+  const pending = new Promise((r) => (release = r));
+  routes["POST /api/share/track"] = () => pending;
+
+  run(`nowState = { playing: true, track: {
+         uri: "spotify:track:t1", name: "Song", artists: ["A"] } }`);
+  resetLog();
+  await run(`openSharePop()`);
+  await tick();
+  check("S1 opening the picker fetches the cached targets once",
+        gets("/api/share/targets") === 1, `${gets("/api/share/targets")} GET(s)`);
+  const pop = $$("share-pop");
+  check("S1 the picker rendered a button per target",
+        /Alice Example/.test(pop.innerHTML) && /bob99/.test(pop.innerHTML),
+        JSON.stringify(pop.innerHTML.slice(0, 80)));
+
+  const target = $$("share-t-1");   // bob99
+  target.onclick(); target.onclick();          // double-click must not double-send
+  await tick();
+  check("S1 two clicks send exactly one share",
+        posts("/api/share/track") === 1, `${posts("/api/share/track")} POST(s)`);
+  check("S1 the POST carries id, title and friend",
+        JSON.stringify(bodies("/api/share/track")[0]) ===
+        JSON.stringify({ track_id: "t1", title: "Song", friend: "bob99" }),
+        JSON.stringify(bodies("/api/share/track")[0]));
+  release({ status: 200, body: { ok: true, targets: ["bob99"] } });
+  await tick();
+  check("S1 the picker closes once the share lands",
+        pop.hidden === true, `hidden=${pop.hidden}`);
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

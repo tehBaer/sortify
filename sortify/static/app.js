@@ -983,6 +983,9 @@ function renderNow() {
   const undo = $("btn-undo-now");
   undo.disabled = nowActions === 0 || inSitting;
   undo.hidden = undo.disabled;
+  // Share needs a real track on screen; local files and episodes have no
+  // spotify:track: uri and the tablet flow can't find them by title anyway.
+  $("btn-share").hidden = !(d.playing && d.track?.uri?.startsWith("spotify:track:"));
   if (!d.cooldown) { stopCooldownTicker(); nowCooldownUntil = nowCooldownTotal = 0; }
   paintNowControls(d);
   syncSittingFromNow(d);
@@ -1229,6 +1232,55 @@ $("btn-blind").onclick = () => {
   toast(blindMode ? "blind mode — tap a blurred field to peek" : "blind mode off");
 };
 applyBlind();
+
+// ---- tablet share (Spotify Messages via the tablet — see /api/share) -------
+
+let shareInFlight = false;
+
+async function openSharePop() {
+  const t = nowState?.track;
+  if (!t?.uri?.startsWith("spotify:track:")) { toast("nothing shareable playing"); return; }
+  const pop = $("share-pop");
+  let targets = [];
+  try { targets = (await api("/api/share/targets")).targets; } catch (e) { toast(e.message); return; }
+  // The cache is empty until the first share has run; free-text still works
+  // then — the share sheet's Search box is not driven yet, so an unknown
+  // name fails fast server-side and the 502 names the real targets.
+  const rows = targets.map((name, i) =>
+    `<button id="share-t-${i}" class="share-target" data-name="${esc(name)}">${esc(name)}</button>`).join("");
+  pop.innerHTML =
+    `<div class="pv-head"><span class="pv-title">Send to…</span>
+       <button id="share-close" class="icon-btn" title="Close">✕</button></div>
+     <div class="share-targets">${rows || '<span class="hint">no targets cached yet — type a name</span>'}</div>
+     <div class="pv-ctl"><input id="share-name" placeholder="friend's name, exactly as in Spotify">
+       <button id="share-go">Send</button></div>`;
+  pop.hidden = false;
+  $("share-close").onclick = () => { pop.hidden = true; };
+  const send = (friend) => doShare(t, friend);
+  targets.forEach((name, i) => { $(`share-t-${i}`).onclick = () => send(name); });
+  $("share-go").onclick = () => {
+    const name = $("share-name").value.trim();
+    if (name) send(name);
+  };
+}
+
+async function doShare(track, friend) {
+  if (shareInFlight) return;
+  shareInFlight = true;
+  const id = track.uri.split(":").pop();
+  toast(`sending to ${friend}… (~40s, the tablet is doing the tapping)`, 45000);
+  try {
+    await api("/api/share/track", { track_id: id, title: track.name, friend });
+    $("share-pop").hidden = true;
+    toast(`sent to ${friend}`);
+  } catch (e) {
+    toast(e.message, 6000);
+  } finally {
+    shareInFlight = false;
+  }
+}
+
+$("btn-share").onclick = openSharePop;
 
 // Capture phase, so a peek on a suggestion's reason line never falls through
 // to the button underneath and files the track.

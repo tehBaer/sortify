@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
 import logging
 import os
 import re
@@ -23,6 +24,7 @@ from pydantic import BaseModel, Field
 
 from . import rootlist
 from . import suggest as sugg
+from . import tabletshare
 from .deezer import Deezer
 from . import inputsets
 from .folders import (
@@ -3584,6 +3586,38 @@ def player_play(body: PlayIn):
         # Liked Songs has no playlist id, so there is no context_uri for it.
         raise HTTPException(400, "Liked Songs can't be started as a playlist — play it from Spotify.")
     return _playback_call(sp.play_context, body.input_id)
+
+
+# ---- tablet share (Spotify Messages via the Android tablet) ----------------
+# No Web API endpoint exists for Messages and the desktop client has no
+# Messages UI, so this drives the tablet's Spotify app over adb
+# (sortify/tabletshare.py). Zero Spotify Web API quota.
+
+
+class ShareIn(BaseModel):
+    track_id: str
+    title: str
+    friend: str
+
+
+@app.post("/api/share/track")
+def share_track_endpoint(body: ShareIn):
+    try:
+        targets = tabletshare.share_track(body.track_id, body.title, body.friend)
+    except tabletshare.UiStepError as e:
+        raise HTTPException(502, str(e))
+    (store.dir / "tabletshare.json").write_text(
+        json.dumps({"targets": targets, "updated": int(time.time())}))
+    return {"ok": True, "targets": targets}
+
+
+@app.get("/api/share/targets")
+def share_targets_endpoint():
+    path = store.dir / "tabletshare.json"
+    if not path.exists():
+        return {"targets": [], "updated": None}
+    data = json.loads(path.read_text())
+    return {"targets": data.get("targets", []), "updated": data.get("updated")}
 
 
 # ---- actions ---------------------------------------------------------------
