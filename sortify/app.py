@@ -3344,6 +3344,99 @@ def _bpm_for(track: dict) -> float | None:
     return None
 
 
+# ---- picker hold-to-preview -------------------------------------------------
+#
+# Spotify's dev-mode API lost preview_url, so the audio bite comes from
+# Deezer's free 30s clips instead — resolved live per hold (the CDN URLs
+# carry expiring tokens, so nothing here is persisted to disk; contrast
+# deezer.json's write-once BPM records). Track PICKING is a pure cache.json
+# read: zero Spotify calls on this path, ever.
+
+PREVIEW_CLIPS = 3          # clips per medley
+PREVIEW_MAX_ATTEMPTS = 6   # Deezer searches per resolve before giving up
+PREVIEW_LIST_N = 10        # text-fallback tracks in the payload
+PREVIEW_TTL = 600          # seconds a resolved medley is served from memory
+_preview_cache: dict[str, tuple[float, dict]] = {}
+_preview_lock = threading.Lock()
+
+
+@app.get("/api/playlist_preview/{playlist_id}")
+def playlist_preview(playlist_id: str, offset: int = 0) -> dict:
+    """One PAGE of a hold-to-preview medley: up to PREVIEW_CLIPS Deezer 30s
+    clip URLs over the playlist's cached tracks, newest additions first
+    (they jog memory best), starting at candidate `offset`. `next_offset`
+    is the cursor for the next page, or None when the playlist is walked —
+    the client chains pages for as long as the user keeps holding, so the
+    medley's length is controlled by the thumb, not by a setting. Also
+    carries a text fallback list so the hold always answers even when
+    Deezer resolves nothing. Pages are cached for PREVIEW_TTL (repeated
+    holds cost zero Deezer requests); a Deezer error just skips that track.
+    The audio itself is never proxied here — the browser streams straight
+    from Deezer's CDN.
+    """
+    entry = store.cache().get("playlists", {}).get(playlist_id)
+    if not isinstance(entry, dict):
+        raise HTTPException(404, "playlist not cached — open it once in sortify first")
+    with _preview_lock:
+        cached = _preview_cache.get((playlist_id, offset))
+        if cached and time.monotonic() - cached[0] < PREVIEW_TTL:
+            return cached[1]
+        candidates = sorted(
+            (t for t in entry.get("tracks") or []
+             if t.get("name") and (t.get("artists") or [{}])[0].get("name")),
+            key=lambda t: t.get("added_at") or "", reverse=True,
+        )
+        clips = []
+        consumed = 0
+        for t in candidates[offset:offset + PREVIEW_MAX_ATTEMPTS]:
+            if len(clips) >= PREVIEW_CLIPS:
+                break
+            consumed += 1
+            artist = t["artists"][0]["name"]
+            try:
+                rec = _deezer_client().fetch_preview(artist, t["name"])
+            except Exception:
+                log.warning("deezer preview failed for %r — skipping", t["name"])
+                continue
+            if not rec.get("miss"):
+                clips.append({"name": t["name"], "artist": artist, "url": rec["url"]})
+        nxt = offset + consumed
+        payload = {
+            "clips": clips,
+            "next_offset": nxt if nxt < len(candidates) else None,
+            "tracks": [{"name": t["name"], "artist": t["artists"][0]["name"]}
+                       for t in candidates[:PREVIEW_LIST_N]],
+            "total": len(entry.get("tracks") or []),
+        }
+        _preview_cache[(playlist_id, offset)] = (time.monotonic(), payload)
+        return payload
+
+
+# On phones the OS gives the preview audio focus and pauses the Spotify app;
+# it does not resume on its own. This endpoint spends exactly ONE budgeted
+# call to un-pause, explicitly user-caused (the preview gesture), debounced
+# client-side per preview session and floored here so a burst of holds can
+# never turn into a burst of playback calls.
+PREVIEW_RESUME_MIN_INTERVAL = 5.0
+_preview_resume_last = -1e9
+
+
+@app.post("/api/preview_resume")
+def preview_resume() -> dict:
+    global _preview_resume_last
+    now = time.monotonic()
+    if now - _preview_resume_last < PREVIEW_RESUME_MIN_INTERVAL:
+        return {"ok": False, "error": "resume already sent"}
+    _preview_resume_last = now
+    try:
+        sp.resume_playback()
+    except Exception as e:
+        # No active device / already playing / cooldown — the preview flow
+        # must never surface a hard failure over a convenience resume.
+        return {"ok": False, "error": str(e)}
+    return {"ok": True}
+
+
 def _idle_inputs_payload() -> list[dict]:
     """Inputs for the not-playing state's "start an input…" CTA — names only.
 

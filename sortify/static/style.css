@@ -261,10 +261,47 @@ kbd {
 #picker-list { overflow-y: auto; flex: 1; }
 #picker-list button { display: block; width: 100%; text-align: left; margin-bottom: .4rem; }
 .picker-row { padding: .55rem .8rem; }
+/* holdable elements: no long-press text selection / iOS callout */
+.picker-row, .sugg { -webkit-touch-callout: none; user-select: none; }
+/* hold-to-preview: one floating card shared by the picker rows and the
+   suggestion buttons — body-level and fixed so it works whether or not the
+   picker overlay is open (z above the picker's 10). aria-live so screen
+   readers hear what's playing. */
+#preview-pop {
+  position: fixed; left: 50%; bottom: 4.2rem; transform: translateX(-50%);
+  width: calc(100% - 2.4rem); max-width: 560px; z-index: 20;
+  background: var(--bg); border-radius: 12px; box-shadow: var(--shadow-card);
+  padding: .55rem .8rem; font-size: .85rem;
+}
+#preview-pop { padding: .75rem .9rem; }
+#preview-pop .pv-now { font-weight: 600; font-size: 1.05rem; margin-top: .35rem; }
+#preview-pop .pv-line { color: var(--muted); }
+#preview-pop .pv-head { display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
+#preview-pop .pv-title { font-weight: 600; color: var(--muted); font-size: .85rem;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#preview-pop .pv-ctl { display: flex; align-items: center; gap: .6rem; margin-top: .6rem; }
+#preview-pop .icon-btn { background: rgba(127,127,127,.14); }
+#preview-pop .icon-btn:disabled { opacity: .35; }
+#preview-pop svg { width: 22px; height: 22px; }
+#preview-pop .pv-pos { color: var(--muted); font-size: .85rem; margin-left: auto;
+  font-variant-numeric: tabular-nums; }
+#btn-blind .eye-slash { display: none; }
+body.blind #btn-blind .eye-slash { display: block; }
 .picker-row .p-name { display: block; font-weight: 600; }
 .picker-row .p-sub { display: block; color: var(--muted); font-size: .78rem; margin-top: .1rem; }
 #pl-new-home input { flex: 1; }
 .picker-create .p-name { color: var(--accent); }
+
+/* blind mode: the ear decides. Blur rather than remove, so layout is stable.
+   One tap on any blurred field lifts every blur (body.peeked) until the
+   track changes — see the capture-phase handler in app.js. The art is also
+   desaturated and dimmed: a blurred cover's color alone can identify it. */
+body.blind:not(.peeked) #now-card .t-name,
+body.blind:not(.peeked) #now-card .t-artist { filter: blur(8px); }
+body.blind:not(.peeked) #now-card .art img,
+body.blind:not(.peeked) #now-card .art .noimg { filter: blur(18px) grayscale(1) brightness(.7); }
+body.blind:not(.peeked) #now-card .s-why { filter: blur(5px); }
+#btn-blind.on { color: var(--accent); }
 
 #toast {
   position: fixed; left: 50%; bottom: 1.2rem; transform: translateX(-50%);

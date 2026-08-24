@@ -80,6 +80,7 @@ const document = {
   getElementById: $$,
   createElement: () => new El("_created"),
   addEventListener: (t, f) => ((handlers[t] ||= []).push(f)),
+  body: new El("_body"),   // blind mode toggles a class here
 };
 
 // ---- scripted fetch --------------------------------------------------------
@@ -115,6 +116,13 @@ async function fetchStub(path, opts) {
 const ctx = vm.createContext({
   document, fetch: fetchStub, setTimeout, clearTimeout, setInterval, clearInterval, console,
   Date, Math, Number, Object, JSON, Error, Map, Set, Promise, String, Array,
+  // Blind mode persists its toggle here; an in-memory map is enough.
+  localStorage: (() => {
+    const m = new Map();
+    return { getItem: (k) => (m.has(k) ? m.get(k) : null),
+             setItem: (k, v) => m.set(k, String(v)),
+             removeItem: (k) => m.delete(k) };
+  })(),
 });
 Object.defineProperty(ctx, "globalThis", { value: ctx });
 

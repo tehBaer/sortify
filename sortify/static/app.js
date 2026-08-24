@@ -534,7 +534,8 @@ function renderCard() {
   </div>`;
 
   $("card").querySelectorAll(".sugg").forEach((b) => {
-    b.onclick = () => moveTo(b.dataset.to);
+    b.onclick = () => { if (previewHold.consumeClick()) return; moveTo(b.dataset.to); };
+    previewHold.attach(b, b.dataset.to, triage.homes.get(b.dataset.to)?.name);
   });
   const more = $("btn-more");
   if (more) more.onclick = () => openPicker(triage.homes, moveTo);
@@ -965,6 +966,12 @@ function renderNow() {
   // on the other. The bar is the part that must still update here: the
   // sitting it described is exactly what just went away.
   if (!d) { paintSittingBar(); return; }
+  // A blind-mode peek lasts exactly one track: the reveal falls away the
+  // moment the playing uri is no longer the one that was peeked.
+  if (document.body.classList.contains("peeked") && d.track?.uri !== peekedUri) {
+    document.body.classList.remove("peeked");
+    peekedUri = null;
+  }
   // The server is authoritative here (see /api/now's `sitting` field): if it
   // says this poll's context is a sitting, it is one, regardless of what
   // this client remembers from before a reload. `/api/undo` knows nothing
@@ -1045,7 +1052,8 @@ function renderNow() {
     wireSittingCard();
   } else {
     $("now-card").querySelectorAll(".sugg").forEach((b) => {
-      b.onclick = () => nowFile(b.dataset.to);
+      b.onclick = () => { if (previewHold.consumeClick()) return; nowFile(b.dataset.to); };
+      previewHold.attach(b, b.dataset.to, nowState.homes.get(b.dataset.to)?.name);
     });
     const more = $("btn-now-more");
     if (more) more.onclick = () => openPicker(nowState.homes, nowFile, nowCreateAndFile);
@@ -1194,6 +1202,46 @@ $("btn-undo-now").onclick = async () => {
   } catch (e) { toast(e.message); }
 };
 
+// ---- blind mode ------------------------------------------------------------
+//
+// Hide what's playing so the ear decides, not the name: blurs title, artist,
+// art, and the suggestion REASONS (they leak artist names) on the listening
+// surfaces (#now-card — the now view and the sitting decide card both render
+// there; triage keeps its labels). Pure client state, persisted locally.
+// Tapping any blurred field peeks it for a moment without filing anything.
+
+let blindMode = localStorage.getItem("blindMode") === "1";
+// One tap on any blurred field reveals EVERYTHING for the remainder of that
+// track — renderNow drops the reveal as soon as the playing uri changes.
+let peekedUri = null;
+
+function applyBlind() {
+  // No emoji in the UI: the button is an inline SVG eye whose slash line is
+  // shown by CSS when body.blind is set (same class the blurs key off).
+  document.body.classList.toggle("blind", blindMode);
+  $("btn-blind").classList.toggle("on", blindMode);
+  if (!blindMode) { document.body.classList.remove("peeked"); peekedUri = null; }
+}
+$("btn-blind").onclick = () => {
+  blindMode = !blindMode;
+  localStorage.setItem("blindMode", blindMode ? "1" : "0");
+  applyBlind();
+  toast(blindMode ? "blind mode — tap a blurred field to peek" : "blind mode off");
+};
+applyBlind();
+
+// Capture phase, so a peek on a suggestion's reason line never falls through
+// to the button underneath and files the track.
+$("now-card").addEventListener("click", (e) => {
+  if (!blindMode || document.body.classList.contains("peeked")) return;
+  const el = e.target.closest(".t-name, .t-artist, .art, .s-why");
+  if (!el) return;
+  e.stopPropagation();
+  e.preventDefault();
+  peekedUri = nowState?.track?.uri || null;
+  document.body.classList.add("peeked");
+}, true);
+
 // ---- picker ----------------------------------------------------------------
 
 function openPicker(homesMap, onPick, onCreate) {
@@ -1217,7 +1265,13 @@ function openPicker(homesMap, onPick, onCreate) {
       const sub = [h.folder, h.total != null ? `${h.total} tracks` : ""].filter(Boolean).join(" · ");
       b.innerHTML = `<span class="p-name">${esc(h.name)}</span>` +
         (sub ? `<span class="p-sub">${esc(sub)}</span>` : "");
-      b.onclick = () => { closePicker(); onPick(h.id); };
+      b.onclick = () => {
+        // A completed hold-preview must not also file the track: the click
+        // that follows pointerup is the same gesture, so it is consumed.
+        if (previewHold.consumeClick()) return;
+        closePicker(); onPick(h.id);
+      };
+      previewHold.attach(b, h.id, h.name);
       list.appendChild(b);
     }
     // The moment of need: the right playlist doesn't exist yet. Create it
@@ -1241,7 +1295,160 @@ function openPicker(homesMap, onPick, onCreate) {
   $("picker").hidden = false;
   $("picker-filter").focus();
 }
-function closePicker() { $("picker").hidden = true; }
+// ---- hold-to-preview: hold opens a clip-player popup -----------------------
+//
+// Spotify's dev-mode API has no preview URLs, so the audio comes from
+// /api/playlist_preview (Deezer 30s clips over the playlist's tracks, newest
+// first — zero Spotify calls; see app.py). Hold ≥450ms on a picker row or a
+// suggestion opens the player and eats the row's click; the popup then owns
+// the audio: full 30s clips, auto-advance on clip end, prev/next controls,
+// and an explicit close — which is also when the single budgeted
+// auto-resume call fires (the phone OS pauses Spotify when preview audio
+// takes focus and never un-pauses it on its own).
+const previewHold = (() => {
+  const HOLD_MS = 450;
+  const ICON = {
+    close: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+    prev: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>',
+    next: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>',
+  };
+  // `fired` marks a completed hold until its trailing click is consumed;
+  // `holding` tracks finger-still-down after the popup opened, for the
+  // scroll blocker only — the popup itself outlives the hold.
+  let timer = null, fired = false, holding = false, seq = 0, audio = null;
+  let wasPlaying = false, audioPlayed = false;
+  // Player state: every clip resolved so far (pages accumulate), the next
+  // page cursor, and the index of the clip being played.
+  let clips = [], nextOffset = null, idx = -1, pid = null, title = "", total = 0, fallback = [];
+
+  const pop = () => $("preview-pop");
+
+  function render(statusLine) {
+    const c = clips[idx];
+    const now = statusLine ? `<div class="pv-now">${statusLine}</div>` :
+      c ? `<div class="pv-now">${esc(c.artist)} — ${esc(c.name)}</div>` : "";
+    // The text list only fills in when there is no audio at all — with a
+    // working player it is noise under the controls.
+    const lines = clips.length ? "" : fallback.slice(0, 5).map((t) =>
+      `<div class="pv-line">${esc(t.artist)} — ${esc(t.name)}</div>`).join("");
+    const atStart = idx <= 0;
+    const atEnd = idx >= clips.length - 1 && nextOffset == null;
+    pop().innerHTML = `
+      <div class="pv-head"><span class="pv-title">${esc(title)}</span>
+        <button id="pv-close" class="icon-btn" aria-label="Close preview">${ICON.close}</button></div>
+      ${now}${lines}
+      <div class="pv-ctl">
+        <button id="pv-prev" class="icon-btn" aria-label="Previous clip"${atStart ? " disabled" : ""}>${ICON.prev}</button>
+        <button id="pv-next" class="icon-btn" aria-label="Next clip"${atEnd ? " disabled" : ""}>${ICON.next}</button>
+        <span class="pv-pos">${clips.length ? `${idx + 1} · ${total} tracks` : `${total} tracks`}</span>
+      </div>`;
+    $("pv-close").onclick = close;
+    $("pv-prev").onclick = () => playAt(idx - 1);
+    $("pv-next").onclick = () => playAt(idx + 1);
+  }
+
+  async function playAt(i) {
+    if (i < 0) return;
+    const mySeq = seq;
+    while (i >= clips.length) {
+      if (nextOffset == null) {
+        // Walked the whole playlist: stay on the last clip's card.
+        if (clips.length) { idx = clips.length - 1; render("end of playlist"); }
+        return;
+      }
+      render("loading…");
+      try {
+        const d = await api(`/api/playlist_preview/${pid}?offset=${nextOffset}`);
+        if (mySeq !== seq) return;
+        clips = clips.concat(d.clips);   // an all-miss page just loops for the next
+        nextOffset = d.next_offset;
+      } catch { if (mySeq === seq) render("couldn't load more clips"); return; }
+    }
+    idx = i;
+    // The previous clip must stop BEFORE the next starts — two live Audio
+    // objects is the "previews over each other" bug.
+    if (audio) { audio.pause(); audio.src = ""; }
+    const c = clips[idx];
+    audio = new Audio(c.url);
+    audio.onended = () => { if (mySeq === seq) playAt(idx + 1); };  // full 30s, then advance
+    audio.play().then(() => { audioPlayed = true; }).catch(() => {});
+    render();
+  }
+
+  async function open(p, t) {
+    seq++; const mySeq = seq;
+    if (audio) { audio.pause(); audio.src = ""; audio = null; }
+    pid = p; title = t || "preview"; clips = []; nextOffset = null; idx = -1; fallback = []; total = 0;
+    // Captured at open: nowState still reflects pre-preview reality here.
+    wasPlaying = wasPlaying || !!(nowState && nowState.playing);
+    render("previewing…");
+    pop().hidden = false;
+    try {
+      const d = await api(`/api/playlist_preview/${pid}`);
+      if (mySeq !== seq) return;   // closed (or replaced) before the answer
+      clips = d.clips; nextOffset = d.next_offset; total = d.total; fallback = d.tracks;
+      if (clips.length || nextOffset != null) playAt(0);
+      else render("no audio preview");
+    } catch (e) {
+      if (mySeq === seq) render(esc(e.message));
+    }
+  }
+
+  function close() {
+    seq++;
+    clearTimeout(timer); timer = null; holding = false;
+    if (audio) { audio.pause(); audio.src = ""; audio = null; }
+    pop().hidden = true;
+    // One budgeted call per popup session, and only when preview audio
+    // actually took focus from a playback that was running.
+    if (wasPlaying && audioPlayed) {
+      api("/api/preview_resume", {}).then((r) => {
+        if (r.ok) repollAfterPlaybackChange();
+      }).catch(() => {});   // a refused resume is a shrug, never an error card
+    }
+    wasPlaying = audioPlayed = false;
+  }
+
+  // While the opening hold is still down, the finger must not scroll the
+  // list. touch-action can't change mid-gesture, so this blocks touchmove at
+  // the document (passive:false is required for preventDefault on touch).
+  document.addEventListener("touchmove", (e) => { if (holding) e.preventDefault(); },
+    { passive: false });
+  // The hold ends wherever the pointer is released — the popup stays open.
+  document.addEventListener("pointerup", () => { holding = false; });
+  document.addEventListener("pointercancel", () => { holding = false; });
+
+  function fire(pid_, name) {
+    fired = true; holding = true;
+    open(pid_, name);
+  }
+
+  return {
+    attach(row, pid_, name) {
+      let x0 = 0, y0 = 0;
+      row.onpointerdown = (e) => {
+        x0 = e.clientX; y0 = e.clientY; fired = false;
+        clearTimeout(timer);
+        timer = setTimeout(() => fire(pid_, name), HOLD_MS);
+      };
+      row.onpointermove = (e) => {
+        if (timer && Math.hypot(e.clientX - x0, e.clientY - y0) > 10) {
+          clearTimeout(timer); timer = null;   // it's a scroll, not a hold
+        }
+      };
+      // A released or drifted-off pointer only cancels a PENDING hold —
+      // an open popup is closed by its own close button.
+      row.onpointerup = row.onpointercancel = row.onpointerleave = () => {
+        clearTimeout(timer); timer = null; holding = false;
+      };
+      row.oncontextmenu = (e) => e.preventDefault();  // long-press menu would steal the hold
+    },
+    consumeClick() { const f = fired; fired = false; return f; },
+    stop: close,
+  };
+})();
+
+function closePicker() { previewHold.stop(); $("picker").hidden = true; }
 $("picker-close").onclick = closePicker;
 $("picker").onclick = (e) => { if (e.target.id === "picker") closePicker(); };
 
@@ -2225,7 +2432,8 @@ function sittingCardBody(tr, srvSitting) {
 
 function wireSittingCard() {
   $("now-card").querySelectorAll("[data-keep]").forEach((b) => {
-    b.onclick = () => decideKeep(b.dataset.keep);
+    b.onclick = () => { if (previewHold.consumeClick()) return; decideKeep(b.dataset.keep); };
+    previewHold.attach(b, b.dataset.keep, nowState.homes.get(b.dataset.keep)?.name);
   });
   const more = $("btn-decide-more");
   if (more) more.onclick = () => openPicker(nowState.homes, decideKeep);

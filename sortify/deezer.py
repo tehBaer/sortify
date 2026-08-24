@@ -38,6 +38,21 @@ class Deezer:
             raise DeezerError(str(data["error"]))
         return data if isinstance(data, dict) else {}
 
+    def fetch_preview(self, artist: str, title: str) -> dict:
+        """{"url", "deezer_id"} for a 30s preview clip, or {"miss": True}.
+
+        One request: search results carry `preview` directly. The URL's CDN
+        token EXPIRES after a while, so callers must not persist it — cache
+        at most for minutes (unlike deezer.json's write-once BPM records).
+        Errors raise, same contract as `fetch_track`.
+        """
+        hits = self._get(
+            "/search", {"q": f'artist:"{artist}" track:"{title}"', "limit": 1}
+        ).get("data") or []
+        if not hits or not hits[0].get("id") or not hits[0].get("preview"):
+            return {"miss": True}
+        return {"url": hits[0]["preview"], "deezer_id": int(hits[0]["id"])}
+
     def fetch_track(self, artist: str, title: str) -> dict:
         """A `deezer.json` record for one track.
 
