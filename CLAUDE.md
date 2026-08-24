@@ -75,10 +75,24 @@ escalating penalties. Therefore:
 
 ## Conventions (encoded in data/config.json — don't re-derive)
 
-- Inputs: bracketed `[Name]` playlists (`input_name_pattern`).
-- Homes: playlists under the `ROOT` folder tree minus ARCHIVED/OLD segments,
-  emoji-prefixed names (🐾/🧸 derived super/subsets), and `__x__`/`{x}`/`<x>`
-  marker names.
+- **Inputs are SETS**, not one flat list (`input_sets`, `sortify/inputsets.py`).
+  Each set matches EITHER a name pattern OR a folder segment, and carries a
+  label the UI groups by. Currently: `buffer` = `^\[.+\]$` (the day-to-day
+  inboxes), `other` = `^<.*>$` (older lists being reworked), `the-bomb` =
+  everything inside the `THE BOMB` folder. The folder form exists so a set
+  can be declared without renaming playlists whose names already carry
+  meaning — "Progressive rock · classic rock · Psychedelic Rock" beats any
+  bracketing convention. Folder-defined sets have **no name rule**, so their
+  playlists are never flagged by the naming checker.
+  `input_name_pattern` remains as the fallback when `input_sets` is absent;
+  ids in `input_ids` still union in and land in the first set.
+  Consequence worth knowing: for a pattern set the NAME is the membership,
+  so renaming is how a playlist moves between sets — and a misnamed one
+  cannot be attributed to its intended set at all.
+- Homes: playlists under the `ROOT` folder tree minus ARCHIVED/OLD/NEUE
+  segments, emoji-prefixed names (🐾/🧸 derived super/subsets), and
+  `__x__`/`{x}`/`<x>` marker names. NEUE was excluded 2026-08-24: they are
+  staging buckets for new finds, not filing destinations.
 - The client speaks the Feb-2026 dev-mode API (`items`/`item`, `/me/library`)
   — do not "fix" it back to pre-2026 shapes. Batch ADD exists: up to 100 uris
   per playlist-items POST (probed 2026-08-23; 150 → 400). There is still no
