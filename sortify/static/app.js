@@ -726,8 +726,7 @@ function fmtCountdown(ms) {
 function renderNowProblem(msg) {
   nowProblem = true;
   paintSittingBar();
-  $("now-context").textContent = "";
-  $("now-controls").hidden = true;
+  hideInputSwitch();
   stopCooldownTicker();
   stopNowTicker();
   const cd = msg.match(/cooldown — try again in ~(\d+) min/);
@@ -788,10 +787,36 @@ try { nowSetsExpanded = localStorage.getItem("sortify-sets-open") === "1"; } cat
 
 function setLabel(key) { return (key || NOW_BUFFER_SET).replace(/-/g, " "); }
 
+// The last `d` paintNowControls saw — the popover re-renders from it on
+// open and on fold-toggle, without waiting for another poll.
+let nowCtl = null;
+
+function hideInputSwitch() {
+  $("btn-input-switch").hidden = true;
+  closeInputPop();
+}
+
 function paintNowControls(d) {
   const playable = (d.inputs || []).filter((l) => l.id !== "liked");
-  if (!playable.length || d.needs_reauth || d.cooldown) { $("now-controls").hidden = true; return; }
-  const sel = $("now-input-switch");
+  if (!playable.length || d.needs_reauth || d.cooldown) { hideInputSwitch(); return; }
+  nowCtl = d;
+  // The trigger's face doubles as the old "playing from …" context line:
+  // whatever is true about the playing context is what the button says.
+  const ctx = d.context;
+  $("input-switch-label").textContent = d.playing
+    ? (ctx?.name
+        ? (ctx.is_input ? ctx.name : `${ctx.name} (not an input)`)
+        : "not playing from a playlist")
+    : "start an input…";
+  $("btn-input-switch").classList.toggle("placeholder", !(d.playing && ctx?.is_input));
+  $("btn-input-switch").hidden = false;
+  if (!$("input-pop").hidden) renderInputPop();
+}
+
+function renderInputPop() {
+  if (!nowCtl) return;
+  const d = nowCtl;
+  const playable = (d.inputs || []).filter((l) => l.id !== "liked");
   const current = d.playing ? d.context?.id : null;
 
   const bySet = new Map();
@@ -800,12 +825,15 @@ function paintNowControls(d) {
     if (!bySet.has(k)) bySet.set(k, []);
     bySet.get(k).push(l);
   }
-  const opt = (l) =>
-    `<option value="${esc(l.id)}"${l.id === current ? " selected" : ""}>` +
-    `${l.has_track ? "• " : ""}${esc(l.name)}</option>`;
+  const row = (l) =>
+    `<button id="ip-${esc(l.id)}" class="ip-row${l.id === current ? " current" : ""}">` +
+    `<span class="ip-name">${esc(l.name)}</span>` +
+    (l.has_track ? `<span class="ip-dot" title="already contains this track"></span>` : "") +
+    `</button>`;
 
-  let html = `<option value="">${d.playing ? "— switch to another input —" : "▶ start an input…"}</option>`;
+  let html = "";
   let hidden = 0;
+  const shownAll = [];
   for (const [key, lists] of bySet) {
     const open = key === NOW_BUFFER_SET || nowSetsExpanded;
     // A folded set is never fully silent: the playing track's own lists,
@@ -813,25 +841,65 @@ function paintNowControls(d) {
     const shown = open ? lists : lists.filter((l) => l.has_track || l.id === current);
     hidden += lists.length - shown.length;
     if (!shown.length) continue;
+    shownAll.push(...shown);
     const note = open || shown.length === lists.length
-      ? "" : ` (${shown.length} of ${lists.length})`;
-    html += key === NOW_BUFFER_SET && bySet.size === 1
-      ? shown.map(opt).join("")
-      : `<optgroup label="${esc(setLabel(key) + note)}">${shown.map(opt).join("")}</optgroup>`;
+      ? "" : ` · ${shown.length} of ${lists.length}`;
+    if (!(key === NOW_BUFFER_SET && bySet.size === 1))
+      html += `<div class="ip-set">${esc(setLabel(key) + note)}</div>`;
+    html += shown.map(row).join("");
   }
-  sel.innerHTML = html;
+  if (hidden || nowSetsExpanded)
+    html += `<button id="btn-now-sets" class="ip-more">${
+      nowSetsExpanded ? "fewer sets" : `show all sets (+${hidden})`}</button>`;
 
-  const btn = $("btn-now-sets");
-  btn.hidden = !hidden && !nowSetsExpanded;
-  btn.textContent = nowSetsExpanded ? "fewer" : `+${hidden} more`;
-  $("now-controls").hidden = false;
+  const pop = $("input-pop");
+  pop.innerHTML = html;
+  // innerHTML replaced the nodes, so the bindings go per render — the same
+  // reason renderNow rewires its card-internal buttons every time.
+  for (const l of shownAll) $("ip-" + l.id).onclick = () => pickInput(l.id);
+  const more = $("btn-now-sets");
+  if (more) more.onclick = () => {
+    nowSetsExpanded = !nowSetsExpanded;
+    try { localStorage.setItem("sortify-sets-open", nowSetsExpanded ? "1" : "0"); } catch (_) {}
+    renderInputPop();
+  };
 }
 
-$("btn-now-sets").onclick = () => {
-  nowSetsExpanded = !nowSetsExpanded;
-  try { localStorage.setItem("sortify-sets-open", nowSetsExpanded ? "1" : "0"); } catch (_) {}
-  if (nowState) paintNowControls(nowState);
+function openInputPop() {
+  renderInputPop();
+  $("input-pop").hidden = false;
+  $("btn-input-switch").classList.add("open");
+}
+
+function closeInputPop() {
+  $("input-pop").hidden = true;
+  $("btn-input-switch").classList.remove("open");
+}
+
+$("btn-input-switch").onclick = (e) => {
+  if (e && e.stopPropagation) e.stopPropagation();
+  if ($("input-pop").hidden) openInputPop(); else closeInputPop();
 };
+
+// Tapping anywhere else dismisses the panel; clicks inside it (rows, the
+// fold toggle) are its own business.
+document.addEventListener("click", (e) => {
+  if ($("input-pop").hidden) return;
+  const t = e && e.target;
+  if (t && t.closest && t.closest("#input-pop, #btn-input-switch")) return;
+  closeInputPop();
+});
+
+async function pickInput(id) {
+  closeInputPop();
+  try {
+    await api("/api/player/play", { input_id: id });
+    toast("starting…");
+    repollAfterPlaybackChange();
+  } catch (err) {
+    toast(err.message);
+  }
+}
 
 // Spotify needs a moment to settle after a skip before it reports the new
 // track; the server has already dropped its cached answer, so this poll is
@@ -929,19 +997,6 @@ function playbackStrip(d, tr) {
   </div>`;
 }
 
-$("now-input-switch").onchange = async (e) => {
-  const id = e.target.value;
-  if (!id) return;
-  try {
-    await api("/api/player/play", { input_id: id });
-    toast("starting…");
-    repollAfterPlaybackChange();
-  } catch (err) {
-    toast(err.message);
-    e.target.value = nowState?.context?.id || "";
-  }
-};
-
 // Keeps the client-side `sitting` convenience global roughly in step with
 // what the server just confirmed, so the persistent bar/Finish button have
 // something recent to show even after the user tabs away from the sitting's
@@ -993,7 +1048,6 @@ function renderNow() {
   if (d.needs_reauth) {
     nowProblem = true;
     stopNowTicker();
-    $("now-context").textContent = "";
     $("now-card").innerHTML =
       `<div class="state-card">
         <p>Spotify needs one more permission<br>(reading what's currently playing).</p>
@@ -1009,7 +1063,6 @@ function renderNow() {
   if (!d.playing) {
     nowProblem = false;
     stopNowTicker();
-    $("now-context").textContent = "";
     const hasInputs = (d.inputs || []).some((l) => l.id !== "liked");
     $("now-card").innerHTML =
       `<div class="state-card">
@@ -1024,12 +1077,6 @@ function renderNow() {
 
   const tr = d.track;
   const ctx = d.context;
-
-  $("now-context").textContent = inSitting
-    ? ""  // the sitting banner directly below already names the pile
-    : ctx?.name
-      ? (ctx.is_input ? `playing from ${ctx.name}` : `playing from ${ctx.name} (not an input)`)
-      : "not playing from a playlist";
 
   const img = tr.image ? `<img src="${esc(tr.image)}" alt="">` : '<div class="noimg"></div>';
   const artists = tr.artists.map((a) => a.name).join(", ");
@@ -2582,6 +2629,7 @@ async function decideUndecide() {
 document.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT") return;
   if (!$("picker").hidden) { if (e.key === "Escape") closePicker(); return; }
+  if (!$("input-pop").hidden) { if (e.key === "Escape") closeInputPop(); return; }
 
   if (!$("view-triage").hidden && triage) {
     const tr = triage.tracks[triage.idx];

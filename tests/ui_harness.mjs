@@ -817,9 +817,11 @@ run("stopNowPolling()");
   check("V4 the sitting banner names the pile and the progress",
         $$("now-sitting-bar").hidden === false && /dreamy pile/.test(status) && /1 of 2 left/.test(status),
         JSON.stringify(status.slice(0, 100)));
-  check("V4 the context line no longer repeats the pile name",
-        $$("now-context").textContent === "",
-        JSON.stringify($$("now-context").textContent));
+  // The old #now-context line is gone; the input-switch trigger inherited
+  // the "what's playing from" role, and it must not echo the pile either.
+  check("V4 nothing above the banner repeats the pile name",
+        !/dreamy pile/.test($$("input-switch-label").textContent),
+        JSON.stringify($$("input-switch-label").textContent));
 }
 
 // ============================================================================
@@ -1208,6 +1210,69 @@ run("stopNowPolling()");
   await tick();
   check("S1 the picker closes once the share lands",
         pop.hidden === true, `hidden=${pop.hidden}`);
+}
+
+// ============================================================================
+// NB — single now bar: the input popover replaces the <select>
+// ============================================================================
+{
+  check("NB openInputPop exists", run(`typeof openInputPop`) === "function",
+        String(run(`typeof openInputPop`)));
+  try {
+    const d = { playing: true, is_playing: true,
+      context: { id: "in2", name: "[B]", is_input: true },
+      inputs: [
+        { id: "in1", name: "[A]", set: "buffer", has_track: false },
+        { id: "in2", name: "[B]", set: "buffer", has_track: false },
+        { id: "o1", name: "<kept>", set: "other", has_track: true },
+        { id: "o2", name: "<folded away>", set: "other", has_track: false },
+      ] };
+    run(`nowSetsExpanded = false; paintNowControls(${JSON.stringify(d)})`);
+    check("NB the trigger is shown wearing the playing input's name",
+          $$("btn-input-switch").hidden === false
+          && /\[B\]/.test($$("input-switch-label").textContent),
+          `hidden=${$$("btn-input-switch").hidden} label=` +
+          JSON.stringify($$("input-switch-label").textContent));
+
+    run(`openInputPop()`);
+    const pop = $$("input-pop");
+    check("NB opening renders a row per visible input into #input-pop",
+          pop.hidden === false && /ip-in1/.test(pop.innerHTML)
+          && /\[A\]/.test(pop.innerHTML),
+          `hidden=${pop.hidden} html=${JSON.stringify(pop.innerHTML.slice(0, 120))}`);
+    check("NB a folded set still peeks the row that contains the track",
+          /ip-o1/.test(pop.innerHTML) && !/ip-o2/.test(pop.innerHTML),
+          JSON.stringify(pop.innerHTML.slice(0, 200)));
+    check("NB the fold toggle lives inside the panel, not the top bar",
+          /btn-now-sets/.test(pop.innerHTML), JSON.stringify(pop.innerHTML.slice(0, 200)));
+
+    run(`$("btn-now-sets").onclick()`);
+    check("NB expanding inside the panel reveals the folded row",
+          /ip-o2/.test($$("input-pop").innerHTML),
+          JSON.stringify($$("input-pop").innerHTML.slice(0, 200)));
+    run(`$("btn-now-sets").onclick()`);   // fold back for a stable end state
+
+    routes["POST /api/player/play"] = { ok: true };
+    resetLog();
+    run(`openInputPop()`);
+    await run(`$("ip-in1").onclick()`);
+    await tick();
+    check("NB picking a row starts that input exactly once",
+          posts("/api/player/play") === 1
+          && bodies("/api/player/play")[0]?.input_id === "in1",
+          `${posts("/api/player/play")} POST(s), body=` +
+          JSON.stringify(bodies("/api/player/play")[0]));
+    check("NB and the panel closes on pick",
+          $$("input-pop").hidden === true, `hidden=${$$("input-pop").hidden}`);
+
+    // Cooldown/reauth must hide the trigger exactly as it hid the old row.
+    run(`paintNowControls(${JSON.stringify({ cooldown: true, inputs: d.inputs })})`);
+    check("NB a cooldown hides the trigger",
+          $$("btn-input-switch").hidden === true,
+          `hidden=${$$("btn-input-switch").hidden}`);
+  } catch (e) {
+    check("NB scenario ran without throwing", false, String(e));
+  }
 }
 
 // ---- summary ---------------------------------------------------------------
