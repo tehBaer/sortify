@@ -45,6 +45,10 @@ async function api(path, body, method) {
 }
 
 function show(view) {
+  // Preview audio must not outlive the card it belongs to: navigating away
+  // used to leave clips playing with no visible control to stop them, and
+  // held the auto-resume back until the user found their way back here.
+  previewHold.stop();
   for (const v of views) $("view-" + v).hidden = v !== view;
   // Triage is reached from (and exits back to) the Playlists view, so it
   // keeps that link lit. Split has its own top-level tab now, and the
@@ -535,7 +539,8 @@ function renderCard() {
 
   $("card").querySelectorAll(".sugg").forEach((b) => {
     b.onclick = () => { if (previewHold.consumeClick()) return; moveTo(b.dataset.to); };
-    previewHold.attach(b, b.dataset.to, triage.homes.get(b.dataset.to)?.name);
+    previewHold.attach(b, b.dataset.to, triage.homes.get(b.dataset.to)?.name,
+      { label: "File here", run: () => moveTo(b.dataset.to) });
   });
   const more = $("btn-more");
   if (more) more.onclick = () => openPicker(triage.homes, moveTo);
@@ -1137,7 +1142,8 @@ function renderNow() {
   } else {
     $("now-card").querySelectorAll(".sugg").forEach((b) => {
       b.onclick = () => { if (previewHold.consumeClick()) return; nowFile(b.dataset.to); };
-      previewHold.attach(b, b.dataset.to, nowState.homes.get(b.dataset.to)?.name);
+      previewHold.attach(b, b.dataset.to, nowState.homes.get(b.dataset.to)?.name,
+        { label: "File here", run: () => nowFile(b.dataset.to) });
     });
     const more = $("btn-now-more");
     if (more) more.onclick = () => openPicker(nowState.homes, nowFile, nowCreateAndFile);
@@ -1406,7 +1412,8 @@ function openPicker(homesMap, onPick, onCreate) {
         if (previewHold.consumeClick()) return;
         closePicker(); onPick(h.id);
       };
-      previewHold.attach(b, h.id, h.name);
+      previewHold.attach(b, h.id, h.name,
+        { label: "File here", run: () => { closePicker(); onPick(h.id); } });
       list.appendChild(b);
     }
     // The moment of need: the right playlist doesn't exist yet. Create it
@@ -1434,33 +1441,61 @@ function openPicker(homesMap, onPick, onCreate) {
 //
 // Spotify's dev-mode API has no preview URLs, so the audio comes from
 // /api/playlist_preview (Deezer 30s clips over the playlist's tracks, newest
-// first — zero Spotify calls; see app.py). Hold ≥450ms on a picker row or a
+// first — zero Spotify calls; see app.py). Hold on a picker row or a
 // suggestion opens the player and eats the row's click; the popup then owns
 // the audio: full 30s clips, auto-advance on clip end, prev/next controls,
 // and an explicit close — which is also when the single budgeted
 // auto-resume call fires (the phone OS pauses Spotify when preview audio
 // takes focus and never un-pauses it on its own).
+//
+// Two things make the gesture honest, because the hold COMPETES with the
+// row's own tap and wins by swallowing it:
+//   - every holdable row wears a small waveform glyph, so the gesture is
+//     discoverable at all rather than folklore;
+//   - the press paints a filling bar along the row from 150ms in, and
+//     buzzes when it fires, so a hold is something the user watches happen
+//     and can abort — not a tap that silently failed to file.
+// The popup also carries the row's own action ("File here"), so hearing the
+// playlist and choosing it is one gesture instead of close-find-tap.
 const previewHold = (() => {
-  const HOLD_MS = 450;
+  const HOLD_MS = 550;   // above the accidental-dwell range a tap can reach
   const ICON = {
     close: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
     prev: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>',
     next: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>',
+    play: '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>',
+    // the affordance: bars, the shape of a clip waiting to be heard
+    wave: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M2 6.5v3M5.5 3v10M9 5v6M12.5 6.5v3M15.5 7.5v1"/></svg>',
   };
   // `fired` marks a completed hold until its trailing click is consumed;
   // `holding` tracks finger-still-down after the popup opened, for the
   // scroll blocker only — the popup itself outlives the hold.
   let timer = null, fired = false, holding = false, seq = 0, audio = null;
-  let wasPlaying = false, audioPlayed = false;
+  let wasPlaying = false, audioPlayed = false, needsTap = false;
   // Player state: every clip resolved so far (pages accumulate), the next
   // page cursor, and the index of the clip being played.
   let clips = [], nextOffset = null, idx = -1, pid = null, title = "", total = 0, fallback = [];
+  // What the held row would have done if tapped, offered inside the popup.
+  let act = null;
+  // The row currently painting a press — cleared on release, fire or close.
+  let heldRow = null;
 
   const pop = () => $("preview-pop");
 
+  function unpress() {
+    if (heldRow) heldRow.classList.remove("holding");
+    heldRow = null;
+  }
+
+  function paintProgress() {
+    const fill = $("pv-fill");
+    if (!fill || !audio || !audio.duration) return;
+    fill.style.width = `${Math.min(100, (audio.currentTime / audio.duration) * 100)}%`;
+  }
+
   function render(statusLine) {
     const c = clips[idx];
-    const now = statusLine ? `<div class="pv-now">${statusLine}</div>` :
+    const now = statusLine ? `<div class="pv-now">${esc(statusLine)}</div>` :
       c ? `<div class="pv-now">${esc(c.artist)} — ${esc(c.name)}</div>` : "";
     // The text list only fills in when there is no audio at all — with a
     // working player it is noise under the controls.
@@ -1468,18 +1503,36 @@ const previewHold = (() => {
       `<div class="pv-line">${esc(t.artist)} — ${esc(t.name)}</div>`).join("");
     const atStart = idx <= 0;
     const atEnd = idx >= clips.length - 1 && nextOffset == null;
+    // How far into this 30s clip we are: `next` is otherwise a blind press.
+    const prog = c ? '<div class="pv-prog"><i id="pv-fill"></i></div>' : "";
+    // idx counts RESOLVED clips and misses are skipped, so it cannot be
+    // "n of total" — the two numbers are not on the same scale.
+    const pos = clips.length ? `clip ${idx + 1} · ${total} tracks` : `${total} tracks`;
     pop().innerHTML = `
       <div class="pv-head"><span class="pv-title">${esc(title)}</span>
         <button id="pv-close" class="icon-btn" aria-label="Close preview">${ICON.close}</button></div>
-      ${now}${lines}
+      <div class="pv-live" aria-live="polite">${now}${lines}</div>
+      ${prog}
       <div class="pv-ctl">
         <button id="pv-prev" class="icon-btn" aria-label="Previous clip"${atStart ? " disabled" : ""}>${ICON.prev}</button>
+        ${needsTap ? `<button id="pv-play" class="icon-btn" aria-label="Play clip">${ICON.play}</button>` : ""}
         <button id="pv-next" class="icon-btn" aria-label="Next clip"${atEnd ? " disabled" : ""}>${ICON.next}</button>
-        <span class="pv-pos">${clips.length ? `${idx + 1} · ${total} tracks` : `${total} tracks`}</span>
-      </div>`;
+        <span class="pv-pos">${pos}</span>
+      </div>
+      ${act ? `<button id="pv-act" class="pv-act primary">${esc(act.label)}</button>` : ""}`;
     $("pv-close").onclick = close;
     $("pv-prev").onclick = () => playAt(idx - 1);
     $("pv-next").onclick = () => playAt(idx + 1);
+    // Autoplay can be refused when play() lands outside the gesture's call
+    // stack (iOS). Silence plus a track name reads as a broken player, so
+    // the card asks for the one tap that unblocks it instead.
+    if (needsTap) $("pv-play").onclick = () => {
+      if (!audio) return;
+      audio.play().then(() => { audioPlayed = true; needsTap = false; render(); }).catch(() => {});
+    };
+    // The whole point of previewing a home is deciding to use it.
+    if (act) $("pv-act").onclick = () => { const a = act; close(); a.run(); };
+    paintProgress();
   }
 
   async function playAt(i) {
@@ -1504,20 +1557,26 @@ const previewHold = (() => {
     // objects is the "previews over each other" bug.
     if (audio) { audio.pause(); audio.src = ""; }
     const c = clips[idx];
+    needsTap = false;
     audio = new Audio(c.url);
     audio.onended = () => { if (mySeq === seq) playAt(idx + 1); };  // full 30s, then advance
-    audio.play().then(() => { audioPlayed = true; }).catch(() => {});
+    audio.ontimeupdate = paintProgress;
+    audio.play().then(() => { audioPlayed = true; })
+      .catch(() => { if (mySeq === seq) { needsTap = true; render(); } });
     render();
   }
 
-  async function open(p, t) {
+  async function open(p, t, a) {
     seq++; const mySeq = seq;
     if (audio) { audio.pause(); audio.src = ""; audio = null; }
-    pid = p; title = t || "preview"; clips = []; nextOffset = null; idx = -1; fallback = []; total = 0;
+    pid = p; title = t || "preview"; clips = []; nextOffset = null; idx = -1; fallback = [];
+    total = 0; needsTap = false; act = a || null;
     // Captured at open: nowState still reflects pre-preview reality here.
     wasPlaying = wasPlaying || !!(nowState && nowState.playing);
     render("previewing…");
     pop().hidden = false;
+    // Lets the picker keep its last rows clear of the card (see style.css).
+    document.body.classList.add("previewing");
     try {
       const d = await api(`/api/playlist_preview/${pid}`);
       if (mySeq !== seq) return;   // closed (or replaced) before the answer
@@ -1525,20 +1584,31 @@ const previewHold = (() => {
       if (clips.length || nextOffset != null) playAt(0);
       else render("no audio preview");
     } catch (e) {
-      if (mySeq === seq) render(esc(e.message));
+      // 404 carries real instruction ("open it once in sortify first"); a
+      // transport or 500 message is machine noise in a body of card text.
+      if (mySeq === seq) render(e.status === 404 ? e.message : "couldn't load the preview");
     }
   }
 
   function close() {
     seq++;
     clearTimeout(timer); timer = null; holding = false;
+    unpress();
     if (audio) { audio.pause(); audio.src = ""; audio = null; }
     pop().hidden = true;
+    document.body.classList.remove("previewing");
+    needsTap = false; act = null;
     // One budgeted call per popup session, and only when preview audio
     // actually took focus from a playback that was running.
     if (wasPlaying && audioPlayed) {
       api("/api/preview_resume", {}).then((r) => {
         if (r.ok) repollAfterPlaybackChange();
+        // The server's own debounce is not a failure — a second popup within
+        // five seconds rides the first resume. Anything else means the music
+        // this preview interrupted is still paused, and only the user can
+        // undo that, so silence is the one answer we must not give.
+        else if (r.error && r.error !== "resume already sent")
+          toast("preview over — press play in Spotify");
       }).catch(() => {});   // a refused resume is a shrug, never an error card
     }
     wasPlaying = audioPlayed = false;
@@ -1550,31 +1620,50 @@ const previewHold = (() => {
   document.addEventListener("touchmove", (e) => { if (holding) e.preventDefault(); },
     { passive: false });
   // The hold ends wherever the pointer is released — the popup stays open.
-  document.addEventListener("pointerup", () => { holding = false; });
-  document.addEventListener("pointercancel", () => { holding = false; });
+  document.addEventListener("pointerup", () => { holding = false; unpress(); });
+  document.addEventListener("pointercancel", () => { holding = false; unpress(); });
+  // Escape closes the player before it closes anything underneath it.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !pop().hidden) { e.stopPropagation(); close(); }
+  });
 
-  function fire(pid_, name) {
+  function fire(pid_, name, act_) {
     fired = true; holding = true;
-    open(pid_, name);
+    unpress();
+    // The gesture won the row's tap — say so in the hand, since the eyes
+    // may be anywhere.
+    if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate(12);
+    open(pid_, name, act_);
   }
 
   return {
-    attach(row, pid_, name) {
+    attach(row, pid_, name, act_) {
+      // Marks the row as holdable AND hangs the affordance on it — one place
+      // for all four call sites, so no caller has to remember the glyph.
+      if (!row.classList.contains("holdable")) {
+        row.classList.add("holdable");
+        const hint = document.createElement("span");
+        hint.className = "hold-hint";
+        hint.setAttribute("aria-hidden", "true");
+        hint.innerHTML = ICON.wave;
+        row.appendChild(hint);
+      }
       let x0 = 0, y0 = 0;
       row.onpointerdown = (e) => {
         x0 = e.clientX; y0 = e.clientY; fired = false;
+        unpress(); heldRow = row; row.classList.add("holding");
         clearTimeout(timer);
-        timer = setTimeout(() => fire(pid_, name), HOLD_MS);
+        timer = setTimeout(() => fire(pid_, name, act_), HOLD_MS);
       };
       row.onpointermove = (e) => {
         if (timer && Math.hypot(e.clientX - x0, e.clientY - y0) > 10) {
-          clearTimeout(timer); timer = null;   // it's a scroll, not a hold
+          clearTimeout(timer); timer = null; unpress();   // it's a scroll, not a hold
         }
       };
       // A released or drifted-off pointer only cancels a PENDING hold —
       // an open popup is closed by its own close button.
       row.onpointerup = row.onpointercancel = row.onpointerleave = () => {
-        clearTimeout(timer); timer = null; holding = false;
+        clearTimeout(timer); timer = null; holding = false; unpress();
       };
       row.oncontextmenu = (e) => e.preventDefault();  // long-press menu would steal the hold
     },
@@ -2568,7 +2657,8 @@ function sittingCardBody(tr, srvSitting) {
 function wireSittingCard() {
   $("now-card").querySelectorAll("[data-keep]").forEach((b) => {
     b.onclick = () => { if (previewHold.consumeClick()) return; decideKeep(b.dataset.keep); };
-    previewHold.attach(b, b.dataset.keep, nowState.homes.get(b.dataset.keep)?.name);
+    previewHold.attach(b, b.dataset.keep, nowState.homes.get(b.dataset.keep)?.name,
+      { label: "Keep here", run: () => decideKeep(b.dataset.keep) });
   });
   const more = $("btn-decide-more");
   if (more) more.onclick = () => openPicker(nowState.homes, decideKeep);
@@ -2710,6 +2800,8 @@ document.addEventListener("keydown", (e) => {
 // Coming back to the tab is the moment a skip is most likely to have happened
 // behind our back, so this one bypasses the predicted TTL.
 document.addEventListener("visibilitychange", () => {
+  // Same reasoning as show(): a backgrounded tab has no visible player.
+  if (document.hidden) previewHold.stop();
   // Manual mode means exactly that — not even the refocus poll fires; the
   // refresh button is the only trigger the user hasn't pressed themselves.
   if (!document.hidden && !$("view-now").hidden && !nowManual) pollNow(true);
