@@ -1314,10 +1314,12 @@ async function openSharePop() {
 async function doShare(track, friend) {
   if (shareInFlight) return;
   shareInFlight = true;
-  const id = track.uri.split(":").pop();
+  // title+artist, no uri: the server drives the tablet via the search
+  // deep link — a track link would autoplay there and steal playback.
+  const artist = (track.artists || []).map((a) => a.name).join(" ");
   toast(`sending to ${friend}… (~40s, the tablet is doing the tapping)`, 45000);
   try {
-    await api("/api/share/track", { track_id: id, title: track.name, friend });
+    await api("/api/share/track", { title: track.name, artist, friend });
     $("share-pop").hidden = true;
     toast(`sent to ${friend}`);
   } catch (e) {

@@ -3595,29 +3595,48 @@ def player_play(body: PlayIn):
 
 
 class ShareIn(BaseModel):
-    track_id: str
+    # title+artist, not a track id: the tablet flow enters via the search
+    # deep link, because any track VIEW intent autoplays and steals the
+    # user's playback via Connect (measured live 2026-08-24).
     title: str
+    artist: str
     friend: str
+
+
+def _share_cache() -> dict:
+    path = store.dir / "tabletshare.json"
+    if not path.exists():
+        return {"targets": [], "updated": None, "aliases": {}}
+    data = json.loads(path.read_text())
+    data.setdefault("aliases", {})
+    return data
 
 
 @app.post("/api/share/track")
 def share_track_endpoint(body: ShareIn):
+    # The picker speaks display names ("Mara"); the tablet's share sheet
+    # only knows the raw thread names, so resolve before driving.
+    aliases = _share_cache()["aliases"]
+    friend = tabletshare.resolve_target(body.friend, aliases)
     try:
-        targets = tabletshare.share_track(body.track_id, body.title, body.friend)
+        targets = tabletshare.share_track(body.title, body.artist, friend)
     except tabletshare.UiStepError as e:
+        # The access log alone shows only the request line on a 502; this
+        # line is the difference between forensics and a blind rerun.
+        log.warning("tablet share failed at: %s", e)
         raise HTTPException(502, str(e))
-    (store.dir / "tabletshare.json").write_text(
-        json.dumps({"targets": targets, "updated": int(time.time())}))
-    return {"ok": True, "targets": targets}
+    # targets is the raw truth from the sheet; aliases ride along so a
+    # cache refresh never loses the user's renames.
+    (store.dir / "tabletshare.json").write_text(json.dumps(
+        {"targets": targets, "updated": int(time.time()), "aliases": aliases}))
+    return {"ok": True, "targets": tabletshare.display_targets(targets, aliases)}
 
 
 @app.get("/api/share/targets")
 def share_targets_endpoint():
-    path = store.dir / "tabletshare.json"
-    if not path.exists():
-        return {"targets": [], "updated": None}
-    data = json.loads(path.read_text())
-    return {"targets": data.get("targets", []), "updated": data.get("updated")}
+    data = _share_cache()
+    return {"targets": tabletshare.display_targets(data["targets"], data["aliases"]),
+            "updated": data["updated"]}
 
 
 # ---- actions ---------------------------------------------------------------

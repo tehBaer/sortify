@@ -1186,7 +1186,7 @@ run("stopNowPolling()");
   routes["POST /api/share/track"] = () => pending;
 
   run(`nowState = { playing: true, track: {
-         uri: "spotify:track:t1", name: "Song", artists: ["A"] } }`);
+         uri: "spotify:track:t1", name: "Song", artists: [{ name: "A" }] } }`);
   resetLog();
   await run(`openSharePop()`);
   await tick();
@@ -1202,9 +1202,9 @@ run("stopNowPolling()");
   await tick();
   check("S1 two clicks send exactly one share",
         posts("/api/share/track") === 1, `${posts("/api/share/track")} POST(s)`);
-  check("S1 the POST carries id, title and friend",
+  check("S1 the POST carries title, artist and friend — never a track id",
         JSON.stringify(bodies("/api/share/track")[0]) ===
-        JSON.stringify({ track_id: "t1", title: "Song", friend: "bob99" }),
+        JSON.stringify({ title: "Song", artist: "A", friend: "bob99" }),
         JSON.stringify(bodies("/api/share/track")[0]));
   release({ status: 200, body: { ok: true, targets: ["bob99"] } });
   await tick();

@@ -73,22 +73,25 @@ def test_share_targets_ignores_search_group_and_link_actions():
 
 # --- track_row_menu_point --------------------------------------------------
 
-ALBUM_PAGE = hierarchy(
-    node(text="Other Song", rid="com.spotify.music:id/title_text",
-         bounds="[66,300][200,344]"),
-    node(text="Found the Way", rid="com.spotify.music:id/title_text",
-         bounds="[66,400][200,444]"),
+SEARCH_PAGE = hierarchy(
+    # search results: rows carry id/title + id/subtitle. The remix row
+    # exists to prove matching is exact, not substring.
+    node(text="Found the Way", rid="com.spotify.music:id/title",
+         bounds="[66,190][1130,234]"),
+    node(text="Song • Lab's Cloud", rid="com.spotify.music:id/subtitle",
+         bounds="[66,234][1104,258]"),
+    node(text="Found the Way - Abstract Seeds Remix",
+         rid="com.spotify.music:id/title", bounds="[66,286][1104,330]"),
 )
 
 
-def test_track_row_menu_point_is_the_dots_column_at_the_rows_height():
-    assert ts.track_row_menu_point(ALBUM_PAGE, "Found the Way") == \
-        (ts.ROW_MENU_X, 422)
+def test_search_row_point_finds_the_exact_title():
+    assert ts.search_row_point(SEARCH_PAGE, "Found the Way") == (598, 212)
 
 
-def test_track_row_menu_point_raises_when_the_track_is_not_on_screen():
+def test_search_row_point_raises_when_the_track_is_not_in_results():
     with pytest.raises(ts.UiStepError, match="Missing Song"):
-        ts.track_row_menu_point(ALBUM_PAGE, "Missing Song")
+        ts.search_row_point(SEARCH_PAGE, "Missing Song")
 
 
 # --- share_track orchestration ---------------------------------------------
@@ -130,60 +133,153 @@ class FakeAdb:
 def share(dumps, friend="bob99", **kw):
     adb = FakeAdb(dumps)
     result = ts.share_track(
-        "4zAS1w7phxmMtQNjNFJVou", "Found the Way", friend,
+        "Found the Way", "Lab's Cloud", friend,
         run=adb, sleep=lambda s: None, **kw)
     return adb, result
 
 
-def test_share_track_taps_row_menu_share_friend_then_send():
-    adb, sent = share([ALBUM_PAGE, MENU_SHEET, SHARE_SHEET, COMPOSE])
+def test_share_track_long_presses_the_row_then_share_friend_send():
+    adb, sent = share([SEARCH_PAGE, MENU_SHEET, SHARE_SHEET, COMPOSE])
     assert sent == ["Alice Example", "bob99"]
+    shells = [c[1] for c in adb.calls if c[0] == "shell"]
+    assert "input swipe 598 212 598 212 800" in shells   # long-press the row
     assert adb.taps() == [
-        f"input tap {ts.ROW_MENU_X} 422",       # the track row's ⋮
         f"input tap {ts.SHARE_ROW_X} 955",      # "Share" under the header
         "input tap 892 1602",                   # bob99's avatar
         "input tap 1080 1740",                  # Send
     ]
 
 
-def test_share_track_deep_links_first_and_pauses_playback_after():
-    adb, _ = share([ALBUM_PAGE, MENU_SHEET, SHARE_SHEET, COMPOSE])
+def test_share_track_opens_search_not_a_track_link():
+    # A track VIEW intent autoplays and steals playback via Connect
+    # (measured live 2026-08-24, both spotify: and https forms); the
+    # search link is the only entry that leaves playback alone.
+    adb, _ = share([SEARCH_PAGE, MENU_SHEET, SHARE_SHEET, COMPOSE])
     shells = [c[1] for c in adb.calls if c[0] == "shell"]
     assert "am start -a android.intent.action.VIEW " \
-           "-d spotify:track:4zAS1w7phxmMtQNjNFJVou" in shells
-    assert shells.index("input keyevent KEYCODE_MEDIA_PAUSE") > \
-        shells.index("input tap 892 1602")
+           "-d spotify:search:Found%20the%20Way%20Lab%27s%20Cloud" in shells
+    assert not any("spotify:track" in s for s in shells)
 
 
 def test_share_track_refuses_an_unknown_friend_and_names_the_targets():
     with pytest.raises(ts.UiStepError, match="Alice Example"):
-        share([ALBUM_PAGE, MENU_SHEET, SHARE_SHEET], friend="nobody")
+        share([SEARCH_PAGE, MENU_SHEET, SHARE_SHEET], friend="nobody")
 
 
 def test_share_track_aborts_when_the_menu_never_opened():
-    # second dump still shows the album page (row tap missed): the header
-    # check must not be satisfied by the row's own id/title_text node
+    # second dump still shows the results page (long-press missed): the
+    # header check must not be satisfied by the row's own id/title node
     with pytest.raises(ts.UiStepError):
-        share([ALBUM_PAGE, ALBUM_PAGE])
+        share([SEARCH_PAGE, SEARCH_PAGE])
 
 
 def test_share_track_aborts_on_an_unmapped_compose_screen():
     with pytest.raises(ts.UiStepError, match="Send"):
-        share([ALBUM_PAGE, MENU_SHEET, SHARE_SHEET, NO_SEND])
+        share([SEARCH_PAGE, MENU_SHEET, SHARE_SHEET, NO_SEND])
 
 
 def test_share_track_pauses_playback_even_when_a_step_fails():
-    adb = FakeAdb([ALBUM_PAGE, ALBUM_PAGE])
+    adb = FakeAdb([SEARCH_PAGE, SEARCH_PAGE])
     with pytest.raises(ts.UiStepError):
-        ts.share_track("id", "Found the Way", "bob99",
+        ts.share_track("Found the Way", "Lab's Cloud", "bob99",
                        run=adb, sleep=lambda s: None)
     assert ("shell", "input keyevent KEYCODE_MEDIA_PAUSE") in adb.calls
     assert ("shell", "input keyevent KEYCODE_SLEEP") in adb.calls
 
 
 def test_share_track_defaults_to_the_real_adb_runner(monkeypatch):
-    adb = FakeAdb([ALBUM_PAGE, MENU_SHEET, SHARE_SHEET, COMPOSE])
+    adb = FakeAdb([SEARCH_PAGE, MENU_SHEET, SHARE_SHEET, COMPOSE])
     monkeypatch.setattr(ts, "_adb", adb)
     monkeypatch.setattr(ts.time, "sleep", lambda s: None)
-    sent = ts.share_track("t1", "Found the Way", "bob99")
+    sent = ts.share_track("Found the Way", "Lab's Cloud", "bob99")
     assert sent == ["Alice Example", "bob99"]
+
+
+def test_share_track_retries_the_first_dump_while_the_app_cold_starts():
+    # Spotify cold-starting: two dumps of nothing before the album page
+    # renders. One fixed sleep was measured too short on the real tablet
+    # (2026-08-24, first live send) — the flow must poll, not hope.
+    blank = hierarchy(node(text="Loading", bounds="[0,0][10,10]"))
+    adb, sent = share([blank, blank, SEARCH_PAGE, MENU_SHEET, SHARE_SHEET, COMPOSE])
+    assert sent == ["Alice Example", "bob99"]
+
+
+def test_share_track_still_aborts_when_the_track_never_appears():
+    blank = hierarchy(node(text="Loading", bounds="[0,0][10,10]"))
+    with pytest.raises(ts.UiStepError, match="Found the Way"):
+        share([blank] * (ts.OPEN_TRIES + 1))
+
+
+# --- picker presentation: groups hidden, aliases applied --------------------
+
+def test_a_multi_person_target_counts_as_a_group():
+    assert ts.is_group("Jonas Sandberg, mariussunde +4")
+    assert ts.is_group("Alice Example, bob99")
+
+
+def test_a_single_person_or_number_is_not_a_group():
+    assert not ts.is_group("Michael Moen Allport")
+    assert not ts.is_group("11161517688")
+
+
+def test_display_targets_hides_groups_and_applies_aliases():
+    raw = ["Jonas Sandberg, mariussunde +4", "11161517688", "soppis96"]
+    assert ts.display_targets(raw, {"11161517688": "Mara"}) == \
+        ["Mara", "soppis96"]
+
+
+def test_resolve_target_maps_a_display_name_back_to_the_raw_name():
+    aliases = {"11161517688": "Mara"}
+    assert ts.resolve_target("Mara", aliases) == "11161517688"
+    assert ts.resolve_target("soppis96", aliases) == "soppis96"
+
+
+# --- adb reconnect ---------------------------------------------------------
+# The tablet's adb link is not durable: Wi-Fi doze drops it and every
+# command then fails "device '...' not found" until someone reconnects by
+# hand (seen live 2026-08-25). The runner heals that itself.
+
+class FlakyAdb:
+    """adb that reports the device missing until `connect` is called."""
+
+    def __init__(self):
+        self.connected = False
+        self.calls = []
+
+    def __call__(self, args):
+        self.calls.append(args)
+        if args[:1] == ("connect",):
+            self.connected = True
+            return "connected to " + ts.TABLET
+        if not self.connected:
+            raise ts.DeviceOffline(
+                f"adb: device '{ts.TABLET}' not found")
+        return "ok"
+
+
+def test_adb_reconnects_once_then_retries_the_command():
+    flaky = FlakyAdb()
+    out = ts._adb_with_reconnect("shell", "input keyevent KEYCODE_WAKEUP",
+                                 attempt=flaky)
+    assert out == "ok"
+    assert flaky.calls == [
+        ("shell", "input keyevent KEYCODE_WAKEUP"),   # fails, device gone
+        ("connect", ts.TABLET),                       # heal
+        ("shell", "input keyevent KEYCODE_WAKEUP"),   # succeeds
+    ]
+
+
+def test_adb_gives_up_with_a_useful_message_when_the_tablet_is_really_off():
+    def always_offline(args):
+        raise ts.DeviceOffline(f"adb: device '{ts.TABLET}' not found")
+    with pytest.raises(ts.UiStepError, match="tablet is not reachable"):
+        ts._adb_with_reconnect("shell", "true", attempt=always_offline)
+
+
+def test_a_reachable_tablet_is_not_reconnected_needlessly():
+    calls = []
+    def fine(args):
+        calls.append(args)
+        return "ok"
+    ts._adb_with_reconnect("shell", "true", attempt=fine)
+    assert calls == [("shell", "true")]
