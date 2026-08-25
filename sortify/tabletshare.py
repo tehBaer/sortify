@@ -178,7 +178,8 @@ def share_track(title: str, artist: str, friend: str,
     2026-08-24, spotify: and https forms both). Search leaves playback
     alone; the result row is long-pressed for its context sheet. Every
     step is verified from a fresh UI dump, aborting on the first surprise;
-    the finally block pauses any stray playback and sleeps the screen.
+    the finally block only sleeps the screen — see there for why no media
+    key may ever be sent.
     Returns the friend names seen in the share sheet, for the cache."""
     run = run if run is not None else _adb
     sleep = sleep if sleep is not None else time.sleep
@@ -216,5 +217,9 @@ def share_track(title: str, artist: str, friend: str,
         sleep(2)
         return [name for name, _ in targets]
     finally:
-        run("shell", "input keyevent KEYCODE_MEDIA_PAUSE")
+        # Screen off only — never a media key. Spotify is the tablet's
+        # registered MediaButtonReceiver and its session is a REMOTE
+        # (Connect) one, so KEYCODE_MEDIA_PAUSE here paused whatever the
+        # user was listening to elsewhere. Nothing in this flow plays
+        # anything, so there is nothing to pause.
         run("shell", "input keyevent KEYCODE_SLEEP")

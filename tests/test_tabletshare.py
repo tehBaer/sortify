@@ -178,12 +178,26 @@ def test_share_track_aborts_on_an_unmapped_compose_screen():
         share([SEARCH_PAGE, MENU_SHEET, SHARE_SHEET, NO_SEND])
 
 
-def test_share_track_pauses_playback_even_when_a_step_fails():
+def test_share_track_sends_no_media_key_at_all():
+    # A media key sent to the tablet reaches Spotify — the only active
+    # media session and the registered MediaButtonReceiver — which is a
+    # Connect controller for whatever the user is really listening on
+    # (volumeType=2 REMOTE, measured 2026-08-25). A cleanup pause left
+    # over from the track-link era therefore paused the USER's music.
+    # Search entry autoplays nothing, so no media key is ever warranted.
+    adb, _ = share([SEARCH_PAGE, MENU_SHEET, SHARE_SHEET, COMPOSE])
+    keys = [c[1] for c in adb.calls if "keyevent" in c[1]]
+    assert not any("MEDIA" in k for k in keys), keys
+
+
+def test_share_track_sends_no_media_key_when_a_step_fails_either():
     adb = FakeAdb([SEARCH_PAGE, SEARCH_PAGE])
     with pytest.raises(ts.UiStepError):
         ts.share_track("Found the Way", "Lab's Cloud", "bob99",
                        run=adb, sleep=lambda s: None)
-    assert ("shell", "input keyevent KEYCODE_MEDIA_PAUSE") in adb.calls
+    keys = [c[1] for c in adb.calls if "keyevent" in c[1]]
+    assert not any("MEDIA" in k for k in keys), keys
+    # the screen still goes back to sleep — that touches no playback
     assert ("shell", "input keyevent KEYCODE_SLEEP") in adb.calls
 
 
