@@ -670,6 +670,9 @@ async function pollNow(force = false) {
   if (document.hidden) { scheduleNext(15000); return; }
   try {
     const data = await api("/api/now" + (force ? "?force=1" : ""));
+    // When the server's answer left its upstream fetch (it may have served
+    // its cache) — the anchor for the "updated Ns ago" line.
+    nowFetchedAt = Date.now() - (data.fetched_ago_ms || 0);
     nowState = { ...data, homes: new Map((data.homes || []).map((h) => [h.id, h])) };
     renderNow();
     scheduleNext(data.poll_after_ms || 60000);
@@ -904,8 +907,17 @@ async function pickInput(id) {
 // Spotify needs a moment to settle after a skip before it reports the new
 // track; the server has already dropped its cached answer, so this poll is
 // guaranteed to go upstream rather than repeat what we just replaced.
-function repollAfterPlaybackChange() {
-  setTimeout(() => pollNow(true), 900);
+function repollAfterPlaybackChange(prevUri = null) {
+  setTimeout(async () => {
+    await pollNow(true);
+    // If Spotify hadn't settled and the poll still got the pre-skip track:
+    // in auto mode the server chases it by itself (an unsettled answer gets
+    // only a short TTL, so poll_after_ms comes right back). Manual mode
+    // schedules nothing, so the one follow-up poll happens here — timed
+    // past that settle TTL, and still part of the same click.
+    if (nowManual && prevUri && nowState?.playing && nowState.track?.uri === prevUri)
+      setTimeout(() => pollNow(), 3600);
+  }, 900);
 }
 
 // Card-internal control (re-created by every renderNow), so it's wired per
@@ -913,9 +925,10 @@ function repollAfterPlaybackChange() {
 async function playerNext() {
   const btn = $("btn-now-next");
   if (btn) btn.disabled = true;
+  const prevUri = nowState?.track?.uri || null;
   try {
     await api("/api/player/next", {});
-    repollAfterPlaybackChange();
+    repollAfterPlaybackChange(prevUri);
   } catch (e) {
     toast(e.message);
   } finally {
@@ -975,6 +988,25 @@ function startNowTicker(d, tr) {
   }, 1000);
 }
 
+// "updated Ns ago": how old the answer on screen is — the server's cache can
+// legitimately serve for a track's whole runtime, and in blind mode the card
+// itself is blurred, so this line is the one visible proof the app actually
+// knows what's playing. Local tick between polls, zero requests.
+let nowAgeTimer = null;
+let nowFetchedAt = null;  // Date.now()-anchored time of the upstream fetch
+
+function paintNowAge() {
+  const el = $("np-updated");
+  if (!el || nowFetchedAt == null) return;
+  el.textContent = `updated ${fmtCountdown(Date.now() - nowFetchedAt)} ago`;
+}
+
+function startAgeTicker() {
+  clearInterval(nowAgeTimer);
+  paintNowAge();
+  nowAgeTimer = setInterval(paintNowAge, 1000);
+}
+
 const ICON_PLAY = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>';
 const ICON_PAUSE = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M7 5h3.6v14H7zM13.4 5H17v14h-3.6z"/></svg>';
 const ICON_NEXT = '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M6 5.5v13l8.5-6.5zM16.5 5.5h2v13h-2z"/></svg>';
@@ -994,7 +1026,7 @@ function playbackStrip(d, tr) {
   return `${bar}<div class="np-buttons">
     <button id="btn-now-toggle" class="np-round" title="${d.is_playing ? "Pause" : "Play"}">${d.is_playing ? ICON_PAUSE : ICON_PLAY}</button>
     <button id="btn-now-next" class="np-round np-small" title="Skip to the next track">${ICON_NEXT}</button>
-  </div>`;
+  </div><div id="np-updated" class="np-updated"></div>`;
 }
 
 // Keeps the client-side `sitting` convenience global roughly in step with
@@ -1071,7 +1103,9 @@ function renderNow() {
         <p class="hint">${hasInputs
           ? "Start one of your inputs above, or put something on in Spotify."
           : "Put something on in Spotify and it shows up here."}</p>
+        <div id="np-updated" class="np-updated"></div>
       </div>`;
+    startAgeTicker();
     return;
   }
 
@@ -1088,7 +1122,6 @@ function renderNow() {
     <div class="art">${img}${d.is_playing ? "" : '<span class="paused-chip">paused</span>'}</div>
     <div class="t-name">${esc(tr.name)}</div>
     <div class="t-artist">${esc(artists)}${tr.album ? " — " + esc(tr.album) : ""}</div>
-    ${tr.bpm ? `<div class="t-meta">${Math.round(tr.bpm)} BPM</div>` : ""}
     ${playbackStrip(d, tr)}
     ${body}
   </div>`;
@@ -1097,6 +1130,7 @@ function renderNow() {
   const nxt = $("btn-now-next");
   if (nxt) nxt.onclick = playerNext;
   startNowTicker(d, tr);
+  startAgeTicker();
 
   if (inSitting) {
     wireSittingCard();

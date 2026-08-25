@@ -2954,6 +2954,15 @@ NOW_ERROR_POLL_MS = 300_000   # cooldown/reauth: sit still, there is nothing to 
 _now_cache: dict = {"at": 0.0, "value": None, "ttl": NOW_TTL_IDLE}
 _now_lock = threading.Lock()
 
+# Skip settle: right after /api/player/next, Spotify can still report the track
+# that was just skipped AWAY from. Caching that answer normally would pin the
+# wrong track for its remaining runtime (minutes), with NOW_FORCE_MIN_INTERVAL
+# blocking any correction — so while the pre-skip uri keeps coming back, the
+# answer only gets a short TTL and the client's server-paced poll re-checks.
+NOW_SKIP_SETTLE_TTL = 3.0     # cache life for a not-yet-settled post-skip answer
+NOW_SKIP_SETTLE_WINDOW = 15.0  # how long after a skip the old uri stays suspect
+_skip_settle: dict = {"uri": None, "until": 0.0}
+
 
 def _now_ttl(value: dict | None) -> float:
     """How long this answer stays true — the track's remaining runtime."""
@@ -2980,8 +2989,21 @@ def _currently_playing_shared(force: bool = False) -> tuple[dict | None, float]:
             return _now_cache["value"], max(0.0, _now_cache["ttl"] - age)
         value = sp.currently_playing()
         ttl = _now_ttl(value)
+        if _skip_settle["uri"] and time.time() < _skip_settle["until"]:
+            if ((value or {}).get("track") or {}).get("uri") == _skip_settle["uri"]:
+                ttl = min(ttl, NOW_SKIP_SETTLE_TTL)
+            else:
+                _skip_settle.update(uri=None, until=0.0)  # settled: back to normal
         _now_cache.update(at=time.time(), value=value, ttl=ttl)
         return value, ttl
+
+
+def _now_fetched_ago_ms() -> int:
+    """How old the answer /api/now just served is — milliseconds since the
+    upstream fetch behind it. Display-only honesty for the client ("updated
+    Ns ago"), so blind mode can tell a live answer from a cached one."""
+    with _now_lock:
+        return int(max(0.0, time.time() - _now_cache["at"]) * 1000)
 
 
 def _poll_after_ms(stale_in: float) -> int:
@@ -3277,17 +3299,11 @@ def _fetch_missing_now_tags(track: dict, *, clock=time.monotonic) -> int:
         _now_fetch_lock.release()
 
 
-# ---- BPM (Deezer) -----------------------------------------------------------
+# ---- Deezer client (preview clips) ------------------------------------------
 #
 # Deezer is not Spotify — none of the budget ledger applies (its own limit is
-# 50 req/5s per IP; this path does at most 2 per minute). The /api/now manners
-# still do: fetch only on ?force=1, write-once into deezer.json, one attempt
-# per NOW_BPM_MIN_INTERVAL, non-blocking, and a failure never breaks the
-# response it rides on.
+# 50 req/5s per IP, far above anything the preview path can produce).
 
-NOW_BPM_MIN_INTERVAL = 60  # seconds between fetch attempts, success or failure
-_now_bpm_lock = threading.Lock()
-_now_bpm_last_attempt = 0.0
 _deezer = None
 
 
@@ -3298,61 +3314,12 @@ def _deezer_client() -> Deezer:
     return _deezer
 
 
-def _fetch_missing_now_bpm(track: dict, *, clock=time.monotonic) -> None:
-    """Fetch and cache the playing track's BPM if deezer.json lacks it.
-
-    Known-or-miss under ANY credited artist's key means done (the same
-    convention `_track_record` reads by); a fetched record is stored under
-    the FIRST artist's key (the same convention the Last.fm side writes by).
-    DeezerError/transport failures record nothing — retryable on a later
-    force once the floor allows, exactly like the Last.fm fetch above.
-    """
-    global _now_bpm_last_attempt
-    if not _now_bpm_lock.acquire(blocking=False):
-        return
-    try:
-        if clock() - _now_bpm_last_attempt < NOW_BPM_MIN_INTERVAL:
-            return
-        artists = track.get("artists") or []
-        title = track.get("name") or ""
-        first = (artists[0].get("name") or "") if artists else ""
-        if not first or not title:
-            return
-        keys = [track_key(a.get("name") or "", title) for a in artists]
-        known = store.deezer_map()
-        if any(k in known for k in keys):
-            return
-        _now_bpm_last_attempt = clock()
-        try:
-            record = _deezer_client().fetch_track(first, title)
-        except Exception:
-            log.warning("deezer bpm fetch failed for %r — will retry later", title)
-            return
-        payload = store.deezer_tracks()
-        payload.setdefault("tracks", {})[keys[0]] = record
-        store.save_deezer_tracks(payload)
-    finally:
-        _now_bpm_lock.release()
-
-
-def _bpm_for(track: dict) -> float | None:
-    """The cached BPM for this track, or None. Local read, zero requests."""
-    known = store.deezer_map()
-    title = track.get("name") or ""
-    for a in track.get("artists") or []:
-        rec = known.get(track_key(a.get("name") or "", title))
-        if isinstance(rec, dict) and rec.get("bpm"):
-            return rec["bpm"]
-    return None
-
-
 # ---- picker hold-to-preview -------------------------------------------------
 #
 # Spotify's dev-mode API lost preview_url, so the audio bite comes from
 # Deezer's free 30s clips instead — resolved live per hold (the CDN URLs
-# carry expiring tokens, so nothing here is persisted to disk; contrast
-# deezer.json's write-once BPM records). Track PICKING is a pure cache.json
-# read: zero Spotify calls on this path, ever.
+# carry expiring tokens, so nothing here is persisted to disk). Track
+# PICKING is a pure cache.json read: zero Spotify calls on this path, ever.
 
 PREVIEW_CLIPS = 3          # clips per medley
 PREVIEW_MAX_ATTEMPTS = 6   # Deezer searches per resolve before giving up
@@ -3472,6 +3439,7 @@ def now_playing(force: bool = False):
         raise
     if not np:
         return {"playing": False, "poll_after_ms": _poll_after_ms(stale_in),
+                "fetched_ago_ms": _now_fetched_ago_ms(),
                 "inputs": _idle_inputs_payload()}
 
     state = _ensure_profiles()
@@ -3489,10 +3457,6 @@ def now_playing(force: bool = False):
             # A fetch failure must never break the now response — this is a
             # bonus enrichment, not the payload the client actually needs.
             log.exception("now-playing tag fetch failed")
-        try:
-            _fetch_missing_now_bpm(track)
-        except Exception:
-            log.exception("now-playing bpm fetch failed")
     # Guard-on-read, fresh on every request — same reasoning as `triage`'s own
     # re-read below `_ensure_profiles`: `_profile_state`'s cached profiles are
     # a profile-build-time snapshot that can sit stale for up to PROFILE_TTL,
@@ -3510,9 +3474,10 @@ def now_playing(force: bool = False):
     return {
         "playing": True,
         "poll_after_ms": _poll_after_ms(stale_in),
+        "fetched_ago_ms": _now_fetched_ago_ms(),
         "is_playing": np["is_playing"],
         "progress_ms": np["progress_ms"],
-        "track": {**track, "sortable": bool(sortable), "bpm": _bpm_for(track)},
+        "track": {**track, "sortable": bool(sortable)},
         "context": (
             {"id": ctx_id, "name": ctx["name"] if ctx else None,
              "is_input": ctx_id in state["input_ids"]}
@@ -3567,7 +3532,16 @@ def _playback_call(fn, *args) -> dict:
 
 @app.post("/api/player/next")
 def player_next():
-    return _playback_call(sp.skip_next)
+    # Remember what we skipped away from BEFORE the cache is dropped: if the
+    # settle-poll still gets this uri back, it must not be cached for the old
+    # track's remaining runtime (see NOW_SKIP_SETTLE_TTL).
+    with _now_lock:
+        prev_uri = ((_now_cache["value"] or {}).get("track") or {}).get("uri")
+    out = _playback_call(sp.skip_next)
+    if prev_uri:
+        with _now_lock:
+            _skip_settle.update(uri=prev_uri, until=time.time() + NOW_SKIP_SETTLE_WINDOW)
+    return out
 
 
 @app.post("/api/player/pause")

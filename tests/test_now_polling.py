@@ -49,8 +49,10 @@ def playing(progress_ms, duration_ms=TRACK_MS, is_playing=True):
 @pytest.fixture(autouse=True)
 def _clear_now_cache():
     appmod._now_cache.update(at=0.0, value=None, ttl=NOW_TTL_IDLE)
+    appmod._skip_settle.update(uri=None, until=0.0)
     yield
     appmod._now_cache.update(at=0.0, value=None, ttl=NOW_TTL_IDLE)
+    appmod._skip_settle.update(uri=None, until=0.0)
 
 
 @pytest.fixture
@@ -156,6 +158,52 @@ def test_force_still_reports_the_automatic_pace(clock, monkeypatch):
     clock[0] += 1
     _, stale_in = _currently_playing_shared(force=True)
     assert stale_in > NOW_FORCE_MIN_INTERVAL
+
+
+# ---- skip settle ------------------------------------------------------------
+#
+# Right after /api/player/next, Spotify can still report the track that was
+# just skipped away from. Caching that answer normally would pin the WRONG
+# track for its remaining runtime (minutes), with NOW_FORCE_MIN_INTERVAL
+# blocking every correction attempt — in blind mode there is no way to even
+# notice. While the pre-skip uri keeps coming back, the answer only lives
+# NOW_SKIP_SETTLE_TTL, so the client's server-paced poll re-checks promptly.
+
+
+def test_an_unsettled_post_skip_answer_is_cached_only_briefly(clock, monkeypatch):
+    monkeypatch.setattr(appmod.sp, "currently_playing", lambda: playing(progress_ms=10_000))
+    _currently_playing_shared()  # cache holds spotify:track:x, minutes left
+
+    # What player_next does: note the pre-skip uri and drop the cache.
+    appmod._skip_settle.update(
+        uri="spotify:track:x", until=clock[0] + appmod.NOW_SKIP_SETTLE_WINDOW)
+    appmod._now_cache["at"] = 0.0
+
+    clock[0] += 1
+    _, stale_in = _currently_playing_shared(force=True)  # upstream: still track x
+    assert stale_in <= appmod.NOW_SKIP_SETTLE_TTL
+
+    # The next paced poll lands just past the short TTL and finds the truth;
+    # from then on the normal remaining-runtime TTL applies again.
+    clock[0] += stale_in + 0.5
+    settled = {**playing(progress_ms=0),
+               "track": {"uri": "spotify:track:y", "duration_ms": TRACK_MS}}
+    monkeypatch.setattr(appmod.sp, "currently_playing", lambda: settled)
+    value, stale_in = _currently_playing_shared()
+    assert value["track"]["uri"] == "spotify:track:y"
+    assert stale_in > appmod.NOW_SKIP_SETTLE_TTL
+    assert appmod._skip_settle["uri"] is None  # settled → suspicion cleared
+
+
+def test_the_settle_window_expires_so_a_replayed_track_is_not_suspect_forever(
+        clock, monkeypatch):
+    """The same uri coming back MINUTES after a skip is the user replaying
+    the track, not Spotify lagging — normal caching must resume."""
+    appmod._skip_settle.update(uri="spotify:track:x", until=clock[0] + 5)
+    clock[0] += 60
+    monkeypatch.setattr(appmod.sp, "currently_playing", lambda: playing(progress_ms=10_000))
+    _, stale_in = _currently_playing_shared()
+    assert stale_in > appmod.NOW_SKIP_SETTLE_TTL
 
 
 # ---- the endpoint itself ----------------------------------------------------
@@ -307,26 +355,31 @@ def test_an_idle_poll_lists_inputs_for_the_start_cta(route_client, monkeypatch):
     assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]
 
 
-def test_a_cached_bpm_rides_the_poll_for_free(route_client, monkeypatch):
-    """BPM comes from deezer.json on the poll path — a local read. The passive
-    poll must never construct a Deezer client at all; only ?force=1 may fetch."""
-    from sortify.tags import track_key
+def test_the_poll_reports_how_old_its_answer_is(route_client):
+    """`fetched_ago_ms` is the display-only honesty behind the client's
+    "updated Ns ago" line — near zero on the poll that fetched, and growing
+    on every cached serve after it. In blind mode it is the only visible
+    proof the blurred card reflects what is actually playing."""
+    first = route_client.get("/api/now").json()
+    assert first["fetched_ago_ms"] < 1000
 
-    s = Store()
-    original = s.deezer_tracks()
-    monkeypatch.setattr(appmod, "_deezer_client",
-                        lambda: (_ for _ in ()).throw(AssertionError("passive poll fetched")))
-    try:
-        payload = s.deezer_tracks()
-        payload["tracks"][track_key("A", "X")] = {"bpm": 128.0, "deezer_id": 1, "fetched_at": 1.0}
-        s.save_deezer_tracks(payload)
+    later = route_client.get("/api/now").json()  # served from cache
+    assert later["fetched_ago_ms"] >= first["fetched_ago_ms"]
+    assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]
 
-        body = route_client.get("/api/now").json()
 
-        assert body["track"]["bpm"] == 128.0
-        assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]
-    finally:
-        s.save_deezer_tracks(original)
+def test_player_next_marks_the_preskip_uri_suspect_and_drops_the_cache(route_client):
+    """The route half of the skip-settle tests above: /api/player/next must
+    remember what it skipped away from (so a not-yet-settled Spotify answer
+    repeating that uri is cached only briefly) and drop the now-cache (so the
+    client's settle-poll goes upstream instead of reading back the track we
+    just left)."""
+    assert route_client.get("/api/now").json()["playing"] is True
+
+    assert route_client.post("/api/player/next").status_code == 200
+
+    assert appmod._skip_settle["uri"] == "spotify:track:x"
+    assert appmod._now_cache["at"] == 0.0
 
 
 def test_the_sitting_lookup_on_the_poll_path_is_free(route_client):

@@ -193,10 +193,13 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 }
 .track-card .t-name { font-size: 1.3rem; font-weight: 700; letter-spacing: -.01em; margin: .8rem 0 .15rem; }
 .track-card .t-artist { color: var(--muted); font-size: .95rem; margin-bottom: .9rem; }
-.track-card .t-meta {
-  color: var(--muted); font-size: .72rem; font-weight: 600;
-  letter-spacing: .08em; margin: -.7rem 0 .9rem;
+/* "updated Ns ago" — deliberately outside the blind-mode blur: it names no
+   track, and it's the proof the card reflects what's actually playing */
+.np-updated {
+  color: var(--muted); font-size: .72rem; font-variant-numeric: tabular-nums;
+  margin: -.4rem 0 .6rem;
 }
+.state-card .np-updated { margin: .6rem 0 0; }
 
 /* playback strip: elapsed / bar / total, then the two round buttons */
 .np-progress {

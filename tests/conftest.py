@@ -43,18 +43,14 @@ def isolated_account_ledger(tmp_path, monkeypatch):
 def no_real_deezer(monkeypatch):
     """No test may reach the real Deezer API through the app's client factory.
 
-    `?force=1` on /api/now runs `_fetch_missing_now_bpm`, and any route test
-    that forces without faking `_deezer_client` used to construct a real
-    `Deezer()` and hit api.deezer.com for the fixture track — the search came
-    back empty and a `{"miss": True}` record for ("A", "X") landed in the
-    session-shared deezer.json, which is exactly what made test_deezer.py
-    fail in reverse file ordering (its floor/failure tests found the track
-    already "known" and never fetched). The factory raising here is swallowed
-    by that path's broad `except` — the force poll still succeeds, records
-    nothing, and stays off the network. Tests that need a working client
-    monkeypatch `_deezer_client` themselves, which overrides this guard;
-    tests of the `Deezer` class itself construct it directly with a fake
-    transport and never touch the factory.
+    The preview routes (`/api/playlist_preview`, the hold-to-preview player)
+    construct a real `Deezer()` through `_deezer_client` and would hit
+    api.deezer.com from any route test that exercises them without faking the
+    factory — this raise turns that into a loud failure instead of live
+    network traffic. Tests that need a working client monkeypatch
+    `_deezer_client` themselves, which overrides this guard; tests of the
+    `Deezer` class itself construct it directly with a fake transport and
+    never touch the factory.
     """
     import sortify.app as appmod
 
