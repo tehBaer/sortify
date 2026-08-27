@@ -1501,7 +1501,9 @@ run("stopNowPolling()");
       next_offset: null, total: 2, tracks: [],
     };
     routes["POST /api/preview_resume"] = { ok: true };
-    run(`nowState = { playing: true, track: { uri: "spotify:track:x" }, homes: new Map() }`);
+    // A fresh uri, so PV's stash for h1 (same playlist, PV4's territory)
+    // cannot leak in here and hand this block a half-walked playlist.
+    run(`nowState = { playing: true, track: { uri: "spotify:track:pv3" }, homes: new Map() }`);
 
     const row3 = new El("pv3-row");
     ctx.__row3 = row3;
@@ -1538,6 +1540,68 @@ run("stopNowPolling()");
           posts("/api/preview_resume") === 2, `${posts("/api/preview_resume")} POST(s)`);
   } catch (e) {
     check("PV3 scenario ran without throwing", false, String(e));
+  }
+}
+
+// ============================================================================
+// PV4 — reopening a playlist's preview within the same track session must
+// CONTINUE where it left off — same clip, no refetch, zero requests — and a
+// new playing track must start the walk over. The stash is per playlist and
+// dies with the track, because the preview serves that track's filing.
+// ============================================================================
+{
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    // A hidden Now view keeps the close→resume repoll (~900ms out) from
+    // rewriting nowState mid-scenario and wiping the stash under test.
+    $$("view-now").hidden = true;
+    routes["GET /api/playlist_preview/h1"] = {
+      clips: [{ name: "Song A", artist: "Artist A", url: "https://cdn/a.mp3" },
+              { name: "Song B", artist: "Artist B", url: "https://cdn/b.mp3" },
+              { name: "Song C", artist: "Artist C", url: "https://cdn/c.mp3" }],
+      next_offset: null, total: 3, tracks: [],
+    };
+    routes["POST /api/preview_resume"] = { ok: true };
+    run(`nowState = { playing: true, track: { uri: "spotify:track:t1" }, homes: new Map() }`);
+
+    const row4 = new El("pv4-row");
+    ctx.__row4 = row4;
+    run(`previewHold.attach(__row4, "h1", "Deep Cuts")`);
+    row4.onpointerdown({ clientX: 10, clientY: 10 });
+    await new Promise((r) => setTimeout(r, 700));
+    await tick();
+    run(`$("pv-next").onclick()`);       // move to clip 2 before leaving
+    await tick();
+    run("previewHold.stop()");
+    await tick();
+
+    row4.onpointerdown({ clientX: 10, clientY: 10 });
+    await new Promise((r) => setTimeout(r, 700));
+    await tick();
+    check("PV4 reopening continues at the clip it left, without refetching",
+          gets("/api/playlist_preview/h1") === 1
+          && AudioStub.made.at(-1)?.src === "https://cdn/b.mp3"
+          && $$("preview-pop").hidden === false,
+          `${gets("/api/playlist_preview/h1")} GET(s), last src=${AudioStub.made.at(-1)?.src}`);
+    check("PV4 the resumed card names the resumed clip",
+          /Song B/.test($$("preview-pop").innerHTML), "pv-now shows Song B");
+
+    // A different playing track is a different decision: start over.
+    run("previewHold.stop()");
+    await tick();
+    run(`nowState = { playing: true, track: { uri: "spotify:track:t2" }, homes: new Map() }`);
+    row4.onpointerdown({ clientX: 10, clientY: 10 });
+    await new Promise((r) => setTimeout(r, 700));
+    await tick();
+    check("PV4 a new playing track starts the walk over, fetching afresh",
+          gets("/api/playlist_preview/h1") === 2
+          && AudioStub.made.at(-1)?.src === "https://cdn/a.mp3",
+          `${gets("/api/playlist_preview/h1")} GET(s), last src=${AudioStub.made.at(-1)?.src}`);
+    run("previewHold.stop()");
+    await tick();
+  } catch (e) {
+    check("PV4 scenario ran without throwing", false, String(e));
   }
 }
 

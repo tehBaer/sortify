@@ -1521,6 +1521,19 @@ const previewHold = (() => {
   // page cursor, and the index of the clip being played.
   let clips = [], nextOffset = null, idx = -1, pid = null, title = "", total = 0, fallback = [];
 
+  // Where each playlist's preview stood, so reopening one continues where it
+  // left off instead of starting over. A preview serves one decision —
+  // "where does the PLAYING track go" — so the memory lives exactly as long
+  // as that track: a different playing uri wipes every stash. Restoring is
+  // pure memory, so a resumed popup costs zero requests of any kind.
+  let resumeTrack = null;       // the playing uri the stashes belong to
+  const resumeAt = new Map();   // pid -> {clips, nextOffset, idx, total, fallback}
+
+  function stashPosition() {
+    if (pid && clips.length && idx >= 0)
+      resumeAt.set(pid, { clips, nextOffset, idx, total, fallback });
+  }
+
   // Nothing in this player starts or stops flat anymore: clips fade in, run
   // a fading tail into the next clip's rise, and land softly when the player
   // stops. All local Audio.volume ramps — zero requests of any kind.
@@ -1688,15 +1701,28 @@ const previewHold = (() => {
 
   async function open(p, t, a) {
     seq++; const mySeq = seq;
+    // Whatever was playing keeps its place first — replacing the popup with
+    // another playlist's must not forget where this one stood.
+    stashPosition();
     stopAudio(true);
+    // The stashes belong to one playing track; a new one starts over.
+    const uri = (nowState && nowState.track && nowState.track.uri) || null;
+    if (uri !== resumeTrack) { resumeAt.clear(); resumeTrack = uri; }
     pid = p; title = t || "preview"; clips = []; nextOffset = null; idx = -1; fallback = [];
     total = 0; needsTap = false; act = a || null; resumed = false;
     // Captured at open: nowState still reflects pre-preview reality here.
     wasPlaying = wasPlaying || !!(nowState && nowState.playing);
-    render("previewing…");
     pop().hidden = false;
     // Lets the picker keep its last rows clear of the card (see style.css).
     document.body.classList.add("previewing");
+    const saved = resumeAt.get(p);
+    if (saved) {
+      // Same playlist, same playing track: continue where it left off.
+      ({ clips, nextOffset, total, fallback } = saved);
+      playAt(saved.idx);
+      return;
+    }
+    render("previewing…");
     try {
       const d = await api(`/api/playlist_preview/${pid}`);
       if (mySeq !== seq) return;   // closed (or replaced) before the answer
@@ -1714,6 +1740,7 @@ const previewHold = (() => {
     seq++;
     clearTimeout(timer); timer = null; holding = false;
     unpress();
+    stashPosition();
     stopAudio();
     pop().hidden = true;
     document.body.classList.remove("previewing");
