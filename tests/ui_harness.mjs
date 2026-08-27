@@ -1275,6 +1275,66 @@ run("stopNowPolling()");
   }
 }
 
+// ============================================================================
+// BR — a remove made in blind mode must name what it removed. The whole point
+// of blind mode is that the ear decides, so the card is blurred while the
+// decision is open; once the track is gone from the input the decision is
+// spent and hiding it only means the input lost a track you never got to see.
+// Reuses the peek the tap gesture already sets, so the reveal expires with
+// the track instead of quietly turning blind mode off.
+// ============================================================================
+{
+  routes["GET /api/now?force=1"] = {
+    status: 200,
+    body: {
+      playing: true, poll_after_ms: 999999,
+      track: { uri: "spotify:track:br1", name: "Removed Song",
+               artists: [{ name: "Removed Artist" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[In]", is_input: true },
+      sitting: null,
+      suggestions: [{ playlist_id: "H1", pct: 90, reasons: [], already: false }],
+      homes: [{ id: "H1", name: "Home", folder: "" }],
+      inputs: [{ id: "IN1", name: "[In]", has_track: true }],
+    },
+  };
+  run(`show("now"); blindMode = true; applyBlind()`);
+  run(`filedUris = {}; nowActions = 0; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  check("BR the card is blurred while the decision is still open",
+        document.body.classList.contains("blind") &&
+        !document.body.classList.contains("peeked"),
+        `blind=${document.body.classList.contains("blind")} ` +
+        `peeked=${document.body.classList.contains("peeked")}`);
+
+  routes["POST /api/act"] = { status: 200, body: {} };
+  await run(`nowRemove()`);
+  await tick();
+  check("BR removing in blind mode reveals what was removed",
+        document.body.classList.contains("peeked"),
+        `peeked=${document.body.classList.contains("peeked")} ` +
+        `toast=${JSON.stringify($$("toast").textContent)} ` +
+        `blindMode=${run("blindMode")} ` +
+        `nowTrack=${run("nowState && nowState.track && nowState.track.uri")}`);
+  check("BR the reveal is pinned to the removed track, not whatever plays next",
+        run("peekedUri") === "spotify:track:br1", String(run("peekedUri")));
+
+  // The reveal has to expire with the track. Otherwise the next track arrives
+  // already named and blind mode is off without anyone having asked for it.
+  routes["GET /api/now?force=1"].body.track =
+    { uri: "spotify:track:br2", name: "Next Song",
+      artists: [{ name: "Next Artist" }], sortable: true, image: null };
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  check("BR the reveal falls away when the next track starts",
+        !document.body.classList.contains("peeked") && run("peekedUri") === null,
+        `peeked=${document.body.classList.contains("peeked")} ` +
+        `peekedUri=${run("peekedUri")}`);
+
+  run(`blindMode = false; applyBlind()`);   // stable end state for the summary
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

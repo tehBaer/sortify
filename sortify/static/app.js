@@ -1269,6 +1269,15 @@ async function nowRemove() {
     await api("/api/act", { action: "remove", uri: tr.uri, from_id: d.context.id });
     nowActions++;
     filedUris[tr.uri] = "nowhere (removed from input)";
+    // Blind mode blurred this track so the ear would decide, not the name.
+    // That decision is spent the moment it leaves the input, so say what left
+    // — otherwise the input quietly loses a track you never got to see. It is
+    // the same peek a tap sets, so renderNow expires it when the next track
+    // starts and the following one is blind again.
+    if (blindMode) {
+      peekedUri = tr.uri;
+      document.body.classList.add("peeked");
+    }
     toast("removed from input");
     renderNow();
   } catch (e) { toast(e.message); }
