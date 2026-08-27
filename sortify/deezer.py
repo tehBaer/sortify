@@ -34,16 +34,30 @@ class Deezer:
             raise DeezerError(str(data["error"]))
         return data if isinstance(data, dict) else {}
 
+    def _search_one(self, q: str) -> dict | None:
+        """The first search hit that actually carries a clip, else None."""
+        hits = self._get("/search", {"q": q, "limit": 1}).get("data") or []
+        if not hits or not hits[0].get("id") or not hits[0].get("preview"):
+            return None
+        return hits[0]
+
     def fetch_preview(self, artist: str, title: str) -> dict:
         """{"url", "deezer_id"} for a 30s preview clip, or {"miss": True}.
 
-        One request: search results carry `preview` directly. The URL's CDN
-        token EXPIRES after a while, so callers must not persist it — cache
-        at most for minutes.
+        Search results carry `preview` directly. The field-scoped query is
+        tried first and is usually the only request; it is an EXACT match,
+        though, so remixes, live takes, `feat.` suffixes and punctuation
+        drift all miss it — and on this path a miss is expensive twice over,
+        costing a candidate from the page's attempt budget and pushing the
+        medley toward the text-only fallback. A plain free-text retry
+        recovers most of them, and only runs when the strict form found
+        nothing, so a clean hit still costs exactly one request.
+
+        The URL's CDN token EXPIRES after a while, so callers must not
+        persist it — cache at most for minutes.
         """
-        hits = self._get(
-            "/search", {"q": f'artist:"{artist}" track:"{title}"', "limit": 1}
-        ).get("data") or []
-        if not hits or not hits[0].get("id") or not hits[0].get("preview"):
+        hit = (self._search_one(f'artist:"{artist}" track:"{title}"')
+               or self._search_one(f"{artist} {title}"))
+        if hit is None:
             return {"miss": True}
-        return {"url": hits[0]["preview"], "deezer_id": int(hits[0]["id"])}
+        return {"url": hit["preview"], "deezer_id": int(hit["id"])}

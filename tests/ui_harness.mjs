@@ -65,6 +65,7 @@ class El {
   querySelectorAll() { return []; }
   querySelector() { return new El("_anon"); }
   appendChild(c) { this.children.push(c); }
+  setAttribute(k, v) { this[k] = String(v); }
   scrollIntoView() {} focus() {} addEventListener() {}
 }
 
@@ -75,6 +76,14 @@ function registerIds(html) {
 }
 
 const handlers = {};
+
+// A real DOM runs EVERY listener registered for an event; addressing one by
+// index silently couples the checks to registration order, so adding a
+// listener anywhere earlier in app.js would make an unrelated check fail.
+function fireKey(key, target = { tagName: "BODY" }) {
+  const ev = { key, target, stopPropagation() {}, preventDefault() {} };
+  for (const h of handlers.keydown || []) h(ev);
+}
 const document = {
   hidden: false,
   getElementById: $$,
@@ -113,8 +122,23 @@ async function fetchStub(path, opts) {
   };
 }
 
+// The preview player is the only code that constructs Audio. It records
+// every instance so a check can prove the OLD clip was paused before the new
+// one started — two live Audio objects is the "previews over each other" bug.
+class AudioStub {
+  constructor(src) {
+    this.src = src; this.currentTime = 0; this.duration = 30; this.paused = false;
+    AudioStub.made.push(this);
+  }
+  play() { this.paused = false; return AudioStub.refuse ? Promise.reject(new Error("blocked")) : Promise.resolve(); }
+  pause() { this.paused = true; }
+}
+AudioStub.made = [];
+AudioStub.refuse = false;
+
 const ctx = vm.createContext({
   document, fetch: fetchStub, setTimeout, clearTimeout, setInterval, clearInterval, console,
+  Audio: AudioStub,
   Date, Math, Number, Object, JSON, Error, Map, Set, Promise, String, Array,
   // Blind mode persists its toggle here; an in-memory map is enough.
   localStorage: (() => {
@@ -330,7 +354,7 @@ run("stopNowPolling()");
   routes["POST /api/split/PL5/decide"] = { status: 200, body: { changed: true, decision: { action: "keep", to_id: "H1" }, remaining: 0 } };
 
   resetLog();
-  handlers.keydown[0]({ key: "1", target: { tagName: "BODY" } });
+  fireKey("1");
   await tick();
   check("I2 baseline: `1` keeps while the live card is on screen",
         posts("/api/split/PL5/decide") === 1, `${posts("/api/split/PL5/decide")} POST(s)`);
@@ -350,8 +374,8 @@ run("stopNowPolling()");
   await tick();
   run("stopNowPolling()");
   resetLog();
-  handlers.keydown[0]({ key: "1", target: { tagName: "BODY" } });
-  handlers.keydown[0]({ key: "r", target: { tagName: "BODY" } });
+  fireKey("1");
+  fireKey("r");
   await tick();
   check("I2 no keep (and no reject) fires from the error screen",
         posts("/api/split/PL5/decide") === 0, `${posts("/api/split/PL5/decide")} POST(s)`);
@@ -1272,6 +1296,113 @@ run("stopNowPolling()");
           `hidden=${$$("btn-input-switch").hidden}`);
   } catch (e) {
     check("NB scenario ran without throwing", false, String(e));
+  }
+}
+
+// ============================================================================
+// PV — hold-to-preview: the affordance, the swallowed tap, and the ONE
+// budgeted resume call. The resume is real Spotify budget, so "exactly one"
+// is the property that matters most here.
+// ============================================================================
+{
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    routes["GET /api/playlist_preview/h1"] = {
+      clips: [{ name: "Song A", artist: "Artist A", url: "https://cdn/a.mp3" },
+              { name: "Song B", artist: "Artist B", url: "https://cdn/b.mp3" }],
+      next_offset: null, total: 12, tracks: [],
+    };
+    routes["POST /api/preview_resume"] = { ok: true };
+    routes["GET /api/now?force=1"] = { status: 200, body: { playing: false, poll_after_ms: 999999 } };
+    // Something IS playing: that is what makes a resume owed on close.
+    run(`nowState = { playing: true, track: { uri: "spotify:track:x" }, homes: new Map() }`);
+
+    const row = new El("pv-row");
+    ctx.__row = row;
+    ctx.__filed = 0;
+    run(`previewHold.attach(__row, "h1", "Deep Cuts",
+           { label: "File here", run: () => { globalThis.__filed++; } })`);
+
+    check("PV the row is marked holdable and wears the waveform hint",
+          row.classList.contains("holdable")
+          && row.children.some((c) => c.className === "hold-hint"),
+          `children=${JSON.stringify(row.children.map((c) => c.className))}`);
+
+    // Press, then let the hold mature.
+    row.onpointerdown({ clientX: 10, clientY: 10 });
+    check("PV pressing paints the countdown on the row",
+          row.classList.contains("holding"), "class holding present");
+    await new Promise((r) => setTimeout(r, 700));
+    await tick();
+
+    check("PV the matured hold opens the player and fetches one page",
+          $$("preview-pop").hidden === false && gets("/api/playlist_preview/h1") === 1,
+          `hidden=${$$("preview-pop").hidden}, ${gets("/api/playlist_preview/h1")} GET(s)`);
+    check("PV the countdown is cleared once it fires",
+          !row.classList.contains("holding"), "class holding gone");
+    check("PV the hold swallows the row's tap, so nothing is filed by accident",
+          run("previewHold.consumeClick()") === true, "click consumed");
+    check("PV the first clip is playing",
+          AudioStub.made.length === 1 && AudioStub.made[0].src === "https://cdn/a.mp3",
+          `${AudioStub.made.length} Audio, src=${AudioStub.made[0]?.src}`);
+
+    // Advancing must stop the old clip before starting the next one.
+    run(`$("pv-next").onclick()`);
+    await tick();
+    check("PV next pauses the previous clip before starting the new one",
+          AudioStub.made.length === 2 && AudioStub.made[0].paused === true
+          && AudioStub.made[1].src === "https://cdn/b.mp3",
+          `made=${AudioStub.made.length}, prevPaused=${AudioStub.made[0]?.paused}`);
+
+    // The popup carries the row's own action: preview then choose, one gesture.
+    check("PV the player offers the held row's action", /File here/.test($$("preview-pop").innerHTML),
+          "action button rendered");
+    run(`$("pv-act").onclick()`);
+    await tick();
+    check("PV taking that action files exactly once and closes the player",
+          ctx.__filed === 1 && $$("preview-pop").hidden === true,
+          `filed=${ctx.__filed}, hidden=${$$("preview-pop").hidden}`);
+    check("PV closing spends exactly ONE budgeted resume call",
+          posts("/api/preview_resume") === 1, `${posts("/api/preview_resume")} POST(s)`);
+
+    // Closing an already-closed player must not spend a second one.
+    run("previewHold.stop()");
+    await tick();
+    check("PV a second close spends no further resume call",
+          posts("/api/preview_resume") === 1, `${posts("/api/preview_resume")} POST(s)`);
+
+  } catch (e) {
+    check("PV scenario ran without throwing", false, String(e));
+  }
+}
+
+// ============================================================================
+// PV2 — leaving the view must not leave clips playing behind the user. Its
+// own block: it must still be exercised when the block above dies early.
+// ============================================================================
+{
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    run("previewHold.stop()");
+    const row2 = new El("pv-row2");
+    ctx.__row2 = row2;
+    run(`previewHold.attach(__row2, "h1", "Deep Cuts")`);
+    row2.onpointerdown({ clientX: 10, clientY: 10 });
+    await new Promise((r) => setTimeout(r, 700));
+    await tick();
+    const opened = $$("preview-pop").hidden === false;
+    const playing = AudioStub.made.length > 0;
+    run(`show("lists")`);
+    await tick();
+    check("PV2 navigating away stops the player instead of leaving it playing",
+          opened && playing && $$("preview-pop").hidden === true
+          && AudioStub.made.every((a) => a.paused),
+          `opened=${opened}, playing=${playing}, hidden=${$$("preview-pop").hidden}, ` +
+          `paused=${JSON.stringify(AudioStub.made.map((a) => a.paused))}`);
+  } catch (e) {
+    check("PV2 scenario ran without throwing", false, String(e));
   }
 }
 

@@ -203,3 +203,73 @@ def test_preview_resume_reports_spotify_refusal_without_raising(monkeypatch):
     appmod._preview_resume_last = -1e9
     out = appmod.preview_resume()
     assert out["ok"] is False and "403" in out["error"]
+
+
+# ---- loose-search fallback --------------------------------------------------
+#
+# The strict `artist:"X" track:"Y"` form is an exact match: remixes, live
+# takes, `feat.` suffixes and punctuation drift all miss it, and every miss
+# costs a candidate from the page's attempt budget. A second, free-text
+# search recovers most of those — but only when the strict one found nothing,
+# so a clean hit still costs exactly one request.
+
+
+def searching_client(handler):
+    dz = Deezer()
+    dz._client = httpx.Client(transport=httpx.MockTransport(handler))
+    return dz
+
+
+def test_fetch_preview_strict_hit_still_costs_one_search():
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.params["q"])
+        return httpx.Response(200, json={"data": [{"id": 1, "preview": "https://cdn/a.mp3"}]})
+
+    rec = searching_client(handler).fetch_preview("Can", "Vitamin C")
+    assert rec == {"url": "https://cdn/a.mp3", "deezer_id": 1}
+    assert len(seen) == 1 and seen[0].startswith("artist:")
+
+
+def test_fetch_preview_retries_loose_when_strict_finds_nothing():
+    seen = []
+
+    def handler(request):
+        q = request.url.params["q"]
+        seen.append(q)
+        if q.startswith("artist:"):
+            return httpx.Response(200, json={"data": []})
+        return httpx.Response(200, json={"data": [{"id": 7, "preview": "https://cdn/b.mp3"}]})
+
+    rec = searching_client(handler).fetch_preview("Miles Davis", "So What - Live")
+    assert rec == {"url": "https://cdn/b.mp3", "deezer_id": 7}
+    assert seen == ['artist:"Miles Davis" track:"So What - Live"',
+                    "Miles Davis So What - Live"]
+
+
+def test_fetch_preview_loose_retry_also_covers_a_hit_without_a_clip():
+    """A strict hit whose `preview` is empty is a miss too — retry it loose."""
+    seen = []
+
+    def handler(request):
+        q = request.url.params["q"]
+        seen.append(q)
+        if q.startswith("artist:"):
+            return httpx.Response(200, json={"data": [{"id": 3, "preview": ""}]})
+        return httpx.Response(200, json={"data": [{"id": 9, "preview": "https://cdn/c.mp3"}]})
+
+    rec = searching_client(handler).fetch_preview("Neu!", "Hallogallo")
+    assert rec == {"url": "https://cdn/c.mp3", "deezer_id": 9}
+    assert len(seen) == 2
+
+
+def test_fetch_preview_miss_after_both_searches():
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.params["q"])
+        return httpx.Response(200, json={"data": []})
+
+    assert searching_client(handler).fetch_preview("Nobody", "Nothing") == {"miss": True}
+    assert len(seen) == 2  # tried both forms before giving up
