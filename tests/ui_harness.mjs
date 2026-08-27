@@ -1289,11 +1289,26 @@ run("stopNowPolling()");
     check("NB and the panel closes on pick",
           $$("input-pop").hidden === true, `hidden=${$$("input-pop").hidden}`);
 
-    // Cooldown/reauth must hide the trigger exactly as it hid the old row.
+    // The trigger never leaves the bar: hiding it made every other top-row
+    // button jump when the first poll landed. Unusable states PARK it —
+    // still there, disabled, saying why.
     run(`paintNowControls(${JSON.stringify({ cooldown: true, inputs: d.inputs })})`);
-    check("NB a cooldown hides the trigger",
-          $$("btn-input-switch").hidden === true,
-          `hidden=${$$("btn-input-switch").hidden}`);
+    check("NB a cooldown parks the trigger instead of hiding it",
+          $$("btn-input-switch").hidden === false
+          && $$("btn-input-switch").disabled === true
+          && /cooling down/.test($$("input-switch-label").textContent),
+          `hidden=${$$("btn-input-switch").hidden} disabled=${$$("btn-input-switch").disabled} ` +
+          `label=${JSON.stringify($$("input-switch-label").textContent)}`);
+    run(`paintNowControls(${JSON.stringify({ inputs: [] })})`);
+    check("NB no inputs parks the trigger too — the bar never reflows",
+          $$("btn-input-switch").hidden === false
+          && $$("btn-input-switch").disabled === true,
+          `hidden=${$$("btn-input-switch").hidden} disabled=${$$("btn-input-switch").disabled}`);
+    run(`paintNowControls(${JSON.stringify(d)})`);
+    check("NB a usable state re-arms the parked trigger",
+          $$("btn-input-switch").disabled === false
+          && /\[B\]/.test($$("input-switch-label").textContent),
+          `disabled=${$$("btn-input-switch").disabled}`);
   } catch (e) {
     check("NB scenario ran without throwing", false, String(e));
   }
@@ -1396,6 +1411,9 @@ run("stopNowPolling()");
     const playing = AudioStub.made.length > 0;
     run(`show("lists")`);
     await tick();
+    // The stop is a fade-out now, not a cut: give the ~180ms landing time
+    // to finish before insisting the audio is actually paused.
+    await new Promise((r) => setTimeout(r, 400));
     check("PV2 navigating away stops the player instead of leaving it playing",
           opened && playing && $$("preview-pop").hidden === true
           && AudioStub.made.every((a) => a.paused),
@@ -1464,6 +1482,132 @@ run("stopNowPolling()");
         `peekedUri=${run("peekedUri")}`);
 
   run(`blindMode = false; applyBlind()`);   // stable end state for the summary
+}
+
+// ============================================================================
+// PV3 — the end of the playlist gives the music back, and clips fade.
+// Running out of clips must fire the SAME single budgeted resume close()
+// would (silence until the user finds the close button serves nobody), keep
+// the popup up, and spend nothing further on a following close. Playing a
+// clip again after that re-arms exactly one more resume.
+// ============================================================================
+{
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    routes["GET /api/playlist_preview/h1"] = {
+      clips: [{ name: "Song A", artist: "Artist A", url: "https://cdn/a.mp3" },
+              { name: "Song B", artist: "Artist B", url: "https://cdn/b.mp3" }],
+      next_offset: null, total: 2, tracks: [],
+    };
+    routes["POST /api/preview_resume"] = { ok: true };
+    run(`nowState = { playing: true, track: { uri: "spotify:track:x" }, homes: new Map() }`);
+
+    const row3 = new El("pv3-row");
+    ctx.__row3 = row3;
+    run(`previewHold.attach(__row3, "h1", "Deep Cuts")`);
+    row3.onpointerdown({ clientX: 10, clientY: 10 });
+    await new Promise((r) => setTimeout(r, 700));
+    await tick();
+
+    const first = AudioStub.made[0];
+    check("PV3 a clip starts silent and fades in",
+          first && (first.volume ?? 1) < 0.5, `volume=${first?.volume}`);
+    await new Promise((r) => setTimeout(r, 600));
+    check("PV3 the fade-in lands on full volume",
+          first.volume === 1, `volume=${first.volume}`);
+
+    first.onended();                       // 30s ran out → auto-advance
+    await tick();
+    AudioStub.made.at(-1).onended();       // last clip ran out → playlist over
+    await tick();
+    check("PV3 the end of the playlist resumes the user's music by itself",
+          posts("/api/preview_resume") === 1, `${posts("/api/preview_resume")} POST(s)`);
+    check("PV3 the popup stays up and says what happened",
+          $$("preview-pop").hidden === false
+          && /back to your music/.test($$("preview-pop").innerHTML),
+          `hidden=${$$("preview-pop").hidden}`);
+
+    // prev after the auto-resume: preview audio takes focus again, so ONE
+    // more resume becomes owed — and close must pay exactly it, no more.
+    run(`$("pv-prev").onclick()`);
+    await tick();
+    run("previewHold.stop()");
+    await tick();
+    check("PV3 replaying after the auto-resume re-arms exactly one more resume",
+          posts("/api/preview_resume") === 2, `${posts("/api/preview_resume")} POST(s)`);
+  } catch (e) {
+    check("PV3 scenario ran without throwing", false, String(e));
+  }
+}
+
+// ============================================================================
+// MT — manual mode's one exception to "no automatic fetches": a song that
+// provably played out while the tool is open refetches ONCE. The same uri is
+// never chased twice (a stopped player would otherwise loop), auto mode
+// leaves the moment to the server's own schedule, and a hidden tab remembers
+// instead of fetching — paying its one fetch on return.
+// ============================================================================
+{
+  try {
+    run("previewHold.stop(); stopNowPolling(); stopNowTicker()");
+    // PV3's resumes schedule force repolls ~900ms out; each of those calls
+    // renderNow, whose startNowTicker would silently kill the ticker this
+    // block is timing. Let them land and die before counting anything.
+    await new Promise((r) => setTimeout(r, 1000));
+    await tick();
+    run("stopNowPolling(); stopNowTicker()");
+    resetLog();
+    // The server still reports the played-out track (Spotify not yet
+    // advanced): the guard is what keeps this from becoming a poll loop.
+    routes["GET /api/now"] = { status: 200, body: {
+      playing: true, is_playing: true, poll_after_ms: 999999,
+      track: { uri: "spotify:track:mt1", name: "Ended Song",
+               artists: [{ name: "A" }], duration_ms: 5200, sortable: true, image: null },
+      progress_ms: 5200,
+      context: { id: "IN1", name: "[In]", is_input: true },
+      sitting: null, suggestions: [], homes: [], inputs: [],
+    } };
+    $$("view-now").hidden = false;
+    run(`nowManual = true; playedOutUri = null; playedOutWhileHidden = false`);
+    run(`startNowTicker({ is_playing: true, progress_ms: 5000 },
+                        { uri: "spotify:track:mt1", duration_ms: 5200 })`);
+    await new Promise((r) => setTimeout(r, 1300));
+    await tick();
+    check("MT a played-out song refetches once in manual mode",
+          gets("/api/now") === 1, `${gets("/api/now")} GET(s)`);
+    // renderNow restarted the ticker on the same (still-ended) answer; give
+    // it another beat to prove the guard holds and no loop starts.
+    await new Promise((r) => setTimeout(r, 1300));
+    check("MT the same uri is never chased twice",
+          gets("/api/now") === 1, `${gets("/api/now")} GET(s)`);
+
+    run(`nowManual = false; stopNowTicker()`);
+    run(`startNowTicker({ is_playing: true, progress_ms: 5000 },
+                        { uri: "spotify:track:mt2", duration_ms: 5200 })`);
+    await new Promise((r) => setTimeout(r, 1300));
+    check("MT auto mode leaves the moment to the poll schedule",
+          gets("/api/now") === 1, `${gets("/api/now")} GET(s)`);
+
+    document.hidden = true;
+    run(`nowManual = true; stopNowTicker()`);
+    run(`startNowTicker({ is_playing: true, progress_ms: 5000 },
+                        { uri: "spotify:track:mt3", duration_ms: 5200 })`);
+    await new Promise((r) => setTimeout(r, 1300));
+    check("MT nothing fires while the tab is hidden",
+          gets("/api/now") === 1, `${gets("/api/now")} GET(s)`);
+    document.hidden = false;
+    for (const h of handlers.visibilitychange || []) h();
+    await tick();
+    check("MT coming back pays the remembered played-out fetch",
+          gets("/api/now") === 2, `${gets("/api/now")} GET(s)`);
+
+    run(`nowManual = false; stopNowPolling(); stopNowTicker()`);
+  } catch (e) {
+    check("MT scenario ran without throwing", false, String(e));
+  } finally {
+    document.hidden = false;
+  }
 }
 
 // ---- summary ---------------------------------------------------------------

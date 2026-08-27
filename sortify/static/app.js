@@ -636,7 +636,7 @@ function paintManualChip() {
   b.textContent = nowManual ? "manual" : "auto";
   b.classList.toggle("on", nowManual);
   b.title = nowManual
-    ? "Manual: nothing is fetched until you press refresh. Tap to switch back to auto."
+    ? "Manual: fetches only when you press refresh — or when a song plays out while the tool is open. Tap to switch back to auto."
     : "Auto: the server paces polling (~1 request per track). Tap for manual mode.";
 }
 
@@ -679,6 +679,8 @@ async function pollNow(force = false) {
     // its cache) — the anchor for the "updated Ns ago" line.
     nowFetchedAt = Date.now() - (data.fetched_ago_ms || 0);
     nowState = { ...data, homes: new Map((data.homes || []).map((h) => [h.id, h])) };
+    // A genuinely new track re-arms the played-out refetch (declared below).
+    if (playedOutUri && data.track?.uri !== playedOutUri) playedOutUri = null;
     renderNow();
     scheduleNext(data.poll_after_ms || 60000);
   } catch (e) {
@@ -734,7 +736,7 @@ function fmtCountdown(ms) {
 function renderNowProblem(msg) {
   nowProblem = true;
   paintSittingBar();
-  hideInputSwitch();
+  parkInputSwitch(/cooldown/.test(msg) ? "Spotify is cooling down" : "waiting for Spotify");
   stopCooldownTicker();
   stopNowTicker();
   const cd = msg.match(/cooldown — try again in ~(\d+) min/);
@@ -781,9 +783,10 @@ function renderNowProblem(msg) {
 
 // The input switcher used to hide whenever nothing was playing — which is
 // exactly the moment "start an input" is the one useful action on the page.
-// It now stays up as the empty state's call to action; only the error-ish
-// states (cooldown, reauth) hide it, since starting playback there would
-// just bounce off the same wall.
+// It now stays up always: as the empty state's call to action, and in the
+// error-ish states (cooldown, reauth) as a disabled placeholder — starting
+// playback there would bounce off the same wall, but hiding the button made
+// the whole top row reflow (see parkInputSwitch).
 // The buffer set is the day-to-day one and stays open; every other set
 // folds, because 26 inputs in one flat <select> is a list you hunt through
 // rather than scan. A folded set still shows any playlist that CONTAINS the
@@ -799,15 +802,25 @@ function setLabel(key) { return (key || NOW_BUFFER_SET).replace(/-/g, " "); }
 // open and on fold-toggle, without waiting for another poll.
 let nowCtl = null;
 
-function hideInputSwitch() {
-  $("btn-input-switch").hidden = true;
+// The switcher never leaves the bar. It used to hide in the unusable states,
+// which meant the whole top row reflowed — every button jumped right — the
+// moment the first poll recognized the song. A parked, disabled placeholder
+// holds the layout still and says why it's inert.
+function parkInputSwitch(label) {
+  const b = $("btn-input-switch");
+  b.disabled = true;
+  b.classList.add("placeholder");
+  $("input-switch-label").textContent = label;
   closeInputPop();
 }
 
 function paintNowControls(d) {
   const playable = (d.inputs || []).filter((l) => l.id !== "liked");
-  if (!playable.length || d.needs_reauth || d.cooldown) { hideInputSwitch(); return; }
+  if (d.needs_reauth) { parkInputSwitch("reconnect Spotify first"); return; }
+  if (d.cooldown) { parkInputSwitch("Spotify is cooling down"); return; }
+  if (!playable.length) { parkInputSwitch("no inputs yet"); return; }
   nowCtl = d;
+  $("btn-input-switch").disabled = false;
   // The trigger's face doubles as the old "playing from …" context line:
   // whatever is true about the playing context is what the button says.
   const ctx = d.context;
@@ -817,7 +830,6 @@ function paintNowControls(d) {
         : "not playing from a playlist")
     : "start an input…";
   $("btn-input-switch").classList.toggle("placeholder", !(d.playing && ctx?.is_input));
-  $("btn-input-switch").hidden = false;
   if (!$("input-pop").hidden) renderInputPop();
 }
 
@@ -987,10 +999,29 @@ function startNowTicker(d, tr) {
     const p = Math.min(tr.duration_ms, nowTickBase.p0 + (Date.now() - nowTickBase.t0));
     elapsed.textContent = fmtTime(p);
     fill.style.width = ((p / tr.duration_ms) * 100).toFixed(2) + "%";
-    // At track end just stop — the poll schedule (whose TTL is exactly the
-    // track's remaining runtime) repaints with the real next track.
-    if (p >= tr.duration_ms) stopNowTicker();
+    // At track end stop the ticker; in auto mode the poll schedule (whose
+    // TTL is exactly the track's remaining runtime) repaints with the real
+    // next track, and manual mode gets its one played-out exception below.
+    if (p >= tr.duration_ms) { stopNowTicker(); refetchAtPlayedOut(tr.uri); }
   }, 1000);
+}
+
+// The card believes the song just played out. In auto mode the server's
+// schedule lands on this same moment, so only manual mode has to act — and
+// this is manual mode's ONE exception to "no automatic fetches": the song is
+// provably over and the tool is open in front of the user, so the fetch is
+// their real listening, not background traffic. One fetch per played-out
+// track — if Spotify comes back with the same uri (stopped at the end, or
+// not yet advanced), we do not chase it. A hidden tab remembers instead and
+// fetches on return (see visibilitychange).
+let playedOutUri = null;
+let playedOutWhileHidden = false;
+
+function refetchAtPlayedOut(uri) {
+  if (!nowManual || $("view-now").hidden || playedOutUri === uri) return;
+  if (document.hidden) { playedOutWhileHidden = true; return; }
+  playedOutUri = uri;
+  pollNow();
 }
 
 // "updated Ns ago": how old the answer on screen is — the server's cache can
@@ -1452,10 +1483,11 @@ function openPicker(homesMap, onPick, onCreate) {
 // /api/playlist_preview (Deezer 30s clips over the playlist's tracks, newest
 // first — zero Spotify calls; see app.py). Hold on a picker row or a
 // suggestion opens the player and eats the row's click; the popup then owns
-// the audio: full 30s clips, auto-advance on clip end, prev/next controls,
-// and an explicit close — which is also when the single budgeted
-// auto-resume call fires (the phone OS pauses Spotify when preview audio
-// takes focus and never un-pauses it on its own).
+// the audio: full 30s clips that fade in and out, auto-advance on clip end,
+// prev/next controls, and an explicit close. The single budgeted
+// auto-resume call fires on close OR when the playlist's clips run out
+// (the phone OS pauses Spotify when preview audio takes focus and never
+// un-pauses it on its own).
 //
 // Two things make the gesture honest, because the hold COMPETES with the
 // row's own tap and wins by swallowing it:
@@ -1481,9 +1513,61 @@ const previewHold = (() => {
   // scroll blocker only — the popup itself outlives the hold.
   let timer = null, fired = false, holding = false, seq = 0, audio = null;
   let wasPlaying = false, audioPlayed = false, needsTap = false;
+  // Set when the end of the playlist resumed Spotify with the popup still
+  // open: the next clip the user plays pauses that music again, so the
+  // resume-owed flags re-arm from this (see playAt).
+  let resumed = false;
   // Player state: every clip resolved so far (pages accumulate), the next
   // page cursor, and the index of the clip being played.
   let clips = [], nextOffset = null, idx = -1, pid = null, title = "", total = 0, fallback = [];
+
+  // Nothing in this player starts or stops flat anymore: clips fade in, run
+  // a fading tail into the next clip's rise, and land softly when the player
+  // stops. All local Audio.volume ramps — zero requests of any kind.
+  const FADE_MS = 450;       // a clip's fade-in, and the tail at its end
+  const FADE_OUT_MS = 180;   // the quick landing when the player stops
+
+  function fadeTo(a, target, ms, then) {
+    if (!a) { if (then) then(); return; }
+    clearInterval(a.__fade);
+    const from = a.volume ?? 1, t0 = Date.now();
+    a.__fade = setInterval(() => {
+      const k = Math.min(1, (Date.now() - t0) / ms);
+      a.volume = from + (target - from) * k;
+      if (k >= 1) { clearInterval(a.__fade); if (then) then(); }
+    }, 40);
+  }
+
+  // `hard` cuts instantly — for a skip (the user rejected the clip) and for
+  // replacing the popup, where the next clip must own the audio NOW (two
+  // live Audio objects is the "previews over each other" bug). The soft path
+  // is detached: nothing waits on it, and nothing else is about to play.
+  function stopAudio(hard) {
+    const a = audio;
+    audio = null;
+    if (!a) return;
+    clearInterval(a.__fade);
+    if (hard) { a.pause(); a.src = ""; return; }
+    fadeTo(a, 0, FADE_OUT_MS, () => { a.pause(); a.src = ""; });
+  }
+
+  // The single budgeted resume, shared by close() and the end of the
+  // playlist. Fires at most once per stretch of preview audio: the owed
+  // flags clear here and re-arm only when another clip takes focus again.
+  function resumeSpotify() {
+    if (!(wasPlaying && audioPlayed)) return;
+    wasPlaying = audioPlayed = false;
+    resumed = true;
+    api("/api/preview_resume", {}).then((r) => {
+      if (r.ok) repollAfterPlaybackChange();
+      // The server's own debounce is not a failure — a second popup within
+      // five seconds rides the first resume. Anything else means the music
+      // this preview interrupted is still paused, and only the user can
+      // undo that, so silence is the one answer we must not give.
+      else if (r.error && r.error !== "resume already sent")
+        toast("preview over — press play in Spotify");
+    }).catch(() => {});   // a refused resume is a shrug, never an error card
+  }
   // What the held row would have done if tapped, offered inside the popup.
   let act = null;
   // The row currently painting a press — cleared on release, fire or close.
@@ -1517,16 +1601,19 @@ const previewHold = (() => {
     // idx counts RESOLVED clips and misses are skipped, so it cannot be
     // "n of total" — the two numbers are not on the same scale.
     const pos = clips.length ? `clip ${idx + 1} · ${total} tracks` : `${total} tracks`;
+    // Next is this player's main verb — skimming clips IS the previewing —
+    // so it is the big center target, with the exit right beside it at the
+    // same size. Prev stays small: going back is the rare move.
     pop().innerHTML = `
       <div class="pv-head"><span class="pv-title">${esc(title)}</span>
-        <button id="pv-close" class="icon-btn" aria-label="Close preview">${ICON.close}</button></div>
+        <span class="pv-pos">${pos}</span></div>
       <div class="pv-live" aria-live="polite">${now}${lines}</div>
       ${prog}
       <div class="pv-ctl">
         <button id="pv-prev" class="icon-btn" aria-label="Previous clip"${atStart ? " disabled" : ""}>${ICON.prev}</button>
         ${needsTap ? `<button id="pv-play" class="icon-btn" aria-label="Play clip">${ICON.play}</button>` : ""}
-        <button id="pv-next" class="icon-btn" aria-label="Next clip"${atEnd ? " disabled" : ""}>${ICON.next}</button>
-        <span class="pv-pos">${pos}</span>
+        <button id="pv-next" class="icon-btn pv-big" aria-label="Next clip"${atEnd ? " disabled" : ""}>${ICON.next}</button>
+        <button id="pv-close" class="icon-btn pv-big" aria-label="Close preview">${ICON.close}</button>
       </div>
       ${act ? `<button id="pv-act" class="pv-act primary">${esc(act.label)}</button>` : ""}`;
     $("pv-close").onclick = close;
@@ -1549,8 +1636,16 @@ const previewHold = (() => {
     const mySeq = seq;
     while (i >= clips.length) {
       if (nextOffset == null) {
-        // Walked the whole playlist: stay on the last clip's card.
-        if (clips.length) { idx = clips.length - 1; render("end of playlist"); }
+        // Walked the whole playlist: stay on the last clip's card, and give
+        // the user their own music back — the medley is over, and silence
+        // until they find the close button serves nobody. The popup stays
+        // up: prev still works, and playing a clip again re-arms the resume.
+        if (clips.length) {
+          idx = clips.length - 1;
+          stopAudio();
+          render("end of playlist — back to your music");
+          resumeSpotify();
+        }
         return;
       }
       render("loading…");
@@ -1563,23 +1658,39 @@ const previewHold = (() => {
     }
     idx = i;
     // The previous clip must stop BEFORE the next starts — two live Audio
-    // objects is the "previews over each other" bug.
-    if (audio) { audio.pause(); audio.src = ""; }
+    // objects is the "previews over each other" bug. Hard cut on purpose: a
+    // skip is a rejection, and the incoming clip still rises from silence.
+    stopAudio(true);
     const c = clips[idx];
     needsTap = false;
-    audio = new Audio(c.url);
-    audio.onended = () => { if (mySeq === seq) playAt(idx + 1); };  // full 30s, then advance
-    audio.ontimeupdate = paintProgress;
-    audio.play().then(() => { audioPlayed = true; })
-      .catch(() => { if (mySeq === seq) { needsTap = true; render(); } });
+    const a = audio = new Audio(c.url);
+    a.volume = 0;
+    a.onended = () => { if (mySeq === seq) playAt(idx + 1); };  // full 30s, then advance
+    a.ontimeupdate = () => {
+      paintProgress();
+      // The clip's last moments fade rather than cut: Deezer clips end hard,
+      // and this tail into the next clip's rise is the medley's rhythm.
+      if (a === audio && !a.__tail && a.duration
+          && a.duration - a.currentTime <= FADE_MS / 1000) {
+        a.__tail = true;
+        fadeTo(a, 0, FADE_MS);
+      }
+    };
+    a.play().then(() => {
+      audioPlayed = true;
+      // Preview audio took focus again, so the music the end-of-playlist
+      // resume brought back is paused again — a resume is owed once more.
+      if (resumed) { wasPlaying = true; resumed = false; }
+    }).catch(() => { if (mySeq === seq) { needsTap = true; render(); } });
+    fadeTo(a, 1, FADE_MS);
     render();
   }
 
   async function open(p, t, a) {
     seq++; const mySeq = seq;
-    if (audio) { audio.pause(); audio.src = ""; audio = null; }
+    stopAudio(true);
     pid = p; title = t || "preview"; clips = []; nextOffset = null; idx = -1; fallback = [];
-    total = 0; needsTap = false; act = a || null;
+    total = 0; needsTap = false; act = a || null; resumed = false;
     // Captured at open: nowState still reflects pre-preview reality here.
     wasPlaying = wasPlaying || !!(nowState && nowState.playing);
     render("previewing…");
@@ -1603,24 +1714,15 @@ const previewHold = (() => {
     seq++;
     clearTimeout(timer); timer = null; holding = false;
     unpress();
-    if (audio) { audio.pause(); audio.src = ""; audio = null; }
+    stopAudio();
     pop().hidden = true;
     document.body.classList.remove("previewing");
     needsTap = false; act = null;
     // One budgeted call per popup session, and only when preview audio
-    // actually took focus from a playback that was running.
-    if (wasPlaying && audioPlayed) {
-      api("/api/preview_resume", {}).then((r) => {
-        if (r.ok) repollAfterPlaybackChange();
-        // The server's own debounce is not a failure — a second popup within
-        // five seconds rides the first resume. Anything else means the music
-        // this preview interrupted is still paused, and only the user can
-        // undo that, so silence is the one answer we must not give.
-        else if (r.error && r.error !== "resume already sent")
-          toast("preview over — press play in Spotify");
-      }).catch(() => {});   // a refused resume is a shrug, never an error card
-    }
-    wasPlaying = audioPlayed = false;
+    // actually took focus from a playback that was running (resumeSpotify
+    // checks exactly that; it is a no-op after the end-of-playlist resume).
+    resumeSpotify();
+    wasPlaying = audioPlayed = false; resumed = false;
   }
 
   // While the opening hold is still down, the finger must not scroll the
@@ -2811,9 +2913,13 @@ document.addEventListener("keydown", (e) => {
 document.addEventListener("visibilitychange", () => {
   // Same reasoning as show(): a backgrounded tab has no visible player.
   if (document.hidden) previewHold.stop();
-  // Manual mode means exactly that — not even the refocus poll fires; the
-  // refresh button is the only trigger the user hasn't pressed themselves.
-  if (!document.hidden && !$("view-now").hidden && !nowManual) pollNow(true);
+  // Manual mode means almost exactly that — the refocus poll doesn't fire,
+  // with one exception: a song that played out while the tab was hidden.
+  // Coming back to the tool is "having it open", which is what the user
+  // said that fetch is worth (see refetchAtPlayedOut).
+  if (document.hidden || $("view-now").hidden) return;
+  if (!nowManual) pollNow(true);
+  else if (playedOutWhileHidden) { playedOutWhileHidden = false; pollNow(); }
 });
 
 paintManualChip();

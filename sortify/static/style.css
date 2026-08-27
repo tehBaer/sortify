@@ -114,6 +114,9 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .input-switch.placeholder #input-switch-label { color: var(--muted); }
+/* Parked (cooldown, reauth, no inputs, first paint): present but inert, so
+   the top row never reflows when the state changes. */
+.input-switch:disabled { opacity: .7; cursor: default; }
 .input-switch .ip-chev { flex-shrink: 0; color: var(--muted); transition: transform .15s ease; }
 .input-switch.open .ip-chev { transform: rotate(180deg); }
 #input-pop {
@@ -335,10 +338,17 @@ kbd {
 #preview-pop .pv-head { display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
 #preview-pop .pv-title { font-weight: 600; color: var(--muted); font-size: .85rem;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#preview-pop .pv-ctl { display: flex; align-items: center; gap: .6rem; margin-top: .6rem; }
+/* Next is the player's main verb, so it sits big in the middle with the
+   exit at the same size beside it; prev stays small at the edge. */
+#preview-pop .pv-ctl {
+  display: flex; align-items: center; justify-content: center;
+  gap: .7rem; margin-top: .6rem;
+}
 #preview-pop .icon-btn { background: rgba(127,127,127,.14); }
 #preview-pop .icon-btn:disabled { opacity: .35; }
 #preview-pop svg { width: 22px; height: 22px; }
+#preview-pop .pv-big { min-width: 84px; min-height: 60px; border-radius: 20px; }
+#preview-pop .pv-big svg { width: 32px; height: 32px; }
 #preview-pop .pv-pos { color: var(--muted); font-size: .85rem; margin-left: auto;
   font-variant-numeric: tabular-nums; }
 /* how far into this 30s clip we are — `next` is a blind press without it */
