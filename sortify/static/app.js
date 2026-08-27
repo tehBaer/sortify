@@ -1045,7 +1045,7 @@ function startAgeTicker() {
 
 const ICON_PLAY = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>';
 const ICON_PAUSE = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M7 5h3.6v14H7zM13.4 5H17v14h-3.6z"/></svg>';
-const ICON_NEXT = '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M6 5.5v13l8.5-6.5zM16.5 5.5h2v13h-2z"/></svg>';
+const ICON_NEXT = '<svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor" aria-hidden="true"><path d="M6 5.5v13l8.5-6.5zM16.5 5.5h2v13h-2z"/></svg>';
 
 // The strip under the title: elapsed / bar / total, then play-pause + next.
 // Local files and episodes carry no duration; they get the buttons only.
@@ -1060,8 +1060,8 @@ function playbackStrip(d, tr) {
     </div>`;
   }
   return `${bar}<div class="np-buttons">
-    <button id="btn-now-toggle" class="np-round" title="${d.is_playing ? "Pause" : "Play"}">${d.is_playing ? ICON_PAUSE : ICON_PLAY}</button>
-    <button id="btn-now-next" class="np-round np-small" title="Skip to the next track">${ICON_NEXT}</button>
+    <button id="btn-now-toggle" class="np-round np-small" title="${d.is_playing ? "Pause" : "Play"}">${d.is_playing ? ICON_PAUSE : ICON_PLAY}</button>
+    <button id="btn-now-next" class="np-round np-big" title="Skip to the next track">${ICON_NEXT}</button>
   </div><div id="np-updated" class="np-updated"></div>`;
 }
 

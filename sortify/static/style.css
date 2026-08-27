@@ -229,6 +229,9 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
   width: 42px; height: 42px; background: var(--card2); color: var(--fg);
   border: 1px solid var(--border);
 }
+/* Next is the filing flow's main verb — sorting IS skipping — so it gets the
+   big filled target and play/pause steps back to the small secondary one. */
+.np-round.np-big { width: 64px; height: 64px; }
 
 .sugg {
   display: block; width: 100%; text-align: left; margin-bottom: .5rem;
