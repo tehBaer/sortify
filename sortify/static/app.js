@@ -637,6 +637,7 @@ $("home-link").onclick = () => { triage = null; boot(); };
 // one person who needed it — someone already logged in with a token issued
 // before a scope was added — was the one person who could not get to it.
 $("nav-reconnect").onclick = () => {
+  closeNavPop();
   stopNowPolling();
   triage = null;
   $("reconnect-hint").hidden = !statusData?.authed;
@@ -647,9 +648,49 @@ $("nav-reconnect").onclick = () => {
   show("setup");
 };
 
-$("nav-now").onclick = showNow;
-$("nav-lists").onclick = () => { stopNowPolling(); stopNowTicker(); triage = null; loadLists(); };
-$("nav-split").onclick = showSplitPicker;
+// ---- the header menu -------------------------------------------------------
+//
+// Four destinations behind one button. The panel borrows the input switcher's
+// language wholesale — same card, same dismissal rules — because two popovers
+// in one app that behave differently is a worse cost than the duplication.
+// Every exit closes it: choosing a destination, Escape, or a tap outside. A
+// nav panel left open sits on top of the view it just navigated to.
+function openNavPop() {
+  $("nav-pop").hidden = false;
+  $("btn-nav-menu").setAttribute("aria-expanded", "true");
+  $("btn-nav-menu").classList.add("open");
+}
+
+function closeNavPop() {
+  $("nav-pop").hidden = true;
+  $("btn-nav-menu").setAttribute("aria-expanded", "false");
+  $("btn-nav-menu").classList.remove("open");
+}
+
+// The markup ships the panel hidden, but the closed state is owned here too:
+// the keydown handler treats "nav-pop is open" as a claim on the keyboard, so
+// a panel that is merely *believed* open swallows every shortcut in the app.
+// One line, and that failure mode cannot exist.
+closeNavPop();
+
+$("btn-nav-menu").onclick = (e) => {
+  if (e && e.stopPropagation) e.stopPropagation();
+  if ($("nav-pop").hidden) openNavPop(); else closeNavPop();
+};
+
+document.addEventListener("click", (e) => {
+  if ($("nav-pop").hidden) return;
+  const t = e && e.target;
+  if (t && t.closest && t.closest("#nav-pop, #btn-nav-menu")) return;
+  closeNavPop();
+});
+
+$("nav-now").onclick = () => { closeNavPop(); showNow(); };
+$("nav-lists").onclick = () => {
+  closeNavPop();
+  stopNowPolling(); stopNowTicker(); triage = null; loadLists();
+};
+$("nav-split").onclick = () => { closeNavPop(); showSplitPicker(); };
 
 // ---- now playing -----------------------------------------------------------
 
@@ -3201,6 +3242,9 @@ document.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT") return;
   if (!$("picker").hidden) { if (e.key === "Escape") closePicker(); return; }
   if (!$("input-pop").hidden) { if (e.key === "Escape") closeInputPop(); return; }
+  // Same rule as the other two overlays: while one is open it owns the
+  // keyboard, so a shortcut cannot fire at the view hidden behind it.
+  if (!$("nav-pop").hidden) { if (e.key === "Escape") closeNavPop(); return; }
 
   if (!$("view-triage").hidden && triage) {
     const tr = triage.tracks[triage.idx];

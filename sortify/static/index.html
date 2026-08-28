@@ -20,13 +20,16 @@
 <body>
 <header>
   <h1 id="home-link">sortify</h1>
-  <nav>
+  <span id="whoami"></span>
+  <button id="btn-nav-menu" class="icon-btn" aria-haspopup="true" aria-expanded="false" title="Menu">
+    <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+  </button>
+  <nav id="nav-pop" hidden>
     <a id="nav-now">Now</a>
     <a id="nav-lists">Playlists</a>
     <a id="nav-split">Split</a>
     <a id="nav-reconnect" title="Log in again — needed after sortify asks for a new permission">Reconnect</a>
   </nav>
-  <span id="whoami"></span>
 </header>
 
 <main>

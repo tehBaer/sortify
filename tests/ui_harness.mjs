@@ -2274,6 +2274,53 @@ run("stopNowPolling()");
         !(sent.home_ids || []).includes("s1"), JSON.stringify(sent.home_ids));
 }
 
+// ============================================================================
+// NM — the header's nav is a menu, and it closes behind you.
+// A panel that opens is half a feature; the half that matters is that it
+// shuts on every exit — picking a destination, Escape, or a tap outside —
+// because a nav panel left open covers the view it just navigated to.
+// ============================================================================
+{
+  resetLog();
+  run(`show("now")`);
+  check("NM the menu starts closed",
+        $$("nav-pop").hidden === true, `hidden=${$$("nav-pop").hidden}`);
+
+  const wired = run(`typeof $("btn-nav-menu").onclick === "function"`);
+  check("NM the menu button is wired", wired,
+        `onclick=${run(`typeof $("btn-nav-menu").onclick`)}`);
+
+  if (wired) {
+    run(`$("btn-nav-menu").onclick({ stopPropagation() {} })`);
+    check("NM pressing it opens the panel",
+          $$("nav-pop").hidden === false, `hidden=${$$("nav-pop").hidden}`);
+    check("NM and the button reports itself expanded",
+          $$("btn-nav-menu")["aria-expanded"] === "true",
+          `aria-expanded=${$$("btn-nav-menu")["aria-expanded"]}`);
+
+    // Picking a destination must close it — otherwise the panel sits on top
+    // of the view it just took you to.
+    run(`$("nav-lists").onclick()`);
+    await tick();
+    check("NM choosing a destination closes it",
+          $$("nav-pop").hidden === true, `hidden=${$$("nav-pop").hidden}`);
+
+    run(`$("btn-nav-menu").onclick({ stopPropagation() {} })`);
+    check("NM it reopens", $$("nav-pop").hidden === false,
+          `hidden=${$$("nav-pop").hidden}`);
+    fireKey("Escape");
+    check("NM Escape closes it",
+          $$("nav-pop").hidden === true, `hidden=${$$("nav-pop").hidden}`);
+
+    // A tap anywhere else dismisses it, same discipline as the input popover.
+    run(`$("btn-nav-menu").onclick({ stopPropagation() {} })`);
+    for (const h of handlers.click || []) h({ target: {} });
+    check("NM a tap outside dismisses it",
+          $$("nav-pop").hidden === true, `hidden=${$$("nav-pop").hidden}`);
+  }
+  run(`show("now")`);   // stable end state for whatever runs after
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
