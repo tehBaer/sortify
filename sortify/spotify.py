@@ -689,6 +689,12 @@ class Spotify:
     def skip_next(self) -> None:
         self.request("POST", "/me/player/next")
 
+    def skip_previous(self) -> None:
+        # Unlike the client UIs, the API's previous never restarts the current
+        # track — it always steps back one, which is what the oops-recovery
+        # button wants.
+        self.request("POST", "/me/player/previous")
+
     def pause_playback(self) -> None:
         self.request("PUT", "/me/player/pause")
 

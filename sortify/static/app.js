@@ -1115,6 +1115,22 @@ async function playerNext() {
   }
 }
 
+// Same shape as playerNext: the track changes, so the settle repoll applies.
+async function playerPrev() {
+  const btn = $("btn-now-prev");
+  if (btn) btn.disabled = true;
+  const prevUri = nowState?.track?.uri || null;
+  try {
+    await api("/api/player/previous", {});
+    repollAfterPlaybackChange(prevUri);
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    const b = $("btn-now-prev");
+    if (b) b.disabled = false;
+  }
+}
+
 // Optimistic flip, deliberately without a forced repoll: pausing doesn't
 // change the track, the server has already dropped its now-cache (see
 // _playback_call), and the next scheduled poll fetches the truth anyway —
@@ -1211,57 +1227,54 @@ function startAgeTicker() {
 
 const ICON_PLAY = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>';
 const ICON_PAUSE = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M7 5h3.6v14H7zM13.4 5H17v14h-3.6z"/></svg>';
-const ICON_NEXT = '<svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor" aria-hidden="true"><path d="M6 5.5v13l8.5-6.5zM16.5 5.5h2v13h-2z"/></svg>';
+const ICON_NEXT = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M6 5.5v13l8.5-6.5zM16.5 5.5h2v13h-2z"/></svg>';
+const ICON_PREV = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M18 5.5v13L9.5 12zM5.5 5.5h2v13h-2z"/></svg>';
 // A list losing a line — "take this out of the input", not "delete the song".
 const ICON_REMOVE = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M3 6h12v2H3zM3 11h12v2H3zM3 16h8v2H3zM14.5 15h7v2h-7z"/></svg>';
 const ICON_UNDO = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9h10a5 5 0 0 1 0 10H9"/><path d="M8 5 4 9l4 4"/></svg>';
 
-// The strip under the title: elapsed / bar / total, then play-pause + next.
-// Local files and episodes carry no duration; they get the buttons only.
+// The strip under the title: the progress line (elapsed / bar / total) with
+// the two quiet controls tucked at its right end, then the verb row.
+// Local files and episodes carry no duration; their progress line is just
+// the quiet controls, right-aligned where they always live.
 function playbackStrip(d, tr) {
-  let bar = "";
-  if (tr.duration_ms) {
-    const pct = Math.min(100, ((d.progress_ms || 0) / tr.duration_ms) * 100).toFixed(2);
-    bar = `<div class="np-progress">
+  // Previous and pause are rare moves — previous is oops-recovery after a
+  // too-eager Next, pause is hardly part of the filing loop at all — so they
+  // live as small ghost discs on the bar line, out of the verb row entirely.
+  // Both together at the right end (not flanking the bar): one corner for
+  // everything quiet, and the bar keeps its full width on the left.
+  const quiet = `<button id="btn-now-prev" class="np-mini"
+        title="Back to the previous track" aria-label="Back to the previous track">${ICON_PREV}</button>
+      <button id="btn-now-toggle" class="np-mini"
+        title="${d.is_playing ? "Pause" : "Play"}" aria-label="${d.is_playing ? "Pause" : "Play"}">${d.is_playing ? ICON_PAUSE : ICON_PLAY}</button>`;
+  const bar = tr.duration_ms
+    ? `<div class="np-progress">
       <span id="np-elapsed" class="np-time">${fmtTime(d.progress_ms || 0)}</span>
-      <span class="np-bar"><span id="np-fill" style="width:${pct}%"></span></span>
+      <span class="np-bar"><span id="np-fill" style="width:${Math.min(100, ((d.progress_ms || 0) / tr.duration_ms) * 100).toFixed(2)}%"></span></span>
       <span class="np-time">${fmtTime(tr.duration_ms)}</span>
-    </div>`;
-  }
-  // Three slots, not a centred row: Next holds the middle column alone so it
-  // sits on the card's centre line, and the flanking slots are reserved even
-  // when empty, so the transport never shifts sideways when the context
-  // changes from an input to something else (same instinct as the
-  // Next-sizing fix). The right slot is Remove's, and it is deliberately NOT
-  // adjacent to Next — Next is pressed once per track, and a destructive
-  // control sharing that thumb path is a mis-tap waiting to happen.
+      ${quiet}
+    </div>`
+    : `<div class="np-progress np-progress-bare">${quiet}</div>`;
   // Once this track has been removed, the slot offers the way back instead —
   // the undo belongs where the hand already is, not in the top bar. It lasts
   // exactly as long as the track does (see renderNow's expiry).
-  // A pill rather than a disc: Remove is the one strip control that is worth
-  // widening — it is the second-most-pressed button in the loop after Next,
-  // and a wide target at the thumb's resting edge is easier to hit than a
-  // disc without moving it any closer to Next.
   const removeBtn = removedUri && removedUri === tr.uri
     ? `<button id="btn-now-undo-remove" class="np-round np-wide np-undo"
-               title="Undo the removal (u)" aria-label="Undo the removal">${ICON_UNDO}</button>`
+               title="Undo the removal (u)" aria-label="Undo the removal">${ICON_UNDO}<span class="np-verb-label">Undo</span></button>`
     : d.context?.is_input
     ? `<button id="btn-now-remove" class="np-round np-wide np-danger"
-               title="Remove from input (r)" aria-label="Remove from input">${ICON_REMOVE}</button>`
+               title="Remove from input (r)" aria-label="Remove from input">${ICON_REMOVE}<span class="np-verb-label">Remove</span></button>`
     : "";
-  // Next alone occupies the centre column, so it sits on the card's true
-  // centre line rather than being pushed off it by whatever shares its slot.
-  // Play/pause rides the left slot and Remove the right, both reserved even
-  // when empty — that is what keeps Next from sliding when the context
-  // changes.
+  // The verb row is the two buttons the loop actually presses, as an equal
+  // pair of pills centred on the card: Remove left, Next right, a deliberate
+  // gap between them (removal is undoable now, but a mis-tap is still a
+  // mis-tap). Each half of the grid is reserved even when Remove is absent,
+  // so Next never slides when the context stops being an input.
   return `${bar}<div class="np-buttons">
-    <span class="np-slot np-toggle-slot">
-      <button id="btn-now-toggle" class="np-round np-small" title="${d.is_playing ? "Pause" : "Play"}">${d.is_playing ? ICON_PAUSE : ICON_PLAY}</button>
-    </span>
-    <span class="np-transport">
-      <button id="btn-now-next" class="np-round np-big" title="Skip to the next track">${ICON_NEXT}</button>
-    </span>
     <span class="np-slot np-remove-slot">${removeBtn}</span>
+    <span class="np-slot np-next-slot">
+      <button id="btn-now-next" class="np-round np-wide np-next" title="Skip to the next track">${ICON_NEXT}<span class="np-verb-label">Next</span></button>
+    </span>
   </div><div id="np-updated" class="np-updated"></div>`;
 }
 
@@ -1367,6 +1380,8 @@ function renderNow() {
   if (tog) tog.onclick = playerToggle;
   const nxt = $("btn-now-next");
   if (nxt) nxt.onclick = playerNext;
+  const prv = $("btn-now-prev");
+  if (prv) prv.onclick = playerPrev;
   // Wired with the other strip controls rather than in the ordinary-card
   // branch below: the button is part of the strip now, and the strip renders
   // for the sitting card too (where an input context — and so this button —

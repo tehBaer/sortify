@@ -254,52 +254,54 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 }
 #np-fill { display: block; height: 100%; background: var(--accent); border-radius: 999px;
            transition: width 1s linear; }
-/* Three slots so NEXT alone holds the centre column and therefore sits on
-   the card's true centre line — play/pause flanks it left, Remove right,
-   and both side slots stay reserved when empty so nothing slides sideways
-   when the context changes. */
+/* The quiet controls (previous, play/pause) ride the progress line as small
+   ghost discs — they are rare moves and must not compete with the verb row
+   below. flex:none so a long bar can't crush them. */
+.np-mini {
+  width: 34px; height: 34px; min-height: 0; padding: 0; border-radius: 50%;
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; color: var(--muted); border: 1px solid var(--border);
+}
+.np-mini:hover { border-color: var(--muted); color: var(--fg); }
+.np-mini svg { display: block; width: 15px; height: 15px; }
+/* No duration (local file / episode): the line is just the quiet controls,
+   held at the right where they always live. */
+.np-progress-bare { justify-content: flex-end; min-height: 34px; }
+/* The verb row: Remove and Next as an equal, centred pair — they are the
+   two buttons the filing loop actually presses. Each 1fr half is reserved
+   even when Remove is absent (context not an input), so Next never slides
+   sideways when the context changes. The column gap IS the mis-tap buffer:
+   removal is undoable now, but the two verbs still must not share one
+   thumb path. */
 .np-buttons {
-  display: grid; grid-template-columns: 1fr auto 1fr;
+  display: grid; grid-template-columns: 1fr 1fr; column-gap: 2.4rem;
   align-items: center; margin-bottom: 1rem;
 }
-.np-transport { display: flex; align-items: center; justify-content: center; }
-.np-slot { display: flex; align-items: center; min-height: 52px; }
-/* Play/pause hugs the centre column so it reads as part of the transport
-   rather than as a third thing adrift in the left margin. */
-.np-toggle-slot { justify-content: flex-end; padding-right: .8rem; }
-/* Pulled in from the edge: hard against the card wall it reads as chrome
-   rather than as one of the card's controls. */
-.np-remove-slot { justify-content: flex-end; padding-right: .9rem; }
+.np-slot { display: flex; align-items: center; min-height: 56px; }
+.np-remove-slot { justify-content: flex-end; }
+.np-next-slot { justify-content: flex-start; }
 .np-round {
-  width: 52px; height: 52px; min-height: 0; padding: 0; border-radius: 50%;
+  min-height: 0; padding: 0; border-radius: 50%;
   display: inline-flex; align-items: center; justify-content: center;
   background: var(--fg); color: var(--bg); border-color: transparent;
 }
 .np-round:hover { border-color: transparent; opacity: .88; }
-.np-round.np-small {
-  width: 42px; height: 42px; background: var(--card2); color: var(--fg);
-  border: 1px solid var(--border);
-}
-/* Next is the filing flow's main verb — sorting IS skipping — so it gets the
-   big filled target and play/pause steps back to the small secondary one. */
-.np-round.np-big { width: 64px; height: 64px; }
 /* An inline SVG sits on the text baseline and leaves descender space below
    it, which is what tilts an icon button's glyph off the circle's centre.
-   Every strip icon is a block, so the three buttons align on one line. */
+   Every strip icon is a block, so the buttons align on one line. */
 .np-round svg { display: block; }
-/* Remove/undo are pills, not discs: a wide target is easier to hit with the
-   thumb already resting at that edge, and widening rather than moving keeps
-   the deliberate gap to Next. 52px tall — between play/pause (42) and Next
-   (64), on the grid's shared centre line — so it reads as part of the same
-   row of controls instead of a detached badge. */
+/* Both verbs are pills of one size — the pair reads as equals, which is the
+   point: Next and Remove are what the loop presses, everything else stepped
+   back onto the bar line. */
 .np-round.np-wide {
-  width: auto; min-width: 88px; height: 52px; border-radius: 999px;
+  width: auto; min-width: 110px; height: 56px; border-radius: 999px;
+  gap: .5rem; padding: 0 1.4rem; font-size: .95rem; font-weight: 600;
 }
-/* Outline, not filled: Remove is destructive, so it is red — but it is also
-   the rarer, optional move, and a filled red disc beside Next reads as a
-   third transport control. MUST stay after .np-small/.np-wide — all three are
-   (0,2,0), so source order alone decides, and placed any earlier the grey
-   secondary background silently wins (which is exactly what happened). */
+/* Outline, not filled: Remove is Next's equal in the pair, but it is still
+   the destructive half, and a filled red pill mirroring a filled dark one
+   would invite pressing them interchangeably. MUST stay after .np-wide —
+   both are (0,2,0), so source order alone decides, and placed any earlier
+   the filled background silently wins (which is exactly what happened). */
 .np-round.np-danger {
   background: transparent; color: var(--danger);
   border: 2px solid var(--danger);

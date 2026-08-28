@@ -1927,13 +1927,22 @@ run("stopNowPolling()");
         at('id="btn-now-remove"') < at('np-updated'),
         `buttons@${at('np-buttons')} remove@${at('id="btn-now-remove"')} ` +
         `updated@${at('np-updated')}`);
-  // Next is the card's main verb; a destructive control must not be the
-  // element immediately following it in the group.
-  check("RB it is not rendered adjacent to Next",
-        at('id="btn-now-next"') < at('id="btn-now-remove"') &&
+  // The verb row is a centred pair: Remove left of Next, each in its own
+  // slot with the deliberate gap between them, so the two most-pressed
+  // buttons read as equals.
+  check("RB remove sits left of Next in the verb pair",
+        at('id="btn-now-remove"') < at('id="btn-now-next"') &&
         at('np-remove-slot') !== -1,
-        `next@${at('id="btn-now-next"')} remove@${at('id="btn-now-remove"')} ` +
+        `remove@${at('id="btn-now-remove"')} next@${at('id="btn-now-next"')} ` +
         `slot@${at('np-remove-slot')}`);
+  // The quiet controls live on the progress-bar line, not in the verb row:
+  // both must render before np-buttons opens.
+  check("RB previous and pause sit on the progress row, above the verb pair",
+        at('id="btn-now-prev"') !== -1 && at('id="btn-now-toggle"') !== -1 &&
+        at('id="btn-now-prev"') < at('np-buttons') &&
+        at('id="btn-now-toggle"') < at('np-buttons'),
+        `prev@${at('id="btn-now-prev"')} toggle@${at('id="btn-now-toggle"')} ` +
+        `buttons@${at('np-buttons')}`);
 
   setNow(nowBody(false));
   run(`filedUris = {}; pollNow(true)`);

@@ -3783,6 +3783,19 @@ def player_next():
     return out
 
 
+@app.post("/api/player/previous")
+def player_previous():
+    # Mirrors player_next, settle window included: Spotify can report the
+    # pre-press track for a moment in either direction.
+    with _now_lock:
+        prev_uri = ((_now_cache["value"] or {}).get("track") or {}).get("uri")
+    out = _playback_call(sp.skip_previous)
+    if prev_uri:
+        with _now_lock:
+            _skip_settle.update(uri=prev_uri, until=time.time() + NOW_SKIP_SETTLE_WINDOW)
+    return out
+
+
 @app.post("/api/player/pause")
 def player_pause():
     return _playback_call(sp.pause_playback)

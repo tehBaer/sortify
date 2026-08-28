@@ -58,6 +58,15 @@ def test_skip_next_asks_spotify_for_the_next_track(sp, monkeypatch):
     assert sent["url"].endswith("/me/player/next")
 
 
+def test_skip_previous_asks_spotify_for_the_previous_track(sp, monkeypatch):
+    sent = record(sp, monkeypatch)
+
+    sp.skip_previous()
+
+    assert sent["method"] == "POST"
+    assert sent["url"].endswith("/me/player/previous")
+
+
 def test_pause_stops_playback(sp, monkeypatch):
     sent = record(sp, monkeypatch)
 
@@ -147,6 +156,37 @@ def test_next_endpoint_skips(appmod, monkeypatch):
 
     assert appmod.player_next()["ok"] is True
     assert called == [True]
+
+
+def test_previous_endpoint_goes_back(appmod, monkeypatch):
+    called = []
+    monkeypatch.setattr(appmod.sp, "skip_previous", lambda: called.append(True))
+
+    assert appmod.player_previous()["ok"] is True
+    assert called == [True]
+
+
+def test_going_back_invalidates_the_now_cache(appmod, monkeypatch):
+    """Same reasoning as skipping forward: the cache predicts the track that
+    was playing, and going back just made that prediction wrong."""
+    monkeypatch.setattr(appmod.sp, "skip_previous", lambda: None)
+    appmod._now_cache.update(at=9_999_999.0, value={"is_playing": True}, ttl=300)
+
+    appmod.player_previous()
+
+    assert appmod._now_cache["at"] == 0.0
+
+
+def test_going_back_arms_the_skip_settle_window(appmod, monkeypatch):
+    """Spotify can still report the pre-press track for a moment after
+    previous, exactly as after next — the settle guard has to cover both."""
+    monkeypatch.setattr(appmod.sp, "skip_previous", lambda: None)
+    appmod._now_cache.update(
+        at=9_999_999.0, value={"track": {"uri": "spotify:track:before"}}, ttl=300)
+
+    appmod.player_previous()
+
+    assert appmod._skip_settle["uri"] == "spotify:track:before"
 
 
 def test_pause_and_resume_endpoints(appmod, monkeypatch):
