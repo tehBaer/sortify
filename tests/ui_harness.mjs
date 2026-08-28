@@ -1935,14 +1935,20 @@ run("stopNowPolling()");
         at('np-remove-slot') !== -1,
         `remove@${at('id="btn-now-remove"')} next@${at('id="btn-now-next"')} ` +
         `slot@${at('np-remove-slot')}`);
-  // The quiet controls live on the progress-bar line, not in the verb row:
-  // both must render before np-buttons opens.
-  check("RB previous and pause sit on the progress row, above the verb pair",
+  // The quiet controls flank the progress bar — previous at its left end
+  // (back = left), pause at its right — and both stay out of the verb row.
+  check("RB previous flanks the bar's left end, pause its right",
         at('id="btn-now-prev"') !== -1 && at('id="btn-now-toggle"') !== -1 &&
-        at('id="btn-now-prev"') < at('np-buttons') &&
+        at('id="btn-now-prev"') < at('np-bar') &&
+        at('np-bar') < at('id="btn-now-toggle"') &&
         at('id="btn-now-toggle"') < at('np-buttons'),
-        `prev@${at('id="btn-now-prev"')} toggle@${at('id="btn-now-toggle"')} ` +
-        `buttons@${at('np-buttons')}`);
+        `prev@${at('id="btn-now-prev"')} bar@${at('np-bar')} ` +
+        `toggle@${at('id="btn-now-toggle"')} buttons@${at('np-buttons')}`);
+  // Share lives on the card itself, in the corner beside the cover — not in
+  // the top bar. It renders only for a real spotify:track uri.
+  check("RB the share button rides the card, beside the cover",
+        at('id="btn-share"') !== -1 && at('id="btn-share"') < at('np-progress'),
+        `share@${at('id="btn-share"')} progress@${at('np-progress')}`);
 
   setNow(nowBody(false));
   run(`filedUris = {}; pollNow(true)`);

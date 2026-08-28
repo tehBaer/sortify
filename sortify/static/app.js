@@ -1216,7 +1216,9 @@ let nowFetchedAt = null;  // Date.now()-anchored time of the upstream fetch
 function paintNowAge() {
   const el = $("np-updated");
   if (!el || nowFetchedAt == null) return;
-  el.textContent = `updated ${fmtCountdown(Date.now() - nowFetchedAt)} ago`;
+  // Just "Ns ago" — the leading "updated" said nothing the timestamp
+  // doesn't, and the corner slot beside the cover is narrow.
+  el.textContent = `${fmtCountdown(Date.now() - nowFetchedAt)} ago`;
 }
 
 function startAgeTicker() {
@@ -1240,21 +1242,22 @@ const ICON_UNDO = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" s
 function playbackStrip(d, tr) {
   // Previous and pause are rare moves — previous is oops-recovery after a
   // too-eager Next, pause is hardly part of the filing loop at all — so they
-  // live as small ghost discs on the bar line, out of the verb row entirely.
-  // Both together at the right end (not flanking the bar): one corner for
-  // everything quiet, and the bar keeps its full width on the left.
-  const quiet = `<button id="btn-now-prev" class="np-mini"
-        title="Back to the previous track" aria-label="Back to the previous track">${ICON_PREV}</button>
-      <button id="btn-now-toggle" class="np-mini"
+  // live as small ghost discs flanking the bar line, out of the verb row
+  // entirely: previous at the left end (back = left, guessable without
+  // reading it), pause at the right.
+  const prevBtn = `<button id="btn-now-prev" class="np-mini"
+        title="Back to the previous track" aria-label="Back to the previous track">${ICON_PREV}</button>`;
+  const pauseBtn = `<button id="btn-now-toggle" class="np-mini"
         title="${d.is_playing ? "Pause" : "Play"}" aria-label="${d.is_playing ? "Pause" : "Play"}">${d.is_playing ? ICON_PAUSE : ICON_PLAY}</button>`;
   const bar = tr.duration_ms
     ? `<div class="np-progress">
+      ${prevBtn}
       <span id="np-elapsed" class="np-time">${fmtTime(d.progress_ms || 0)}</span>
       <span class="np-bar"><span id="np-fill" style="width:${Math.min(100, ((d.progress_ms || 0) / tr.duration_ms) * 100).toFixed(2)}%"></span></span>
       <span class="np-time">${fmtTime(tr.duration_ms)}</span>
-      ${quiet}
+      ${pauseBtn}
     </div>`
-    : `<div class="np-progress np-progress-bare">${quiet}</div>`;
+    : `<div class="np-progress np-progress-bare">${prevBtn}${pauseBtn}</div>`;
   // Once this track has been removed, the slot offers the way back instead —
   // the undo belongs where the hand already is, not in the top bar. It lasts
   // exactly as long as the track does (see renderNow's expiry).
@@ -1321,9 +1324,6 @@ function renderNow() {
   const undo = $("btn-undo-now");
   undo.disabled = nowActions === 0 || inSitting;
   undo.hidden = undo.disabled;
-  // Share needs a real track on screen; local files and episodes have no
-  // spotify:track: uri and the tablet flow can't find them by title anyway.
-  $("btn-share").hidden = !(d.playing && d.track?.uri?.startsWith("spotify:track:"));
   if (!d.cooldown) { stopCooldownTicker(); nowCooldownUntil = nowCooldownTotal = 0; }
   paintNowControls(d);
   syncSittingFromNow(d);
@@ -1368,8 +1368,20 @@ function renderNow() {
 
   const body = inSitting ? sittingCardBody(tr, d.sitting) : ordinaryCardBody(d, tr, ctx);
 
+  // Share needs a real track on screen; local files and episodes have no
+  // spotify:track: uri and the tablet flow can't find them by title anyway.
+  // It rides the card's corner beside the cover — the whitespace flanking
+  // the art is exactly where a once-in-a-while control can sit without
+  // costing the layout anything.
+  const shareBtn = tr.uri?.startsWith("spotify:track:")
+    ? `<button id="btn-share" class="icon-btn np-share" title="Send this song to a friend — Spotify Messages, via the tablet">
+        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>
+      </button>`
+    : "";
+
   nowProblem = false;  // a real card for a real track is about to go up
   $("now-card").innerHTML = `<div class="track-card${d.is_playing ? "" : " is-paused"}">
+    ${shareBtn}
     <div class="art">${img}${d.is_playing ? "" : '<span class="paused-chip">paused</span>'}</div>
     <div class="t-name">${esc(tr.name)}</div>
     <div class="t-artist">${esc(artists)}${tr.album ? " — " + esc(tr.album) : ""}</div>
@@ -1390,6 +1402,8 @@ function renderNow() {
   if (rem) rem.onclick = nowRemove;
   const undoRem = $("btn-now-undo-remove");
   if (undoRem) undoRem.onclick = undoRemoval;
+  const sh = $("btn-share");
+  if (sh) sh.onclick = openSharePop;
   startNowTicker(d, tr);
   startAgeTicker();
 
@@ -1749,7 +1763,8 @@ async function doShare(track, friend) {
   }
 }
 
-$("btn-share").onclick = openSharePop;
+// btn-share is card-internal now (rendered and wired by renderNow, like the
+// other strip controls) — there is no static element left to wire here.
 
 // Capture phase, so a peek on a suggestion's reason line never falls through
 // to the button underneath and files the track.

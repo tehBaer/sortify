@@ -200,6 +200,9 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 #triage-loading p { text-align: center; color: var(--muted); }
 
 .track-card {
+  /* relative: the share button and the "updated" line sit absolutely in the
+     whitespace flanking the cover, costing the layout no height */
+  position: relative;
   background: var(--card); border: 1px solid var(--border); border-radius: 18px;
   padding: 1.25rem 1.1rem 1.1rem; text-align: center;
   box-shadow: var(--shadow-card);
@@ -239,6 +242,19 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
   margin: -.4rem 0 .6rem;
 }
 .state-card .np-updated { margin: .6rem 0 0; }
+/* On the track card it costs no height: pinned to the top-left corner, in
+   the margin beside the cover, mirroring the share button on the right. */
+.track-card .np-updated {
+  position: absolute; top: .8rem; left: .9rem; margin: 0; max-width: 5.5rem;
+  text-align: left; line-height: 1.3;
+}
+/* Share rides the opposite corner — a once-in-a-while control living in the
+   other strip of whitespace beside the art. */
+.np-share { position: absolute; top: .55rem; right: .55rem; color: var(--muted); }
+/* Hidden by request, not deleted: renderNow and the undo stack still drive
+   btn-undo-now (the strip's own undo covers removals; keyboard u remains),
+   and the auto/manual chip keeps its logic for if it ever comes back. */
+#btn-undo-now, #btn-now-manual { display: none; }
 
 /* playback strip: elapsed / bar / total, then the two round buttons */
 .np-progress {
@@ -264,9 +280,9 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 }
 .np-mini:hover { border-color: var(--muted); color: var(--fg); }
 .np-mini svg { display: block; width: 15px; height: 15px; }
-/* No duration (local file / episode): the line is just the quiet controls,
-   held at the right where they always live. */
-.np-progress-bare { justify-content: flex-end; min-height: 34px; }
+/* No duration (local file / episode): no bar between them, but the quiet
+   controls hold their ends of the line. */
+.np-progress-bare { justify-content: space-between; min-height: 34px; }
 /* The verb row: Remove and Next as an equal, centred pair — they are the
    two buttons the filing loop actually presses. Each 1fr half is reserved
    even when Remove is absent (context not an input), so Next never slides
