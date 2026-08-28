@@ -187,12 +187,13 @@ function makeListRow(p) {
     <div class="pl-roles">
       <button class="chip r-input">In</button>
       <button class="chip r-home">Home</button>
+      <button class="chip r-subset">Subset</button>
       <button class="pl-sort" title="Sort this input">▶</button>
       <button class="pl-split" title="Split into piles">⑃</button>
     </div>
     <input class="pl-hints" placeholder="matching hints, e.g. ambient, piano"
            title="Your own words about what belongs here — they join this home's tag profile (docs/matching.md)">`;
-  const [bIn, bHome, bSort, bSplit] = row.querySelectorAll("button");
+  const [bIn, bHome, bSubset, bSort, bSplit] = row.querySelectorAll("button");
   const hintsEl = row.querySelector(".pl-hints");
   hintsEl.value = hintTexts[p.id] || "";
   hintsEl.oninput = () => {
@@ -203,6 +204,10 @@ function makeListRow(p) {
     bIn.classList.toggle("on-input", roles[p.id] === "input");
     bHome.classList.toggle("on-home", roles[p.id] === "home");
     bHome.hidden = p.id === "liked" || !p.editable;
+    bSubset.classList.toggle("on-subset", roles[p.id] === "subset");
+    // Only a {}-named playlist can be a subset — the server resolves the
+    // same rule, so offering the chip anywhere else would be a lie.
+    bSubset.hidden = !/^\{.*\}$/.test((p.name || "").trim()) || !p.editable;
     bSort.hidden = roles[p.id] !== "input";
     // The hints field only makes sense for a home — it feeds that home's
     // matching profile. Kept visible if it has leftover text so the user
@@ -221,6 +226,10 @@ function makeListRow(p) {
   };
   bIn.onclick = () => { roles[p.id] = roles[p.id] === "input" ? null : "input"; paint(); };
   bHome.onclick = () => { roles[p.id] = roles[p.id] === "home" ? null : "home"; paint(); };
+  bSubset.onclick = () => {
+    roles[p.id] = roles[p.id] === "subset" ? null : "subset";
+    paint();
+  };
   bSort.onclick = () => { saveConfig().then(() => startTriage(p.id, p.name)); };
   bSplit.onclick = () => openSplit(p.id, p.name);
   paint();
@@ -434,7 +443,8 @@ $("btn-folders-refresh").onclick = async () => {
 async function saveConfig() {
   const input_ids = Object.keys(roles).filter((k) => roles[k] === "input");
   const home_ids = Object.keys(roles).filter((k) => roles[k] === "home");
-  await api("/api/config", { input_ids, home_ids, home_hints: hintTexts });
+  const subset_ids = Object.keys(roles).filter((k) => roles[k] === "subset");
+  await api("/api/config", { input_ids, home_ids, home_hints: hintTexts, subset_ids });
 }
 
 $("btn-save-config").onclick = async () => {

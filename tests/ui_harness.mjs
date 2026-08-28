@@ -88,7 +88,16 @@ class El {
   // exactly as in a real DOM. renderPiles() relies on this to clear rows.
   set innerHTML(v) { this._html = String(v); this.children = []; registerIds(this._html); }
   get innerHTML() { return this._html; }
-  querySelectorAll() { return []; }
+  // "button" is modeled for real (one fresh El per <button> tag in document
+  // order) because makeListRow destructures its role chips positionally and
+  // wires paint()/onclick straight onto them — an empty stub would throw
+  // before the row's markup (what SM's checks actually read) ever gets
+  // built. Other selectors stay unmodeled: nothing else needs them, and O1
+  // pins the pure gating function specifically to avoid depending on this.
+  querySelectorAll(sel) {
+    if (sel === "button") return [...this._html.matchAll(/<button[^>]*>/g)].map(() => new El("_btn"));
+    return [];
+  }
   querySelector() { return new El("_anon"); }
   appendChild(c) { this.children.push(c); }
   setAttribute(k, v) { this[k] = String(v); }
@@ -2175,6 +2184,42 @@ run("stopNowPolling()");
   check("SS and it sends no from_id",
         bodies("/api/act").slice(-1)[0].from_id === null,
         JSON.stringify(bodies("/api/act").slice(-1)[0]));
+}
+
+// ============================================================================
+// SM — only {}-named playlists can be marked as subsets, and the mark saves.
+// ============================================================================
+{
+  resetLog();
+  routes["GET /api/playlists"] = {
+    status: 200,
+    body: {
+      playlists: [
+        { id: "s1", name: "{solfest}", editable: true, total: 22, role: null,
+          folder: null, hints: "", split: null },
+        { id: "h1", name: "Ordinary", editable: true, total: 12, role: "home",
+          folder: null, hints: "", split: null },
+      ],
+      fetched_at: 1, sitting_orphans: [],
+    },
+  };
+  routes["POST /api/config"] = { status: 200, body: { ok: true } };
+  await run(`loadLists()`);
+  await tick();
+  check("SM a {} playlist offers a Subset chip",
+        $$("playlists").children.some((r) =>
+          String(r.innerHTML).includes("r-subset")),
+        "no r-subset chip rendered");
+
+  run(`roles["s1"] = "subset"`);
+  await run(`saveConfig()`);
+  await tick();
+  const sent = bodies("/api/config").slice(-1)[0];
+  check("SM saving sends subset_ids",
+        Array.isArray(sent.subset_ids) && sent.subset_ids.includes("s1"),
+        JSON.stringify(sent));
+  check("SM and does not put it in home_ids",
+        !(sent.home_ids || []).includes("s1"), JSON.stringify(sent.home_ids));
 }
 
 // ---- summary ---------------------------------------------------------------

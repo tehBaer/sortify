@@ -88,6 +88,7 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 }
 .chip.on-input { background: #2d6cdf; color: #fff; border-color: transparent; }
 .chip.on-home { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
+.chip.on-subset { background: var(--accent); color: var(--bg); border-color: transparent; }
 .pl-sort { font-size: 1.1rem; padding: .3rem .6rem; }
 /* full-width second line inside the (flex-wrap) row, homes only */
 .pl-row { flex-wrap: wrap; }
