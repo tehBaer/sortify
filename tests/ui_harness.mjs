@@ -2184,6 +2184,25 @@ run("stopNowPolling()");
   check("SS and it sends no from_id",
         bodies("/api/act").slice(-1)[0].from_id === null,
         JSON.stringify(bodies("/api/act").slice(-1)[0]));
+
+  // I3: nowRemove writes filedUris[uri] too ("nowhere (removed from input)"),
+  // so subsetBlock's old `!!filedUris[tr.uri]` gate treated a removal as
+  // "settled" and offered subsets for a track with no home — spec §4: "a
+  // track with no home shows no subset row at all." removedUri is what
+  // tells settled apart from a genuine filing.
+  routes["GET /api/now?force=1"] = body({
+    track: { uri: "spotify:track:ss3", name: "Rem", duration_ms: 200000,
+             artists: [{ name: "Artist" }], sortable: true, image: null },
+    context: { id: "IN1", name: "Input One", is_input: true },
+    suggestions: [{ playlist_id: "H1", pct: 80, reasons: [], already: false }],
+  });
+  run(`filedUris = {}; nowActionLog = []; nowActions = 0; removedUri = null; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  await run(`nowRemove()`);
+  await tick();
+  check("I3 a removed track shows no subset row even though subsets matched",
+        !html().includes("{solfest}") && !html().includes("already in"), html());
 }
 
 // ============================================================================
@@ -2196,9 +2215,14 @@ run("stopNowPolling()");
     body: {
       playlists: [
         { id: "s1", name: "{solfest}", editable: true, total: 22, role: null,
-          folder: null, hints: "", split: null },
+          folder: null, hints: "", split: null, subset_eligible: true },
         { id: "h1", name: "Ordinary", editable: true, total: 12, role: "home",
-          folder: null, hints: "", split: null },
+          folder: null, hints: "", split: null, subset_eligible: false },
+        // Already a subset when the list loaded — resaving it must not be
+        // priced, even though its own warm cost (if it were newly marked)
+        // would blow well past SUBSET_WARM_BUDGET.
+        { id: "s3", name: "{teh bomb}", editable: true, total: 5000, role: "subset",
+          folder: null, hints: "", split: null, subset_eligible: true },
       ],
       fetched_at: 1, sitting_orphans: [],
     },
@@ -2210,6 +2234,34 @@ run("stopNowPolling()");
         $$("playlists").children.some((r) =>
           String(r.innerHTML).includes("r-subset")),
         "no r-subset chip rendered");
+
+  // M2: the client reads the server's subset_eligible answer instead of
+  // testing its own hardcoded /^\{.*\}$/, so the chip's visibility gate is
+  // just this pure function — see splitDisabledReason for the same pattern.
+  check("M2 subsetChipHidden hides a non-{}-eligible row's chip",
+        run(`subsetChipHidden({ subset_eligible: false })`) === true,
+        String(run(`subsetChipHidden({ subset_eligible: false })`)));
+  check("M2 subsetChipHidden shows an eligible row's chip",
+        run(`subsetChipHidden({ subset_eligible: true })`) === false,
+        String(run(`subsetChipHidden({ subset_eligible: true })`)));
+
+  // C2: the Save button states the pending cost before the save that incurs
+  // it (spec §2). Nothing newly marked yet — s3 was already a subset on load.
+  check("C2 Save roles has no price with nothing newly marked",
+        $$("btn-save-config").textContent === "Save roles",
+        $$("btn-save-config").textContent);
+
+  run(`roles["s1"] = "subset"`);
+  run(`updateSaveLabel()`);
+  check("C2 Save roles prices a newly-marked subset (ceil(22/100) = 1 call)",
+        $$("btn-save-config").textContent === "Save roles (1 call)",
+        $$("btn-save-config").textContent);
+
+  run(`roles["s1"] = null`);
+  run(`updateSaveLabel()`);
+  check("C2 un-marking it drops the price again",
+        $$("btn-save-config").textContent === "Save roles",
+        $$("btn-save-config").textContent);
 
   run(`roles["s1"] = "subset"`);
   await run(`saveConfig()`);

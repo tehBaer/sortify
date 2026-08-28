@@ -7,6 +7,10 @@ let statusData = null;
 let playlistData = [];   // lists view
 let roles = {};          // id -> "input" | "home" | null
 let hintTexts = {};      // id -> "ambient, piano" — per-home matching hints
+// Subset ids as they were on load, before any chip taps this view visit —
+// what "newly marked" means for the Save button's pending-cost label. A
+// subset opted in earlier (and so already cached) costs nothing to re-save.
+let loadedSubsetIds = new Set();
 let triage = null;       // {id, name, homes:Map, tracks, idx, sorted, skipped, history}
 let split = null;        // {id, name, piles, decided, active_sitting} — the open split view
 // {splitId, sittingId, pileId, pileName, uris, decided} — a UI convenience,
@@ -146,12 +150,14 @@ async function loadLists() {
     roles = Object.fromEntries(playlistData.map((p) => [p.id, p.role]));
     hintTexts = Object.fromEntries(
       playlistData.filter((p) => p.hints).map((p) => [p.id, p.hints]));
+    loadedSubsetIds = new Set(playlistData.filter((p) => p.role === "subset").map((p) => p.id));
     // The list is cached until refreshed by hand, so say how old it is rather
     // than present a stale list as current.
     $("pl-age").textContent = ageText(data.fetched_at);
     renderOrphans(data.sitting_orphans || []);
     loadNaming();
     renderLists();
+    updateSaveLabel();
   } catch (e) {
     if (e.message === "auth needed") return;
     $("playlists").innerHTML =
@@ -171,6 +177,16 @@ async function loadLists() {
 // without the DOM (see ui_harness.mjs).
 function splitDisabledReason(p) {
   return p.editable ? null : "Not yours to split — make your own copy in Spotify first, then split that copy";
+}
+
+// The server resolves subset eligibility against the live (possibly
+// user-configured) subset_name_pattern and emits it as `subset_eligible` —
+// this just reads that answer rather than re-testing a hardcoded regex
+// client-side, so the chip can never silently disagree with what a save
+// would actually do. A pure function, same reasoning as splitDisabledReason
+// above: unit-testable without the DOM (see ui_harness.mjs).
+function subsetChipHidden(p) {
+  return !p.subset_eligible;
 }
 
 function makeListRow(p) {
@@ -205,9 +221,7 @@ function makeListRow(p) {
     bHome.classList.toggle("on-home", roles[p.id] === "home");
     bHome.hidden = p.id === "liked" || !p.editable;
     bSubset.classList.toggle("on-subset", roles[p.id] === "subset");
-    // Only a {}-named playlist can be a subset — the server resolves the
-    // same rule, so offering the chip anywhere else would be a lie.
-    bSubset.hidden = !/^\{.*\}$/.test((p.name || "").trim()) || !p.editable;
+    bSubset.hidden = subsetChipHidden(p);
     bSort.hidden = roles[p.id] !== "input";
     // The hints field only makes sense for a home — it feeds that home's
     // matching profile. Kept visible if it has leftover text so the user
@@ -224,11 +238,12 @@ function makeListRow(p) {
     bSplit.disabled = !!reason;
     bSplit.title = reason || "Split into piles";
   };
-  bIn.onclick = () => { roles[p.id] = roles[p.id] === "input" ? null : "input"; paint(); };
-  bHome.onclick = () => { roles[p.id] = roles[p.id] === "home" ? null : "home"; paint(); };
+  bIn.onclick = () => { roles[p.id] = roles[p.id] === "input" ? null : "input"; paint(); updateSaveLabel(); };
+  bHome.onclick = () => { roles[p.id] = roles[p.id] === "home" ? null : "home"; paint(); updateSaveLabel(); };
   bSubset.onclick = () => {
     roles[p.id] = roles[p.id] === "subset" ? null : "subset";
     paint();
+    updateSaveLabel();
   };
   bSort.onclick = () => { saveConfig().then(() => startTriage(p.id, p.name)); };
   bSplit.onclick = () => openSplit(p.id, p.name);
@@ -447,8 +462,28 @@ async function saveConfig() {
   await api("/api/config", { input_ids, home_ids, home_hints: hintTexts, subset_ids });
 }
 
+// States the pending cost before the save that incurs it (spec §2): a
+// subset just ticked in this view visit (not one already marked when the
+// list loaded) warms cold on the next profile rebuild at ceil(total/100)
+// calls. `p.total` is already on every row, so this is free client-side.
+function updateSaveLabel() {
+  let calls = 0;
+  for (const p of playlistData) {
+    if (roles[p.id] === "subset" && !loadedSubsetIds.has(p.id)) {
+      calls += Math.ceil((p.total || 0) / 100);
+    }
+  }
+  $("btn-save-config").textContent =
+    calls > 0 ? `Save roles (${calls} call${calls === 1 ? "" : "s"})` : "Save roles";
+}
+
 $("btn-save-config").onclick = async () => {
-  try { await saveConfig(); toast("saved"); } catch (e) { toast(e.message); }
+  try {
+    await saveConfig();
+    loadedSubsetIds = new Set(Object.keys(roles).filter((k) => roles[k] === "subset"));
+    updateSaveLabel();
+    toast("saved");
+  } catch (e) { toast(e.message); }
 };
 
 // Creating a home from here is 1 call; the row appears in place, already
@@ -701,7 +736,7 @@ async function pollNow(force = false) {
     nowFetchedAt = Date.now() - (data.fetched_ago_ms || 0);
     nowState = { ...data, homes: new Map((data.homes || []).map((h) => [h.id, h])),
                  subsetTargets: new Map((data.subset_targets || [])
-                   .map((s) => [s.id, { id: s.id, name: s.name, total: s.total, folder: null }])) };
+                   .map((s) => [s.id, { id: s.id, name: s.name, total: s.total, folder: s.folder }])) };
     // A genuinely new track re-arms the played-out refetch (declared below)
     // — and so does the SAME track started over, which is what Spotify's
     // repeat-one does. Matching on uri alone meant repeat-one armed the
@@ -1273,7 +1308,15 @@ function renderNow() {
 // because the server says it is already in a home. A homeless track shows
 // none of this, by design.
 function subsetBlock(d, tr) {
-  const settled = !!filedUris[tr.uri] || (d.suggestions || []).some((s) => s.already);
+  // filedUris is overloaded: nowRemove also writes into it ("nowhere
+  // (removed from input)") so the strip's undo can target the right badge,
+  // but a removal is a rejection that leaves the track with no home — not a
+  // filing. `removedUri` names exactly the track a removal is pending for
+  // (cleared the moment the playing track changes or the removal is
+  // undone), so it is what distinguishes the two cases here. Spec §4: a
+  // track with no home shows no subset row at all.
+  const filed = !!filedUris[tr.uri] && tr.uri !== removedUri;
+  const settled = filed || (d.suggestions || []).some((s) => s.already);
   if (!settled) return "";
   const offers = (d.subsets || []).filter((s) => !s.already);
   const already = (d.subsets || []).filter((s) => s.already);

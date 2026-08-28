@@ -88,7 +88,11 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 }
 .chip.on-input { background: #2d6cdf; color: #fff; border-color: transparent; }
 .chip.on-home { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
-.chip.on-subset { background: var(--accent); color: var(--bg); border-color: transparent; }
+/* Distinct fill from Home on purpose: the role invariant (a playlist can
+   never be both) exists precisely so Home and Subset must never be
+   confused for each other at a glance, and sharing --accent undercut that.
+   --danger is already in the palette, in both themes. */
+.chip.on-subset { background: var(--danger); color: #fff; border-color: transparent; }
 .pl-sort { font-size: 1.1rem; padding: .3rem .6rem; }
 /* full-width second line inside the (flex-wrap) row, homes only */
 .pl-row { flex-wrap: wrap; }

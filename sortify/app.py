@@ -6,6 +6,7 @@ import hashlib
 import html
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -234,6 +235,12 @@ def playlists():
     # this was a purely local-disk cost the user was still paying constantly.
     splits = store.splits()["splits"]
     hints = cfg.get("home_hints") or {}
+    # `subset_name_pattern` is configurable server-side; the client used to
+    # test its own hardcoded `/^\{.*\}$/`, which could silently disagree with
+    # this. Emitting the eligibility check here makes the client's chip
+    # gate observe the same live pattern this endpoint's own role resolution
+    # (and `_effective_subset_ids`) already uses.
+    subset_pattern = cfg.get("subset_name_pattern") or DEFAULT_SUBSET_PATTERN
     for p in out:
         p["folder"] = (folders.get(p["id"]) or {}).get("path")
         p["role"] = (
@@ -242,6 +249,8 @@ def playlists():
             else "subset" if p["id"] in subsets
             else None
         )
+        p["subset_eligible"] = bool(p.get("editable")) and is_subset_name(
+            p.get("name") or "", subset_pattern)
         p["input_set"] = (
             inputsets.set_of(p["name"], p.get("folder"), _sets) or inputsets.DEFAULT_KEY
         ) if p["role"] == "input" else None
@@ -394,6 +403,22 @@ def apply_naming_rename(playlist_id: str):
 
 @app.post("/api/config")
 def set_config(body: ConfigIn):
+    # Opting subsets in is unbounded — ticking all 70 {} playlists and saving
+    # would land ~90 paginated calls inside the very next /api/now poll (see
+    # SUBSET_WARM_BUDGET above). Refuse here, where the user can act on it —
+    # mark fewer, save, let them warm, then mark more — rather than silently
+    # truncating the list they asked for.
+    previously_marked = set(store.config().get("subset_ids") or [])
+    newly_marked = set(body.subset_ids) - previously_marked
+    uncached, cost = _subset_cold_cost(newly_marked)
+    if cost > SUBSET_WARM_BUDGET:
+        raise HTTPException(
+            400,
+            f"that marks {uncached} uncached subset{'s' if uncached != 1 else ''} — "
+            f"warming them would cost ~{cost} Spotify calls, over the "
+            f"{SUBSET_WARM_BUDGET}-call save budget. Mark fewer, save, let those "
+            "warm on the next poll, then mark more.",
+        )
     store.update_config(
         input_ids=body.input_ids, home_ids=body.home_ids,
         home_hints={k: v.strip() for k, v in body.home_hints.items() if v.strip()},
@@ -500,6 +525,39 @@ def _effective_input_ids(cfg: dict, playlists: list[dict]) -> set[str]:
 # this}` — a shape `home_name_exclude_patterns` already refuses, so a subset
 # can never also be a home (pinned by tests/test_subsets.py).
 DEFAULT_SUBSET_PATTERN = r"^\{.*\}$"
+
+# Opting a subset in is a chip tap, not a bounded action like Home marking —
+# so unlike homes (guarded structurally by the ">40 candidates" check below),
+# nothing stops a user from ticking all 70 {} playlists and saving at once.
+# Each uncached one costs ceil(total/100) calls on the very next profile
+# rebuild, which for /api/now means inside a poll — the exact shape of the
+# traffic that earned this project its multi-hour quota trips (see
+# CLAUDE.md). 25 calls is comfortably under WINDOW_CAP's 12/60s while still
+# covering several median-sized (~22-track) subsets in one save.
+SUBSET_WARM_BUDGET = 25
+
+
+def _subset_cold_cost(ids: set[str]) -> tuple[int, int]:
+    """(how many of `ids` have no cached tracks, total ceil(total/100) calls).
+
+    Reads only what's already local — the cached listing (for `total`) and
+    the cached track cache (for what's already warm) — so computing this
+    costs nothing itself. A playlist absent from the cached listing is
+    treated as needing a full paginated read (total unknown -> 0 pages
+    counted, but still flagged uncached), which only undercounts a playlist
+    that hasn't even been listed yet — vanishingly rare and never the bulk
+    of a 70-playlist tick-all.
+    """
+    cache = store.cache()
+    cached_pids = set(cache.get("playlists") or {})
+    listing = (cache.get("playlist_list") or {}).get("items") or []
+    by_id = {p["id"]: p for p in listing}
+    uncached = [pid for pid in ids if pid not in cached_pids]
+    cost = sum(
+        math.ceil(((by_id.get(pid) or {}).get("total") or 0) / 100)
+        for pid in uncached
+    )
+    return len(uncached), cost
 
 
 def _effective_subset_ids(cfg: dict, playlists: list[dict]) -> set[str]:
@@ -619,6 +677,19 @@ def _ensure_profiles_locked(force: bool) -> dict:
     # after opting one in pays ceil(total/100) calls for it, which is the
     # contract homes already have.
     subset_ids = _effective_subset_ids(cfg, all_playlists)
+    # Backstop, mirroring the homes guard above: /api/config already refuses
+    # a save that would cross SUBSET_WARM_BUDGET, but this mirrors that shape
+    # here too so no other path to this function (a stale config written
+    # some other way, a future caller) can reach the same unbounded cost.
+    uncached, cost = _subset_cold_cost(subset_ids)
+    if cost > SUBSET_WARM_BUDGET:
+        raise HTTPException(
+            400,
+            f"{uncached} opted-in subsets are uncached — warming them would cost "
+            f"~{cost} Spotify calls, over the {SUBSET_WARM_BUDGET}-call budget. "
+            "Un-mark some subsets in the Playlists view, save, let the rest warm, "
+            "then mark more.",
+        )
     subsets = [p for p in all_playlists if p["id"] in subset_ids]
     subset_profiles = {
         s["id"]: sugg.build_profile(
@@ -720,8 +791,10 @@ def _subset_targets_payload(state: dict) -> list[dict]:
     """
     cfg = store.config()
     pattern = cfg.get("subset_name_pattern") or DEFAULT_SUBSET_PATTERN
+    folders = store.folders()
     return [
-        {"id": p["id"], "name": p["name"], "total": p.get("total")}
+        {"id": p["id"], "name": p["name"], "total": p.get("total"),
+         "folder": (folders.get(p["id"]) or {}).get("path")}
         for p in state.get("playlists", [])
         if p.get("editable") and is_subset_name(p.get("name") or "", pattern)
     ]
@@ -3765,10 +3838,25 @@ def act(body: ActIn):
     # Filing into a subset is not filing. A song put into a best-of still
     # needs its home, so it must not leave the input it came from — and that
     # rule belongs here, where every caller passes, rather than in whichever
-    # button happens to be current. Costs nothing to enforce. (Spec §6.)
+    # button happens to be current.
+    #
+    # Keyed on the destination's NAME, not `_effective_subset_ids` — the
+    # picker in §5 reaches every {}-named playlist, opted in or not, and the
+    # guard has to cover the same reach or ~69 of 70 subsets go unguarded.
+    #
+    # Reads the cached listing directly rather than `sp.my_playlists()`,
+    # which fetches (~21 paginated calls, ~60s stall) when
+    # `cache["playlist_list"]` is absent — e.g. right after a cache wipe.
+    # With nothing cached there is nothing to check against, so the guard
+    # is skipped rather than paying that cost to enforce it. Genuinely
+    # costs nothing only with a warm cache; degrades to no-guard, not a
+    # fetch, when cold.
     if body.to_id and body.from_id:
         cfg = store.config()
-        if body.to_id in _effective_subset_ids(cfg, sp.my_playlists()):
+        listing = (store.cache().get("playlist_list") or {}).get("items") or []
+        name_by_id = {p["id"]: p.get("name") or "" for p in listing}
+        pattern = cfg.get("subset_name_pattern") or DEFAULT_SUBSET_PATTERN
+        if body.to_id in name_by_id and is_subset_name(name_by_id[body.to_id], pattern):
             raise HTTPException(
                 400,
                 "that destination is a subset — adding to a subset must not "
