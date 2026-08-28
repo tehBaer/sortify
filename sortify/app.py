@@ -608,6 +608,19 @@ def _ensure_profiles_locked(force: bool) -> dict:
          if isinstance(p, dict)}
     )
 
+    # Subsets: the same mechanism as homes, on an opt-in set. Snapshot-keyed
+    # like every other cached read, so warm cost is zero; the first build
+    # after opting one in pays ceil(total/100) calls for it, which is the
+    # contract homes already have.
+    subset_ids = _effective_subset_ids(cfg, all_playlists)
+    subsets = [p for p in all_playlists if p["id"] in subset_ids]
+    subset_profiles = {
+        s["id"]: sugg.build_profile(
+            _cached_tracks(s["id"], s["snapshot_id"]), tag_artists
+        )
+        for s in subsets
+    }
+
     # Input contents too, so the capture chips can show membership.
     by_id = {p["id"]: p for p in all_playlists}
     inputs = []
@@ -628,6 +641,7 @@ def _ensure_profiles_locked(force: bool) -> dict:
         playlists=all_playlists, input_ids=input_ids,
         playlist_artists=playlist_artists,
         last_added={hid: _last_added_at(tracks) for hid, tracks in home_tracks.items()},
+        subset_profiles=subset_profiles, subsets=subsets,
     )
     return _profile_state
 
@@ -651,6 +665,56 @@ def _homes_payload(state: dict, exclude: str = "") -> list[dict]:
          "folder": (folders.get(h["id"]) or {}).get("path"),
          "last_added_at": last_added.get(h["id"])}
         for h in state["homes"] if h["id"] != exclude
+    ]
+
+
+# Homes show three; a subset row appears in a "done, moving on" moment, and
+# three more decisions there work against it. (Spec §3.)
+SUBSET_TOP_N = 2
+
+
+def _subset_matches(state: dict, track: dict, tag_artists: dict,
+                    track_map: dict) -> list[dict]:
+    """Subsets worth offering for this track. Local arithmetic, zero calls.
+
+    The same scorer homes use, over the subset profiles — suggest.py is not
+    modified for this. Two caller-side rules: no weak (sub-threshold) tier,
+    because a guess about an optional selection is noise rather than
+    pressure to decide; and at most SUBSET_TOP_N.
+    """
+    if not state.get("subset_profiles"):
+        return []
+    names = {s["id"]: s["name"] for s in state.get("subsets", [])}
+    scored = sugg.suggest(
+        track, state["subset_profiles"], tag_artists, track_map,
+        state.get("artist_similar") or {}, state.get("playlist_artists") or {},
+    )
+    out = []
+    for s in scored:
+        if s.get("weak"):
+            continue
+        out.append({
+            "playlist_id": s["playlist_id"],
+            "name": names.get(s["playlist_id"], "subset"),
+            "pct": s["pct"],
+            "already": s["already"],
+            "reasons": s["reasons"],
+        })
+    return out[:SUBSET_TOP_N]
+
+
+def _subset_targets_payload(state: dict) -> list[dict]:
+    """Every editable {}-named playlist, opted in or not — the picker's list.
+
+    Opting in gates whether a subset SUGGESTS itself; filing by hand reaches
+    all of them, so this reads the listing rather than the opt-in set.
+    """
+    cfg = store.config()
+    pattern = cfg.get("subset_name_pattern") or DEFAULT_SUBSET_PATTERN
+    return [
+        {"id": p["id"], "name": p["name"], "total": p.get("total")}
+        for p in state.get("playlists", [])
+        if p.get("editable") and is_subset_name(p.get("name") or "", pattern)
     ]
 
 
@@ -3522,6 +3586,8 @@ def now_playing(force: bool = False):
             track, state["profiles"], tag_artists, track_map, artist_map,
             state.get("playlist_artists"),
         ) if sortable else [],
+        "subsets": _subset_matches(state, track, tag_artists, track_map) if sortable else [],
+        "subset_targets": _subset_targets_payload(state),
         "homes": _homes_payload(state),
         "inputs": [
             {"id": l["id"], "name": l["name"], "has_track": track["uri"] in l["uris"],

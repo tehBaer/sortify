@@ -91,3 +91,84 @@ def test_the_pattern_defaults_when_config_omits_it():
     cfg = {"input_ids": [], "home_ids": [], "subset_ids": ["s1"],
            "input_name_pattern": r"^\[.+\]$"}
     assert appmod._effective_subset_ids(cfg, SUBSET_LISTING) == {"s1"}
+
+
+import pytest
+
+
+@pytest.fixture
+def wired(monkeypatch):
+    """A profile state built from fakes — no Store writes, no HTTP."""
+    listing = SUBSET_LISTING + [
+        {"id": "h1", "name": "Home One", "owner": "me", "editable": True,
+         "total": 12, "snapshot_id": "s-h1", "image": None, "description": ""},
+    ]
+    tracks = {
+        "h1": [{"uri": "spotify:track:a", "id": "a", "name": "A", "is_local": False,
+                "type": "track", "artists": [{"id": "ar1", "name": "Ar One"}],
+                "added_at": "2026-01-01T00:00:00Z"}],
+        "s1": [{"uri": "spotify:track:b", "id": "b", "name": "B", "is_local": False,
+                "type": "track", "artists": [{"id": "ar1", "name": "Ar One"}],
+                "added_at": "2026-01-01T00:00:00Z"}],
+        "s2": [{"uri": "spotify:track:c", "id": "c", "name": "C", "is_local": False,
+                "type": "track", "artists": [{"id": "ar9", "name": "Ar Nine"}],
+                "added_at": "2026-01-01T00:00:00Z"}],
+    }
+    appmod.store.save_config(_cfg(subset_ids=["s1", "s2"], home_ids=["h1"]))
+    monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: listing)
+    monkeypatch.setattr(appmod, "_cached_tracks", lambda pid, snap: tracks.get(pid, []))
+    appmod._profile_state.clear()
+    appmod._profile_state["built_at"] = 0.0
+    return appmod._ensure_profiles(force=True)
+
+
+PLAYING = {"uri": "spotify:track:z", "id": "z", "name": "Z", "is_local": False,
+           "type": "track", "artists": [{"id": "ar1", "name": "Ar One"}]}
+
+
+def test_only_opted_in_subsets_get_profiles(wired):
+    assert set(wired["subset_profiles"]) == {"s1", "s2"}
+
+
+def test_a_subset_sharing_the_artist_matches(wired):
+    matches = appmod._subset_matches(wired, PLAYING, appmod.store.tag_artists(),
+                                     appmod.store.lastfm_track_map())
+    assert [m["playlist_id"] for m in matches] == ["s1"]
+    assert matches[0]["name"] == "{solfest}"
+    assert any("Ar One" in r for r in matches[0]["reasons"])
+
+
+def test_matches_never_include_weak_guesses(wired):
+    """suggest()'s sub-threshold tier exists to force a decision that must be
+    made; a curated selection is optional, so a guess there is noise."""
+    matches = appmod._subset_matches(wired, PLAYING, appmod.store.tag_artists(),
+                                     appmod.store.lastfm_track_map())
+    assert all(not m.get("weak") for m in matches)
+    assert "s2" not in [m["playlist_id"] for m in matches]
+
+
+def test_at_most_two_matches(wired, monkeypatch):
+    fake = [{"playlist_id": p, "pct": 90, "already": False, "reasons": []}
+            for p in ("s1", "s2", "s3")]
+    monkeypatch.setattr(appmod.sugg, "suggest", lambda *a, **k: fake)
+    matches = appmod._subset_matches(wired, PLAYING, {}, {})
+    assert len(matches) == 2
+
+
+def test_a_subset_the_track_is_already_in_is_flagged(wired):
+    track = {**PLAYING, "uri": "spotify:track:b", "id": "b"}
+    matches = appmod._subset_matches(wired, track, appmod.store.tag_artists(),
+                                     appmod.store.lastfm_track_map())
+    assert any(m["already"] for m in matches if m["playlist_id"] == "s1")
+
+
+def test_subset_targets_include_every_brace_playlist_not_just_opted_in(wired):
+    """Filing by hand must never be gated by a list curated for suggestions.
+
+    Both s1 and s2 are {}-shaped and editable, so both are reachable even
+    though only the opted-in ones can suggest themselves.
+    """
+    ids = {t["id"] for t in appmod._subset_targets_payload(wired)}
+    assert ids == {"s1", "s2"}
+    assert "plain" not in ids       # not {}-shaped
+    assert "notmine" not in ids     # {}-shaped but not ours to edit
