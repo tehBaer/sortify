@@ -20,7 +20,8 @@
 - **At most 2** subset suggestions; **never** a `weak: True` entry.
 - House copy rule: any control that spends Spotify calls states its cost.
 - Verification: `.venv/bin/pytest -q` (781 passing at plan time), `node --check sortify/static/app.js`, `node tests/ui_harness.mjs` (160/160 at plan time). All three must stay green.
-- `tests/ui_harness.mjs` has a known hazard: blocks are appended before the `// ---- summary` anchor, and two edits racing there silently eat a brace. Append with an exact-match edit on that anchor and re-run the harness immediately.
+- `tests/ui_harness.mjs` has two hazards, both now named in its own header comment — read that header before appending. (1) Blocks are appended before the `// ---- summary` anchor, and two edits racing there silently eat a brace; append with an exact-match edit and re-run immediately. (2) It is ONE long-lived context, so a previous block's leftovers become your mystery failure. **Every new scenario must open with `show("now")` and restore what it changed in a `finally`.** This is load-bearing, not hygiene: `pollNow` returns immediately when `view-now` is hidden, so a scenario inheriting a hidden view never calls `renderNow` and every assertion about card markup fails for a reason that has nothing to do with the code under test.
+- Harness fixtures staging a playing track must set **both** `playing` and `is_playing`. `playing` only means a track object exists; `is_playing` is whether audio is actually coming out. A fixture with only `playing` is a PAUSED player, and the block passes for the wrong reason — that is exactly why the preview blocks were blind to a real resume bug.
 
 ---
 
@@ -627,7 +628,10 @@ Append immediately before `// ---- summary ---` in `tests/ui_harness.mjs`:
   };
   routes["POST /api/act"] = { status: 200, body: {} };
   routes["POST /api/undo"] = { status: 200, body: { restored_to: null } };
-  run(`filedUris = {}; nowActions = 0; removedUri = null; nowActionLog = []; pollNow(true)`);
+  // show("now") is load-bearing: pollNow returns immediately on a hidden
+  // view-now, so a block inheriting a hidden view never renders at all.
+  run(`show("now"); filedUris = {}; nowActions = 0; removedUri = null;
+       nowActionLog = []; pollNow(true)`);
   await tick();
   run("stopNowPolling()");
 
@@ -789,7 +793,9 @@ Append immediately before `// ---- summary ---`:
 
   routes["GET /api/now?force=1"] = body({});
   routes["POST /api/act"] = { status: 200, body: {} };
-  run(`filedUris = {}; nowActions = 0; nowActionLog = []; removedUri = null; pollNow(true)`);
+  // show("now") first — see the harness header: pollNow no-ops on a hidden view.
+  run(`show("now"); filedUris = {}; nowActions = 0; nowActionLog = [];
+       removedUri = null; pollNow(true)`);
   await tick();
   run("stopNowPolling()");
   check("SS an unfiled track is offered no subsets",
@@ -1116,7 +1122,19 @@ rebuild. Every `{}` playlist stays reachable by hand through **Add to
 subset…**, opted in or not.
 ```
 
-- [ ] **Step 2: Add the convention to `CLAUDE.md`**
+- [ ] **Step 2: Make CLAUDE.md's Run section mention the harness**
+
+Its test line currently names only pytest, so a fresh session has no idea
+168 frontend checks exist and will not run them. Change the Tests bullet to:
+
+```markdown
+- Tests: `.venv/bin/pytest -q` — keep them green; they cost zero API calls.
+  Frontend: `node tests/ui_harness.mjs` (no framework, no build step — a
+  hand-run harness of ~168 checks against a stub DOM, also zero API calls).
+  Both must be green before any commit touching their surface.
+```
+
+- [ ] **Step 3: Add the convention to `CLAUDE.md`**
 
 In the Conventions section, after the Homes bullet:
 
@@ -1128,13 +1146,15 @@ In the Conventions section, after the Homes bullet:
   shared with homes and was not modified for them.
 ```
 
-- [ ] **Step 3: Verify and commit**
+- [ ] **Step 4: Verify and commit**
 
-Run: `.venv/bin/pytest -q` (docs are read by no test, but the suite must be green before any commit).
+Run: `.venv/bin/pytest -q` and `node tests/ui_harness.mjs` (docs are read by no
+test, but both suites must be green before any commit — which is exactly the
+rule Step 2 writes down).
 
 ```bash
 git add docs/matching.md CLAUDE.md
-git commit -m "docs: subsets in matching.md and the CLAUDE.md conventions"
+git commit -m "docs: subsets, and CLAUDE.md finally mentions the frontend harness"
 ```
 
 ---
