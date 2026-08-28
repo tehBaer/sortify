@@ -76,9 +76,18 @@ Cold cost is one call per subset (13 for `{teh bomb}`), paid on the first
 profile rebuild after opting in. This is the contract homes already have.
 The Playlists view states the pending cost before the save that incurs it.
 
-The `>40 candidate homes` guard in `_ensure_profiles_locked` has no subset
-equivalent: subsets are opt-in by construction, so there is no unbounded
-default set to protect against.
+Opt-in bounds *which* subsets can ever cost anything, but not *how many* get
+marked in one save — a chip tap per row and a single Save can opt in all 70
+at once, and `set_config` clears `_profile_state`, so the next `/api/now`
+poll would pay the whole cold cost inline. That is exactly the traffic
+shape (a burst inside a poll, not spread across the day) that earned this
+project its quota trips, so a guard is needed despite the opt-in: a new
+`SUBSET_WARM_BUDGET` (25 calls) caps the cold cost a single config save may
+introduce. `POST /api/config` refuses a save whose newly-marked, not-yet-cached
+subsets would exceed it, naming the count, the cost, and the remedy (mark
+fewer, save, let them warm, then mark more); `_ensure_profiles_locked` carries
+the same check as a backstop, mirroring the `>40 candidate homes` guard's
+shape, so no other path to a profile rebuild can reach the same cost.
 
 ### 3. Scoring: `suggest.py` is not modified
 

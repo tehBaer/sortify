@@ -88,7 +88,16 @@ class El {
   // exactly as in a real DOM. renderPiles() relies on this to clear rows.
   set innerHTML(v) { this._html = String(v); this.children = []; registerIds(this._html); }
   get innerHTML() { return this._html; }
-  querySelectorAll() { return []; }
+  // "button" is modeled for real (one fresh El per <button> tag in document
+  // order) because makeListRow destructures its role chips positionally and
+  // wires paint()/onclick straight onto them — an empty stub would throw
+  // before the row's markup (what SM's checks actually read) ever gets
+  // built. Other selectors stay unmodeled: nothing else needs them, and O1
+  // pins the pure gating function specifically to avoid depending on this.
+  querySelectorAll(sel) {
+    if (sel === "button") return [...this._html.matchAll(/<button[^>]*>/g)].map(() => new El("_btn"));
+    return [];
+  }
   querySelector() { return new El("_anon"); }
   appendChild(c) { this.children.push(c); }
   setAttribute(k, v) { this[k] = String(v); }
@@ -1979,6 +1988,290 @@ run("stopNowPolling()");
         `undo=${has('id="btn-now-undo-remove"')} removedUri=${run("removedUri")}`);
   check("RU and the next track gets its own Remove",
         has('id="btn-now-remove"'), `remove=${has('id="btn-now-remove"')}`);
+}
+
+// ============================================================================
+// UL — the undo log is ordered, and only home filings own a filed state.
+// btn-undo-now used to pop the last KEY of filedUris, which is not the last
+// ACTION once subset adds (which write no key) exist: undoing one wiped an
+// unrelated track's "filed" badge.
+// ============================================================================
+{
+  resetLog();
+  routes["GET /api/now?force=1"] = {
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri: "spotify:track:ul1", name: "Song", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: null, sitting: null, suggestions: [],
+      homes: [{ id: "H1", name: "Home", folder: "" }],
+      subsets: [], subset_targets: [{ id: "S1", name: "{sel}", total: 4 }],
+      inputs: [],
+    },
+  };
+  routes["POST /api/act"] = { status: 200, body: {} };
+  routes["POST /api/undo"] = { status: 200, body: { restored_to: null } };
+  // show("now") is load-bearing: pollNow returns immediately on a hidden
+  // view-now, so a block inheriting a hidden view never renders at all.
+  run(`show("now"); filedUris = {}; nowActions = 0; removedUri = null;
+       nowActionLog = []; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+
+  // An earlier track was filed to a home; this session still remembers it.
+  run(`filedUris["spotify:track:earlier"] = "Some Home";
+       nowActionLog = [{ uri: "spotify:track:earlier", kind: "home" }]`);
+  // Now a subset add on the CURRENT track — writes no filedUris key.
+  const wired = run(`typeof nowAddToSubset === "function"`);
+  check("UL nowAddToSubset exists", wired, `type=${run(`typeof nowAddToSubset`)}`);
+  if (wired) { await run(`nowAddToSubset("S1")`); await tick(); }
+  check("UL a subset add writes no filed state",
+        run(`filedUris["spotify:track:ul1"] === undefined`),
+        `filed=${run(`JSON.stringify(filedUris)`)}`);
+  check("UL a subset add is recorded in the ordered log",
+        run(`nowActionLog.length === 2 && nowActionLog[1].kind === "subset"`),
+        run(`JSON.stringify(nowActionLog)`));
+
+  await run(`$("btn-undo-now").onclick()`);
+  await tick();
+  check("UL undoing the subset add leaves the earlier home filing alone",
+        run(`filedUris["spotify:track:earlier"] === "Some Home"`),
+        `filed=${run(`JSON.stringify(filedUris)`)}`);
+  check("UL and the log pops the action that was actually undone",
+        run(`nowActionLog.length === 1 && nowActionLog[0].kind === "home"`),
+        run(`JSON.stringify(nowActionLog)`));
+}
+
+// ============================================================================
+// UD — undoRemoval must keep nowActionLog in step with nowActions, or a later
+// btn-undo-now pops a stale entry: file track A to a home, remove a
+// DIFFERENT track B from an input, undo that removal with the strip's own
+// button (nowActions and nowActionLog both drop the B entry), then press the
+// top btn-undo-now — it must clear A's filed badge (the one action still on
+// the log), not silently miss it or touch B again.
+// ============================================================================
+{
+  resetLog();
+  routes["GET /api/now?force=1"] = {
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri: "spotify:track:ud-a", name: "Song A", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: null, sitting: null, suggestions: [],
+      homes: [{ id: "H1", name: "Home", folder: "" }],
+      subsets: [], subset_targets: [], inputs: [],
+    },
+  };
+  routes["POST /api/act"] = { status: 200, body: {} };
+  routes["POST /api/undo"] = { status: 200, body: { restored_to: "IN1" } };
+  // show("now") is load-bearing: pollNow returns immediately on a hidden
+  // view-now, so a block inheriting a hidden view never renders at all.
+  run(`show("now"); filedUris = {}; nowActions = 0; removedUri = null;
+       nowActionLog = []; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+
+  // File track A to the home.
+  await run(`nowFile("H1")`);
+  await tick();
+  check("UD filing A logs a home entry",
+        run(`nowActionLog.length === 1 && nowActionLog[0].uri === "spotify:track:ud-a"`),
+        run(`JSON.stringify(nowActionLog)`));
+
+  // Playback moves on to a different track B, sitting in an input.
+  run(`nowState.track = { uri: "spotify:track:ud-b", name: "Song B",
+         duration_ms: 200000, artists: [{ name: "Artist" }], sortable: true, image: null };
+       nowState.context = { id: "IN1", name: "[In]", is_input: true };`);
+  await run(`nowRemove()`);
+  await tick();
+  check("UD removing B logs a second home-kind entry",
+        run(`nowActionLog.length === 2 && nowActionLog[1].uri === "spotify:track:ud-b"`),
+        run(`JSON.stringify(nowActionLog)`));
+
+  // The strip's own undo restores B — this must pop B's entry, not A's.
+  await run(`undoRemoval()`);
+  await tick();
+  check("UD undoRemoval keeps nowActionLog in step with nowActions",
+        run(`nowActionLog.length === 1 && nowActionLog[0].uri === "spotify:track:ud-a"`),
+        `log=${run(`JSON.stringify(nowActionLog)`)} actions=${run("nowActions")}`);
+  check("UD undoRemoval left B's own filed state cleared, A's untouched",
+        run(`filedUris["spotify:track:ud-b"] === undefined &&
+             filedUris["spotify:track:ud-a"] === "Home"`),
+        `filed=${run(`JSON.stringify(filedUris)`)}`);
+
+  // Now the top undo: only A's action remains on the log, so it must be the
+  // one that gets cleared — not a stale leftover from B.
+  await run(`$("btn-undo-now").onclick()`);
+  await tick();
+  check("UD btn-undo-now clears A's filed badge, not a stale leftover",
+        run(`filedUris["spotify:track:ud-a"] === undefined`),
+        `filed=${run(`JSON.stringify(filedUris)`)}`);
+  check("UD and the log is empty, matching nowActions",
+        run(`nowActionLog.length === 0`),
+        `log=${run(`JSON.stringify(nowActionLog)`)} actions=${run("nowActions")}`);
+}
+
+// ============================================================================
+// SS — subsets are offered only once the home question is settled.
+// The server cannot gate this itself: profiles carry a build-time uris set
+// that /api/act never updates, so for a few seconds after filing the server
+// still believes the track has no home. The client decides.
+// ============================================================================
+{
+  resetLog();
+  const body = (over) => ({
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri: "spotify:track:ss1", name: "Song", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: null, sitting: null,
+      suggestions: [{ playlist_id: "H1", pct: 80, reasons: [], already: false }],
+      homes: [{ id: "H1", name: "Home", folder: "" }],
+      subsets: [{ playlist_id: "S1", name: "{solfest}", pct: 70, already: false,
+                  reasons: ["2 tracks by Artist here"] },
+                { playlist_id: "S2", name: "{tøft}", pct: 60, already: true,
+                  reasons: [] }],
+      subset_targets: [{ id: "S1", name: "{solfest}", total: 4 }],
+      inputs: [],
+      ...over,
+    },
+  });
+  const html = () => $$("now-card").innerHTML;
+
+  routes["GET /api/now?force=1"] = body({});
+  routes["POST /api/act"] = { status: 200, body: {} };
+  // show("now") first — see the harness header: pollNow no-ops on a hidden view.
+  run(`show("now"); filedUris = {}; nowActions = 0; nowActionLog = [];
+       removedUri = null; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  check("SS an unfiled track is offered no subsets",
+        !html().includes("{solfest}"), `html has solfest=${html().includes("{solfest}")}`);
+  check("SS but the Add to subset button is always there",
+        html().includes('id="btn-now-subset"'), "missing btn-now-subset");
+
+  // File it to a home: the row appears for the track just filed.
+  await run(`nowFile("H1")`);
+  await tick();
+  check("SS filing to a home reveals the subset offers",
+        html().includes("{solfest}"), "no subset row after filing");
+  check("SS an already-in subset is a muted line, not a button",
+        html().includes("already in") && html().includes("{tøft}") &&
+        !html().includes('data-subset="S2"'),
+        `html=${html().slice(0, 0)}already=${html().includes("already in")}`);
+
+  // A track already in a home (server-flagged) gets the row with no filing.
+  routes["GET /api/now?force=1"] = body({
+    track: { uri: "spotify:track:ss2", name: "Other", duration_ms: 200000,
+             artists: [{ name: "Artist" }], sortable: true, image: null },
+    suggestions: [{ playlist_id: "H1", pct: 80, reasons: [], already: true }],
+  });
+  run(`filedUris = {}; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  check("SS a track already in a home gets the row without filing again",
+        html().includes("{solfest}"), "no subset row for an already-filed track");
+
+  // Adding to a subset must not put the card into its filed state.
+  await run(`nowAddToSubset("S1")`);
+  await tick();
+  check("SS adding to a subset does not consume the filed state",
+        run(`filedUris["spotify:track:ss2"] === undefined`),
+        run(`JSON.stringify(filedUris)`));
+  check("SS and it sends no from_id",
+        bodies("/api/act").slice(-1)[0].from_id === null,
+        JSON.stringify(bodies("/api/act").slice(-1)[0]));
+
+  // I3: nowRemove writes filedUris[uri] too ("nowhere (removed from input)"),
+  // so subsetBlock's old `!!filedUris[tr.uri]` gate treated a removal as
+  // "settled" and offered subsets for a track with no home — spec §4: "a
+  // track with no home shows no subset row at all." removedUri is what
+  // tells settled apart from a genuine filing.
+  routes["GET /api/now?force=1"] = body({
+    track: { uri: "spotify:track:ss3", name: "Rem", duration_ms: 200000,
+             artists: [{ name: "Artist" }], sortable: true, image: null },
+    context: { id: "IN1", name: "Input One", is_input: true },
+    suggestions: [{ playlist_id: "H1", pct: 80, reasons: [], already: false }],
+  });
+  run(`filedUris = {}; nowActionLog = []; nowActions = 0; removedUri = null; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  await run(`nowRemove()`);
+  await tick();
+  check("I3 a removed track shows no subset row even though subsets matched",
+        !html().includes("{solfest}") && !html().includes("already in"), html());
+}
+
+// ============================================================================
+// SM — only {}-named playlists can be marked as subsets, and the mark saves.
+// ============================================================================
+{
+  resetLog();
+  routes["GET /api/playlists"] = {
+    status: 200,
+    body: {
+      playlists: [
+        { id: "s1", name: "{solfest}", editable: true, total: 22, role: null,
+          folder: null, hints: "", split: null, subset_eligible: true },
+        { id: "h1", name: "Ordinary", editable: true, total: 12, role: "home",
+          folder: null, hints: "", split: null, subset_eligible: false },
+        // Already a subset when the list loaded — resaving it must not be
+        // priced, even though its own warm cost (if it were newly marked)
+        // would blow well past SUBSET_WARM_BUDGET.
+        { id: "s3", name: "{teh bomb}", editable: true, total: 5000, role: "subset",
+          folder: null, hints: "", split: null, subset_eligible: true },
+      ],
+      fetched_at: 1, sitting_orphans: [],
+    },
+  };
+  routes["POST /api/config"] = { status: 200, body: { ok: true } };
+  await run(`loadLists()`);
+  await tick();
+  check("SM a {} playlist offers a Subset chip",
+        $$("playlists").children.some((r) =>
+          String(r.innerHTML).includes("r-subset")),
+        "no r-subset chip rendered");
+
+  // M2: the client reads the server's subset_eligible answer instead of
+  // testing its own hardcoded /^\{.*\}$/, so the chip's visibility gate is
+  // just this pure function — see splitDisabledReason for the same pattern.
+  check("M2 subsetChipHidden hides a non-{}-eligible row's chip",
+        run(`subsetChipHidden({ subset_eligible: false })`) === true,
+        String(run(`subsetChipHidden({ subset_eligible: false })`)));
+  check("M2 subsetChipHidden shows an eligible row's chip",
+        run(`subsetChipHidden({ subset_eligible: true })`) === false,
+        String(run(`subsetChipHidden({ subset_eligible: true })`)));
+
+  // C2: the Save button states the pending cost before the save that incurs
+  // it (spec §2). Nothing newly marked yet — s3 was already a subset on load.
+  check("C2 Save roles has no price with nothing newly marked",
+        $$("btn-save-config").textContent === "Save roles",
+        $$("btn-save-config").textContent);
+
+  run(`roles["s1"] = "subset"`);
+  run(`updateSaveLabel()`);
+  check("C2 Save roles prices a newly-marked subset (ceil(22/100) = 1 call)",
+        $$("btn-save-config").textContent === "Save roles (1 call)",
+        $$("btn-save-config").textContent);
+
+  run(`roles["s1"] = null`);
+  run(`updateSaveLabel()`);
+  check("C2 un-marking it drops the price again",
+        $$("btn-save-config").textContent === "Save roles",
+        $$("btn-save-config").textContent);
+
+  run(`roles["s1"] = "subset"`);
+  await run(`saveConfig()`);
+  await tick();
+  const sent = bodies("/api/config").slice(-1)[0];
+  check("SM saving sends subset_ids",
+        Array.isArray(sent.subset_ids) && sent.subset_ids.includes("s1"),
+        JSON.stringify(sent));
+  check("SM and does not put it in home_ids",
+        !(sent.home_ids || []).includes("s1"), JSON.stringify(sent.home_ids));
 }
 
 // ---- summary ---------------------------------------------------------------

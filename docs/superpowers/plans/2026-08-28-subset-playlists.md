@@ -382,7 +382,7 @@ SUBSET_TOP_N = 2
 
 
 def _subset_matches(state: dict, track: dict, tag_artists: dict,
-                    track_map: dict) -> list[dict]:
+                    track_map: dict, artist_map: dict) -> list[dict]:
     """Subsets worth offering for this track. Local arithmetic, zero calls.
 
     The same scorer homes use, over the subset profiles — suggest.py is not
@@ -393,9 +393,16 @@ def _subset_matches(state: dict, track: dict, tag_artists: dict,
     if not state.get("subset_profiles"):
         return []
     names = {s["id"]: s["name"] for s in state.get("subsets", [])}
+    # artist_map is a PARAMETER, not something read off `state`: the Last.fm
+    # similar-artist map lives in the store, and the homes call site already
+    # builds it once per request — subsets reuse that same local. Reading a
+    # `state` key here instead would silently pass {} and make subsets score
+    # differently from homes on a signal with ~52% coverage, with no test
+    # failure to show it. (This is a corrected defect; do not "simplify" it
+    # back to a state lookup.)
     scored = sugg.suggest(
         track, state["subset_profiles"], tag_artists, track_map,
-        state.get("artist_similar") or {}, state.get("playlist_artists") or {},
+        artist_map, state.get("playlist_artists") or {},
     )
     out = []
     for s in scored:
@@ -429,11 +436,11 @@ def _subset_targets_payload(state: dict) -> list[dict]:
 In `/api/now`'s return dict, beside `"homes": _homes_payload(state),`:
 
 ```python
-        "subsets": _subset_matches(track, state, tag_artists, track_map) if sortable else [],
+        "subsets": _subset_matches(state, track, tag_artists, track_map, artist_map) if sortable else [],
         "subset_targets": _subset_targets_payload(state),
 ```
 
-**Note the argument order** — use `_subset_matches(state, track, tag_artists, track_map)` exactly as defined above; write the call to match the definition.
+**Two things about this call.** Its argument order is `(state, track, ...)` — write it to match the definition above. And `artist_map` is the local the homes suggestion call already built a few lines earlier in `now_playing` (`artist_map = store.lastfm_artist_map()`); reuse that exact local rather than reading the store a second time.
 
 - [ ] **Step 4: Run tests to verify they pass**
 

@@ -7,6 +7,10 @@ let statusData = null;
 let playlistData = [];   // lists view
 let roles = {};          // id -> "input" | "home" | null
 let hintTexts = {};      // id -> "ambient, piano" — per-home matching hints
+// Subset ids as they were on load, before any chip taps this view visit —
+// what "newly marked" means for the Save button's pending-cost label. A
+// subset opted in earlier (and so already cached) costs nothing to re-save.
+let loadedSubsetIds = new Set();
 let triage = null;       // {id, name, homes:Map, tracks, idx, sorted, skipped, history}
 let split = null;        // {id, name, piles, decided, active_sitting} — the open split view
 // {splitId, sittingId, pileId, pileName, uris, decided} — a UI convenience,
@@ -146,12 +150,14 @@ async function loadLists() {
     roles = Object.fromEntries(playlistData.map((p) => [p.id, p.role]));
     hintTexts = Object.fromEntries(
       playlistData.filter((p) => p.hints).map((p) => [p.id, p.hints]));
+    loadedSubsetIds = new Set(playlistData.filter((p) => p.role === "subset").map((p) => p.id));
     // The list is cached until refreshed by hand, so say how old it is rather
     // than present a stale list as current.
     $("pl-age").textContent = ageText(data.fetched_at);
     renderOrphans(data.sitting_orphans || []);
     loadNaming();
     renderLists();
+    updateSaveLabel();
   } catch (e) {
     if (e.message === "auth needed") return;
     $("playlists").innerHTML =
@@ -173,6 +179,16 @@ function splitDisabledReason(p) {
   return p.editable ? null : "Not yours to split — make your own copy in Spotify first, then split that copy";
 }
 
+// The server resolves subset eligibility against the live (possibly
+// user-configured) subset_name_pattern and emits it as `subset_eligible` —
+// this just reads that answer rather than re-testing a hardcoded regex
+// client-side, so the chip can never silently disagree with what a save
+// would actually do. A pure function, same reasoning as splitDisabledReason
+// above: unit-testable without the DOM (see ui_harness.mjs).
+function subsetChipHidden(p) {
+  return !p.subset_eligible;
+}
+
 function makeListRow(p) {
   const row = document.createElement("div");
   row.className = "pl-row";
@@ -187,12 +203,13 @@ function makeListRow(p) {
     <div class="pl-roles">
       <button class="chip r-input">In</button>
       <button class="chip r-home">Home</button>
+      <button class="chip r-subset">Subset</button>
       <button class="pl-sort" title="Sort this input">▶</button>
       <button class="pl-split" title="Split into piles">⑃</button>
     </div>
     <input class="pl-hints" placeholder="matching hints, e.g. ambient, piano"
            title="Your own words about what belongs here — they join this home's tag profile (docs/matching.md)">`;
-  const [bIn, bHome, bSort, bSplit] = row.querySelectorAll("button");
+  const [bIn, bHome, bSubset, bSort, bSplit] = row.querySelectorAll("button");
   const hintsEl = row.querySelector(".pl-hints");
   hintsEl.value = hintTexts[p.id] || "";
   hintsEl.oninput = () => {
@@ -203,6 +220,8 @@ function makeListRow(p) {
     bIn.classList.toggle("on-input", roles[p.id] === "input");
     bHome.classList.toggle("on-home", roles[p.id] === "home");
     bHome.hidden = p.id === "liked" || !p.editable;
+    bSubset.classList.toggle("on-subset", roles[p.id] === "subset");
+    bSubset.hidden = subsetChipHidden(p);
     bSort.hidden = roles[p.id] !== "input";
     // The hints field only makes sense for a home — it feeds that home's
     // matching profile. Kept visible if it has leftover text so the user
@@ -219,8 +238,13 @@ function makeListRow(p) {
     bSplit.disabled = !!reason;
     bSplit.title = reason || "Split into piles";
   };
-  bIn.onclick = () => { roles[p.id] = roles[p.id] === "input" ? null : "input"; paint(); };
-  bHome.onclick = () => { roles[p.id] = roles[p.id] === "home" ? null : "home"; paint(); };
+  bIn.onclick = () => { roles[p.id] = roles[p.id] === "input" ? null : "input"; paint(); updateSaveLabel(); };
+  bHome.onclick = () => { roles[p.id] = roles[p.id] === "home" ? null : "home"; paint(); updateSaveLabel(); };
+  bSubset.onclick = () => {
+    roles[p.id] = roles[p.id] === "subset" ? null : "subset";
+    paint();
+    updateSaveLabel();
+  };
   bSort.onclick = () => { saveConfig().then(() => startTriage(p.id, p.name)); };
   bSplit.onclick = () => openSplit(p.id, p.name);
   paint();
@@ -434,11 +458,32 @@ $("btn-folders-refresh").onclick = async () => {
 async function saveConfig() {
   const input_ids = Object.keys(roles).filter((k) => roles[k] === "input");
   const home_ids = Object.keys(roles).filter((k) => roles[k] === "home");
-  await api("/api/config", { input_ids, home_ids, home_hints: hintTexts });
+  const subset_ids = Object.keys(roles).filter((k) => roles[k] === "subset");
+  await api("/api/config", { input_ids, home_ids, home_hints: hintTexts, subset_ids });
+}
+
+// States the pending cost before the save that incurs it (spec §2): a
+// subset just ticked in this view visit (not one already marked when the
+// list loaded) warms cold on the next profile rebuild at ceil(total/100)
+// calls. `p.total` is already on every row, so this is free client-side.
+function updateSaveLabel() {
+  let calls = 0;
+  for (const p of playlistData) {
+    if (roles[p.id] === "subset" && !loadedSubsetIds.has(p.id)) {
+      calls += Math.ceil((p.total || 0) / 100);
+    }
+  }
+  $("btn-save-config").textContent =
+    calls > 0 ? `Save roles (${calls} call${calls === 1 ? "" : "s"})` : "Save roles";
 }
 
 $("btn-save-config").onclick = async () => {
-  try { await saveConfig(); toast("saved"); } catch (e) { toast(e.message); }
+  try {
+    await saveConfig();
+    loadedSubsetIds = new Set(Object.keys(roles).filter((k) => roles[k] === "subset"));
+    updateSaveLabel();
+    toast("saved");
+  } catch (e) { toast(e.message); }
 };
 
 // Creating a home from here is 1 call; the row appears in place, already
@@ -620,6 +665,17 @@ let nowProblem = false;
 let nowTimer = null;
 let nowActions = 0;    // enables Undo
 let filedUris = {};    // uri -> home name we filed it to this session
+// Every filing action this session, oldest first. The undo stack is the
+// server's; this mirrors ONLY what the client must undo locally, which is
+// why each entry carries its kind: a subset add writes no filed state, so
+// undoing one must not clear a filed badge that belongs to another track.
+//
+// Invariant: every path that changes `nowActions` makes the matching change
+// to `nowActionLog`, in the same order, or `btn-undo-now`'s pop stops lining
+// up with the server's own undo stack. The six sites: nowCapture, nowFile,
+// nowRemove and nowAddToSubset push on increment; undoRemoval and
+// btn-undo-now's onclick pop on decrement.
+let nowActionLog = [];
 
 function stopNowPolling() { clearTimeout(nowTimer); nowTimer = null; }
 
@@ -678,7 +734,9 @@ async function pollNow(force = false) {
     // When the server's answer left its upstream fetch (it may have served
     // its cache) — the anchor for the "updated Ns ago" line.
     nowFetchedAt = Date.now() - (data.fetched_ago_ms || 0);
-    nowState = { ...data, homes: new Map((data.homes || []).map((h) => [h.id, h])) };
+    nowState = { ...data, homes: new Map((data.homes || []).map((h) => [h.id, h])),
+                 subsetTargets: new Map((data.subset_targets || [])
+                   .map((s) => [s.id, { id: s.id, name: s.name, total: s.total, folder: s.folder }])) };
     // A genuinely new track re-arms the played-out refetch (declared below)
     // — and so does the SAME track started over, which is what Spotify's
     // repeat-one does. Matching on uri alone meant repeat-one armed the
@@ -1226,6 +1284,11 @@ function renderNow() {
     });
     const more = $("btn-now-more");
     if (more) more.onclick = () => openPicker(nowState.homes, nowFile, nowCreateAndFile);
+    const sub = $("btn-now-subset");
+    if (sub) sub.onclick = () => openPicker(nowState.subsetTargets, nowAddToSubset);
+    $("now-card").querySelectorAll(".sub-offer").forEach((b) => {
+      b.onclick = () => nowAddToSubset(b.dataset.subset);
+    });
     $("now-card").querySelectorAll(".in-chip").forEach((b) => {
       b.onclick = () => nowCapture(b.dataset.in);
     });
@@ -1240,9 +1303,49 @@ function renderNow() {
   }
 }
 
+// Subsets are the second question, never the first: they appear once the
+// home question is settled — either because we just filed this track, or
+// because the server says it is already in a home. A homeless track shows
+// none of this, by design.
+function subsetBlock(d, tr) {
+  // filedUris is overloaded: nowRemove also writes into it ("nowhere
+  // (removed from input)") so the strip's undo can target the right badge,
+  // but a removal is a rejection that leaves the track with no home — not a
+  // filing. `removedUri` names exactly the track a removal is pending for
+  // (cleared the moment the playing track changes or the removal is
+  // undone), so it is what distinguishes the two cases here. Spec §4: a
+  // track with no home shows no subset row at all.
+  const filed = !!filedUris[tr.uri] && tr.uri !== removedUri;
+  const settled = filed || (d.suggestions || []).some((s) => s.already);
+  if (!settled) return "";
+  const offers = (d.subsets || []).filter((s) => !s.already);
+  const already = (d.subsets || []).filter((s) => s.already);
+  let out = "";
+  for (const s of offers) {
+    out += `<button class="sub-offer" data-subset="${esc(s.playlist_id)}">
+      <span class="s-pct">${s.pct}%</span>
+      <span class="s-name">+ ${esc(s.name)}</span>
+      <span class="s-why">${esc((s.reasons || []).join(" · "))}</span>
+    </button>`;
+  }
+  for (const s of already) {
+    out += `<p class="sub-already hint">already in <b>${esc(s.name)}</b></p>`;
+  }
+  return out ? `<div class="subsets">${out}</div>` : "";
+}
+
+function subsetButtonRow() {
+  return `<div class="minor-actions">
+    <button id="btn-now-subset">Add to subset…</button>
+  </div>`;
+}
+
 function ordinaryCardBody(d, tr, ctx) {
   const filedTo = filedUris[tr.uri];
-  if (filedTo) return `<p class="done-msg">✓ filed to <b>${esc(filedTo)}</b></p>`;
+  if (filedTo) {
+    return `<p class="done-msg">✓ filed to <b>${esc(filedTo)}</b></p>` +
+           subsetBlock(d, tr) + subsetButtonRow();
+  }
   if (!tr.sortable) return '<p class="hint">Can\'t be sorted via the API (local file or episode).</p>';
 
   let body = "";
@@ -1262,9 +1365,11 @@ function ordinaryCardBody(d, tr, ctx) {
   // Remove from input lives in the playback strip now (see playbackStrip).
   body += `<div class="minor-actions">
     <button id="btn-now-more"><kbd>m</kbd> Add to…</button>
+    <button id="btn-now-subset">Add to subset…</button>
   </div>`;
   const chips = captureChips(d.inputs || []);
   if (chips) body += `<div class="capture"><span class="hint">capture to input:</span>${chips}</div>`;
+  body += subsetBlock(d, tr);
   return body;
 }
 
@@ -1310,9 +1415,32 @@ async function nowCapture(inId) {
   try {
     const res = await api("/api/act", { action: "move", uri: tr.uri, from_id: null, to_id: inId });
     nowActions++;
+    // Kind "input", not "home": capturing writes no filedUris key, so
+    // undoing one must clear nothing — the existing kind === "home" check
+    // in btn-undo-now already gets that right for free.
+    nowActionLog.push({ uri: tr.uri, kind: "input" });
     const entry = d.inputs.find((l) => l.id === inId);
     if (entry) entry.has_track = true;
     toast(res.note || `+ ${entry?.name || "input"}`);
+    renderNow();
+  } catch (e) { toast(e.message); }
+}
+
+async function nowAddToSubset(id) {
+  const tr = nowState.track;
+  const name = nowState.subsetTargets?.get(id)?.name
+    || (nowState.subsets || []).find((s) => s.playlist_id === id)?.name || "subset";
+  try {
+    // from_id stays null: a song in a best-of has not been sorted, so it
+    // must not leave its input. The server refuses the other shape too.
+    await api("/api/act", { action: "move", uri: tr.uri, from_id: null, to_id: id });
+    nowActions++;
+    nowActionLog.push({ uri: tr.uri, kind: "subset" });
+    if (nowState.subsets) {
+      const hit = nowState.subsets.find((s) => s.playlist_id === id);
+      if (hit) hit.already = true;
+    }
+    toast(`+ ${name}`);
     renderNow();
   } catch (e) { toast(e.message); }
 }
@@ -1324,6 +1452,7 @@ async function nowFile(toId) {
     const res = await api("/api/act", { action: "move", uri: tr.uri, from_id: fromId, to_id: toId });
     nowActions++;
     filedUris[tr.uri] = d.homes.get(toId)?.name || "home";
+    nowActionLog.push({ uri: tr.uri, kind: "home" });
     toast(res.note || `→ ${filedUris[tr.uri]}${fromId ? " (removed from input)" : ""}`);
     renderNow();
   } catch (e) { toast(e.message); }
@@ -1352,6 +1481,7 @@ async function nowRemove() {
     await api("/api/act", { action: "remove", uri: tr.uri, from_id: d.context.id });
     nowActions++;
     filedUris[tr.uri] = "nowhere (removed from input)";
+    nowActionLog.push({ uri: tr.uri, kind: "home" });
     // Blind mode blurred this track so the ear would decide, not the name.
     // That decision is spent the moment it leaves the input, so say what left
     // — otherwise the input quietly loses a track you never got to see. It is
@@ -1380,6 +1510,18 @@ async function undoRemoval() {
     // Targeted, unlike btn-undo-now's pop-the-last-key: we know exactly which
     // uri this undo restores.
     delete filedUris[uri];
+    // Keep nowActionLog in step with nowActions (see the invariant at its
+    // declaration). This undo is necessarily the log's own top entry in the
+    // common case, so pop it there first; but if something reordered the
+    // log, search for the matching uri instead of popping the wrong track's
+    // entry, and if nothing matches leave the log alone rather than
+    // corrupting it further — a missed pop is recoverable, a wrong one isn't.
+    if (nowActionLog.length && nowActionLog[nowActionLog.length - 1].uri === uri) {
+      nowActionLog.pop();
+    } else {
+      const idx = nowActionLog.map((e) => e.uri).lastIndexOf(uri);
+      if (idx !== -1) nowActionLog.splice(idx, 1);
+    }
     removedUri = null;
     toast(res.restored_to ? "undone — restored to input" : "undone");
     renderNow();
@@ -1391,9 +1533,13 @@ $("btn-undo-now").onclick = async () => {
   try {
     const res = await api("/api/undo", {});
     nowActions--;
-    const uri = Object.keys(filedUris).pop();
-    if (uri) delete filedUris[uri];
-    toast(res.restored_to ? "undone — restored to input" : "undone — removed from home again");
+    // Pop the last ACTION, not the last filedUris key: a subset add adds an
+    // entry here but no key there, so keying off the object undid the wrong
+    // track's badge.
+    const last = nowActionLog.pop();
+    if (last && last.kind === "home") delete filedUris[last.uri];
+    if (last && last.uri === removedUri) removedUri = null;
+    toast(res.restored_to ? "undone — restored to input" : "undone");
     renderNow();
   } catch (e) { toast(e.message); }
 };
