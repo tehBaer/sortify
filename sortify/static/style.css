@@ -228,7 +228,9 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 }
 .np-transport { display: flex; align-items: center; justify-content: center; gap: .8rem; }
 .np-slot { display: flex; align-items: center; min-height: 52px; }
-.np-remove-slot { justify-content: flex-end; }
+/* Pulled in from the edge: hard against the card wall it reads as chrome
+   rather than as one of the card's controls. */
+.np-remove-slot { justify-content: flex-end; padding-right: .9rem; }
 .np-round {
   width: 52px; height: 52px; min-height: 0; padding: 0; border-radius: 50%;
   display: inline-flex; align-items: center; justify-content: center;
@@ -242,14 +244,29 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 /* Next is the filing flow's main verb — sorting IS skipping — so it gets the
    big filled target and play/pause steps back to the small secondary one. */
 .np-round.np-big { width: 64px; height: 64px; }
-/* Red, and filled: Remove is destructive, so it says so rather than hiding in
-   the secondary-button grey. MUST stay after .np-small — both selectors are
-   (0,2,0), so source order is the only thing deciding the winner, and placed
-   any earlier .np-small's card2 background silently takes it back to grey. */
+/* An inline SVG sits on the text baseline and leaves descender space below
+   it, which is what tilts an icon button's glyph off the circle's centre.
+   Every strip icon is a block, so the three buttons align on one line. */
+.np-round svg { display: block; }
+/* Between play/pause (42) and Next (64): present without competing. */
+.np-round.np-mid { width: 48px; height: 48px; }
+/* Outline, not filled: Remove is destructive, so it is red — but it is also
+   the rarer, optional move, and a filled red disc beside Next reads as a
+   third transport control. MUST stay after .np-small/.np-mid — all three are
+   (0,2,0), so source order alone decides, and placed any earlier the grey
+   secondary background silently wins (which is exactly what happened). */
 .np-round.np-danger {
-  background: var(--danger); color: #fff; border-color: transparent;
+  background: transparent; color: var(--danger);
+  border: 2px solid var(--danger);
 }
-.np-round.np-danger:hover { background: var(--danger); border-color: transparent; opacity: .88; }
+.np-round.np-danger:hover { border-color: var(--danger); opacity: .8; }
+/* The undo that replaces it: same footprint, neutral rather than alarming —
+   taking it back is not itself a destructive act. */
+.np-round.np-undo {
+  background: transparent; color: var(--fg);
+  border: 2px solid var(--border);
+}
+.np-round.np-undo:hover { border-color: var(--fg); opacity: .8; }
 
 .sugg {
   display: block; width: 100%; text-align: left; margin-bottom: .5rem;

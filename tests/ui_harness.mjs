@@ -1739,6 +1739,75 @@ run("stopNowPolling()");
         at('np-remove-slot') !== -1, `slot@${at('np-remove-slot')}`);
 }
 
+// ============================================================================
+// RU — removing swaps the strip's Remove for an Undo, for this track only.
+// The undo has to live where the button that caused it was: that is where the
+// hand already is. It must expire with the track, or the next song inherits an
+// undo for a decision made about a different one.
+// ============================================================================
+{
+  resetLog();
+  const nowBody = (uri) => ({
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri, name: "Song", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[In]", is_input: true },
+      sitting: null, suggestions: [],
+      homes: [{ id: "H1", name: "Home", folder: "" }],
+      inputs: [{ id: "IN1", name: "[In]", has_track: true }],
+    },
+  });
+  const html = () => $$("now-card").innerHTML;
+  const has = (needle) => html().includes(needle);
+
+  routes["GET /api/now?force=1"] = nowBody("spotify:track:ru1");
+  routes["POST /api/act"] = { status: 200, body: {} };
+  routes["POST /api/undo"] = { status: 200, body: { restored_to: "IN1" } };
+  run(`filedUris = {}; nowActions = 0; removedUri = null; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  check("RU the strip starts with Remove and no Undo",
+        has('id="btn-now-remove"') && !has('id="btn-now-undo-remove"'),
+        `remove=${has('id="btn-now-remove"')} undo=${has('id="btn-now-undo-remove"')}`);
+
+  await run(`nowRemove()`);
+  await tick();
+  check("RU removing puts Undo where Remove was",
+        has('id="btn-now-undo-remove"') && !has('id="btn-now-remove"'),
+        `undo=${has('id="btn-now-undo-remove"')} remove=${has('id="btn-now-remove"')}`);
+  check("RU the Undo sits in the same reserved slot",
+        html().indexOf('np-remove-slot') < html().indexOf('id="btn-now-undo-remove"') &&
+        html().indexOf('id="btn-now-undo-remove"') < html().indexOf('np-updated'),
+        `slot@${html().indexOf('np-remove-slot')} ` +
+        `undo@${html().indexOf('id="btn-now-undo-remove"')}`);
+
+  // Guarded: an unwired button is a failed check, not an exception that ends
+  // the whole run before the later scenarios get to speak.
+  const wired = run(`typeof $("btn-now-undo-remove").onclick === "function"`);
+  check("RU the Undo is wired", wired, `onclick=${run(`typeof $("btn-now-undo-remove").onclick`)}`);
+  if (wired) { await run(`$("btn-now-undo-remove").onclick()`); await tick(); }
+  check("RU pressing it spends exactly one undo",
+        posts("/api/undo") === 1, `${posts("/api/undo")} POST(s)`);
+  check("RU undoing brings Remove back",
+        has('id="btn-now-remove"') && !has('id="btn-now-undo-remove"'),
+        `remove=${has('id="btn-now-remove"')} undo=${has('id="btn-now-undo-remove"')}`);
+
+  // Remove again, then let the track change: the offer must not survive it.
+  await run(`nowRemove()`);
+  await tick();
+  routes["GET /api/now?force=1"] = nowBody("spotify:track:ru2");
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  check("RU the Undo expires when the next track starts",
+        !has('id="btn-now-undo-remove"') && run("removedUri") === null,
+        `undo=${has('id="btn-now-undo-remove"')} removedUri=${run("removedUri")}`);
+  check("RU and the next track gets its own Remove",
+        has('id="btn-now-remove"'), `remove=${has('id="btn-now-remove"')}`);
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

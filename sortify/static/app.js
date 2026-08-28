@@ -1047,7 +1047,8 @@ const ICON_PLAY = '<svg viewBox="0 0 24 24" width="22" height="22" fill="current
 const ICON_PAUSE = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M7 5h3.6v14H7zM13.4 5H17v14h-3.6z"/></svg>';
 const ICON_NEXT = '<svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor" aria-hidden="true"><path d="M6 5.5v13l8.5-6.5zM16.5 5.5h2v13h-2z"/></svg>';
 // A list losing a line — "take this out of the input", not "delete the song".
-const ICON_REMOVE = '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M3 6h12v2H3zM3 11h12v2H3zM3 16h8v2H3zM14.5 15h7v2h-7z"/></svg>';
+const ICON_REMOVE = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M3 6h12v2H3zM3 11h12v2H3zM3 16h8v2H3zM14.5 15h7v2h-7z"/></svg>';
+const ICON_UNDO = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9h10a5 5 0 0 1 0 10H9"/><path d="M8 5 4 9l4 4"/></svg>';
 
 // The strip under the title: elapsed / bar / total, then play-pause + next.
 // Local files and episodes carry no duration; they get the buttons only.
@@ -1068,8 +1069,14 @@ function playbackStrip(d, tr) {
   // the only thing that ever fills it, and it is deliberately NOT adjacent to
   // Next — Next is pressed once per track, and a destructive control sharing
   // that thumb path is a mis-tap waiting to happen.
-  const removeBtn = d.context?.is_input
-    ? `<button id="btn-now-remove" class="np-round np-small np-danger"
+  // Once this track has been removed, the slot offers the way back instead —
+  // the undo belongs where the hand already is, not in the top bar. It lasts
+  // exactly as long as the track does (see renderNow's expiry).
+  const removeBtn = removedUri && removedUri === tr.uri
+    ? `<button id="btn-now-undo-remove" class="np-round np-mid np-undo"
+               title="Undo the removal (u)" aria-label="Undo the removal">${ICON_UNDO}</button>`
+    : d.context?.is_input
+    ? `<button id="btn-now-remove" class="np-round np-mid np-danger"
                title="Remove from input (r)" aria-label="Remove from input">${ICON_REMOVE}</button>`
     : "";
   return `${bar}<div class="np-buttons">
@@ -1112,6 +1119,8 @@ function renderNow() {
     document.body.classList.remove("peeked");
     peekedUri = null;
   }
+  // Same expiry, same reason: the strip's undo offer belongs to one track.
+  if (removedUri && d.track?.uri !== removedUri) removedUri = null;
   // The server is authoritative here (see /api/now's `sitting` field): if it
   // says this poll's context is a sitting, it is one, regardless of what
   // this client remembers from before a reload. `/api/undo` knows nothing
@@ -1188,6 +1197,8 @@ function renderNow() {
   // simply never occurs).
   const rem = $("btn-now-remove");
   if (rem) rem.onclick = nowRemove;
+  const undoRem = $("btn-now-undo-remove");
+  if (undoRem) undoRem.onclick = undoRemoval;
   startNowTicker(d, tr);
   startAgeTicker();
 
@@ -1336,7 +1347,27 @@ async function nowRemove() {
       peekedUri = tr.uri;
       document.body.classList.add("peeked");
     }
+    removedUri = tr.uri;
     toast("removed from input");
+    renderNow();
+  } catch (e) { toast(e.message); }
+}
+
+// The strip's own undo, offered only for the track it was removed from. The
+// server's undo stack is authoritative; this just spends the top entry, which
+// is necessarily this removal — the card is in its done state, so nothing else
+// on this track can have acted since.
+async function undoRemoval() {
+  const uri = removedUri;
+  if (!uri) return;
+  try {
+    const res = await api("/api/undo", {});
+    nowActions = Math.max(0, nowActions - 1);
+    // Targeted, unlike btn-undo-now's pop-the-last-key: we know exactly which
+    // uri this undo restores.
+    delete filedUris[uri];
+    removedUri = null;
+    toast(res.restored_to ? "undone — restored to input" : "undone");
     renderNow();
   } catch (e) { toast(e.message); }
 }
@@ -1365,6 +1396,10 @@ let blindMode = localStorage.getItem("blindMode") === "1";
 // One tap on any blurred field reveals EVERYTHING for the remainder of that
 // track — renderNow drops the reveal as soon as the playing uri changes.
 let peekedUri = null;
+// The track whose removal the strip is currently offering to undo. Expires
+// with the track (renderNow), because an undo inherited by the next song
+// would undo a decision made about a different one.
+let removedUri = null;
 
 function applyBlind() {
   // No emoji in the UI: the button is an inline SVG eye whose slash line is
