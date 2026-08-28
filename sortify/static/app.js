@@ -1219,9 +1219,9 @@ let nowFetchedAt = null;  // Date.now()-anchored time of the upstream fetch
 function paintNowAge() {
   const el = $("np-updated");
   if (!el || nowFetchedAt == null) return;
-  // Just "Ns ago" — the leading "updated" said nothing the timestamp
-  // doesn't, and the corner slot beside the cover is narrow.
-  el.textContent = `${fmtCountdown(Date.now() - nowFetchedAt)} ago`;
+  // Just the age, no "updated"/"ago" dressing: it sits beside the refresh
+  // button in the top bar, and that neighbourhood is the context.
+  el.textContent = fmtCountdown(Date.now() - nowFetchedAt);
 }
 
 function startAgeTicker() {
@@ -1281,7 +1281,7 @@ function playbackStrip(d, tr) {
     <span class="np-slot np-next-slot">
       <button id="btn-now-next" class="np-round np-wide np-next" title="Skip to the next track">${ICON_NEXT}<span class="np-verb-label">Next</span></button>
     </span>
-  </div><div id="np-updated" class="np-updated"></div>`;
+  </div>`;
 }
 
 // Keeps the client-side `sitting` convenience global roughly in step with
@@ -1357,7 +1357,6 @@ function renderNow() {
         <p class="hint">${hasInputs
           ? "Start one of your inputs above, or put something on in Spotify."
           : "Put something on in Spotify and it shows up here."}</p>
-        <div id="np-updated" class="np-updated"></div>
       </div>`;
     startAgeTicker();
     return;

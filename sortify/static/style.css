@@ -53,7 +53,9 @@ nav a.active { color: var(--fg); font-weight: 600; border-bottom-color: var(--ac
    them for width. Deliberately the same card, radius, shadow and animation as
    #input-pop — two popovers that look and dismiss differently would cost more
    than the duplicated declarations do. */
-#btn-nav-menu { flex-shrink: 0; }
+/* Bare glyph, no circle: the hamburger is the leftmost thing on the bar and
+   the outline made it compete with the real controls. */
+#btn-nav-menu { flex-shrink: 0; background: none; border: 0; }
 #btn-nav-menu.open { color: var(--accent); }
 #nav-pop {
   /* Opens under its button — which sits at the header's LEFT edge now. */
@@ -153,7 +155,11 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
    Narrow, not full-width: it sizes to its label up to a cap and ellipsizes
    past it — the header row has to hold the menu, title and actions too. */
 .input-switch {
-  flex: 0 1 auto; min-width: 0; max-width: min(42vw, 12rem); min-height: 40px;
+  /* A fixed width, not shrink-to-label: the face starts as "checking…" and
+     becomes a playlist name, and the bar must not jump when that happens.
+     flex-shrink stays on so a very narrow screen squeezes this, never the
+     icons at the row's end. */
+  flex: 0 1 auto; width: min(42vw, 12rem); min-width: 0; min-height: 40px;
   display: inline-flex; align-items: center; gap: .35rem;
   padding: .3rem .55rem .3rem .8rem; border-radius: 12px;
   background: var(--card); text-align: left;
@@ -254,21 +260,18 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 }
 .track-card .t-name { font-size: 1.3rem; font-weight: 700; letter-spacing: -.01em; margin: .8rem 0 .15rem; }
 .track-card .t-artist { color: var(--muted); font-size: .95rem; margin-bottom: .9rem; }
-/* "updated Ns ago" — deliberately outside the blind-mode blur: it names no
-   track, and it's the proof the card reflects what's actually playing */
+/* The freshness age ("12s", no dressing) — a static header element now,
+   sitting against the refresh button whose meaning it completes. Outside
+   the blind-mode blur by nature: it names no track, and it's the proof the
+   card reflects what's actually playing. */
 .np-updated {
   color: var(--muted); font-size: .72rem; font-variant-numeric: tabular-nums;
-  margin: -.4rem 0 .6rem;
+  /* Width reserved even while empty (pre-fetch): the age appearing must not
+     nudge the row — same rule as the switcher's fixed width. */
+  min-width: 2.4rem; text-align: right; margin-right: -.2rem;
 }
-.state-card .np-updated { margin: .6rem 0 0; }
-/* On the track card it costs no height: pinned to the top-left corner, in
-   the margin beside the cover, mirroring the share button on the right. */
-.track-card .np-updated {
-  position: absolute; top: .8rem; left: .9rem; margin: 0; max-width: 5.5rem;
-  text-align: left; line-height: 1.3;
-}
-/* Share rides the opposite corner — a once-in-a-while control living in the
-   other strip of whitespace beside the art. */
+/* Share rides the card's corner — a once-in-a-while control living in the
+   strip of whitespace beside the art. */
 .np-share { position: absolute; top: .55rem; right: .55rem; color: var(--muted); }
 /* Hidden by request, not deleted: renderNow and the undo stack still drive
    btn-undo-now (the strip's own undo covers removals; keyboard u remains),

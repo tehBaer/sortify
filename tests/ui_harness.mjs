@@ -1930,9 +1930,12 @@ run("stopNowPolling()");
   check("RB it is inside the transport button group",
         at('np-buttons') !== -1 &&
         at('np-buttons') < at('id="btn-now-remove"') &&
-        at('id="btn-now-remove"') < at('np-updated'),
+        at('id="btn-now-remove"') < at('np-next-slot'),
         `buttons@${at('np-buttons')} remove@${at('id="btn-now-remove"')} ` +
-        `updated@${at('np-updated')}`);
+        `next-slot@${at('np-next-slot')}`);
+  // The freshness timer lives in the top bar now, not on the card.
+  check("RB the card does not carry the np-updated line",
+        at('np-updated') === -1, `updated@${at('np-updated')}`);
   // The verb row is a centred pair: Remove left of Next, each in its own
   // slot with the deliberate gap between them, so the two most-pressed
   // buttons read as equals.
@@ -2009,7 +2012,7 @@ run("stopNowPolling()");
         `undo=${has('id="btn-now-undo-remove"')} remove=${has('id="btn-now-remove"')}`);
   check("RU the Undo sits in the same reserved slot",
         html().indexOf('np-remove-slot') < html().indexOf('id="btn-now-undo-remove"') &&
-        html().indexOf('id="btn-now-undo-remove"') < html().indexOf('np-updated'),
+        html().indexOf('id="btn-now-undo-remove"') < html().indexOf('np-next-slot'),
         `slot@${html().indexOf('np-remove-slot')} ` +
         `undo@${html().indexOf('id="btn-now-undo-remove"')}`);
 
