@@ -60,7 +60,14 @@ class Store:
     #   tiny anyway.
     # - config/queue/pacing/splits/…: sub-millisecond parses; caching buys
     #   nothing and widens the mutate-nothing contract for free.
-    CACHED_READS = frozenset({"tags.json", "lastfm_tracks.json", "lastfm_artists.json"})
+    # folders.json rides along (2026-08-28, sortify-d0's suggestion): 95KB
+    # /~1.7ms but read on every light poll via _effective_input_ids and ~once
+    # per input inside each profile build, and it is as write-once as the
+    # Last.fm files — it changes only on an explicit re-import, whose save
+    # invalidates like any other. Callers audited read-only (.get() lookups
+    # everywhere; the refresh endpoint builds a fresh mapping to save).
+    CACHED_READS = frozenset({"tags.json", "lastfm_tracks.json",
+                              "lastfm_artists.json", "folders.json"})
 
     def __init__(self, data_dir: Path | str | None = None):
         self.dir = Path(data_dir or os.environ.get("SORTIFY_DATA_DIR") or DEFAULT_DATA_DIR)

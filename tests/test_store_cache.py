@@ -18,7 +18,7 @@ Deliberately NOT cached (see Store.CACHED_READS):
 - config.json, queue.json, pacing.json, splits.json, …: sub-millisecond
   parses; caching buys nothing and widens the sharing contract for free.
 
-The sharing contract for the cached three: callers get THE SAME parsed
+The sharing contract for the cached files: callers get THE SAME parsed
 object until the file changes, so they must never mutate it — which the
 in-process writers already honour (_merge_save_* build new dicts, enrich
 copies, suggest/split only build local structures).
@@ -44,12 +44,14 @@ def write_raw(store, name, text):
 def test_a_repeated_read_serves_the_same_parsed_object(store):
     store.save_tag_artists({"a1": {"name": "A", "tags": []}})
     assert store.tags() is store.tags()
+    store.save_folders({"p1": {"path": "ROOT / Sub", "caps": False}})
+    assert store.folders() is store.folders()
     assert store.lastfm_tracks() is not None  # missing file: exercised below
 
 
-def test_all_three_big_files_are_cached_and_only_those(store):
+def test_the_cached_file_whitelist_is_exactly_these(store):
     assert Store.CACHED_READS == frozenset(
-        {"tags.json", "lastfm_tracks.json", "lastfm_artists.json"})
+        {"tags.json", "lastfm_tracks.json", "lastfm_artists.json", "folders.json"})
     store.save_cache({"playlists": {}, "artists": {}, "me": None, "playlist_list": None})
     store.save_config({"client_id": None})
     # Uncached files keep today's fresh-copy-per-read behaviour: their
