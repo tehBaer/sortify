@@ -1674,6 +1674,71 @@ run("stopNowPolling()");
   }
 }
 
+// ============================================================================
+// RB — "Remove from input" lives in the playback strip, not the minor row.
+// Sorting is skipping, so the destructive control belongs where the transport
+// controls are — but it must stay conditional on an input context, and it
+// must NOT sit adjacent to the 64px Next target (mis-tap risk), which is why
+// the assertions pin its POSITION and not merely its existence.
+// ============================================================================
+{
+  const nowBody = (isInput) => ({
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri: "spotify:track:rb1", name: "Song", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[In]", is_input: isInput },
+      sitting: null,
+      suggestions: [{ playlist_id: "H1", pct: 90, reasons: [], already: false }],
+      homes: [{ id: "H1", name: "Home", folder: "" }],
+      inputs: [{ id: "IN1", name: "[In]", has_track: true }],
+    },
+  });
+  const html = () => $$("now-card").innerHTML;
+  const at = (needle) => html().indexOf(needle);
+
+  routes["GET /api/now?force=1"] = nowBody(true);
+  run(`filedUris = {}; nowActions = 0; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+
+  check("RB the remove button renders when playing from an input",
+        at('id="btn-now-remove"') !== -1, `index ${at('id="btn-now-remove"')}`);
+  // The strip is emitted before the card body, so a remove button that sits
+  // inside np-buttons necessarily precedes minor-actions. If it is still in
+  // the minor row this ordering inverts — that is the whole check.
+  check("RB it sits in the playback strip, not the minor-actions row",
+        at('id="btn-now-remove"') !== -1 &&
+        at('id="btn-now-remove"') < at('minor-actions'),
+        `remove@${at('id="btn-now-remove"')} minor@${at('minor-actions')}`);
+  check("RB it is inside the transport button group",
+        at('np-buttons') !== -1 &&
+        at('np-buttons') < at('id="btn-now-remove"') &&
+        at('id="btn-now-remove"') < at('np-updated'),
+        `buttons@${at('np-buttons')} remove@${at('id="btn-now-remove"')} ` +
+        `updated@${at('np-updated')}`);
+  // Next is the card's main verb; a destructive control must not be the
+  // element immediately following it in the group.
+  check("RB it is not rendered adjacent to Next",
+        at('id="btn-now-next"') < at('id="btn-now-remove"') &&
+        at('np-remove-slot') !== -1,
+        `next@${at('id="btn-now-next"')} remove@${at('id="btn-now-remove"')} ` +
+        `slot@${at('np-remove-slot')}`);
+
+  routes["GET /api/now?force=1"] = nowBody(false);
+  run(`filedUris = {}; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+
+  check("RB no remove button when the context is not an input",
+        at('id="btn-now-remove"') === -1, `index ${at('id="btn-now-remove"')}`);
+  // The slot stays so play/pause and Next never shift sideways when the
+  // context changes — the same instinct as 1f8ae2c.
+  check("RB the reserved slot survives so the transport never shifts",
+        at('np-remove-slot') !== -1, `slot@${at('np-remove-slot')}`);
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

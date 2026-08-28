@@ -1046,6 +1046,8 @@ function startAgeTicker() {
 const ICON_PLAY = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>';
 const ICON_PAUSE = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M7 5h3.6v14H7zM13.4 5H17v14h-3.6z"/></svg>';
 const ICON_NEXT = '<svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor" aria-hidden="true"><path d="M6 5.5v13l8.5-6.5zM16.5 5.5h2v13h-2z"/></svg>';
+// A list losing a line — "take this out of the input", not "delete the song".
+const ICON_REMOVE = '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M3 6h12v2H3zM3 11h12v2H3zM3 16h8v2H3zM14.5 15h7v2h-7z"/></svg>';
 
 // The strip under the title: elapsed / bar / total, then play-pause + next.
 // Local files and episodes carry no duration; they get the buttons only.
@@ -1059,9 +1061,24 @@ function playbackStrip(d, tr) {
       <span class="np-time">${fmtTime(tr.duration_ms)}</span>
     </div>`;
   }
+  // Three slots, not a centred row: play/pause and Next stay dead centre
+  // whatever else is present, so the transport never shifts sideways when the
+  // context changes from an input to something else (same instinct as the
+  // Next-sizing fix). The right slot is reserved even when empty; Remove is
+  // the only thing that ever fills it, and it is deliberately NOT adjacent to
+  // Next — Next is pressed once per track, and a destructive control sharing
+  // that thumb path is a mis-tap waiting to happen.
+  const removeBtn = d.context?.is_input
+    ? `<button id="btn-now-remove" class="np-round np-small np-danger"
+               title="Remove from input (r)" aria-label="Remove from input">${ICON_REMOVE}</button>`
+    : "";
   return `${bar}<div class="np-buttons">
-    <button id="btn-now-toggle" class="np-round np-small" title="${d.is_playing ? "Pause" : "Play"}">${d.is_playing ? ICON_PAUSE : ICON_PLAY}</button>
-    <button id="btn-now-next" class="np-round np-big" title="Skip to the next track">${ICON_NEXT}</button>
+    <span class="np-slot"></span>
+    <span class="np-transport">
+      <button id="btn-now-toggle" class="np-round np-small" title="${d.is_playing ? "Pause" : "Play"}">${d.is_playing ? ICON_PAUSE : ICON_PLAY}</button>
+      <button id="btn-now-next" class="np-round np-big" title="Skip to the next track">${ICON_NEXT}</button>
+    </span>
+    <span class="np-slot np-remove-slot">${removeBtn}</span>
   </div><div id="np-updated" class="np-updated"></div>`;
 }
 
@@ -1165,6 +1182,12 @@ function renderNow() {
   if (tog) tog.onclick = playerToggle;
   const nxt = $("btn-now-next");
   if (nxt) nxt.onclick = playerNext;
+  // Wired with the other strip controls rather than in the ordinary-card
+  // branch below: the button is part of the strip now, and the strip renders
+  // for the sitting card too (where an input context — and so this button —
+  // simply never occurs).
+  const rem = $("btn-now-remove");
+  if (rem) rem.onclick = nowRemove;
   startNowTicker(d, tr);
   startAgeTicker();
 
@@ -1178,8 +1201,6 @@ function renderNow() {
     });
     const more = $("btn-now-more");
     if (more) more.onclick = () => openPicker(nowState.homes, nowFile, nowCreateAndFile);
-    const rem = $("btn-now-remove");
-    if (rem) rem.onclick = nowRemove;
     $("now-card").querySelectorAll(".in-chip").forEach((b) => {
       b.onclick = () => nowCapture(b.dataset.in);
     });
@@ -1213,9 +1234,9 @@ function ordinaryCardBody(d, tr, ctx) {
     </button>`;
   });
   if (!d.suggestions.length) body += '<p class="hint">No confident match — use Add to…</p>';
+  // Remove from input lives in the playback strip now (see playbackStrip).
   body += `<div class="minor-actions">
     <button id="btn-now-more"><kbd>m</kbd> Add to…</button>
-    ${ctx?.is_input ? '<button id="btn-now-remove" class="danger"><kbd>r</kbd> Remove from input</button>' : ""}
   </div>`;
   const chips = captureChips(d.inputs || []);
   if (chips) body += `<div class="capture"><span class="hint">capture to input:</span>${chips}</div>`;
