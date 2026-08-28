@@ -1072,11 +1072,15 @@ function playbackStrip(d, tr) {
   // Once this track has been removed, the slot offers the way back instead —
   // the undo belongs where the hand already is, not in the top bar. It lasts
   // exactly as long as the track does (see renderNow's expiry).
+  // A pill rather than a disc: Remove is the one strip control that is worth
+  // widening — it is the second-most-pressed button in the loop after Next,
+  // and a wide target at the thumb's resting edge is easier to hit than a
+  // disc without moving it any closer to Next.
   const removeBtn = removedUri && removedUri === tr.uri
-    ? `<button id="btn-now-undo-remove" class="np-round np-mid np-undo"
+    ? `<button id="btn-now-undo-remove" class="np-round np-wide np-undo"
                title="Undo the removal (u)" aria-label="Undo the removal">${ICON_UNDO}</button>`
     : d.context?.is_input
-    ? `<button id="btn-now-remove" class="np-round np-mid np-danger"
+    ? `<button id="btn-now-remove" class="np-round np-wide np-danger"
                title="Remove from input (r)" aria-label="Remove from input">${ICON_REMOVE}</button>`
     : "";
   return `${bar}<div class="np-buttons">

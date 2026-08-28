@@ -248,11 +248,17 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
    it, which is what tilts an icon button's glyph off the circle's centre.
    Every strip icon is a block, so the three buttons align on one line. */
 .np-round svg { display: block; }
-/* Between play/pause (42) and Next (64): present without competing. */
-.np-round.np-mid { width: 48px; height: 48px; }
+/* Remove/undo are pills, not discs: a wide target is easier to hit with the
+   thumb already resting at that edge, and widening rather than moving keeps
+   the deliberate gap to Next. 52px tall — between play/pause (42) and Next
+   (64), on the grid's shared centre line — so it reads as part of the same
+   row of controls instead of a detached badge. */
+.np-round.np-wide {
+  width: auto; min-width: 104px; height: 52px; border-radius: 999px;
+}
 /* Outline, not filled: Remove is destructive, so it is red — but it is also
    the rarer, optional move, and a filled red disc beside Next reads as a
-   third transport control. MUST stay after .np-small/.np-mid — all three are
+   third transport control. MUST stay after .np-small/.np-wide — all three are
    (0,2,0), so source order alone decides, and placed any earlier the grey
    secondary background silently wins (which is exactly what happened). */
 .np-round.np-danger {
