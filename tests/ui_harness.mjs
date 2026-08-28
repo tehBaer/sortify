@@ -1981,6 +1981,59 @@ run("stopNowPolling()");
         has('id="btn-now-remove"'), `remove=${has('id="btn-now-remove"')}`);
 }
 
+// ============================================================================
+// UL — the undo log is ordered, and only home filings own a filed state.
+// btn-undo-now used to pop the last KEY of filedUris, which is not the last
+// ACTION once subset adds (which write no key) exist: undoing one wiped an
+// unrelated track's "filed" badge.
+// ============================================================================
+{
+  resetLog();
+  routes["GET /api/now?force=1"] = {
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri: "spotify:track:ul1", name: "Song", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: null, sitting: null, suggestions: [],
+      homes: [{ id: "H1", name: "Home", folder: "" }],
+      subsets: [], subset_targets: [{ id: "S1", name: "{sel}", total: 4 }],
+      inputs: [],
+    },
+  };
+  routes["POST /api/act"] = { status: 200, body: {} };
+  routes["POST /api/undo"] = { status: 200, body: { restored_to: null } };
+  // show("now") is load-bearing: pollNow returns immediately on a hidden
+  // view-now, so a block inheriting a hidden view never renders at all.
+  run(`show("now"); filedUris = {}; nowActions = 0; removedUri = null;
+       nowActionLog = []; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+
+  // An earlier track was filed to a home; this session still remembers it.
+  run(`filedUris["spotify:track:earlier"] = "Some Home";
+       nowActionLog = [{ uri: "spotify:track:earlier", kind: "home" }]`);
+  // Now a subset add on the CURRENT track — writes no filedUris key.
+  const wired = run(`typeof nowAddToSubset === "function"`);
+  check("UL nowAddToSubset exists", wired, `type=${run(`typeof nowAddToSubset`)}`);
+  if (wired) { await run(`nowAddToSubset("S1")`); await tick(); }
+  check("UL a subset add writes no filed state",
+        run(`filedUris["spotify:track:ul1"] === undefined`),
+        `filed=${run(`JSON.stringify(filedUris)`)}`);
+  check("UL a subset add is recorded in the ordered log",
+        run(`nowActionLog.length === 2 && nowActionLog[1].kind === "subset"`),
+        run(`JSON.stringify(nowActionLog)`));
+
+  await run(`$("btn-undo-now").onclick()`);
+  await tick();
+  check("UL undoing the subset add leaves the earlier home filing alone",
+        run(`filedUris["spotify:track:earlier"] === "Some Home"`),
+        `filed=${run(`JSON.stringify(filedUris)`)}`);
+  check("UL and the log pops the action that was actually undone",
+        run(`nowActionLog.length === 1 && nowActionLog[0].kind === "home"`),
+        run(`JSON.stringify(nowActionLog)`));
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

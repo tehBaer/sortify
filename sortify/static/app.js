@@ -620,6 +620,11 @@ let nowProblem = false;
 let nowTimer = null;
 let nowActions = 0;    // enables Undo
 let filedUris = {};    // uri -> home name we filed it to this session
+// Every filing action this session, oldest first. The undo stack is the
+// server's; this mirrors ONLY what the client must undo locally, which is
+// why each entry carries its kind: a subset add writes no filed state, so
+// undoing one must not clear a filed badge that belongs to another track.
+let nowActionLog = [];
 
 function stopNowPolling() { clearTimeout(nowTimer); nowTimer = null; }
 
@@ -1317,6 +1322,18 @@ async function nowCapture(inId) {
   } catch (e) { toast(e.message); }
 }
 
+// Stub for Task 6, which replaces this with the real subset-target UI wiring.
+async function nowAddToSubset(id) {
+  const tr = nowState.track;
+  try {
+    await api("/api/act", { action: "move", uri: tr.uri, from_id: null, to_id: id });
+    nowActions++;
+    nowActionLog.push({ uri: tr.uri, kind: "subset" });
+    toast("added");
+    renderNow();
+  } catch (e) { toast(e.message); }
+}
+
 async function nowFile(toId) {
   const d = nowState, tr = d.track;
   const fromId = d.context?.is_input ? d.context.id : null;
@@ -1324,6 +1341,7 @@ async function nowFile(toId) {
     const res = await api("/api/act", { action: "move", uri: tr.uri, from_id: fromId, to_id: toId });
     nowActions++;
     filedUris[tr.uri] = d.homes.get(toId)?.name || "home";
+    nowActionLog.push({ uri: tr.uri, kind: "home" });
     toast(res.note || `→ ${filedUris[tr.uri]}${fromId ? " (removed from input)" : ""}`);
     renderNow();
   } catch (e) { toast(e.message); }
@@ -1352,6 +1370,7 @@ async function nowRemove() {
     await api("/api/act", { action: "remove", uri: tr.uri, from_id: d.context.id });
     nowActions++;
     filedUris[tr.uri] = "nowhere (removed from input)";
+    nowActionLog.push({ uri: tr.uri, kind: "home" });
     // Blind mode blurred this track so the ear would decide, not the name.
     // That decision is spent the moment it leaves the input, so say what left
     // — otherwise the input quietly loses a track you never got to see. It is
@@ -1391,9 +1410,13 @@ $("btn-undo-now").onclick = async () => {
   try {
     const res = await api("/api/undo", {});
     nowActions--;
-    const uri = Object.keys(filedUris).pop();
-    if (uri) delete filedUris[uri];
-    toast(res.restored_to ? "undone — restored to input" : "undone — removed from home again");
+    // Pop the last ACTION, not the last filedUris key: a subset add adds an
+    // entry here but no key there, so keying off the object undid the wrong
+    // track's badge.
+    const last = nowActionLog.pop();
+    if (last && last.kind === "home") delete filedUris[last.uri];
+    if (last && last.uri === removedUri) removedUri = null;
+    toast(res.restored_to ? "undone — restored to input" : "undone");
     renderNow();
   } catch (e) { toast(e.message); }
 };
