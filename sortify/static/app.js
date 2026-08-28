@@ -624,6 +624,12 @@ let filedUris = {};    // uri -> home name we filed it to this session
 // server's; this mirrors ONLY what the client must undo locally, which is
 // why each entry carries its kind: a subset add writes no filed state, so
 // undoing one must not clear a filed badge that belongs to another track.
+//
+// Invariant: every path that changes `nowActions` makes the matching change
+// to `nowActionLog`, in the same order, or `btn-undo-now`'s pop stops lining
+// up with the server's own undo stack. The six sites: nowCapture, nowFile,
+// nowRemove and nowAddToSubset push on increment; undoRemoval and
+// btn-undo-now's onclick pop on decrement.
 let nowActionLog = [];
 
 function stopNowPolling() { clearTimeout(nowTimer); nowTimer = null; }
@@ -1315,6 +1321,10 @@ async function nowCapture(inId) {
   try {
     const res = await api("/api/act", { action: "move", uri: tr.uri, from_id: null, to_id: inId });
     nowActions++;
+    // Kind "input", not "home": capturing writes no filedUris key, so
+    // undoing one must clear nothing — the existing kind === "home" check
+    // in btn-undo-now already gets that right for free.
+    nowActionLog.push({ uri: tr.uri, kind: "input" });
     const entry = d.inputs.find((l) => l.id === inId);
     if (entry) entry.has_track = true;
     toast(res.note || `+ ${entry?.name || "input"}`);
@@ -1399,6 +1409,18 @@ async function undoRemoval() {
     // Targeted, unlike btn-undo-now's pop-the-last-key: we know exactly which
     // uri this undo restores.
     delete filedUris[uri];
+    // Keep nowActionLog in step with nowActions (see the invariant at its
+    // declaration). This undo is necessarily the log's own top entry in the
+    // common case, so pop it there first; but if something reordered the
+    // log, search for the matching uri instead of popping the wrong track's
+    // entry, and if nothing matches leave the log alone rather than
+    // corrupting it further — a missed pop is recoverable, a wrong one isn't.
+    if (nowActionLog.length && nowActionLog[nowActionLog.length - 1].uri === uri) {
+      nowActionLog.pop();
+    } else {
+      const idx = nowActionLog.map((e) => e.uri).lastIndexOf(uri);
+      if (idx !== -1) nowActionLog.splice(idx, 1);
+    }
     removedUri = null;
     toast(res.restored_to ? "undone — restored to input" : "undone");
     renderNow();

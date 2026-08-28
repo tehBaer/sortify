@@ -2034,6 +2034,76 @@ run("stopNowPolling()");
         run(`JSON.stringify(nowActionLog)`));
 }
 
+// ============================================================================
+// UD — undoRemoval must keep nowActionLog in step with nowActions, or a later
+// btn-undo-now pops a stale entry: file track A to a home, remove a
+// DIFFERENT track B from an input, undo that removal with the strip's own
+// button (nowActions and nowActionLog both drop the B entry), then press the
+// top btn-undo-now — it must clear A's filed badge (the one action still on
+// the log), not silently miss it or touch B again.
+// ============================================================================
+{
+  resetLog();
+  routes["GET /api/now?force=1"] = {
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri: "spotify:track:ud-a", name: "Song A", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: null, sitting: null, suggestions: [],
+      homes: [{ id: "H1", name: "Home", folder: "" }],
+      subsets: [], subset_targets: [], inputs: [],
+    },
+  };
+  routes["POST /api/act"] = { status: 200, body: {} };
+  routes["POST /api/undo"] = { status: 200, body: { restored_to: "IN1" } };
+  // show("now") is load-bearing: pollNow returns immediately on a hidden
+  // view-now, so a block inheriting a hidden view never renders at all.
+  run(`show("now"); filedUris = {}; nowActions = 0; removedUri = null;
+       nowActionLog = []; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+
+  // File track A to the home.
+  await run(`nowFile("H1")`);
+  await tick();
+  check("UD filing A logs a home entry",
+        run(`nowActionLog.length === 1 && nowActionLog[0].uri === "spotify:track:ud-a"`),
+        run(`JSON.stringify(nowActionLog)`));
+
+  // Playback moves on to a different track B, sitting in an input.
+  run(`nowState.track = { uri: "spotify:track:ud-b", name: "Song B",
+         duration_ms: 200000, artists: [{ name: "Artist" }], sortable: true, image: null };
+       nowState.context = { id: "IN1", name: "[In]", is_input: true };`);
+  await run(`nowRemove()`);
+  await tick();
+  check("UD removing B logs a second home-kind entry",
+        run(`nowActionLog.length === 2 && nowActionLog[1].uri === "spotify:track:ud-b"`),
+        run(`JSON.stringify(nowActionLog)`));
+
+  // The strip's own undo restores B — this must pop B's entry, not A's.
+  await run(`undoRemoval()`);
+  await tick();
+  check("UD undoRemoval keeps nowActionLog in step with nowActions",
+        run(`nowActionLog.length === 1 && nowActionLog[0].uri === "spotify:track:ud-a"`),
+        `log=${run(`JSON.stringify(nowActionLog)`)} actions=${run("nowActions")}`);
+  check("UD undoRemoval left B's own filed state cleared, A's untouched",
+        run(`filedUris["spotify:track:ud-b"] === undefined &&
+             filedUris["spotify:track:ud-a"] === "Home"`),
+        `filed=${run(`JSON.stringify(filedUris)`)}`);
+
+  // Now the top undo: only A's action remains on the log, so it must be the
+  // one that gets cleared — not a stale leftover from B.
+  await run(`$("btn-undo-now").onclick()`);
+  await tick();
+  check("UD btn-undo-now clears A's filed badge, not a stale leftover",
+        run(`filedUris["spotify:track:ud-a"] === undefined`),
+        `filed=${run(`JSON.stringify(filedUris)`)}`);
+  check("UD and the log is empty, matching nowActions",
+        run(`nowActionLog.length === 0`),
+        `log=${run(`JSON.stringify(nowActionLog)`)} actions=${run("nowActions")}`);
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
