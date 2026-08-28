@@ -1130,13 +1130,13 @@ function playbackStrip(d, tr) {
       <span class="np-time">${fmtTime(tr.duration_ms)}</span>
     </div>`;
   }
-  // Three slots, not a centred row: play/pause and Next stay dead centre
-  // whatever else is present, so the transport never shifts sideways when the
-  // context changes from an input to something else (same instinct as the
-  // Next-sizing fix). The right slot is reserved even when empty; Remove is
-  // the only thing that ever fills it, and it is deliberately NOT adjacent to
-  // Next — Next is pressed once per track, and a destructive control sharing
-  // that thumb path is a mis-tap waiting to happen.
+  // Three slots, not a centred row: Next holds the middle column alone so it
+  // sits on the card's centre line, and the flanking slots are reserved even
+  // when empty, so the transport never shifts sideways when the context
+  // changes from an input to something else (same instinct as the
+  // Next-sizing fix). The right slot is Remove's, and it is deliberately NOT
+  // adjacent to Next — Next is pressed once per track, and a destructive
+  // control sharing that thumb path is a mis-tap waiting to happen.
   // Once this track has been removed, the slot offers the way back instead —
   // the undo belongs where the hand already is, not in the top bar. It lasts
   // exactly as long as the track does (see renderNow's expiry).
@@ -1151,10 +1151,16 @@ function playbackStrip(d, tr) {
     ? `<button id="btn-now-remove" class="np-round np-wide np-danger"
                title="Remove from input (r)" aria-label="Remove from input">${ICON_REMOVE}</button>`
     : "";
+  // Next alone occupies the centre column, so it sits on the card's true
+  // centre line rather than being pushed off it by whatever shares its slot.
+  // Play/pause rides the left slot and Remove the right, both reserved even
+  // when empty — that is what keeps Next from sliding when the context
+  // changes.
   return `${bar}<div class="np-buttons">
-    <span class="np-slot"></span>
-    <span class="np-transport">
+    <span class="np-slot np-toggle-slot">
       <button id="btn-now-toggle" class="np-round np-small" title="${d.is_playing ? "Pause" : "Play"}">${d.is_playing ? ICON_PAUSE : ICON_PLAY}</button>
+    </span>
+    <span class="np-transport">
       <button id="btn-now-next" class="np-round np-big" title="Skip to the next track">${ICON_NEXT}</button>
     </span>
     <span class="np-slot np-remove-slot">${removeBtn}</span>

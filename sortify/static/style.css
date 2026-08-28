@@ -227,16 +227,19 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 }
 #np-fill { display: block; height: 100%; background: var(--accent); border-radius: 999px;
            transition: width 1s linear; }
-/* Three slots so the transport pair stays centred on the card whatever the
-   side slots hold: an input context adds Remove on the right, and without
-   the reserved slot play/pause and Next would slide sideways every time the
-   context changed. */
+/* Three slots so NEXT alone holds the centre column and therefore sits on
+   the card's true centre line — play/pause flanks it left, Remove right,
+   and both side slots stay reserved when empty so nothing slides sideways
+   when the context changes. */
 .np-buttons {
   display: grid; grid-template-columns: 1fr auto 1fr;
   align-items: center; margin-bottom: 1rem;
 }
-.np-transport { display: flex; align-items: center; justify-content: center; gap: .8rem; }
+.np-transport { display: flex; align-items: center; justify-content: center; }
 .np-slot { display: flex; align-items: center; min-height: 52px; }
+/* Play/pause hugs the centre column so it reads as part of the transport
+   rather than as a third thing adrift in the left margin. */
+.np-toggle-slot { justify-content: flex-end; padding-right: .8rem; }
 /* Pulled in from the edge: hard against the card wall it reads as chrome
    rather than as one of the card's controls. */
 .np-remove-slot { justify-content: flex-end; padding-right: .9rem; }
@@ -263,7 +266,7 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
    (64), on the grid's shared centre line — so it reads as part of the same
    row of controls instead of a detached badge. */
 .np-round.np-wide {
-  width: auto; min-width: 104px; height: 52px; border-radius: 999px;
+  width: auto; min-width: 88px; height: 52px; border-radius: 999px;
 }
 /* Outline, not filled: Remove is destructive, so it is red — but it is also
    the rarer, optional move, and a filled red disc beside Next reads as a
