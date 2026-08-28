@@ -1,32 +1,19 @@
-"""Subset playlists: {} selections that any song can join.
+"""Subset playlists: selections any song can join, and any song can leave.
 
 Spec: docs/superpowers/specs/2026-08-28-subset-playlists-design.md.
 Zero-Spotify-call throughout: fake transports and monkeypatched clients only.
+
+A subset was originally identified by a `{braced}` name. That requirement is
+gone: the chip that marks one only renders on rows the Playlists view draws
+(200 of ~990), so a name rule made most of the library unmarkable in
+practice. Marking is now the entire definition, which is why the tests below
+are about the opt-in list and never about names.
+
+Role exclusivity used to lean partly on that name rule — `{}` is also in
+`home_name_exclude_patterns`, so a subset could not accidentally be a home.
+It now rests entirely on `_effective_subset_ids` dropping ids that are inputs
+or homes, which `test_inputs_and_homes_win_over_a_subset_mark` pins.
 """
-
-from sortify.folders import home_name_excluded, is_subset_name
-
-SUBSET_PAT = r"^\{.*\}$"
-HOME_EXCLUDES = [r"^__.+__$", r"^\{.*\}$", r"^<.*>$"]
-
-
-def test_braced_names_are_subsets():
-    for name in ("{solfest}", "{ny jazz}", "{teh bomb}", "{}", "  {tøft}  "):
-        assert is_subset_name(name, SUBSET_PAT), name
-
-
-def test_other_shapes_are_not_subsets():
-    for name in ("[Hazy]", "<motor>", "__start__", "THROTTLE BACK PSY", "🐾 sub", ""):
-        assert not is_subset_name(name, SUBSET_PAT), name
-
-
-def test_a_subset_name_can_never_be_a_home():
-    """The binding invariant (spec §1): the two rules must not drift apart and
-    let one playlist be both a home and a subset."""
-    for name in ("{solfest}", "{}", "{ny jazz}"):
-        assert is_subset_name(name, SUBSET_PAT)
-        assert home_name_excluded(name, HOME_EXCLUDES, emoji=True), name
-
 
 from sortify import app as appmod
 
@@ -52,7 +39,6 @@ def _cfg(**over):
     base = {
         "input_ids": [], "home_ids": [], "subset_ids": [],
         "input_name_pattern": r"^\[.+\]$",
-        "subset_name_pattern": r"^\{.*\}$",
     }
     base.update(over)
     return base
@@ -69,8 +55,15 @@ def test_unmarked_braced_playlists_do_not_resolve():
     assert appmod._effective_subset_ids(_cfg(), SUBSET_LISTING) == set()
 
 
-def test_a_marked_playlist_that_is_not_braced_is_dropped():
-    assert appmod._effective_subset_ids(_cfg(subset_ids=["plain"]), SUBSET_LISTING) == set()
+def test_a_marked_playlist_resolves_whatever_it_is_called():
+    """The `{}` requirement is gone: marking IS the definition of a subset.
+
+    It was dropped because the chip that does the marking only renders on
+    rows the Playlists view actually draws (200 of ~990), so a name rule
+    made most of the library unmarkable in practice.
+    """
+    assert appmod._effective_subset_ids(
+        _cfg(subset_ids=["plain"]), SUBSET_LISTING) == {"plain"}
 
 
 def test_a_marked_playlist_we_cannot_edit_is_dropped():
@@ -175,16 +168,30 @@ def test_the_similar_artist_map_reaches_the_subset_scorer(wired, monkeypatch):
     assert seen["artist_map"] == {"ar1": ["ar2"]}
 
 
-def test_subset_targets_include_every_brace_playlist_not_just_opted_in(wired):
-    """Filing by hand must never be gated by a list curated for suggestions.
+def test_subset_targets_are_exactly_the_marked_subsets(wired):
+    """The picker offers what you marked — no more, no less.
 
-    Both s1 and s2 are {}-shaped and editable, so both are reachable even
-    though only the opted-in ones can suggest themselves.
+    It used to offer every `{}`-named playlist whether marked or not, because
+    the name convention gave "a subset" a meaning of its own. With the name
+    requirement gone, marking is the whole definition, so the picker's reach
+    and the opt-in list are the same set by construction. The alternative —
+    offering all ~990 owned playlists — would ship the library in every
+    /api/now poll to save a marking step.
+
+    `wired` marks s1 and s2 only.
     """
     ids = {t["id"] for t in appmod._subset_targets_payload(wired)}
     assert ids == {"s1", "s2"}
-    assert "plain" not in ids       # not {}-shaped
-    assert "notmine" not in ids     # {}-shaped but not ours to edit
+    assert "plain" not in ids       # editable, but never marked
+    assert "notmine" not in ids     # marked or not, not ours to edit
+
+
+def test_marking_an_unbraced_playlist_puts_it_in_the_picker(wired, monkeypatch):
+    """The regression the {} removal exists to prevent: a plainly-named
+    playlist the user marked must be reachable, not silently filtered."""
+    appmod.store.save_config(_cfg(subset_ids=["s1", "plain"], home_ids=["h1"]))
+    ids = {t["id"] for t in appmod._subset_targets_payload(wired)}
+    assert ids == {"s1", "plain"}
 
 
 from fastapi.testclient import TestClient
@@ -253,11 +260,16 @@ def test_act_allows_adding_to_a_subset_without_a_from_id(client, monkeypatch):
     assert res.status_code == 200
 
 
-def test_act_guard_covers_a_non_opted_in_subset_too(client, monkeypatch):
-    """I2: the guard used to key on _effective_subset_ids (opt-in only), so
-    ~69 of 70 {}-named playlists were unguarded — the picker in spec §5
-    reaches all of them, opted in or not. `s2` is {}-shaped but never
-    opted in (subset_ids only has s1), and must still be guarded."""
+def test_act_guard_covers_exactly_what_the_picker_offers(client, monkeypatch):
+    """The guard keys on the opt-in list, and so does the picker.
+
+    It used to key on the `{}` name, because back then the picker reached
+    every {}-named playlist and a marked-only guard would have missed most
+    of them. With the name requirement gone, being marked IS what makes a
+    playlist a subset — so `s2`, {}-shaped but never marked, is an ordinary
+    destination and a move into it is an ordinary move. The two reaches are
+    now the same set by construction and cannot drift apart.
+    """
     appmod.store.save_config(_cfg(subset_ids=["s1"]))
     _seed_listing(SUBSET_LISTING)
     spent = []
@@ -265,11 +277,16 @@ def test_act_guard_covers_a_non_opted_in_subset_too(client, monkeypatch):
                         lambda *a, **k: spent.append(a) or "snap")
     monkeypatch.setattr(appmod.sp, "remove_from_playlist",
                         lambda *a, **k: spent.append(a) or "snap")
-    res = client.post("/api/act", json={
+
+    marked = client.post("/api/act", json={
+        "action": "move", "uri": "spotify:track:z", "from_id": "inp", "to_id": "s1"})
+    assert marked.status_code == 400
+    assert "subset" in marked.json()["detail"].lower()
+    assert spent == []          # refused before anything was spent
+
+    unmarked = client.post("/api/act", json={
         "action": "move", "uri": "spotify:track:z", "from_id": "inp", "to_id": "s2"})
-    assert res.status_code == 400
-    assert "subset" in res.json()["detail"].lower()
-    assert spent == []
+    assert unmarked.status_code == 200
 
 
 def test_act_guard_skips_rather_than_fetches_with_no_cached_listing(client, monkeypatch):

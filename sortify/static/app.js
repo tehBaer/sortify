@@ -179,12 +179,12 @@ function splitDisabledReason(p) {
   return p.editable ? null : "Not yours to split — make your own copy in Spotify first, then split that copy";
 }
 
-// The server resolves subset eligibility against the live (possibly
-// user-configured) subset_name_pattern and emits it as `subset_eligible` —
-// this just reads that answer rather than re-testing a hardcoded regex
-// client-side, so the chip can never silently disagree with what a save
-// would actually do. A pure function, same reasoning as splitDisabledReason
-// above: unit-testable without the DOM (see ui_harness.mjs).
+// Whether a row may be marked as a subset is the server's answer, read from
+// `subset_eligible`, not re-derived here — so the chip can never disagree
+// with what a save would actually do. That mattered more when eligibility
+// was a name pattern; it still holds now that it is simply "do you own it",
+// because ownership is the server's fact too. A pure function, same
+// reasoning as splitDisabledReason above: unit-testable without the DOM.
 function subsetChipHidden(p) {
   return !p.subset_eligible;
 }
@@ -201,7 +201,7 @@ function makeListRow(p) {
   row.innerHTML = `${img}
     <div class="pl-meta"><div class="name">${esc(p.name)}</div><div class="sub">${esc(sub)}</div></div>
     <div class="pl-roles">
-      <button class="chip r-input">In</button>
+      <button class="chip r-input">Buffer</button>
       <button class="chip r-home">Home</button>
       <button class="chip r-subset">Subset</button>
       <button class="pl-sort" title="Sort this input">▶</button>
@@ -798,7 +798,13 @@ async function pollNow(force = false) {
     // poll's over so the input switcher doesn't flash "no inputs yet"
     // between phases. The suggest merge refreshes them (with this track's
     // own has_track flags) moments later.
-    nowState = { ...data, homes: new Map(), subsetTargets: new Map(),
+    // subsetTargets is carried across the light phase for the same reason
+    // inputs are: it answers "which playlists exist to file into", which
+    // changes when config or the listing changes — never per track. Rebuilt
+    // empty here, tapping Add to subset… during the light phase would open
+    // an empty picker.
+    nowState = { ...data, homes: new Map(),
+                 subsetTargets: nowState?.subsetTargets || new Map(),
                  suggestions: [], subsets: [],
                  inputs: data.inputs || nowState?.inputs || [] };
     // A genuinely new track re-arms the played-out refetch (declared below)

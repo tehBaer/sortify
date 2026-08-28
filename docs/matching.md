@@ -52,9 +52,14 @@ next suggestion after saving.
 
 ## Subsets
 
-A **subset** is a `{braced}` playlist — a non-exclusive selection any song
-can join, including songs that already have a home. Best-ofs, moods,
-project lists.
+A **subset** is a non-exclusive selection any song can join, including songs
+that already have a home. Best-ofs, moods, project lists.
+
+Any playlist you own can be one — you say so with the **Subset** chip on the
+Playlists view, and that marking is the whole definition. (Subsets used to
+have to be named `{like this}`. That requirement is gone: the chip only
+appears on rows the list actually draws, 200 of your ~990 playlists, so a
+name rule meant most of your library could never be marked at all.)
 
 Subsets are scored by the same three signals as homes, against the tracks
 already in them, with two differences: they never show sub-threshold
@@ -65,10 +70,11 @@ They appear only once the home question is settled — right after you file a
 track, or when it is already in a home. A track with no home is never
 offered a subset; the home decision comes first.
 
-**Opting in** (the Subset chip on the Playlists view) is what lets a subset
-propose itself, and costs one read of that playlist on the next profile
-rebuild. Every `{}` playlist stays reachable by hand through **Add to
-subset…**, opted in or not.
+**Marking** a subset is what lets it propose itself, and costs one read of
+that playlist (more for a long one) on the next profile rebuild — the Save
+button tells you the price first, and refuses a save that would spend too
+much at once. **Add to subset…** on the Now card reaches the subsets you
+have marked, which is the same set the suggestions come from.
 
 ## Where the data comes from
 

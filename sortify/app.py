@@ -32,7 +32,6 @@ from .folders import (
     creatable_home_name_problem,
     extract_folder_map,
     home_name_excluded,
-    is_subset_name,
     select_home_ids,
 )
 from .naming import split_output_name, violations as naming_violations
@@ -235,12 +234,6 @@ def playlists():
     # this was a purely local-disk cost the user was still paying constantly.
     splits = store.splits()["splits"]
     hints = cfg.get("home_hints") or {}
-    # `subset_name_pattern` is configurable server-side; the client used to
-    # test its own hardcoded `/^\{.*\}$/`, which could silently disagree with
-    # this. Emitting the eligibility check here makes the client's chip
-    # gate observe the same live pattern this endpoint's own role resolution
-    # (and `_effective_subset_ids`) already uses.
-    subset_pattern = cfg.get("subset_name_pattern") or DEFAULT_SUBSET_PATTERN
     for p in out:
         p["folder"] = (folders.get(p["id"]) or {}).get("path")
         p["role"] = (
@@ -249,8 +242,11 @@ def playlists():
             else "subset" if p["id"] in subsets
             else None
         )
-        p["subset_eligible"] = bool(p.get("editable")) and is_subset_name(
-            p.get("name") or "", subset_pattern)
+        # Any playlist you own can be marked a subset. This used to also
+        # require a `{}` name; that made most of a 990-playlist library
+        # unmarkable in a view that renders 200 rows, since the chip only
+        # appears on rows you can actually see.
+        p["subset_eligible"] = bool(p.get("editable"))
         p["input_set"] = (
             inputsets.set_of(p["name"], p.get("folder"), _sets) or inputsets.DEFAULT_KEY
         ) if p["role"] == "input" else None
@@ -524,8 +520,6 @@ def _effective_input_ids(cfg: dict, playlists: list[dict]) -> set[str]:
 # The convention, when config does not say otherwise. Subsets are `{like
 # this}` — a shape `home_name_exclude_patterns` already refuses, so a subset
 # can never also be a home (pinned by tests/test_subsets.py).
-DEFAULT_SUBSET_PATTERN = r"^\{.*\}$"
-
 # Opting a subset in is a chip tap, not a bounded action like Home marking —
 # so unlike homes (guarded structurally by the ">40 candidates" check below),
 # nothing stops a user from ticking all 70 {} playlists and saving at once.
@@ -561,29 +555,30 @@ def _subset_cold_cost(ids: set[str]) -> tuple[int, int]:
 
 
 def _effective_subset_ids(cfg: dict, playlists: list[dict]) -> set[str]:
-    """Subsets that may suggest themselves.
+    """The subsets: the playlists the user marked as one.
 
-    Opt-in, unlike inputs: only ids the user marked count, and marking is
-    what earns a profile (and so the read that builds it). Every other {}
-    playlist stays filable by hand through the picker — see the spec's
-    "opting in gates suggestion, not reach".
+    Opt-in, unlike inputs, and marking is the WHOLE definition — there is no
+    name convention any more. `{}` originally gated which playlists could be
+    marked, but that made most of a 990-playlist library unmarkable in a view
+    that renders 200 rows, so the requirement was dropped: any playlist you
+    own can be a subset if you say it is.
 
-    A mark is dropped when the playlist is gone, not ours to edit, no longer
-    {}-shaped, or has since become an input or a home. Those last two make
-    the role exclusive in the one direction that matters: a stale
-    `subset_ids` entry can never quietly turn a home into something else.
+    A mark is dropped when the playlist is gone, not ours to edit, or has
+    since become an input or a home. That last rule is now the only thing
+    keeping the roles exclusive — the name rule used to help, since `{}` is
+    also in `home_name_exclude_patterns` — so it carries more weight than it
+    did: a stale `subset_ids` entry must never quietly turn a home into
+    something else.
     """
     marked = set(cfg.get("subset_ids") or [])
     if not marked:
         return set()
-    pattern = cfg.get("subset_name_pattern") or DEFAULT_SUBSET_PATTERN
     taken = _effective_input_ids(cfg, playlists) | set(cfg.get("home_ids") or [])
     return {
         p["id"] for p in playlists
         if p["id"] in marked
         and p["id"] not in taken
         and p.get("editable")
-        and is_subset_name(p.get("name") or "", pattern)
     }
 
 
@@ -784,19 +779,21 @@ def _subset_matches(state: dict, track: dict, tag_artists: dict,
 
 
 def _subset_targets_payload(state: dict) -> list[dict]:
-    """Every editable {}-named playlist, opted in or not — the picker's list.
+    """The marked subsets — the Add-to-subset picker's list.
 
-    Opting in gates whether a subset SUGGESTS itself; filing by hand reaches
-    all of them, so this reads the listing rather than the opt-in set.
+    This used to be every `{}`-named playlist, opted in or not, because the
+    name convention gave "a subset" a meaning independent of the opt-in list.
+    With the name requirement gone, marking IS the definition, so the picker
+    reaches exactly what the user marked. The alternative — offering all ~990
+    owned playlists — would ship the whole library in every /api/now poll to
+    save a marking step.
     """
-    cfg = store.config()
-    pattern = cfg.get("subset_name_pattern") or DEFAULT_SUBSET_PATTERN
+    ids = _effective_subset_ids(store.config(), state.get("playlists", []))
     folders = store.folders()
     return [
         {"id": p["id"], "name": p["name"], "total": p.get("total"),
          "folder": (folders.get(p["id"]) or {}).get("path")}
-        for p in state.get("playlists", [])
-        if p.get("editable") and is_subset_name(p.get("name") or "", pattern)
+        for p in state.get("playlists", []) if p["id"] in ids
     ]
 
 
@@ -3900,9 +3897,12 @@ def act(body: ActIn):
     # rule belongs here, where every caller passes, rather than in whichever
     # button happens to be current.
     #
-    # Keyed on the destination's NAME, not `_effective_subset_ids` — the
-    # picker in §5 reaches every {}-named playlist, opted in or not, and the
-    # guard has to cover the same reach or ~69 of 70 subsets go unguarded.
+    # Keyed on the OPT-IN LIST. It used to key on the destination's `{}` name,
+    # because back then the picker reached every {}-named playlist and a
+    # name-blind guard would have missed most of them. With the name
+    # requirement gone, being marked is the entire definition of a subset —
+    # so the marked set is both what the picker offers and what the guard
+    # must cover, and the two can no longer drift apart.
     #
     # Reads the cached listing directly rather than `sp.my_playlists()`,
     # which fetches (~21 paginated calls, ~60s stall) when
@@ -3912,11 +3912,8 @@ def act(body: ActIn):
     # costs nothing only with a warm cache; degrades to no-guard, not a
     # fetch, when cold.
     if body.to_id and body.from_id:
-        cfg = store.config()
         listing = (store.cache().get("playlist_list") or {}).get("items") or []
-        name_by_id = {p["id"]: p.get("name") or "" for p in listing}
-        pattern = cfg.get("subset_name_pattern") or DEFAULT_SUBSET_PATTERN
-        if body.to_id in name_by_id and is_subset_name(name_by_id[body.to_id], pattern):
+        if body.to_id in _effective_subset_ids(store.config(), listing):
             raise HTTPException(
                 400,
                 "that destination is a subset — adding to a subset must not "

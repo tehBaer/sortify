@@ -96,11 +96,16 @@ escalating penalties. Therefore:
   segments, emoji-prefixed names (🐾/🧸 derived super/subsets), and
   `__x__`/`{x}`/`<x>` marker names. NEUE was excluded 2026-08-24: they are
   staging buckets for new finds, not filing destinations.
-- **Subsets** are `{braced}` playlists (`subset_name_pattern`): non-exclusive
-  selections, never a filing home, never an input. `subset_ids` is the
-  opt-in list of those allowed to suggest themselves — marking one costs a
-  read of it; the picker reaches all of them regardless. `suggest.py` is
-  shared with homes and was not modified for them.
+- **Subsets** are non-exclusive selections: never a filing home, never an
+  input, and a song in one still needs its home. `subset_ids` is the whole
+  definition — **any playlist you own can be marked one**; there is no name
+  convention. (There was, `{braced}`, until 2026-08-28: the chip that marks a
+  subset only renders on rows the Playlists view draws, 200 of ~990, so a
+  name rule left most of the library unmarkable. Don't reinstate it.)
+  Marking costs `ceil(total/100)` calls to warm, capped per save by
+  `SUBSET_WARM_BUDGET`; the picker and the `/api/act` guard both key on the
+  marked set, so their reach cannot drift apart. `suggest.py` is shared with
+  homes and was not modified for subsets.
 - The client speaks the Feb-2026 dev-mode API (`items`/`item`, `/me/library`)
   — do not "fix" it back to pre-2026 shapes. Batch ADD exists: up to 100 uris
   per playlist-items POST (probed 2026-08-23; 150 → 400). There is still no

@@ -31,21 +31,6 @@ def home_name_excluded(name: str, patterns: list[str], emoji: bool) -> bool:
     return any(re.fullmatch(p, s) for p in patterns)
 
 
-def is_subset_name(name: str, pattern: str) -> bool:
-    """True for a subset playlist name — `{like this}` by default.
-
-    A subset is a non-exclusive selection: any song can be in one, including
-    songs that already have a home. The pattern lives in config so the
-    convention can move without a code change, exactly like
-    `input_name_pattern`.
-
-    Every name this accepts must also be rejected by `home_name_excluded`,
-    or a playlist could be both a home and a subset — see the invariant test
-    in tests/test_subsets.py.
-    """
-    return bool(re.fullmatch(pattern, name.strip()))
-
-
 def creatable_home_name_problem(
     name: str, input_pattern: str | None, exclude_patterns: list[str], exclude_emoji: bool
 ) -> str | None:

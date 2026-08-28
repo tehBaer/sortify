@@ -4,6 +4,21 @@ Design, 2026-08-28. Approved in the 2026-08-28 session. Every decision below
 was explicitly approved by the user; this document records them, it does not
 reopen them.
 
+> **Amended 2026-08-28, after first use.** The `{}` name requirement in §1 is
+> **gone**, and with it `subset_name_pattern`, `is_subset_name`, and the
+> drift invariant in §1/§Tests. Any playlist the user owns can be marked a
+> subset; marking is the entire definition. The reason is a discoverability
+> failure this design did not anticipate: the Subset chip renders only on
+> rows the Playlists view draws — 200 of ~990 — so a name rule left the
+> large majority of the library unmarkable, and the user could not find a
+> way to add a subset at all. Two consequences follow. §5's picker now
+> reaches the **marked** subsets rather than every `{}` playlist (offering
+> all ~990 would ship the library in every `/api/now` poll), and §6's
+> `/api/act` guard keys on the marked set for the same reason — the two
+> reaches are now one set by construction. Role exclusivity, which §1 partly
+> rested on the name rule for, now rests entirely on `_effective_subset_ids`
+> dropping inputs and homes. Everything else below stands as written.
+
 Supersedes the deferred-subset appendix of
 `2026-08-21-create-home-playlists-design.md`, which surveyed the idea and
 recorded the measurements. Two decisions from that appendix are **reversed
