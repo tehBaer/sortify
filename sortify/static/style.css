@@ -278,7 +278,9 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 }
 .np-bar {
   flex: 1; display: block; height: 4px; border-radius: 999px;
-  background: color-mix(in srgb, var(--fg) 12%, transparent); overflow: hidden;
+  background: color-mix(in srgb, var(--fg) 12%, transparent);
+  /* No overflow:hidden — the fill rounds itself, and the last-update marker
+     deliberately pokes past the track's 4px so it reads as a tick. */
   position: relative;   /* anchors the last-update marker */
 }
 #np-fill { display: block; height: 100%; background: var(--accent); border-radius: 999px;
@@ -290,8 +292,8 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
    blurred but the bar is not: this stays the proof the app actually knows
    what's playing. */
 #np-fill-mark {
-  position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px;
-  background: #e0b62f;
+  position: absolute; top: -2px; bottom: -2px; width: 3px; margin-left: -1.5px;
+  background: #f2c027; border-radius: 2px;
 }
 /* The quiet controls (previous, play/pause) ride the progress line as small
    ghost discs — they are rare moves and must not compete with the verb row
