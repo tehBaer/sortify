@@ -1246,12 +1246,19 @@ function playbackStrip(d, tr) {
       ${pauseBtn}
     </div>`
     : `<div class="np-progress np-progress-bare">${prevBtn}${pauseBtn}</div>`;
-  // Once this track has been removed, the slot offers the way back instead —
-  // the undo belongs where the hand already is, not in the top bar. It lasts
-  // exactly as long as the track does (see renderNow's expiry).
-  const removeBtn = removedUri && removedUri === tr.uri
+  // Once this track has been removed — or filed, or captured, or added to a
+  // subset: any action of its own sitting on top of the undo stack — the
+  // slot offers the way back instead. The undo belongs where the hand
+  // already is, not in the top bar, and it lasts exactly as long as the
+  // track does (the log's top entry stops matching the moment the next
+  // track starts; removedUri has its own expiry in renderNow). Sittings are
+  // excluded: their decisions have no /api/undo.
+  const lastAct = nowActionLog[nowActionLog.length - 1];
+  const undoable = (removedUri && removedUri === tr.uri) ||
+    (!d.sitting && lastAct && lastAct.uri === tr.uri);
+  const removeBtn = undoable
     ? `<button id="btn-now-undo-remove" class="np-round np-wide np-undo"
-               title="Undo the removal (u)" aria-label="Undo the removal">${ICON_UNDO}<span class="np-verb-label">Undo</span></button>`
+               title="Undo the last action for this track (u)" aria-label="Undo the last action for this track">${ICON_UNDO}<span class="np-verb-label">Undo</span></button>`
     : d.context?.is_input
     ? `<button id="btn-now-remove" class="np-round np-wide np-danger"
                title="Remove from input (r)" aria-label="Remove from input">${ICON_REMOVE}<span class="np-verb-label">Remove</span></button>`
@@ -1387,7 +1394,7 @@ function renderNow() {
   const rem = $("btn-now-remove");
   if (rem) rem.onclick = nowRemove;
   const undoRem = $("btn-now-undo-remove");
-  if (undoRem) undoRem.onclick = undoRemoval;
+  if (undoRem) undoRem.onclick = undoStripAction;
   const sh = $("btn-share");
   if (sh) sh.onclick = openSharePop;
   startNowTicker(d, tr);
@@ -1614,7 +1621,7 @@ async function undoRemoval() {
   } catch (e) { toast(e.message); }
 }
 
-$("btn-undo-now").onclick = async () => {
+async function undoLastNowAction() {
   if (!nowActions) return;
   try {
     const res = await api("/api/undo", {});
@@ -1628,7 +1635,17 @@ $("btn-undo-now").onclick = async () => {
     toast(res.restored_to ? "undone — restored to input" : "undone");
     renderNow();
   } catch (e) { toast(e.message); }
-};
+}
+$("btn-undo-now").onclick = undoLastNowAction;
+
+// The strip's undo dispatch: a removal has its own targeted path (it knows
+// the uri it restores); anything else — a filing, a capture, a subset add —
+// is the generic pop of the stack's top entry, which the button only renders
+// for when that entry belongs to the playing track.
+async function undoStripAction() {
+  if (removedUri && nowState?.track?.uri === removedUri) return undoRemoval();
+  return undoLastNowAction();
+}
 
 // ---- blind mode ------------------------------------------------------------
 //
@@ -3317,6 +3334,13 @@ document.addEventListener("keydown", (e) => {
       } else if (e.key === "m" && nowState.track.sortable) openPicker(nowState.homes, decideKeep);
       else if (e.key === "r") decideReject();
       return;
+    }
+    // Before the filed-guard below: once this track is filed or removed the
+    // strip shows its Undo, and `u` must reach it — the guard used to eat
+    // the key first, so the "(u)" the button advertised never worked.
+    if (e.key === "u") {
+      const b = $("btn-now-undo-remove");
+      if (b) { b.click(); return; }
     }
     if (filedUris[nowState.track.uri]) return;
     if (["1", "2", "3"].includes(e.key)) {

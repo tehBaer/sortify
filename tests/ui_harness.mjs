@@ -2046,6 +2046,25 @@ run("stopNowPolling()");
         `undo=${has('id="btn-now-undo-remove"')} removedUri=${run("removedUri")}`);
   check("RU and the next track gets its own Remove",
         has('id="btn-now-remove"'), `remove=${has('id="btn-now-remove"')}`);
+
+  // Filing is as undoable as removing: while this track's decision is the
+  // top of the undo stack, the same slot offers the way back.
+  await run(`nowFile("H1")`);
+  await tick();
+  check("RU filing swaps Remove for Undo too",
+        has('id="btn-now-undo-remove"') && !has('id="btn-now-remove"'),
+        `undo=${has('id="btn-now-undo-remove"')} remove=${has('id="btn-now-remove"')}`);
+  const undoPosts = posts("/api/undo");
+  const wiredFiled = run(`typeof $("btn-now-undo-remove").onclick === "function"`);
+  check("RU the filed Undo is wired", wiredFiled, "");
+  if (wiredFiled) { await run(`$("btn-now-undo-remove").onclick()`); await tick(); }
+  check("RU undoing the filing spends one undo and restores Remove",
+        posts("/api/undo") === undoPosts + 1 &&
+        has('id="btn-now-remove"') && !has('id="btn-now-undo-remove"'),
+        `posts=${posts("/api/undo")} remove=${has('id="btn-now-remove"')}`);
+  check("RU and the filed badge is cleared",
+        run(`filedUris["spotify:track:ru2"] === undefined`),
+        run(`JSON.stringify(filedUris)`));
 }
 
 // ============================================================================

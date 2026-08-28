@@ -303,12 +303,12 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
    ghost discs — they are rare moves and must not compete with the verb row
    below. flex:none so a long bar can't crush them. */
 .np-mini {
-  width: 34px; height: 34px; min-height: 0; padding: 0; border-radius: 50%;
+  width: 40px; height: 40px; min-height: 0; padding: 0; border-radius: 50%;
   flex: none; display: inline-flex; align-items: center; justify-content: center;
   background: transparent; color: var(--muted); border: 1px solid var(--border);
 }
 .np-mini:hover { border-color: var(--muted); color: var(--fg); }
-.np-mini svg { display: block; width: 15px; height: 15px; }
+.np-mini svg { display: block; width: 18px; height: 18px; }
 /* No duration (local file / episode): no bar between them, but the quiet
    controls hold their ends of the line. */
 .np-progress-bare { justify-content: space-between; min-height: 34px; }
