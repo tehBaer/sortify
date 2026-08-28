@@ -10,6 +10,7 @@ import copy
 import json
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -32,19 +33,82 @@ def _atomic_write(path: Path, payload: Any) -> None:
 
 
 class Store:
+    # Parsed-JSON read cache, ONLY for the big read-mostly files: tags.json
+    # (1.9MB/~30ms), lastfm_tracks.json (5.8MB/~110ms), lastfm_artists.json
+    # (2.8MB/~40ms). /api/now/suggest re-reads all three per request by
+    # design (guard-on-read freshness), which was ~180ms of parsing per
+    # suggestion for files that almost never change. Keyed on the file's
+    # (inode, mtime_ns, size), so freshness still comes from the filesystem,
+    # not a TTL: any writer — this process, a sibling Store instance, a
+    # backfill script, a hand edit — lands a new stat identity and the next
+    # read reparses. Atomic writes replace the inode every save, so even a
+    # same-nanosecond overwrite cannot be mistaken for the cached version.
+    #
+    # The sharing contract this creates: callers of the cached readers get
+    # THE SAME parsed object until the file changes, so they must never
+    # mutate it. The in-process writers already honour this (_merge_save_*
+    # in app.py build new dicts, tags.enrich copies its `cached` argument,
+    # suggest/split only build local structures) — audited 2026-08-28.
+    #
+    # Deliberately NOT cached:
+    # - cache.json: its writers (_cache_move, _apply_snapshot, the spotify
+    #   client's listing updates) mutate the parsed object in place before
+    #   saving, so a shared object would let one request thread mutate what
+    #   another is iterating.
+    # - usage.json and everything the budget ledger touches: the Spotify
+    #   budget must never act on a stale read (CLAUDE.md), and the files are
+    #   tiny anyway.
+    # - config/queue/pacing/splits/…: sub-millisecond parses; caching buys
+    #   nothing and widens the mutate-nothing contract for free.
+    CACHED_READS = frozenset({"tags.json", "lastfm_tracks.json", "lastfm_artists.json"})
+
     def __init__(self, data_dir: Path | str | None = None):
         self.dir = Path(data_dir or os.environ.get("SORTIFY_DATA_DIR") or DEFAULT_DATA_DIR)
         self.dir.mkdir(parents=True, exist_ok=True)
+        # name -> ((st_ino, st_mtime_ns, st_size), parsed). Per instance, not
+        # per class: a fresh Store must never serve another data dir's parse.
+        self._read_cache: dict[str, tuple[tuple[int, int, int], Any]] = {}
+        self._read_cache_lock = threading.Lock()
 
     def _load(self, name: str, default: Any) -> Any:
         path = self.dir / name
-        if not path.exists():
+        if name not in self.CACHED_READS:
+            if not path.exists():
+                return default
+            with open(path) as f:
+                return json.load(f)
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            # The default is NEVER cached: callers may fill the dict they
+            # got and save it, and a shared default would leak that fill
+            # into another caller's "empty" read.
+            with self._read_cache_lock:
+                self._read_cache.pop(name, None)
             return default
+        key = (st.st_ino, st.st_mtime_ns, st.st_size)
+        with self._read_cache_lock:
+            hit = self._read_cache.get(name)
+            if hit and hit[0] == key:
+                return hit[1]
+        # Parse outside the lock — a 100ms parse must not stall every other
+        # cached read. A racing replace between stat and open just files the
+        # newer content under the older key; the next read's stat mismatches
+        # and reparses, which fails toward freshness. A JSON error propagates
+        # (same as before the cache) and caches nothing.
         with open(path) as f:
-            return json.load(f)
+            parsed = json.load(f)
+        with self._read_cache_lock:
+            self._read_cache[name] = (key, parsed)
+        return parsed
 
     def _save(self, name: str, payload: Any) -> None:
         _atomic_write(self.dir / name, payload)
+        # Drop, don't update: caching `payload` would share an object the
+        # caller may keep mutating after the save. The next read reparses
+        # once — writes to these files are rare by definition.
+        with self._read_cache_lock:
+            self._read_cache.pop(name, None)
 
     # config.json: client_id + which playlists play which role
     def config(self) -> dict:
