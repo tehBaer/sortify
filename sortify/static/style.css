@@ -261,8 +261,12 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 .track-card .t-name { font-size: 1.3rem; font-weight: 700; letter-spacing: -.01em; margin: .8rem 0 .15rem; }
 .track-card .t-artist { color: var(--muted); font-size: .95rem; margin-bottom: .9rem; }
 /* Share rides the card's corner — a once-in-a-while control living in the
-   strip of whitespace beside the art. */
-.np-share { position: absolute; top: .55rem; right: .55rem; color: var(--muted); }
+   strip of whitespace beside the art. Bare glyph, same as the hamburger:
+   an outlined circle up there competed with the real controls. */
+.np-share {
+  position: absolute; top: .55rem; right: .55rem; color: var(--muted);
+  background: none; border: 0;
+}
 /* Hidden by request, not deleted: renderNow and the undo stack still drive
    btn-undo-now (the strip's own undo covers removals; keyboard u remains),
    and the auto/manual chip keeps its logic for if it ever comes back. */
