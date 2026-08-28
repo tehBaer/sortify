@@ -795,8 +795,12 @@ async function pollNow(force = false) {
     // /api/now/suggest and is merged in when it lands.
     const data = await api("/api/now?light=1" + (force ? "&force=1" : ""));
     // When the server's answer left its upstream fetch (it may have served
-    // its cache) — the anchor for the "updated Ns ago" line.
+    // its cache) — the anchor for the bar's last-update marker: the track
+    // position Spotify actually confirmed, as opposed to where the local
+    // ticker has extrapolated to since.
     nowFetchedAt = Date.now() - (data.fetched_ago_ms || 0);
+    nowFetchedProgress = data.track?.uri
+      ? { uri: data.track.uri, ms: data.progress_ms || 0 } : null;
     // The light payload has no inputs while playing; carry the previous
     // poll's over so the input switcher doesn't flash "no inputs yet"
     // between phases. The suggest merge refreshes them (with this track's
@@ -1209,26 +1213,15 @@ function refetchAtPlayedOut(uri) {
   pollNow();
 }
 
-// "updated Ns ago": how old the answer on screen is — the server's cache can
+// Freshness lives in the bar: a thin yellow marker inside the green fill at
+// the track position Spotify last confirmed. The fill running ahead of it is
+// the local ticker's extrapolation, so the gap between marker and fill tip
+// IS the age — visible at a glance, no number. The server's cache can
 // legitimately serve for a track's whole runtime, and in blind mode the card
-// itself is blurred, so this line is the one visible proof the app actually
-// knows what's playing. Local tick between polls, zero requests.
-let nowAgeTimer = null;
-let nowFetchedAt = null;  // Date.now()-anchored time of the upstream fetch
-
-function paintNowAge() {
-  const el = $("np-updated");
-  if (!el || nowFetchedAt == null) return;
-  // Just the age, no "updated"/"ago" dressing: it sits beside the refresh
-  // button in the top bar, and that neighbourhood is the context.
-  el.textContent = fmtCountdown(Date.now() - nowFetchedAt);
-}
-
-function startAgeTicker() {
-  clearInterval(nowAgeTimer);
-  paintNowAge();
-  nowAgeTimer = setInterval(paintNowAge, 1000);
-}
+// itself is blurred, so the marker is the one visible proof the app actually
+// knows what's playing. Zero requests.
+let nowFetchedAt = null;       // Date.now()-anchored time of the upstream fetch
+let nowFetchedProgress = null; // {uri, ms}: the progress that fetch confirmed
 
 const ICON_PLAY = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>';
 const ICON_PAUSE = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M7 5h3.6v14H7zM13.4 5H17v14h-3.6z"/></svg>';
@@ -1252,11 +1245,19 @@ function playbackStrip(d, tr) {
         title="Back to the previous track" aria-label="Back to the previous track">${ICON_PREV}</button>`;
   const pauseBtn = `<button id="btn-now-toggle" class="np-mini"
         title="${d.is_playing ? "Pause" : "Play"}" aria-label="${d.is_playing ? "Pause" : "Play"}">${d.is_playing ? ICON_PAUSE : ICON_PLAY}</button>`;
+  // The last-update marker: pinned where the server's answer put the track,
+  // regardless of what a local re-render (pause toggle, filing) has done to
+  // d.progress_ms since. Only rendered for the track it was measured on.
+  const markPct = nowFetchedProgress && nowFetchedProgress.uri === tr.uri && tr.duration_ms
+    ? Math.min(100, (nowFetchedProgress.ms / tr.duration_ms) * 100).toFixed(2)
+    : null;
   const bar = tr.duration_ms
     ? `<div class="np-progress">
       ${prevBtn}
       <span id="np-elapsed" class="np-time">${fmtTime(d.progress_ms || 0)}</span>
-      <span class="np-bar"><span id="np-fill" style="width:${Math.min(100, ((d.progress_ms || 0) / tr.duration_ms) * 100).toFixed(2)}%"></span></span>
+      <span class="np-bar"><span id="np-fill" style="width:${Math.min(100, ((d.progress_ms || 0) / tr.duration_ms) * 100).toFixed(2)}%"></span>${
+        markPct !== null ? `<span id="np-fill-mark" style="left:${markPct}%"></span>` : ""
+      }</span>
       <span class="np-time">${fmtTime(tr.duration_ms)}</span>
       ${pauseBtn}
     </div>`
@@ -1358,7 +1359,6 @@ function renderNow() {
           ? "Start one of your inputs above, or put something on in Spotify."
           : "Put something on in Spotify and it shows up here."}</p>
       </div>`;
-    startAgeTicker();
     return;
   }
 
@@ -1407,7 +1407,6 @@ function renderNow() {
   const sh = $("btn-share");
   if (sh) sh.onclick = openSharePop;
   startNowTicker(d, tr);
-  startAgeTicker();
 
   if (inSitting) {
     wireSittingCard();

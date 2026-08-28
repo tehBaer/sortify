@@ -260,16 +260,6 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 }
 .track-card .t-name { font-size: 1.3rem; font-weight: 700; letter-spacing: -.01em; margin: .8rem 0 .15rem; }
 .track-card .t-artist { color: var(--muted); font-size: .95rem; margin-bottom: .9rem; }
-/* The freshness age ("12s", no dressing) — a static header element now,
-   sitting against the refresh button whose meaning it completes. Outside
-   the blind-mode blur by nature: it names no track, and it's the proof the
-   card reflects what's actually playing. */
-.np-updated {
-  color: var(--muted); font-size: .72rem; font-variant-numeric: tabular-nums;
-  /* Width reserved even while empty (pre-fetch): the age appearing must not
-     nudge the row — same rule as the switcher's fixed width. */
-  min-width: 2.4rem; text-align: right; margin-right: -.2rem;
-}
 /* Share rides the card's corner — a once-in-a-while control living in the
    strip of whitespace beside the art. */
 .np-share { position: absolute; top: .55rem; right: .55rem; color: var(--muted); }
@@ -289,9 +279,20 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 .np-bar {
   flex: 1; display: block; height: 4px; border-radius: 999px;
   background: color-mix(in srgb, var(--fg) 12%, transparent); overflow: hidden;
+  position: relative;   /* anchors the last-update marker */
 }
 #np-fill { display: block; height: 100%; background: var(--accent); border-radius: 999px;
            transition: width 1s linear; }
+/* The freshness signal: a thin yellow line inside the green at the position
+   Spotify last confirmed. The green running ahead of it is the local ticker
+   extrapolating, so marker-to-tip distance is how old the answer is — and a
+   fresh poll snaps the marker forward to the tip. In blind mode the card is
+   blurred but the bar is not: this stays the proof the app actually knows
+   what's playing. */
+#np-fill-mark {
+  position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px;
+  background: #e0b62f;
+}
 /* The quiet controls (previous, play/pause) ride the progress line as small
    ghost discs — they are rare moves and must not compete with the verb row
    below. flex:none so a long bar can't crush them. */

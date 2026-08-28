@@ -1933,9 +1933,16 @@ run("stopNowPolling()");
         at('id="btn-now-remove"') < at('np-next-slot'),
         `buttons@${at('np-buttons')} remove@${at('id="btn-now-remove"')} ` +
         `next-slot@${at('np-next-slot')}`);
-  // The freshness timer lives in the top bar now, not on the card.
+  // The freshness signal is the bar itself now: a thin yellow marker sits
+  // inside the green fill at the position the server last confirmed, and the
+  // fill running ahead of it is local extrapolation — the gap IS the age.
+  // No numeric timer anywhere — not on the card, not in the top bar.
   check("RB the card does not carry the np-updated line",
         at('np-updated') === -1, `updated@${at('np-updated')}`);
+  check("RB the bar carries the last-update marker inside the fill",
+        at('id="np-fill"') !== -1 && at('id="np-fill-mark"') !== -1 &&
+        at('id="np-fill"') < at('id="np-fill-mark"'),
+        `fill@${at('id="np-fill"')} mark@${at('id="np-fill-mark"')}`);
   // The verb row is a centred pair: Remove left of Next, each in its own
   // slot with the deliberate gap between them, so the two most-pressed
   // buttons read as equals.
