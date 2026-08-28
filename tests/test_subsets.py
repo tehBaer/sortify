@@ -185,3 +185,55 @@ def test_subset_targets_include_every_brace_playlist_not_just_opted_in(wired):
     assert ids == {"s1", "s2"}
     assert "plain" not in ids       # not {}-shaped
     assert "notmine" not in ids     # {}-shaped but not ours to edit
+
+
+from fastapi.testclient import TestClient
+
+
+@pytest.fixture
+def client():
+    return TestClient(appmod.app, raise_server_exceptions=False)
+
+
+def test_config_persists_subset_ids(client, monkeypatch):
+    appmod.store.save_config(_cfg())
+    monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: SUBSET_LISTING)
+    res = client.post("/api/config", json={
+        "input_ids": [], "home_ids": [], "home_hints": {}, "subset_ids": ["s1"]})
+    assert res.status_code == 200
+    assert appmod.store.config()["subset_ids"] == ["s1"]
+
+
+def test_playlists_listing_reports_the_subset_role(client, monkeypatch):
+    appmod.store.save_config(_cfg(subset_ids=["s1"]))
+    monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: SUBSET_LISTING)
+    monkeypatch.setattr(appmod, "_split_summary", lambda pid, splits: None)
+    rows = {p["id"]: p for p in client.get("/api/playlists").json()["playlists"]}
+    assert rows["s1"]["role"] == "subset"
+    assert rows["s2"]["role"] is None      # {}-shaped but not opted in
+
+
+def test_act_refuses_to_remove_from_an_input_when_filing_into_a_subset(client, monkeypatch):
+    """A song put into a best-of has not been sorted — it must not leave the
+    input it came from (spec §6). Structural, not a property of one caller."""
+    appmod.store.save_config(_cfg(subset_ids=["s1"]))
+    monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: SUBSET_LISTING)
+    spent = []
+    monkeypatch.setattr(appmod.sp, "add_to_playlist",
+                        lambda *a, **k: spent.append(a) or "snap")
+    monkeypatch.setattr(appmod.sp, "remove_from_playlist",
+                        lambda *a, **k: spent.append(a) or "snap")
+    res = client.post("/api/act", json={
+        "action": "move", "uri": "spotify:track:z", "from_id": "inp", "to_id": "s1"})
+    assert res.status_code == 400
+    assert "subset" in res.json()["detail"].lower()
+    assert spent == []          # refused before anything was spent
+
+
+def test_act_allows_adding_to_a_subset_without_a_from_id(client, monkeypatch):
+    appmod.store.save_config(_cfg(subset_ids=["s1"]))
+    monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: SUBSET_LISTING)
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", lambda *a, **k: "snap")
+    res = client.post("/api/act", json={
+        "action": "move", "uri": "spotify:track:z", "from_id": None, "to_id": "s1"})
+    assert res.status_code == 200

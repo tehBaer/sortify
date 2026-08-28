@@ -81,6 +81,9 @@ class ConfigIn(BaseModel):
     # {playlist_id: "ambient, piano"} — the user's own matching hints per
     # home, free text split on commas at profile-build time.
     home_hints: dict[str, str] = {}
+    # Subsets that may suggest themselves. Opt-in: marking one is what earns
+    # it a profile, and so the read that builds it.
+    subset_ids: list[str] = []
 
 
 class CreatePlaylistIn(BaseModel):
@@ -220,6 +223,7 @@ def playlists():
              "total": None, "image": None}
     out = [liked] + items
     inputs = _effective_input_ids(cfg, items)
+    subsets = _effective_subset_ids(cfg, items)
     _sets = inputsets.resolve_sets(cfg)
     # One disk read + JSON parse for the whole listing, not one per playlist.
     # Against a real ~1000-playlist account with a splits.json that has grown
@@ -235,6 +239,7 @@ def playlists():
         p["role"] = (
             "input" if p["id"] in inputs
             else "home" if p["id"] in cfg.get("home_ids", [])
+            else "subset" if p["id"] in subsets
             else None
         )
         p["input_set"] = (
@@ -392,6 +397,7 @@ def set_config(body: ConfigIn):
     store.update_config(
         input_ids=body.input_ids, home_ids=body.home_ids,
         home_hints={k: v.strip() for k, v in body.home_hints.items() if v.strip()},
+        subset_ids=sorted(set(body.subset_ids)),
         # A sticky role must still be revocable: Home toggled off in the
         # Playlists view drops the id here too, or the next folder ingest
         # would resurrect it. (Spec §2.)
@@ -3756,6 +3762,18 @@ def _apply_snapshot(pid: str, snapshot_id: str | None) -> None:
 
 @app.post("/api/act")
 def act(body: ActIn):
+    # Filing into a subset is not filing. A song put into a best-of still
+    # needs its home, so it must not leave the input it came from — and that
+    # rule belongs here, where every caller passes, rather than in whichever
+    # button happens to be current. Costs nothing to enforce. (Spec §6.)
+    if body.to_id and body.from_id:
+        cfg = store.config()
+        if body.to_id in _effective_subset_ids(cfg, sp.my_playlists()):
+            raise HTTPException(
+                400,
+                "that destination is a subset — adding to a subset must not "
+                "remove the track from its input; send from_id: null",
+            )
     note = None
     if body.action == "move":
         if not body.to_id:
