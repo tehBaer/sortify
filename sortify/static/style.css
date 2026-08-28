@@ -206,8 +206,12 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
   animation: card-in .18s ease-out;
 }
 @keyframes card-in { from { opacity: .4; transform: translateY(5px); } }
+/* Phase 1 of the two-phase card: the track is up, suggestions still computing. */
+.sugg-loading { animation: sugg-pulse 1.2s ease-in-out infinite; }
+@keyframes sugg-pulse { 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) {
   .track-card { animation: none; }
+  .sugg-loading { animation: none; }
   button:active { transform: none; }
 }
 .track-card .art { position: relative; display: inline-block; line-height: 0; }

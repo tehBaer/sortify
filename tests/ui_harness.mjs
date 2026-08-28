@@ -218,10 +218,36 @@ const splitBody = (active) => ({
 
 function resetLog() { log.length = 0; }
 
+// Two-phase now card: pollNow asks /api/now?light=1[&force=1] for the track
+// and /api/now/suggest[?force=1] for the suggestion side, merging the second
+// answer in when it lands. A scenario still describes the card as ONE full
+// body; this registers it as all four routes, split exactly the way the
+// server splits it — so a check that reads the finished card keeps working,
+// and a check that wants the in-between state can override a single route.
+function setNow(bodyOrRoute) {
+  const status = bodyOrRoute.status ?? 200;
+  const body = bodyOrRoute.status === undefined ? bodyOrRoute : bodyOrRoute.body;
+  const light = { status, body };
+  routes["GET /api/now?light=1"] = light;
+  routes["GET /api/now?light=1&force=1"] = light;
+  const sugg = status === 200 && body.playing ? {
+    status: 200,
+    body: {
+      playing: true, track_uri: body.track?.uri,
+      context: body.context ?? null,
+      suggestions: body.suggestions || [], subsets: body.subsets || [],
+      subset_targets: body.subset_targets || [], homes: body.homes || [],
+      inputs: body.inputs || [],
+    },
+  } : { status: 200, body: { playing: false } };
+  routes["GET /api/now/suggest"] = sugg;
+  routes["GET /api/now/suggest?force=1"] = sugg;
+}
+
 // ---- boot ------------------------------------------------------------------
 
 routes["GET /api/status"] = { status: 200, body: { authed: true, me: { name: "me" } } };
-routes["GET /api/now?force=1"] = { status: 200, body: { playing: false, poll_after_ms: 999999 } };
+setNow({ status: 200, body: { playing: false, poll_after_ms: 999999 } });
 
 run(src);
 await tick();
@@ -371,7 +397,7 @@ run("stopNowPolling()");
 {
   run(`show("now");`);
   // A good poll first: a live sitting card with a suggestion under key "1".
-  routes["GET /api/now?force=1"] = {
+  setNow({
     status: 200,
     body: {
       playing: true, poll_after_ms: 999999,
@@ -382,7 +408,7 @@ run("stopNowPolling()");
       homes: [{ id: "H1", name: "Home", folder: "" }],
       inputs: [],
     },
-  };
+  });
   run(`pollNow(true)`);
   await tick();
   run("stopNowPolling()");
@@ -404,7 +430,7 @@ run("stopNowPolling()");
         run(`Object.keys(nowState.sitting.decided).length`) === 0, "");
 
   // Now a failed poll: nowState is deliberately left intact, card replaced.
-  routes["GET /api/now"] = { status: 500, body: { detail: "boom" } };
+  routes["GET /api/now?light=1"] = { status: 500, body: { detail: "boom" } };
   run(`pollNow()`);
   await tick();
   run("stopNowPolling()");
@@ -759,10 +785,10 @@ run("stopNowPolling()");
   // V1 — a cooldown renders a countdown card with real h/m arithmetic and a
   // resume time, never Math.round'ed hours ("~178 min" used to say "3 hours",
   // "~25 min" said "0 hours").
-  routes["GET /api/now?force=1"] = {
+  setNow({
     status: 200,
     body: { playing: false, cooldown: "cooldown — try again in ~178 min", poll_after_ms: 999999 },
-  };
+  });
   run(`pollNow(true)`);
   await tick();
   run("stopNowPolling()");
@@ -772,10 +798,10 @@ run("stopNowPolling()");
   check("V1 the card names the resume time of day",
         /around <b>\d{1,2}:\d{2}<\/b>/.test(card), JSON.stringify(card.slice(0, 160)));
 
-  routes["GET /api/now?force=1"] = {
+  setNow({
     status: 200,
     body: { playing: false, cooldown: "cooldown — try again in ~25 min", poll_after_ms: 999999 },
-  };
+  });
   run(`pollNow(true)`);
   await tick();
   run("stopNowPolling()");
@@ -801,10 +827,10 @@ run("stopNowPolling()");
   DriftingDate.now = (() => { let n = 0; return () => RealDate.now() + n++; })();
   ctx.Date = DriftingDate;
   try {
-    routes["GET /api/now?force=1"] = {
+    setNow({
       status: 200,
       body: { playing: false, cooldown: "cooldown — try again in ~178 min", poll_after_ms: 999999 },
-    };
+    });
     run(`pollNow(true)`);
     await tick();
     run("stopNowPolling()");
@@ -817,7 +843,7 @@ run("stopNowPolling()");
 
   // V2 — the 1s countdown ticker must die the moment a real answer lands,
   // or a long-lived tab accumulates intervals.
-  routes["GET /api/now?force=1"] = { status: 200, body: { playing: false, poll_after_ms: 999999 } };
+  setNow({ status: 200, body: { playing: false, poll_after_ms: 999999 } });
   run(`pollNow(true)`);
   await tick();
   run("stopNowPolling()");
@@ -830,7 +856,7 @@ run("stopNowPolling()");
 {
   // V3 — Undo is hidden while there is nothing it could undo, and appears
   // once a filing lands.
-  routes["GET /api/now?force=1"] = {
+  setNow({
     status: 200,
     body: {
       playing: true, poll_after_ms: 999999,
@@ -841,7 +867,7 @@ run("stopNowPolling()");
       homes: [{ id: "H1", name: "Home", folder: "" }],
       inputs: [{ id: "IN1", name: "[In]", has_track: true }],
     },
-  };
+  });
   run(`nowActions = 0; pollNow(true)`);
   await tick();
   run("stopNowPolling()");
@@ -858,7 +884,7 @@ run("stopNowPolling()");
 {
   // V4 — in a sitting, the banner owns the pile name; the context line must
   // not repeat it one line below.
-  routes["GET /api/now?force=1"] = {
+  setNow({
     status: 200,
     body: {
       playing: true, poll_after_ms: 999999,
@@ -868,7 +894,7 @@ run("stopNowPolling()");
                  uris: ["spotify:track:u9", "u2"], decided: { u2: { action: "keep", to_id: "H1" } } },
       suggestions: [], homes: [], inputs: [],
     },
-  };
+  });
   run(`pollNow(true)`);
   await tick();
   run("stopNowPolling()");
@@ -890,7 +916,7 @@ run("stopNowPolling()");
 // NOTHING was confident, so the lead-in hint keys off suggestions[0].
 // ============================================================================
 {
-  routes["GET /api/now?force=1"] = {
+  setNow({
     status: 200,
     body: {
       playing: true, poll_after_ms: 999999,
@@ -904,7 +930,7 @@ run("stopNowPolling()");
       homes: [{ id: "H1", name: "Guess One", folder: "" }, { id: "H2", name: "Guess Two", folder: "" }],
       inputs: [],
     },
-  };
+  });
   run(`pollNow(true)`);
   await tick();
   run("stopNowPolling()");
@@ -918,7 +944,7 @@ run("stopNowPolling()");
         !/No confident match — use Add to…/.test(card), "");
 
   // Confident entries must render exactly as before — no hint, no weak class.
-  routes["GET /api/now?force=1"].body.suggestions = [
+  routes["GET /api/now/suggest?force=1"].body.suggestions = [
     { playlist_id: "H1", pct: 90, reasons: ["3 tracks by A here"], already: false },
   ];
   run(`pollNow(true)`);
@@ -929,9 +955,9 @@ run("stopNowPolling()");
         !/class="sugg weak"/.test($$("now-card").innerHTML), "");
 
   // And the sitting decide list gets the same treatment.
-  routes["GET /api/now?force=1"].body.sitting =
+  routes["GET /api/now?light=1"].body.sitting =
     { split_id: "PLW", pile_id: "p1", pile_name: "pile", uris: ["spotify:track:w1"], decided: {} };
-  routes["GET /api/now?force=1"].body.suggestions = [
+  routes["GET /api/now/suggest?force=1"].body.suggestions = [
     { playlist_id: "H1", pct: 3, reasons: ["artist tags: cumbia"], already: false, weak: true },
   ];
   run(`pollNow(true)`);
@@ -1364,7 +1390,7 @@ run("stopNowPolling()");
       next_offset: null, total: 12, tracks: [],
     };
     routes["POST /api/preview_resume"] = { ok: true };
-    routes["GET /api/now?force=1"] = { status: 200, body: { playing: false, poll_after_ms: 999999 } };
+    setNow({ status: 200, body: { playing: false, poll_after_ms: 999999 } });
     // Something IS playing: that is what makes a resume owed on close.
     run(`nowState = { playing: true, is_playing: true, track: { uri: "spotify:track:x" }, homes: new Map() }`);
 
@@ -1468,7 +1494,7 @@ run("stopNowPolling()");
 // the track instead of quietly turning blind mode off.
 // ============================================================================
 {
-  routes["GET /api/now?force=1"] = {
+  setNow({
     status: 200,
     body: {
       playing: true, poll_after_ms: 999999,
@@ -1480,7 +1506,7 @@ run("stopNowPolling()");
       homes: [{ id: "H1", name: "Home", folder: "" }],
       inputs: [{ id: "IN1", name: "[In]", has_track: true }],
     },
-  };
+  });
   run(`show("now"); blindMode = true; applyBlind()`);
   run(`filedUris = {}; nowActions = 0; pollNow(true)`);
   await tick();
@@ -1505,9 +1531,10 @@ run("stopNowPolling()");
 
   // The reveal has to expire with the track. Otherwise the next track arrives
   // already named and blind mode is off without anyone having asked for it.
-  routes["GET /api/now?force=1"].body.track =
+  routes["GET /api/now?light=1"].body.track =
     { uri: "spotify:track:br2", name: "Next Song",
       artists: [{ name: "Next Artist" }], sortable: true, image: null };
+  routes["GET /api/now/suggest?force=1"].body.track_uri = "spotify:track:br2";
   run(`pollNow(true)`);
   await tick();
   run("stopNowPolling()");
@@ -1665,14 +1692,14 @@ run("stopNowPolling()");
     resetLog();
     // The server still reports the played-out track (Spotify not yet
     // advanced): the guard is what keeps this from becoming a poll loop.
-    routes["GET /api/now"] = { status: 200, body: {
+    setNow({ status: 200, body: {
       playing: true, is_playing: true, poll_after_ms: 999999,
       track: { uri: "spotify:track:mt1", name: "Ended Song",
                artists: [{ name: "A" }], duration_ms: 5200, sortable: true, image: null },
       progress_ms: 5200,
       context: { id: "IN1", name: "[In]", is_input: true },
       sitting: null, suggestions: [], homes: [], inputs: [],
-    } };
+    } });
     $$("view-now").hidden = false;
     run(`nowManual = true; playedOutUri = null; playedOutWhileHidden = false`);
     run(`startNowTicker({ is_playing: true, progress_ms: 5000 },
@@ -1680,19 +1707,19 @@ run("stopNowPolling()");
     await new Promise((r) => setTimeout(r, 1300));
     await tick();
     check("MT a played-out song refetches once in manual mode",
-          gets("/api/now") === 1, `${gets("/api/now")} GET(s)`);
+          gets("/api/now?light=1") === 1, `${gets("/api/now?light=1")} GET(s)`);
     // renderNow restarted the ticker on the same (still-ended) answer; give
     // it another beat to prove the guard holds and no loop starts.
     await new Promise((r) => setTimeout(r, 1300));
     check("MT the same uri is never chased twice",
-          gets("/api/now") === 1, `${gets("/api/now")} GET(s)`);
+          gets("/api/now?light=1") === 1, `${gets("/api/now?light=1")} GET(s)`);
 
     run(`nowManual = false; stopNowTicker()`);
     run(`startNowTicker({ is_playing: true, progress_ms: 5000 },
                         { uri: "spotify:track:mt2", duration_ms: 5200 })`);
     await new Promise((r) => setTimeout(r, 1300));
     check("MT auto mode leaves the moment to the poll schedule",
-          gets("/api/now") === 1, `${gets("/api/now")} GET(s)`);
+          gets("/api/now?light=1") === 1, `${gets("/api/now?light=1")} GET(s)`);
 
     document.hidden = true;
     run(`nowManual = true; stopNowTicker()`);
@@ -1700,12 +1727,12 @@ run("stopNowPolling()");
                         { uri: "spotify:track:mt3", duration_ms: 5200 })`);
     await new Promise((r) => setTimeout(r, 1300));
     check("MT nothing fires while the tab is hidden",
-          gets("/api/now") === 1, `${gets("/api/now")} GET(s)`);
+          gets("/api/now?light=1") === 1, `${gets("/api/now?light=1")} GET(s)`);
     document.hidden = false;
     for (const h of handlers.visibilitychange || []) h();
     await tick();
     check("MT coming back pays the remembered played-out fetch",
-          gets("/api/now") === 2, `${gets("/api/now")} GET(s)`);
+          gets("/api/now?light=1") === 2, `${gets("/api/now?light=1")} GET(s)`);
 
     run(`nowManual = false; stopNowPolling(); stopNowTicker()`);
   } catch (e) {
@@ -1880,7 +1907,7 @@ run("stopNowPolling()");
   const html = () => $$("now-card").innerHTML;
   const at = (needle) => html().indexOf(needle);
 
-  routes["GET /api/now?force=1"] = nowBody(true);
+  setNow(nowBody(true));
   run(`filedUris = {}; nowActions = 0; pollNow(true)`);
   await tick();
   run("stopNowPolling()");
@@ -1908,7 +1935,7 @@ run("stopNowPolling()");
         `next@${at('id="btn-now-next"')} remove@${at('id="btn-now-remove"')} ` +
         `slot@${at('np-remove-slot')}`);
 
-  routes["GET /api/now?force=1"] = nowBody(false);
+  setNow(nowBody(false));
   run(`filedUris = {}; pollNow(true)`);
   await tick();
   run("stopNowPolling()");
@@ -1944,7 +1971,7 @@ run("stopNowPolling()");
   const html = () => $$("now-card").innerHTML;
   const has = (needle) => html().includes(needle);
 
-  routes["GET /api/now?force=1"] = nowBody("spotify:track:ru1");
+  setNow(nowBody("spotify:track:ru1"));
   routes["POST /api/act"] = { status: 200, body: {} };
   routes["POST /api/undo"] = { status: 200, body: { restored_to: "IN1" } };
   run(`filedUris = {}; nowActions = 0; removedUri = null; pollNow(true)`);
@@ -1979,7 +2006,7 @@ run("stopNowPolling()");
   // Remove again, then let the track change: the offer must not survive it.
   await run(`nowRemove()`);
   await tick();
-  routes["GET /api/now?force=1"] = nowBody("spotify:track:ru2");
+  setNow(nowBody("spotify:track:ru2"));
   run(`pollNow(true)`);
   await tick();
   run("stopNowPolling()");
@@ -1998,7 +2025,7 @@ run("stopNowPolling()");
 // ============================================================================
 {
   resetLog();
-  routes["GET /api/now?force=1"] = {
+  setNow({
     status: 200,
     body: {
       playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
@@ -2009,7 +2036,7 @@ run("stopNowPolling()");
       subsets: [], subset_targets: [{ id: "S1", name: "{sel}", total: 4 }],
       inputs: [],
     },
-  };
+  });
   routes["POST /api/act"] = { status: 200, body: {} };
   routes["POST /api/undo"] = { status: 200, body: { restored_to: null } };
   // show("now") is load-bearing: pollNow returns immediately on a hidden
@@ -2053,7 +2080,7 @@ run("stopNowPolling()");
 // ============================================================================
 {
   resetLog();
-  routes["GET /api/now?force=1"] = {
+  setNow({
     status: 200,
     body: {
       playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
@@ -2063,7 +2090,7 @@ run("stopNowPolling()");
       homes: [{ id: "H1", name: "Home", folder: "" }],
       subsets: [], subset_targets: [], inputs: [],
     },
-  };
+  });
   routes["POST /api/act"] = { status: 200, body: {} };
   routes["POST /api/undo"] = { status: 200, body: { restored_to: "IN1" } };
   // show("now") is load-bearing: pollNow returns immediately on a hidden
@@ -2141,7 +2168,7 @@ run("stopNowPolling()");
   });
   const html = () => $$("now-card").innerHTML;
 
-  routes["GET /api/now?force=1"] = body({});
+  setNow(body({}));
   routes["POST /api/act"] = { status: 200, body: {} };
   // show("now") first — see the harness header: pollNow no-ops on a hidden view.
   run(`show("now"); filedUris = {}; nowActions = 0; nowActionLog = [];
@@ -2164,11 +2191,11 @@ run("stopNowPolling()");
         `html=${html().slice(0, 0)}already=${html().includes("already in")}`);
 
   // A track already in a home (server-flagged) gets the row with no filing.
-  routes["GET /api/now?force=1"] = body({
+  setNow(body({
     track: { uri: "spotify:track:ss2", name: "Other", duration_ms: 200000,
              artists: [{ name: "Artist" }], sortable: true, image: null },
     suggestions: [{ playlist_id: "H1", pct: 80, reasons: [], already: true }],
-  });
+  }));
   run(`filedUris = {}; pollNow(true)`);
   await tick();
   run("stopNowPolling()");
@@ -2190,12 +2217,12 @@ run("stopNowPolling()");
   // "settled" and offered subsets for a track with no home — spec §4: "a
   // track with no home shows no subset row at all." removedUri is what
   // tells settled apart from a genuine filing.
-  routes["GET /api/now?force=1"] = body({
+  setNow(body({
     track: { uri: "spotify:track:ss3", name: "Rem", duration_ms: 200000,
              artists: [{ name: "Artist" }], sortable: true, image: null },
     context: { id: "IN1", name: "Input One", is_input: true },
     suggestions: [{ playlist_id: "H1", pct: 80, reasons: [], already: false }],
-  });
+  }));
   run(`filedUris = {}; nowActionLog = []; nowActions = 0; removedUri = null; pollNow(true)`);
   await tick();
   run("stopNowPolling()");
@@ -2319,6 +2346,77 @@ run("stopNowPolling()");
           $$("nav-pop").hidden === true, `hidden=${$$("nav-pop").hidden}`);
   }
   run(`show("now")`);   // stable end state for whatever runs after
+}
+
+// ============================================================================
+// TP — the two-phase card: the track renders the moment the light poll
+// answers, with the suggestion side arriving (and filling in) afterwards.
+// The lag this kills: presenting a track used to block on the whole
+// suggestion pipeline — profile rebuilds, Last.fm round trips — before the
+// card could even say the track's name.
+// ============================================================================
+{
+  resetLog();
+  run(`show("now"); filedUris = {}; nowActions = 0; removedUri = null; nowSuggestCache = null`);
+  const html = () => $$("now-card").innerHTML;
+  const tpBody = (uri) => ({
+    playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+    track: { uri, name: "Two Phase", duration_ms: 200000,
+             artists: [{ name: "Artist" }], sortable: true, image: null },
+    context: { id: "IN1", name: "[In]", is_input: true }, sitting: null,
+    suggestions: [{ playlist_id: "H1", pct: 90, reasons: ["3 tracks by Artist here"], already: false }],
+    homes: [{ id: "H1", name: "Home", folder: "" }],
+    inputs: [{ id: "IN1", name: "[In]", has_track: true }],
+  });
+
+  // Hold the suggest answer open: the card must go up without it.
+  setNow(tpBody("spotify:track:tp1"));
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const suggRoute = routes["GET /api/now/suggest?force=1"];
+  routes["GET /api/now/suggest?force=1"] = () => gate.then(() => suggRoute);
+  run(`pollNow(true)`);
+  await tick();
+  check("TP the track card is up before the suggest answer lands",
+        html().includes("Two Phase") && /finding a home…/.test(html()),
+        JSON.stringify(html().slice(0, 160)));
+  check("TP no suggestion buttons render while pending",
+        !html().includes('class="sugg"'), "");
+  check("TP the playback strip is live while pending (Remove included)",
+        html().includes('id="btn-now-next"') && html().includes('id="btn-now-remove"'),
+        `next=${html().includes('id="btn-now-next"')} remove=${html().includes('id="btn-now-remove"')}`);
+  release();
+  await tick();
+  check("TP suggestions fill in when the second answer lands",
+        html().includes('class="sugg"') && html().includes("Home") &&
+        !/finding a home…/.test(html()),
+        JSON.stringify(html().slice(0, 200)));
+  run("stopNowPolling()");
+
+  // An unchanged track re-poll answers the suggestion side from the cache.
+  resetLog();
+  run(`pollNow()`);
+  await tick();
+  run("stopNowPolling()");
+  check("TP an unchanged track re-poll never re-asks the suggest endpoint",
+        gets("/api/now/suggest") === 0 && gets("/api/now/suggest?force=1") === 0,
+        `${gets("/api/now/suggest")}+${gets("/api/now/suggest?force=1")} GET(s)`);
+  check("TP and the cached suggestions are still on the card",
+        html().includes('class="sugg"'), "");
+
+  // A suggest answer for a track that is no longer playing is dropped, not
+  // painted over the wrong card.
+  setNow(tpBody("spotify:track:tp2"));
+  routes["GET /api/now/suggest?force=1"] = {
+    status: 200,
+    body: { ...routes["GET /api/now/suggest?force=1"].body, track_uri: "spotify:track:tp-stale" },
+  };
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  check("TP a stale suggest answer is dropped, the card stays pending",
+        /finding a home…/.test(html()) && !html().includes('class="sugg"'),
+        JSON.stringify(html().slice(0, 160)));
 }
 
 // ---- summary ---------------------------------------------------------------

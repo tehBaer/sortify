@@ -3605,8 +3605,81 @@ def _idle_inputs_payload() -> list[dict]:
     return out
 
 
+def _now_sortable(track: dict) -> bool:
+    return bool(track["type"] == "track" and not track["is_local"] and track.get("id"))
+
+
+def _light_context(ctx_id: str | None) -> dict | None:
+    """Context for the light payload — cached listing + config only, zero API
+    calls, the same discipline as `_idle_inputs_payload`: the light branch
+    must never be able to trigger a profile build (a missing-listing fetch,
+    the >40-homes 400) just to name the playing context."""
+    if not ctx_id:
+        return None
+    items = (store.cache().get("playlist_list") or {}).get("items") or []
+    p = next((x for x in items if x["id"] == ctx_id), None)
+    return {"id": ctx_id, "name": p["name"] if p else None,
+            "is_input": ctx_id in _effective_input_ids(store.config(), items)}
+
+
+def _suggestion_payload(np: dict) -> dict:
+    """The suggestion side of the now card — everything that needs profiles,
+    tag maps, or CPU beyond naming the track. Shared verbatim by the one-shot
+    /api/now and the two-phase /api/now/suggest so the pair cannot drift."""
+    state = _ensure_profiles()
+    track = np["track"]
+    sortable = _now_sortable(track)
+    # Guard-on-read, fresh on every request — same reasoning as `triage`'s own
+    # re-read below `_ensure_profiles`: `_profile_state`'s cached profiles are
+    # a profile-build-time snapshot that can sit stale for up to PROFILE_TTL,
+    # so an enrichment fetch just before this (or any other write to
+    # tags.json) would otherwise be invisible for up to 10 minutes. Deliberate
+    # freshness/cost trade-off: a local JSON read on every request (zero API
+    # cost) buys always-current tags instead of leaning on the profile cache.
+    # lastfm_track_map() gets the same treatment, and for the same reason —
+    # the force-path fetch can land a brand-new neighbour/track-tag record
+    # mid-poll.
+    tag_artists = store.tag_artists()
+    track_map = store.lastfm_track_map()
+    artist_map = store.lastfm_artist_map()
+    ctx_id = np["context_playlist_id"]
+    ctx = next((p for p in state["playlists"] if p["id"] == ctx_id), None)
+    return {
+        "context": (
+            {"id": ctx_id, "name": ctx["name"] if ctx else None,
+             "is_input": ctx_id in state["input_ids"]}
+            if ctx_id else None
+        ),
+        "suggestions": sugg.suggest(
+            track, state["profiles"], tag_artists, track_map, artist_map,
+            state.get("playlist_artists"),
+        ) if sortable else [],
+        "subsets": _subset_matches(state, track, tag_artists, track_map, artist_map) if sortable else [],
+        "subset_targets": _subset_targets_payload(state),
+        "homes": _homes_payload(state),
+        "inputs": [
+            {"id": l["id"], "name": l["name"], "has_track": track["uri"] in l["uris"],
+             "set": l.get("set", inputsets.DEFAULT_KEY)}
+            for l in state["inputs"]
+        ],
+    }
+
+
+def _now_fetch_tags_safe(track: dict) -> None:
+    try:
+        _fetch_missing_now_tags(track)
+    except Exception:
+        # A fetch failure must never break the response it rides on — this is
+        # a bonus enrichment, not the payload the client actually needs.
+        log.exception("now-playing tag fetch failed")
+
+
 @app.get("/api/now")
-def now_playing(force: bool = False):
+def now_playing(force: bool = False, light: bool = False):
+    """`light=1` is the fast half of the two-phase card: just the track,
+    context, and sitting — no profile build, no Last.fm, no tag-map parsing.
+    The client renders the card from it immediately and asks /api/now/suggest
+    for the rest. The full (default) shape is unchanged."""
     try:
         np, stale_in = _currently_playing_shared(force=force)
     except SpotifyError as e:
@@ -3622,61 +3695,48 @@ def now_playing(force: bool = False):
                 "fetched_ago_ms": _now_fetched_ago_ms(),
                 "inputs": _idle_inputs_payload()}
 
-    state = _ensure_profiles()
     track = np["track"]
-    # A targeted artist fetch used to sit here to sharpen the card's genre
-    # reasons; it cost a call per unseen artist to learn nothing, since the
-    # dev-mode API stopped returning Spotify genres at all. `_fetch_missing_now_tags`
-    # is that fetch's replacement — Last.fm instead of Spotify, bounded, and
-    # gated on `force` so the passive poll still spends nothing.
-    sortable = track["type"] == "track" and not track["is_local"] and track.get("id")
-    if force and sortable:
-        try:
-            _fetch_missing_now_tags(track)
-        except Exception:
-            # A fetch failure must never break the now response — this is a
-            # bonus enrichment, not the payload the client actually needs.
-            log.exception("now-playing tag fetch failed")
-    # Guard-on-read, fresh on every request — same reasoning as `triage`'s own
-    # re-read below `_ensure_profiles`: `_profile_state`'s cached profiles are
-    # a profile-build-time snapshot that can sit stale for up to PROFILE_TTL,
-    # so a fetch just above (or any other write to tags.json) would otherwise
-    # be invisible for up to 10 minutes. Deliberate freshness/cost trade-off: a
-    # local JSON read on every poll (zero API cost) buys always-current tags
-    # instead of leaning on the profile cache. lastfm_track_map() gets the
-    # same treatment, and for the same reason — the force-path fetch just
-    # above can land a brand-new neighbour/track-tag record mid-poll.
-    tag_artists = store.tag_artists()
-    track_map = store.lastfm_track_map()
-    artist_map = store.lastfm_artist_map()
+    sortable = _now_sortable(track)
     ctx_id = np["context_playlist_id"]
-    ctx = next((p for p in state["playlists"] if p["id"] == ctx_id), None)
-    return {
+    base = {
         "playing": True,
         "poll_after_ms": _poll_after_ms(stale_in),
         "fetched_ago_ms": _now_fetched_ago_ms(),
         "is_playing": np["is_playing"],
         "progress_ms": np["progress_ms"],
-        "track": {**track, "sortable": bool(sortable)},
-        "context": (
-            {"id": ctx_id, "name": ctx["name"] if ctx else None,
-             "is_input": ctx_id in state["input_ids"]}
-            if ctx_id else None
-        ),
+        "track": {**track, "sortable": sortable},
         "sitting": _sitting_for_context(ctx_id),
-        "suggestions": sugg.suggest(
-            track, state["profiles"], tag_artists, track_map, artist_map,
-            state.get("playlist_artists"),
-        ) if sortable else [],
-        "subsets": _subset_matches(state, track, tag_artists, track_map, artist_map) if sortable else [],
-        "subset_targets": _subset_targets_payload(state),
-        "homes": _homes_payload(state),
-        "inputs": [
-            {"id": l["id"], "name": l["name"], "has_track": track["uri"] in l["uris"],
-             "set": l.get("set", inputsets.DEFAULT_KEY)}
-            for l in state["inputs"]
-        ],
     }
+    if light:
+        # Even `force=1` spends nothing extra here: force is forwarded to the
+        # suggest phase by the client, where the Last.fm gate has moved.
+        return {**base, "light": True, "context": _light_context(ctx_id)}
+    # A targeted artist fetch used to sit here to sharpen the card's genre
+    # reasons; it cost a call per unseen artist to learn nothing, since the
+    # dev-mode API stopped returning Spotify genres at all. `_fetch_missing_now_tags`
+    # is that fetch's replacement — Last.fm instead of Spotify, bounded, and
+    # gated on `force` so the passive poll still spends nothing.
+    if force and sortable:
+        _now_fetch_tags_safe(track)
+    return {**base, **_suggestion_payload(np)}
+
+
+@app.get("/api/now/suggest")
+def now_suggest(force: bool = False):
+    """Phase two of the card: suggestions for the track the now-cache already
+    holds. Never calls Spotify's currently-playing itself — the light poll
+    that preceded it owns that call — so a stale or empty cache just answers
+    `playing: false` and the client's next poll sorts it out."""
+    with _now_lock:
+        np = _now_cache["value"] if _now_cache["at"] else None
+    if not np:
+        return {"playing": False}
+    track = np["track"]
+    # The same gate the one-shot endpoint has always had, relocated: only an
+    # explicit user action (`force=1`) may spend bounded Last.fm calls.
+    if force and _now_sortable(track):
+        _now_fetch_tags_safe(track)
+    return {"playing": True, "track_uri": track["uri"], **_suggestion_payload(np)}
 
 
 # ---- playback control ------------------------------------------------------

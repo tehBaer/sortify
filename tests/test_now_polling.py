@@ -404,6 +404,102 @@ def test_the_sitting_lookup_on_the_poll_path_is_free(route_client):
     assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]
 
 
+# ---- the two-phase card: light poll + /api/now/suggest ----------------------
+#
+# Presenting a track used to block on the whole suggestion pipeline — a
+# possible profile rebuild, up to ~8 sequential Last.fm requests, and ~10MB of
+# JSON re-parsing — before the client could even show the track's name. The
+# split: `?light=1` returns just the card (track, context, sitting) as fast as
+# the now-cache allows, and /api/now/suggest computes the suggestion side for
+# the already-cached track afterwards, spending no currently-playing call of
+# its own.
+
+LIGHT_HEAVY_KEYS = ("suggestions", "subsets", "subset_targets", "homes")
+
+
+def test_light_poll_returns_the_track_without_the_suggestion_payload(route_client):
+    body = route_client.get("/api/now?light=1").json()
+    assert body["playing"] is True
+    assert body["light"] is True
+    assert body["track"]["uri"] == "spotify:track:x"
+    assert body["track"]["sortable"] is True
+    for heavy in LIGHT_HEAVY_KEYS:
+        assert heavy not in body
+    assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]
+
+
+def test_light_poll_resolves_context_from_the_cached_listing(route_client):
+    """The card needs `context` up front (the Remove button and the context
+    line hang off it), but from the cached listing only — the light branch
+    must never be able to trigger a profile build."""
+    body = route_client.get("/api/now?light=1").json()
+    assert body["context"] == {"id": "CTX1", "name": "Some playlist", "is_input": False}
+
+
+def test_light_poll_carries_the_sitting(route_client):
+    """The sitting card renders in phase 1, so the light payload includes the
+    same free splits.json lookup the full endpoint does."""
+    Store().save_splits({"version": 1, "splits": {"PL_NOW": {
+        "created_at": "t", "snapshot_id": None, "params": {},
+        "piles": [{"id": "p1", "name": "dream pop", "tags": [], "uris": ["spotify:track:x"]}],
+        "decided": {},
+        "active_sitting": {"playlist_id": "CTX1", "pile_id": "p1",
+                           "uris": ["spotify:track:x"], "started_at": "t", "claim": "c1"},
+    }}})
+    body = route_client.get("/api/now?light=1").json()
+    assert body["sitting"]["split_id"] == "PL_NOW"
+
+
+def test_a_forced_light_poll_does_not_reach_lastfm(route_client, monkeypatch):
+    """Enrichment moved to the suggest phase: the light poll's whole point is
+    to be fast, so even `force=1` must not put Last.fm round trips on it."""
+    fetched = []
+    monkeypatch.setattr(appmod, "_fetch_missing_now_tags", lambda t: fetched.append(t))
+    assert route_client.get("/api/now?force=1&light=1").status_code == 200
+    assert fetched == []
+
+
+def test_suggest_serves_the_cached_track_without_a_spotify_call(route_client):
+    route_client.get("/api/now?light=1")  # primes the now-cache: the one call
+    body = route_client.get("/api/now/suggest").json()
+    assert body["playing"] is True
+    assert body["track_uri"] == "spotify:track:x"
+    for key in LIGHT_HEAVY_KEYS + ("inputs", "context"):
+        assert key in body
+    assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]
+
+
+def test_suggest_with_no_cached_answer_reports_not_playing(route_client):
+    body = route_client.get("/api/now/suggest").json()
+    assert body["playing"] is False
+    assert route_client.spotify_calls == []
+
+
+def test_suggest_fetches_lastfm_only_when_forced(route_client, monkeypatch):
+    """The same gate the full endpoint has always had, relocated: an explicit
+    user action (`force=1`) may spend bounded Last.fm calls to sharpen the
+    suggestions; the passive follow-up may not."""
+    fetched = []
+    monkeypatch.setattr(appmod, "_fetch_missing_now_tags", lambda t: fetched.append(t))
+    route_client.get("/api/now?light=1")
+    route_client.get("/api/now/suggest")
+    assert fetched == []
+    route_client.get("/api/now/suggest?force=1")
+    assert len(fetched) == 1
+
+
+def test_light_then_suggest_matches_the_full_payload(route_client):
+    """The two-phase pair must add up to exactly what the one-shot endpoint
+    serves — a key that drifts out of the union is a field the split silently
+    dropped."""
+    light = route_client.get("/api/now?light=1").json()
+    sugg = route_client.get("/api/now/suggest").json()
+    full = route_client.get("/api/now").json()
+    merged = {**light, **{k: v for k, v in sugg.items() if k != "track_uri"}}
+    merged.pop("light")
+    assert set(merged) == set(full)
+
+
 # ---- picker recency: last_added_at on the homes payload ---------------------
 
 

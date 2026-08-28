@@ -767,17 +767,40 @@ function scheduleNext(ms) {
   nowTimer = setTimeout(() => pollNow(), ms);
 }
 
+// Last /api/now/suggest payload, keyed by the track it was computed for, so
+// unchanged-track polls merge it locally instead of asking the server again.
+let nowSuggestCache = null;   // {uri, data}
+
+// Fold a /api/now/suggest payload into nowState. `track_uri`/`playing` are
+// the suggest response's own envelope, not card state — strip them.
+function applySuggest(data) {
+  const { track_uri, playing, ...rest } = data;
+  nowState = { ...nowState, ...rest,
+    suggPending: false, suggError: null,
+    homes: new Map((data.homes || []).map((h) => [h.id, h])),
+    subsetTargets: new Map((data.subset_targets || [])
+      .map((s) => [s.id, { id: s.id, name: s.name, total: s.total, folder: s.folder }])) };
+}
+
 async function pollNow(force = false) {
   if ($("view-now").hidden) return;
   if (document.hidden) { scheduleNext(15000); return; }
   try {
-    const data = await api("/api/now" + (force ? "?force=1" : ""));
+    // Two-phase card: `light=1` answers with just the track — no profile
+    // build, no Last.fm, no tag-map parsing on the server — so the card
+    // goes up the moment Spotify answers. The suggestion side follows from
+    // /api/now/suggest and is merged in when it lands.
+    const data = await api("/api/now?light=1" + (force ? "&force=1" : ""));
     // When the server's answer left its upstream fetch (it may have served
     // its cache) — the anchor for the "updated Ns ago" line.
     nowFetchedAt = Date.now() - (data.fetched_ago_ms || 0);
-    nowState = { ...data, homes: new Map((data.homes || []).map((h) => [h.id, h])),
-                 subsetTargets: new Map((data.subset_targets || [])
-                   .map((s) => [s.id, { id: s.id, name: s.name, total: s.total, folder: s.folder }])) };
+    // The light payload has no inputs while playing; carry the previous
+    // poll's over so the input switcher doesn't flash "no inputs yet"
+    // between phases. The suggest merge refreshes them (with this track's
+    // own has_track flags) moments later.
+    nowState = { ...data, homes: new Map(), subsetTargets: new Map(),
+                 suggestions: [], subsets: [],
+                 inputs: data.inputs || nowState?.inputs || [] };
     // A genuinely new track re-arms the played-out refetch (declared below)
     // — and so does the SAME track started over, which is what Spotify's
     // repeat-one does. Matching on uri alone meant repeat-one armed the
@@ -785,12 +808,40 @@ async function pollNow(force = false) {
     const dur = data.track?.duration_ms || 0;
     const restarted = dur && (data.progress_ms || 0) < dur * PLAYED_OUT_RESTART_FRACTION;
     if (playedOutUri && (data.track?.uri !== playedOutUri || restarted)) playedOutUri = null;
+    const uri = data.track?.uri;
+    const cached = nowSuggestCache && nowSuggestCache.uri === uri ? nowSuggestCache.data : null;
+    if (cached) applySuggest(cached);
+    // A force may sharpen suggestions (it is what unlocks the Last.fm
+    // fetch), so it refetches even with a cached payload — but the cached
+    // one still paints first, so nothing visibly goes blank meanwhile.
+    const needsSuggest = !!(data.playing && data.track?.sortable && (force || !cached));
+    if (!cached) nowState.suggPending = needsSuggest;
     renderNow();
     scheduleNext(data.poll_after_ms || 60000);
+    if (needsSuggest) fetchNowSuggest(uri, force);
   } catch (e) {
     if (e.message === "auth needed") { stopNowPolling(); return; }
     renderNowProblem(e.message);
     scheduleNext(90000);
+  }
+}
+
+async function fetchNowSuggest(uri, force = false) {
+  try {
+    const s = await api("/api/now/suggest" + (force ? "?force=1" : ""));
+    // The track may have moved on while this computed — a stale payload is
+    // dropped, never painted over the wrong card.
+    if (!s.playing || s.track_uri !== uri) return;
+    nowSuggestCache = { uri, data: s };
+    if (!nowState || nowState.track?.uri !== uri) return;
+    applySuggest(s);
+    renderNow();
+  } catch (e) {
+    if (e.message === "auth needed") { stopNowPolling(); return; }
+    if (!nowState || nowState.track?.uri !== uri) return;
+    nowState.suggPending = false;
+    nowState.suggError = e.message;
+    renderNow();
   }
 }
 
@@ -1394,6 +1445,11 @@ function ordinaryCardBody(d, tr, ctx) {
            subsetBlock(d, tr) + subsetButtonRow();
   }
   if (!tr.sortable) return '<p class="hint">Can\'t be sorted via the API (local file or episode).</p>';
+
+  // Phase 1 of the two-phase card: the track is up, the suggestion side is
+  // still computing. No buttons yet — homes and inputs arrive with it.
+  if (d.suggPending) return '<p class="hint sugg-loading">finding a home…</p>';
+  if (d.suggError) return `<p class="hint">suggestions failed: ${esc(d.suggError)} — refresh to retry.</p>`;
 
   let body = "";
   if (d.suggestions.length && d.suggestions[0].weak) {
@@ -3117,6 +3173,8 @@ function sittingCardBody(tr, srvSitting) {
   let html = "";
   if (!tr.sortable) {
     html += '<p class="hint">Can\'t be kept via the API (local file or episode) — reject it instead.</p>';
+  } else if (nowState.suggPending) {
+    html += '<p class="hint sugg-loading">finding a home…</p>';
   } else {
     const sugg = nowState.suggestions || [];
     if (sugg.length && sugg[0].weak) {
@@ -3134,7 +3192,7 @@ function sittingCardBody(tr, srvSitting) {
     if (!nowState.suggestions.length) html += '<p class="hint">No confident match — use Keep to… below.</p>';
   }
   html += `<div class="minor-actions">
-    ${tr.sortable ? `<button id="btn-decide-more"><kbd>m</kbd> Keep to…</button>` : ""}
+    ${tr.sortable && !nowState.suggPending ? `<button id="btn-decide-more"><kbd>m</kbd> Keep to…</button>` : ""}
     <button id="btn-decide-reject" class="danger"><kbd>r</kbd> Reject (free)</button>
   </div>`;
   return html;
