@@ -31,6 +31,7 @@ from .folders import (
     creatable_home_name_problem,
     extract_folder_map,
     home_name_excluded,
+    is_subset_name,
     select_home_ids,
 )
 from .naming import split_output_name, violations as naming_violations
@@ -487,6 +488,39 @@ def _effective_input_ids(cfg: dict, playlists: list[dict]) -> set[str]:
     """
     ids = set(cfg.get("input_ids", []))
     return ids | inputsets.matched_ids(playlists, store.folders(), cfg)
+
+
+# The convention, when config does not say otherwise. Subsets are `{like
+# this}` — a shape `home_name_exclude_patterns` already refuses, so a subset
+# can never also be a home (pinned by tests/test_subsets.py).
+DEFAULT_SUBSET_PATTERN = r"^\{.*\}$"
+
+
+def _effective_subset_ids(cfg: dict, playlists: list[dict]) -> set[str]:
+    """Subsets that may suggest themselves.
+
+    Opt-in, unlike inputs: only ids the user marked count, and marking is
+    what earns a profile (and so the read that builds it). Every other {}
+    playlist stays filable by hand through the picker — see the spec's
+    "opting in gates suggestion, not reach".
+
+    A mark is dropped when the playlist is gone, not ours to edit, no longer
+    {}-shaped, or has since become an input or a home. Those last two make
+    the role exclusive in the one direction that matters: a stale
+    `subset_ids` entry can never quietly turn a home into something else.
+    """
+    marked = set(cfg.get("subset_ids") or [])
+    if not marked:
+        return set()
+    pattern = cfg.get("subset_name_pattern") or DEFAULT_SUBSET_PATTERN
+    taken = _effective_input_ids(cfg, playlists) | set(cfg.get("home_ids") or [])
+    return {
+        p["id"] for p in playlists
+        if p["id"] in marked
+        and p["id"] not in taken
+        and p.get("editable")
+        and is_subset_name(p.get("name") or "", pattern)
+    }
 
 
 # ---- cache helpers ---------------------------------------------------------
