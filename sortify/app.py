@@ -674,20 +674,23 @@ SUBSET_TOP_N = 2
 
 
 def _subset_matches(state: dict, track: dict, tag_artists: dict,
-                    track_map: dict) -> list[dict]:
+                    track_map: dict, artist_map: dict) -> list[dict]:
     """Subsets worth offering for this track. Local arithmetic, zero calls.
 
     The same scorer homes use, over the subset profiles — suggest.py is not
-    modified for this. Two caller-side rules: no weak (sub-threshold) tier,
-    because a guess about an optional selection is noise rather than
-    pressure to decide; and at most SUBSET_TOP_N.
+    modified for this. `artist_map` is threaded straight through (the same
+    Last.fm similar-artist map the homes call gets) so subsets keep parity
+    with homes rather than silently losing that signal. Two caller-side
+    rules: no weak (sub-threshold) tier, because a guess about an optional
+    selection is noise rather than pressure to decide; and at most
+    SUBSET_TOP_N.
     """
     if not state.get("subset_profiles"):
         return []
     names = {s["id"]: s["name"] for s in state.get("subsets", [])}
     scored = sugg.suggest(
         track, state["subset_profiles"], tag_artists, track_map,
-        state.get("artist_similar") or {}, state.get("playlist_artists") or {},
+        artist_map, state.get("playlist_artists") or {},
     )
     out = []
     for s in scored:
@@ -3586,7 +3589,7 @@ def now_playing(force: bool = False):
             track, state["profiles"], tag_artists, track_map, artist_map,
             state.get("playlist_artists"),
         ) if sortable else [],
-        "subsets": _subset_matches(state, track, tag_artists, track_map) if sortable else [],
+        "subsets": _subset_matches(state, track, tag_artists, track_map, artist_map) if sortable else [],
         "subset_targets": _subset_targets_payload(state),
         "homes": _homes_payload(state),
         "inputs": [

@@ -132,7 +132,7 @@ def test_only_opted_in_subsets_get_profiles(wired):
 
 def test_a_subset_sharing_the_artist_matches(wired):
     matches = appmod._subset_matches(wired, PLAYING, appmod.store.tag_artists(),
-                                     appmod.store.lastfm_track_map())
+                                     appmod.store.lastfm_track_map(), {})
     assert [m["playlist_id"] for m in matches] == ["s1"]
     assert matches[0]["name"] == "{solfest}"
     assert any("Ar One" in r for r in matches[0]["reasons"])
@@ -142,7 +142,7 @@ def test_matches_never_include_weak_guesses(wired):
     """suggest()'s sub-threshold tier exists to force a decision that must be
     made; a curated selection is optional, so a guess there is noise."""
     matches = appmod._subset_matches(wired, PLAYING, appmod.store.tag_artists(),
-                                     appmod.store.lastfm_track_map())
+                                     appmod.store.lastfm_track_map(), {})
     assert all(not m.get("weak") for m in matches)
     assert "s2" not in [m["playlist_id"] for m in matches]
 
@@ -151,15 +151,28 @@ def test_at_most_two_matches(wired, monkeypatch):
     fake = [{"playlist_id": p, "pct": 90, "already": False, "reasons": []}
             for p in ("s1", "s2", "s3")]
     monkeypatch.setattr(appmod.sugg, "suggest", lambda *a, **k: fake)
-    matches = appmod._subset_matches(wired, PLAYING, {}, {})
+    matches = appmod._subset_matches(wired, PLAYING, {}, {}, {})
     assert len(matches) == 2
 
 
 def test_a_subset_the_track_is_already_in_is_flagged(wired):
     track = {**PLAYING, "uri": "spotify:track:b", "id": "b"}
     matches = appmod._subset_matches(wired, track, appmod.store.tag_artists(),
-                                     appmod.store.lastfm_track_map())
+                                     appmod.store.lastfm_track_map(), {})
     assert any(m["already"] for m in matches if m["playlist_id"] == "s1")
+
+
+def test_the_similar_artist_map_reaches_the_subset_scorer(wired, monkeypatch):
+    """Subsets claim parity with homes; a signal homes get and subsets don't
+    is a silent scoring difference no other test would show."""
+    seen = {}
+    def recorder(track, profiles, tag_artists, track_map=None, artist_map=None,
+                 playlist_artists=None):
+        seen["artist_map"] = artist_map
+        return []
+    monkeypatch.setattr(appmod.sugg, "suggest", recorder)
+    appmod._subset_matches(wired, PLAYING, {}, {}, {"ar1": ["ar2"]})
+    assert seen["artist_map"] == {"ar1": ["ar2"]}
 
 
 def test_subset_targets_include_every_brace_playlist_not_just_opted_in(wired):
