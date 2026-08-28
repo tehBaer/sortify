@@ -679,8 +679,13 @@ async function pollNow(force = false) {
     // its cache) — the anchor for the "updated Ns ago" line.
     nowFetchedAt = Date.now() - (data.fetched_ago_ms || 0);
     nowState = { ...data, homes: new Map((data.homes || []).map((h) => [h.id, h])) };
-    // A genuinely new track re-arms the played-out refetch (declared below).
-    if (playedOutUri && data.track?.uri !== playedOutUri) playedOutUri = null;
+    // A genuinely new track re-arms the played-out refetch (declared below)
+    // — and so does the SAME track started over, which is what Spotify's
+    // repeat-one does. Matching on uri alone meant repeat-one armed the
+    // guard once and manual mode never refetched that track again.
+    const dur = data.track?.duration_ms || 0;
+    const restarted = dur && (data.progress_ms || 0) < dur * PLAYED_OUT_RESTART_FRACTION;
+    if (playedOutUri && (data.track?.uri !== playedOutUri || restarted)) playedOutUri = null;
     renderNow();
     scheduleNext(data.poll_after_ms || 60000);
   } catch (e) {
@@ -1016,6 +1021,11 @@ function startNowTicker(d, tr) {
 // fetches on return (see visibilitychange).
 let playedOutUri = null;
 let playedOutWhileHidden = false;
+// A FRACTION of the runtime, not a fixed number of seconds: "back near the
+// beginning" is what distinguishes a track that started again (repeat-one)
+// from one still sitting at the end we already refetched for — and a fixed
+// threshold reads a short track's ending as a restart.
+const PLAYED_OUT_RESTART_FRACTION = 0.25;
 
 function refetchAtPlayedOut(uri) {
   if (!nowManual || $("view-now").hidden || playedOutUri === uri) return;
@@ -1560,6 +1570,10 @@ function openPicker(homesMap, onPick, onCreate) {
 // playlist and choosing it is one gesture instead of close-find-tap.
 const previewHold = (() => {
   const HOLD_MS = 550;   // above the accidental-dwell range a tap can reach
+  // Mirrors app.py's PREVIEW_RESUME_MIN_INTERVAL (5.0s), with a second of
+  // slack for the round trip. Only used to tell "the server debounced MY
+  // last resume" from "it debounced somebody else's" — never to gate a call.
+  const PREVIEW_RESUME_DEBOUNCE_MS = 6000;
   const ICON = {
     close: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
     prev: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>',
@@ -1577,6 +1591,17 @@ const previewHold = (() => {
   // open: the next clip the user plays pauses that music again, so the
   // resume-owed flags re-arm from this (see playAt).
   let resumed = false;
+  // When THIS client last fired a resume, so the server's 5s debounce can be
+  // told apart from a genuine second resume of our own (see resumeSpotify).
+  let lastResumeFiredAt = 0;
+  // The playing uri the popup was opened for. The card's action files
+  // whatever is playing WHEN TAPPED, so this is what proves the two are
+  // still the same track (see the pv-act handler).
+  let actUri = null;
+  // Consecutive clips whose URL would not load. One is a stale CDN token;
+  // a run of them means the whole cached page has expired.
+  let deadClips = 0;
+  const DEAD_CLIP_LIMIT = 4;
   // Player state: every clip resolved so far (pages accumulate), the next
   // page cursor, and the index of the clip being played.
   let clips = [], nextOffset = null, idx = -1, pid = null, title = "", total = 0, fallback = [];
@@ -1631,15 +1656,30 @@ const previewHold = (() => {
     if (!(wasPlaying && audioPlayed)) return;
     wasPlaying = audioPlayed = false;
     resumed = true;
+    const prevFired = lastResumeFiredAt;
+    lastResumeFiredAt = Date.now();
     api("/api/preview_resume", {}).then((r) => {
-      if (r.ok) repollAfterPlaybackChange();
-      // The server's own debounce is not a failure — a second popup within
-      // five seconds rides the first resume. Anything else means the music
-      // this preview interrupted is still paused, and only the user can
-      // undo that, so silence is the one answer we must not give.
-      else if (r.error && r.error !== "resume already sent")
+      if (r.ok) { repollAfterPlaybackChange(); return; }
+      // "resume already sent" is the server's 5s debounce (app.py's
+      // PREVIEW_RESUME_MIN_INTERVAL). Benign when some OTHER popup's resume
+      // covered us — but NOT when the one it collided with was our own: that
+      // resume landed before this clip re-paused the music, so the music is
+      // still paused and no second call is coming. That is the one case the
+      // old blanket swallow got wrong, and it is exactly the end-of-playlist
+      // re-arm. Anything else is a plain failure and always speaks up.
+      const oursCollided = r.error === "resume already sent"
+        && prevFired && Date.now() - prevFired < PREVIEW_RESUME_DEBOUNCE_MS;
+      if (r.error && (r.error !== "resume already sent" || oursCollided))
         toast("preview over — press play in Spotify");
     }).catch(() => {});   // a refused resume is a shrug, never an error card
+  }
+
+  // Preview audio has taken focus, which is what pauses Spotify on a phone.
+  // Both play paths funnel through here so neither can forget to re-arm the
+  // resume the end-of-playlist one already spent.
+  function notePreviewAudioStarted() {
+    audioPlayed = true;
+    if (resumed) { wasPlaying = true; resumed = false; }
   }
   // What the held row would have done if tapped, offered inside the popup.
   let act = null;
@@ -1689,7 +1729,9 @@ const previewHold = (() => {
         <button id="pv-close" class="icon-btn pv-big" aria-label="Close preview">${ICON.close}</button>
       </div>
       ${act ? `<button id="pv-act" class="pv-act primary">${esc(act.label)}</button>` : ""}`;
-    $("pv-close").onclick = close;
+    // Arrow, not a bare reference: close() takes a `hard` argument, and an
+    // onclick handler is called with the click event — which is truthy.
+    $("pv-close").onclick = () => close();
     $("pv-prev").onclick = () => playAt(idx - 1);
     $("pv-next").onclick = () => playAt(idx + 1);
     // Autoplay can be refused when play() lands outside the gesture's call
@@ -1697,10 +1739,31 @@ const previewHold = (() => {
     // the card asks for the one tap that unblocks it instead.
     if (needsTap) $("pv-play").onclick = () => {
       if (!audio) return;
-      audio.play().then(() => { audioPlayed = true; needsTap = false; render(); }).catch(() => {});
+      // Same funnel as the main path: this tap also takes audio focus, and
+      // skipping the re-arm here left the music paused after an
+      // end-of-playlist resume — on iOS, the only platform needsTap exists
+      // for, so the two features collided by construction.
+      audio.play().then(() => { notePreviewAudioStarted(); needsTap = false; render(); })
+        .catch(() => {});
     };
-    // The whole point of previewing a home is deciding to use it.
-    if (act) $("pv-act").onclick = () => { const a = act; close(); a.run(); };
+    // The whole point of previewing a home is deciding to use it — but the
+    // action files WHATEVER IS PLAYING when it is tapped, while the decision
+    // was made about the track playing when the popup opened. Those came
+    // apart the moment the player learned to advance the music by itself:
+    // the end-of-playlist resume restarts Spotify with the popup still up,
+    // and manual mode's played-out refetch repaints nowState under it. Then
+    // one tap files — and removes from the input — a song the user never
+    // judged. The stash already honours this invariant; the action must too.
+    if (act) $("pv-act").onclick = () => {
+      const a = act;
+      const playing = (nowState && nowState.track && nowState.track.uri) || null;
+      close();
+      if (actUri && playing !== actUri) {
+        toast("the track moved on — nothing was filed");
+        return;
+      }
+      a.run();
+    };
     paintProgress();
   }
 
@@ -1749,11 +1812,21 @@ const previewHold = (() => {
         fadeTo(a, 0, FADE_MS);
       }
     };
+    // A clip URL carries a CDN token that EXPIRES (deezer.py says so), and
+    // the position stash now holds those URLs for a whole track session — so
+    // a dead clip is expected, not exotic. `error` fires instead of `ended`,
+    // which used to strand the medley on a silent card with no auto-advance.
+    // Skipping mirrors the server's own posture toward a miss; a whole page
+    // of dead URLs stops rather than spinning through hundreds of them.
+    a.onerror = () => {
+      if (mySeq !== seq) return;
+      if (++deadClips > DEAD_CLIP_LIMIT) { render("these clips have expired — reopen to refetch"); return; }
+      playAt(idx + 1);
+    };
     a.play().then(() => {
-      audioPlayed = true;
-      // Preview audio took focus again, so the music the end-of-playlist
-      // resume brought back is paused again — a resume is owed once more.
-      if (resumed) { wasPlaying = true; resumed = false; }
+      if (mySeq !== seq) return;   // closed between play() and its microtask
+      notePreviewAudioStarted();
+      deadClips = 0;               // a clip that plays clears the run
     }).catch(() => { if (mySeq === seq) { needsTap = true; render(); } });
     fadeTo(a, 1, FADE_MS);
     render();
@@ -1769,9 +1842,26 @@ const previewHold = (() => {
     const uri = (nowState && nowState.track && nowState.track.uri) || null;
     if (uri !== resumeTrack) { resumeAt.clear(); resumeTrack = uri; }
     pid = p; title = t || "preview"; clips = []; nextOffset = null; idx = -1; fallback = [];
-    total = 0; needsTap = false; act = a || null; resumed = false;
+    total = 0; needsTap = false; act = a || null; resumed = false; deadClips = 0;
+    // The track this popup's action belongs to, so a decision can't land on
+    // a different one (see the pv-act handler).
+    actUri = uri;
     // Captured at open: nowState still reflects pre-preview reality here.
-    wasPlaying = wasPlaying || !!(nowState && nowState.playing);
+    //
+    // `playing` is NOT "music is coming out of the phone" — app.py sets it
+    // whenever a track object exists at all, and reports the transport state
+    // separately as `is_playing` (which is what playerToggle reads). Reading
+    // `playing` here meant previewing while DELIBERATELY PAUSED spent a
+    // budgeted call to start music the user had just stopped.
+    //
+    // nowState is null until the Now view has polled once, so a preview held
+    // from Triage knows nothing. Unknown is treated as playing: previewing
+    // is something you do while listening, and the failure that matters here
+    // is the one this whole mechanism exists to prevent — preview audio
+    // taking focus, the OS pausing Spotify, and nothing ever un-pausing it.
+    // A needless resume costs one call and fails gracefully server-side;
+    // silence costs the user their music with no clue why.
+    wasPlaying = wasPlaying || (nowState ? !!nowState.is_playing : true);
     pop().hidden = false;
     // Lets the picker keep its last rows clear of the card (see style.css).
     document.body.classList.add("previewing");
@@ -1796,12 +1886,17 @@ const previewHold = (() => {
     }
   }
 
-  function close() {
+  // `hard` cuts the audio instead of fading it out. The hidden-tab path uses
+  // it: a background tab clamps timers to ~1s, so the 180ms fade stretches
+  // into seconds of clip that keep playing OVER the music resumeSpotify()
+  // restarts on the very next line — audible, and invisible to the harness,
+  // whose timers are never throttled.
+  function close(hard) {
     seq++;
     clearTimeout(timer); timer = null; holding = false;
     unpress();
     stashPosition();
-    stopAudio();
+    stopAudio(hard);
     pop().hidden = true;
     document.body.classList.remove("previewing");
     needsTap = false; act = null;
@@ -1866,7 +1961,7 @@ const previewHold = (() => {
       row.oncontextmenu = (e) => e.preventDefault();  // long-press menu would steal the hold
     },
     consumeClick() { const f = fired; fired = false; return f; },
-    stop: close,
+    stop: (hard) => close(hard),
   };
 })();
 
@@ -2998,8 +3093,10 @@ document.addEventListener("keydown", (e) => {
 // Coming back to the tab is the moment a skip is most likely to have happened
 // behind our back, so this one bypasses the predicted TTL.
 document.addEventListener("visibilitychange", () => {
-  // Same reasoning as show(): a backgrounded tab has no visible player.
-  if (document.hidden) previewHold.stop();
+  // Same reasoning as show(): a backgrounded tab has no visible player. Hard
+  // cut, not a fade — a hidden tab's timers are clamped, so a fade would go
+  // on sounding over the music the close's resume just brought back.
+  if (document.hidden) previewHold.stop(true);
   // Manual mode means almost exactly that — the refocus poll doesn't fire,
   // with one exception: a song that played out while the tab was hidden.
   // Coming back to the tool is "having it open", which is what the user

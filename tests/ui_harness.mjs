@@ -1331,7 +1331,7 @@ run("stopNowPolling()");
     routes["POST /api/preview_resume"] = { ok: true };
     routes["GET /api/now?force=1"] = { status: 200, body: { playing: false, poll_after_ms: 999999 } };
     // Something IS playing: that is what makes a resume owed on close.
-    run(`nowState = { playing: true, track: { uri: "spotify:track:x" }, homes: new Map() }`);
+    run(`nowState = { playing: true, is_playing: true, track: { uri: "spotify:track:x" }, homes: new Map() }`);
 
     const row = new El("pv-row");
     ctx.__row = row;
@@ -1501,9 +1501,15 @@ run("stopNowPolling()");
       next_offset: null, total: 2, tracks: [],
     };
     routes["POST /api/preview_resume"] = { ok: true };
+    // A hidden Now view makes pollNow a no-op, so no earlier block's still-in-
+    // flight repoll can land here and overwrite nowState with ITS fixture.
+    // resumeSpotify schedules one ~900ms out on a bare setTimeout that
+    // stopNowPolling cannot cancel; that is what silently replaced this
+    // block's is_playing and made the resume below look unspent.
+    $$("view-now").hidden = true;
     // A fresh uri, so PV's stash for h1 (same playlist, PV4's territory)
     // cannot leak in here and hand this block a half-walked playlist.
-    run(`nowState = { playing: true, track: { uri: "spotify:track:pv3" }, homes: new Map() }`);
+    run(`nowState = { playing: true, is_playing: true, track: { uri: "spotify:track:pv3" }, homes: new Map() }`);
 
     const row3 = new El("pv3-row");
     ctx.__row3 = row3;
@@ -1563,7 +1569,7 @@ run("stopNowPolling()");
       next_offset: null, total: 3, tracks: [],
     };
     routes["POST /api/preview_resume"] = { ok: true };
-    run(`nowState = { playing: true, track: { uri: "spotify:track:t1" }, homes: new Map() }`);
+    run(`nowState = { playing: true, is_playing: true, track: { uri: "spotify:track:t1" }, homes: new Map() }`);
 
     const row4 = new El("pv4-row");
     ctx.__row4 = row4;
@@ -1590,7 +1596,7 @@ run("stopNowPolling()");
     // A different playing track is a different decision: start over.
     run("previewHold.stop()");
     await tick();
-    run(`nowState = { playing: true, track: { uri: "spotify:track:t2" }, homes: new Map() }`);
+    run(`nowState = { playing: true, is_playing: true, track: { uri: "spotify:track:t2" }, homes: new Map() }`);
     row4.onpointerdown({ clientX: 10, clientY: 10 });
     await new Promise((r) => setTimeout(r, 700));
     await tick();
@@ -1671,6 +1677,147 @@ run("stopNowPolling()");
     check("MT scenario ran without throwing", false, String(e));
   } finally {
     document.hidden = false;
+  }
+}
+
+// ============================================================================
+// PV5 — the preview player's promises about the USER'S OWN music and the
+// user's own decision. Four properties, each one a bug that shipped:
+//   * previewing while PAUSED must not spend a budgeted call to start music
+//     the user deliberately stopped (/api/now's `playing` merely means a
+//     track object exists; `is_playing` is the transport);
+//   * the card's action files whatever is playing WHEN TAPPED, so once the
+//     player learned to advance the music by itself it could file — and
+//     remove from the input — a track the user never judged;
+//   * a clip whose CDN token has expired must skip, not strand the medley;
+//   * the iOS tap-to-play path must re-arm the resume like the main path,
+//     or the music stays paused after an end-of-playlist resume.
+// ============================================================================
+{
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    $$("view-now").hidden = true;   // same isolation as PV3/PV4
+    routes["GET /api/playlist_preview/h5"] = {
+      clips: [{ name: "Song A", artist: "Artist A", url: "https://cdn/a5.mp3" },
+              { name: "Song B", artist: "Artist B", url: "https://cdn/b5.mp3" }],
+      next_offset: null, total: 2, tracks: [],
+    };
+    routes["POST /api/preview_resume"] = { ok: true };
+    routes["POST /api/act"] = { status: 200, body: {} };
+
+    // --- paused: a preview owes nothing back -------------------------------
+    run(`nowState = { playing: true, is_playing: false,
+                      track: { uri: "spotify:track:p5" }, homes: new Map() }`);
+    const row5 = new El("pv5-row");
+    ctx.__row5 = row5;
+    run(`previewHold.attach(__row5, "h5", "Paused Home")`);
+    row5.onpointerdown({ clientX: 10, clientY: 10 });
+    await new Promise((r) => setTimeout(r, 700));
+    await tick();
+    run("previewHold.stop()");
+    await tick();
+    check("PV5 previewing while paused spends no resume call",
+          posts("/api/preview_resume") === 0,
+          `${posts("/api/preview_resume")} POST(s)`);
+
+    // --- the action is bound to the track it was opened for -----------------
+    resetLog();
+    AudioStub.made.length = 0;
+    run(`nowState = { playing: true, is_playing: true,
+                      track: { uri: "spotify:track:judged" }, homes: new Map() }`);
+    ctx.__filed5 = 0;
+    const row5b = new El("pv5-row-b");
+    ctx.__row5b = row5b;
+    run(`previewHold.attach(__row5b, "h5", "Home",
+           { label: "File here", run: () => { globalThis.__filed5++; } })`);
+    row5b.onpointerdown({ clientX: 10, clientY: 10 });
+    await new Promise((r) => setTimeout(r, 700));
+    await tick();
+    // The music moved on under the open popup — exactly what the
+    // end-of-playlist resume and the played-out refetch now cause.
+    run(`nowState = { playing: true, is_playing: true,
+                      track: { uri: "spotify:track:NOTjudged" }, homes: new Map() }`);
+    run(`$("pv-act").onclick()`);
+    await tick();
+    check("PV5 a decision does not land on a track that arrived after it",
+          ctx.__filed5 === 0 && posts("/api/act") === 0,
+          `filed=${ctx.__filed5}, ${posts("/api/act")} act POST(s)`);
+    check("PV5 and the user is told why nothing happened",
+          /moved on/.test($$("toast").textContent),
+          JSON.stringify($$("toast").textContent));
+
+    // Same gesture, same track still playing: the action must still work —
+    // the guard must not have cost the popup its whole purpose.
+    resetLog();
+    row5b.onpointerdown({ clientX: 10, clientY: 10 });
+    await new Promise((r) => setTimeout(r, 700));
+    await tick();
+    run(`$("pv-act").onclick()`);
+    await tick();
+    check("PV5 the same track still files, one gesture as before",
+          ctx.__filed5 === 1, `filed=${ctx.__filed5}`);
+
+    // --- an expired clip URL skips instead of stranding the medley ---------
+    resetLog();
+    AudioStub.made.length = 0;
+    const row5c = new El("pv5-row-c");
+    ctx.__row5c = row5c;
+    run(`previewHold.attach(__row5c, "h5", "Home")`);
+    row5c.onpointerdown({ clientX: 10, clientY: 10 });
+    await new Promise((r) => setTimeout(r, 700));
+    await tick();
+    const firstSrc = AudioStub.made.at(-1)?.src;
+    AudioStub.made.at(-1).onerror();     // Deezer 403: `error`, never `ended`
+    await tick();
+    check("PV5 a dead clip advances the medley instead of freezing it",
+          firstSrc === "https://cdn/a5.mp3"
+          && AudioStub.made.at(-1)?.src === "https://cdn/b5.mp3",
+          `first=${firstSrc}, now=${AudioStub.made.at(-1)?.src}`);
+
+    // --- iOS: tap-to-play re-arms the resume the auto-resume spent ---------
+    resetLog();
+    AudioStub.made.length = 0;
+    run("previewHold.stop()");
+    await tick();
+    resetLog();
+    const row5d = new El("pv5-row-d");
+    ctx.__row5d = row5d;
+    run(`previewHold.attach(__row5d, "h5", "Home")`);
+    row5d.onpointerdown({ clientX: 10, clientY: 10 });
+    await new Promise((r) => setTimeout(r, 700));
+    await tick();
+    AudioStub.made.at(-1).onended();     // clip A over
+    await tick();
+    AudioStub.made.at(-1).onended();     // clip B over → playlist over
+    await tick();
+    const afterAuto = posts("/api/preview_resume");
+    // Back a clip, with autoplay refused — the iOS case needsTap exists for.
+    AudioStub.refuse = true;
+    run(`$("pv-prev").onclick()`);
+    await tick();
+    const askedForTap = /pv-play/.test($$("preview-pop").innerHTML);
+    AudioStub.refuse = false;
+    run(`$("pv-play").onclick()`);
+    await tick();
+    run("previewHold.stop()");
+    await tick();
+    check("PV5 the end of the playlist resumed the music once",
+          afterAuto === 1, `${afterAuto} POST(s)`);
+    check("PV5 an autoplay-refused clip asks for the unblocking tap",
+          askedForTap, "pv-play offered");
+    check("PV5 that tap re-arms the resume, so closing gives the music back",
+          posts("/api/preview_resume") === 2,
+          `${posts("/api/preview_resume")} POST(s)`);
+  } catch (e) {
+    check("PV5 scenario ran without throwing", false, String(e));
+  } finally {
+    // Hand the next block a Now view it can actually poll into: pollNow is a
+    // no-op while this is hidden, so leaving it set makes the FOLLOWING
+    // block's card go stale and fail for a reason that isn't its own.
+    $$("view-now").hidden = false;
+    AudioStub.refuse = false;
+    run("previewHold.stop(); stopNowPolling()");
   }
 }
 
