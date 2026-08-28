@@ -119,53 +119,14 @@ PLAYING = {"uri": "spotify:track:z", "id": "z", "name": "Z", "is_local": False,
            "type": "track", "artists": [{"id": "ar1", "name": "Ar One"}]}
 
 
-def test_only_opted_in_subsets_get_profiles(wired):
-    assert set(wired["subset_profiles"]) == {"s1", "s2"}
-
-
-def test_a_subset_sharing_the_artist_matches(wired):
-    matches = appmod._subset_matches(wired, PLAYING, appmod.store.tag_artists(),
-                                     appmod.store.lastfm_track_map(), {})
-    assert [m["playlist_id"] for m in matches] == ["s1"]
-    assert matches[0]["name"] == "{solfest}"
-    assert any("Ar One" in r for r in matches[0]["reasons"])
-
-
-def test_matches_never_include_weak_guesses(wired):
-    """suggest()'s sub-threshold tier exists to force a decision that must be
-    made; a curated selection is optional, so a guess there is noise."""
-    matches = appmod._subset_matches(wired, PLAYING, appmod.store.tag_artists(),
-                                     appmod.store.lastfm_track_map(), {})
-    assert all(not m.get("weak") for m in matches)
-    assert "s2" not in [m["playlist_id"] for m in matches]
-
-
-def test_at_most_two_matches(wired, monkeypatch):
-    fake = [{"playlist_id": p, "pct": 90, "already": False, "reasons": []}
-            for p in ("s1", "s2", "s3")]
-    monkeypatch.setattr(appmod.sugg, "suggest", lambda *a, **k: fake)
-    matches = appmod._subset_matches(wired, PLAYING, {}, {}, {})
-    assert len(matches) == 2
-
-
-def test_a_subset_the_track_is_already_in_is_flagged(wired):
-    track = {**PLAYING, "uri": "spotify:track:b", "id": "b"}
-    matches = appmod._subset_matches(wired, track, appmod.store.tag_artists(),
-                                     appmod.store.lastfm_track_map(), {})
-    assert any(m["already"] for m in matches if m["playlist_id"] == "s1")
-
-
-def test_the_similar_artist_map_reaches_the_subset_scorer(wired, monkeypatch):
-    """Subsets claim parity with homes; a signal homes get and subsets don't
-    is a silent scoring difference no other test would show."""
-    seen = {}
-    def recorder(track, profiles, tag_artists, track_map=None, artist_map=None,
-                 playlist_artists=None):
-        seen["artist_map"] = artist_map
-        return []
-    monkeypatch.setattr(appmod.sugg, "suggest", recorder)
-    appmod._subset_matches(wired, PLAYING, {}, {}, {"ar1": ["ar2"]})
-    assert seen["artist_map"] == {"ar1": ["ar2"]}
+def test_subsets_build_no_profile(wired):
+    """The scoring machinery is gone: subsets are destinations you choose,
+    never things that propose themselves. Building a profile is the ONLY
+    reason marking one ever cost a Spotify call, so its absence is what makes
+    marking free — this pins that it stays absent."""
+    assert "subset_profiles" not in wired
+    assert not hasattr(appmod, "_subset_matches")
+    assert not hasattr(appmod, "SUBSET_WARM_BUDGET")
 
 
 def test_subset_targets_are_exactly_the_marked_subsets(wired):
@@ -324,68 +285,21 @@ def _seed_cache(listing, playlists=None):
     appmod.store.save_cache(cache)
 
 
-def test_config_refuses_a_save_above_the_subset_warm_budget(client):
-    """s3 alone (3000 tracks -> ceil(3000/100) = 30 calls) is already over
-    SUBSET_WARM_BUDGET (25) — the save must be refused before anything is
-    persisted, naming the count and the cost rather than silently truncating
-    the list."""
+def test_marking_many_subsets_is_free_and_never_refused(client):
+    """Marking used to be refused past a call budget, because each new mark
+    meant reading that playlist to score against. Nothing is read now, so a
+    save of every subset at once must go through — the budget guard it would
+    have tripped is deleted, not merely raised."""
     appmod.store.save_config(_cfg())
-    _seed_cache(SUBSET_LISTING + [BIG_SUBSET])
+    _seed_listing(SUBSET_LISTING)
+    every = [p["id"] for p in SUBSET_LISTING if p.get("editable")]
     res = client.post("/api/config", json={
-        "input_ids": [], "home_ids": [], "home_hints": {}, "subset_ids": ["s3"]})
-    assert res.status_code == 400
-    assert "call" in res.json()["detail"].lower()
-    assert appmod.store.config()["subset_ids"] == []   # nothing persisted
-
-
-def test_config_allows_a_save_at_or_below_the_subset_warm_budget(client):
-    """s1 (22 tracks) + s2 (40 tracks) cost 1 + 1 = 2 calls, comfortably
-    under the 25-call budget."""
-    appmod.store.save_config(_cfg())
-    _seed_cache(SUBSET_LISTING)
-    res = client.post("/api/config", json={
-        "input_ids": [], "home_ids": [], "home_hints": {}, "subset_ids": ["s1", "s2"]})
+        "input_ids": [], "home_ids": [], "home_hints": {}, "subset_ids": every})
     assert res.status_code == 200
-    assert appmod.store.config()["subset_ids"] == ["s1", "s2"]
+    assert set(appmod.store.config()["subset_ids"]) == set(every)
 
 
-def test_config_only_counts_newly_marked_subsets_toward_the_budget(client):
-    """A subset already marked (and so, in the real world, already warmed on
-    an earlier save) must not count again just because it appears in the
-    same save as a new one — only the newly-marked, still-uncached ones do."""
-    appmod.store.save_config(_cfg(subset_ids=["s1"]))
-    # s1 is "already marked" and (per this test) already cached — its
-    # re-appearance in the save below must cost nothing. s3 stays uncached
-    # and alone exceeds the budget, so the save must still be refused.
-    _seed_cache(SUBSET_LISTING + [BIG_SUBSET],
-                playlists={"s1": {"snapshot_id": "s-s1", "tracks": [], "fetched_at": 0.0}})
-    res = client.post("/api/config", json={
-        "input_ids": [], "home_ids": [], "home_hints": {}, "subset_ids": ["s1", "s3"]})
-    assert res.status_code == 400
-    assert appmod.store.config()["subset_ids"] == ["s1"]   # unchanged
-
-
-def test_ensure_profiles_backstop_refuses_an_over_budget_config(monkeypatch):
-    """The `/api/config` refusal is the front door; this is the backstop in
-    `_ensure_profiles_locked` for any other path that could leave `subset_ids`
-    over budget (a hand-edited config, a future caller) — it must raise
-    rather than pay the cold-fetch cost."""
-    appmod.store.save_config(_cfg(subset_ids=["s3"], home_ids=["nope-no-such-home"]))
-    listing = SUBSET_LISTING + [BIG_SUBSET]
-    monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: listing)
-    cache = appmod.store.cache()
-    cache["playlists"] = {}
-    appmod.store.save_cache(cache)
-    appmod._profile_state.clear()
-    appmod._profile_state["built_at"] = 0.0
-    from fastapi import HTTPException
-    with pytest.raises(HTTPException) as exc:
-        appmod._ensure_profiles(force=True)
-    assert exc.value.status_code == 400
-    assert "call" in str(exc.value.detail).lower()
-
-
-# ---- M1: /api/now actually carries subsets ---------------------------------
+# ---- /api/now's subset payload ---------------------------------------------
 
 NOW_HOME_TRACK = {"uri": "spotify:track:z", "id": "z", "name": "Z", "type": "track",
                    "is_local": False, "duration_ms": 210_000,
@@ -398,11 +312,14 @@ NOW_RAW_CURRENTLY_PLAYING = {
 }
 
 
-def test_now_route_carries_subset_matches(monkeypatch):
-    """Every other subset test calls `_subset_matches` directly, which means a
-    re-swapped `(state, track)` argument order in the /api/now handler itself
-    would silently return [] with nothing to catch it (the exact defect fixed
-    once already). This exercises the real route."""
+def test_now_route_offers_targets_and_suggests_nothing(monkeypatch):
+    """The route must carry the picker's list and NOT propose subsets.
+
+    Exercised through the real endpoint rather than a helper: the absence of
+    a key is exactly the kind of thing a unit test of a deleted function
+    cannot check, and re-adding scoring would most plausibly show up here
+    first — as a `subsets` array quietly reappearing in the payload.
+    """
     from fastapi.testclient import TestClient
 
     original_cache, original_config = appmod.store.cache(), appmod.store.config()
@@ -442,11 +359,10 @@ def test_now_route_carries_subset_matches(monkeypatch):
         assert res.status_code == 200
         data = res.json()
         assert data["playing"] is True
-        assert "subsets" in data
-        assert len(data["subsets"]) <= 2
-        assert any(m["playlist_id"] == "s1" for m in data["subsets"])
-        s1_match = next(m for m in data["subsets"] if m["playlist_id"] == "s1")
-        assert "already" in s1_match
+        # Nothing proposes a subset any more.
+        assert "subsets" not in data
+        # But the marked ones are still reachable by hand.
+        assert [t["id"] for t in data["subset_targets"]] == ["s1"]
     finally:
         appmod.store.save_cache(original_cache)
         appmod.store.save_config(original_config)

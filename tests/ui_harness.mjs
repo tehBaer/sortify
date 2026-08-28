@@ -2172,10 +2172,12 @@ run("stopNowPolling()");
 }
 
 // ============================================================================
-// SS — subsets are offered only once the home question is settled.
-// The server cannot gate this itself: profiles carry a build-time uris set
-// that /api/act never updates, so for a few seconds after filing the server
-// still believes the track has no home. The client decides.
+// SS — subsets are a destination you pick, never a suggestion.
+// They were scored and offered on the filed card until 2026-08-28. The user
+// did not want to be suggested into them, so the offers are gone and only
+// the picker remains. These checks are written as absences on purpose: the
+// most likely way this regresses is a `subsets` array quietly reappearing in
+// the payload and being rendered again.
 // ============================================================================
 {
   resetLog();
@@ -2188,10 +2190,11 @@ run("stopNowPolling()");
       context: null, sitting: null,
       suggestions: [{ playlist_id: "H1", pct: 80, reasons: [], already: false }],
       homes: [{ id: "H1", name: "Home", folder: "" }],
+      // Deliberately still present, and deliberately ignored: a stale server
+      // (or a reinstated scorer) sending these must not put offers back on
+      // the card without someone editing the client too.
       subsets: [{ playlist_id: "S1", name: "{solfest}", pct: 70, already: false,
-                  reasons: ["2 tracks by Artist here"] },
-                { playlist_id: "S2", name: "{tøft}", pct: 60, already: true,
-                  reasons: [] }],
+                  reasons: ["2 tracks by Artist here"] }],
       subset_targets: [{ id: "S1", name: "{solfest}", total: 4 }],
       inputs: [],
       ...over,
@@ -2208,63 +2211,36 @@ run("stopNowPolling()");
   run("stopNowPolling()");
   check("SS an unfiled track is offered no subsets",
         !html().includes("{solfest}"), `html has solfest=${html().includes("{solfest}")}`);
-  check("SS but the Add to subset button is always there",
+  check("SS the Add to subset button is there",
         html().includes('id="btn-now-subset"'), "missing btn-now-subset");
 
-  // File it to a home: the row appears for the track just filed.
   await run(`nowFile("H1")`);
   await tick();
-  check("SS filing to a home reveals the subset offers",
-        html().includes("{solfest}"), "no subset row after filing");
-  check("SS an already-in subset is a muted line, not a button",
-        html().includes("already in") && html().includes("{tøft}") &&
-        !html().includes('data-subset="S2"'),
-        `html=${html().slice(0, 0)}already=${html().includes("already in")}`);
+  check("SS filing to a home still offers no subsets",
+        !html().includes("{solfest}"), `html=${html()}`);
+  check("SS and the filed card keeps the Add to subset button",
+        html().includes('id="btn-now-subset"'), `html=${html()}`);
+  check("SS a payload carrying matches renders none of them",
+        !html().includes("sub-offer") && !html().includes("already in"), `html=${html()}`);
 
-  // A track already in a home (server-flagged) gets the row with no filing.
-  setNow(body({
-    track: { uri: "spotify:track:ss2", name: "Other", duration_ms: 200000,
-             artists: [{ name: "Artist" }], sortable: true, image: null },
-    suggestions: [{ playlist_id: "H1", pct: 80, reasons: [], already: true }],
-  }));
-  run(`filedUris = {}; pollNow(true)`);
-  await tick();
-  run("stopNowPolling()");
-  check("SS a track already in a home gets the row without filing again",
-        html().includes("{solfest}"), "no subset row for an already-filed track");
-
-  // Adding to a subset must not put the card into its filed state.
+  // Adding to a subset by hand still works, and still must not consume the
+  // filed state or remove the track from its input.
   await run(`nowAddToSubset("S1")`);
   await tick();
   check("SS adding to a subset does not consume the filed state",
-        run(`filedUris["spotify:track:ss2"] === undefined`),
+        run(`filedUris["spotify:track:ss1"] === "Home"`),
         run(`JSON.stringify(filedUris)`));
   check("SS and it sends no from_id",
         bodies("/api/act").slice(-1)[0].from_id === null,
         JSON.stringify(bodies("/api/act").slice(-1)[0]));
-
-  // I3: nowRemove writes filedUris[uri] too ("nowhere (removed from input)"),
-  // so subsetBlock's old `!!filedUris[tr.uri]` gate treated a removal as
-  // "settled" and offered subsets for a track with no home — spec §4: "a
-  // track with no home shows no subset row at all." removedUri is what
-  // tells settled apart from a genuine filing.
-  setNow(body({
-    track: { uri: "spotify:track:ss3", name: "Rem", duration_ms: 200000,
-             artists: [{ name: "Artist" }], sortable: true, image: null },
-    context: { id: "IN1", name: "Input One", is_input: true },
-    suggestions: [{ playlist_id: "H1", pct: 80, reasons: [], already: false }],
-  }));
-  run(`filedUris = {}; nowActionLog = []; nowActions = 0; removedUri = null; pollNow(true)`);
-  await tick();
-  run("stopNowPolling()");
-  await run(`nowRemove()`);
-  await tick();
-  check("I3 a removed track shows no subset row even though subsets matched",
-        !html().includes("{solfest}") && !html().includes("already in"), html());
+  check("SS the subset add is logged as its own kind",
+        run(`nowActionLog.slice(-1)[0].kind === "subset"`),
+        run(`JSON.stringify(nowActionLog)`));
 }
 
 // ============================================================================
-// SM — only {}-named playlists can be marked as subsets, and the mark saves.
+// SM — the Subset chip marks a playlist, and the mark saves. No name rule,
+// and no price: marking reads nothing.
 // ============================================================================
 {
   resetLog();
@@ -2276,9 +2252,9 @@ run("stopNowPolling()");
           folder: null, hints: "", split: null, subset_eligible: true },
         { id: "h1", name: "Ordinary", editable: true, total: 12, role: "home",
           folder: null, hints: "", split: null, subset_eligible: false },
-        // Already a subset when the list loaded — resaving it must not be
-        // priced, even though its own warm cost (if it were newly marked)
-        // would blow well past SUBSET_WARM_BUDGET.
+        // A large playlist already marked as a subset: kept as a fixture
+        // because size used to matter here (it drove the save's price) and
+        // the check that it now doesn't is worth keeping honest.
         { id: "s3", name: "{teh bomb}", editable: true, total: 5000, role: "subset",
           folder: null, hints: "", split: null, subset_eligible: true },
       ],
@@ -2303,23 +2279,16 @@ run("stopNowPolling()");
         run(`subsetChipHidden({ subset_eligible: true })`) === false,
         String(run(`subsetChipHidden({ subset_eligible: true })`)));
 
-  // C2: the Save button states the pending cost before the save that incurs
-  // it (spec §2). Nothing newly marked yet — s3 was already a subset on load.
-  check("C2 Save roles has no price with nothing newly marked",
-        $$("btn-save-config").textContent === "Save roles",
-        $$("btn-save-config").textContent);
-
-  run(`roles["s1"] = "subset"`);
-  run(`updateSaveLabel()`);
-  check("C2 Save roles prices a newly-marked subset (ceil(22/100) = 1 call)",
-        $$("btn-save-config").textContent === "Save roles (1 call)",
-        $$("btn-save-config").textContent);
-
-  run(`roles["s1"] = null`);
-  run(`updateSaveLabel()`);
-  check("C2 un-marking it drops the price again",
-        $$("btn-save-config").textContent === "Save roles",
-        $$("btn-save-config").textContent);
+  // Save no longer prices anything: marking a subset reads nothing, so there
+  // is no pending cost to state. Pinned as an absence — a price reappearing
+  // would mean the scoring machinery (and its per-poll reads) came back.
+  // Asserted as "never mentions calls" rather than "equals Save roles": the
+  // stub does not parse index.html, so the button's static label is absent
+  // here. What matters is that nothing WRITES a price into it, which is
+  // exactly what this catches.
+  check("SM Save roles never advertises a call cost",
+        !/call/i.test($$("btn-save-config").textContent),
+        JSON.stringify($$("btn-save-config").textContent));
 
   run(`roles["s1"] = "subset"`);
   await run(`saveConfig()`);

@@ -399,15 +399,6 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 .danger { color: var(--danger); }
 .done-msg { text-align: center; padding: 3rem 0; color: var(--muted); }
 
-.subsets { margin-top: .7rem; }
-.sub-offer {
-  display: block; width: 100%; text-align: left; margin-bottom: .4rem;
-  padding: .5rem .8rem; border-radius: 10px;
-  background: transparent; border: 1px dashed var(--border);
-}
-.sub-offer .s-name { font-weight: 600; }
-.sub-already { margin: .3rem 0 0; }
-
 /* full-page states (nothing playing, reauth): centered in the viewport
    instead of a text strip floating over 60% dead whitespace */
 .state-card {

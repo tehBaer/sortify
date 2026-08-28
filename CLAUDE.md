@@ -102,10 +102,15 @@ escalating penalties. Therefore:
   convention. (There was, `{braced}`, until 2026-08-28: the chip that marks a
   subset only renders on rows the Playlists view draws, 200 of ~990, so a
   name rule left most of the library unmarkable. Don't reinstate it.)
-  Marking costs `ceil(total/100)` calls to warm, capped per save by
-  `SUBSET_WARM_BUDGET`; the picker and the `/api/act` guard both key on the
-  marked set, so their reach cannot drift apart. `suggest.py` is shared with
-  homes and was not modified for subsets.
+  **Subsets are never suggested** — no profile is built for them, so marking
+  one reads nothing and costs nothing. They were scored for a few hours on
+  2026-08-28 and the user rejected it; `_subset_matches`, `SUBSET_TOP_N` and
+  the `SUBSET_WARM_BUDGET` guard were deleted with it, and the warm budget
+  only ever existed because scoring needed the tracks. Reinstating any of it
+  reinstates a per-poll cost that is currently zero. The picker and the
+  `/api/act` guard both key on the marked set, so their reach cannot drift
+  apart. `suggest.py` is shared with homes and was never modified for
+  subsets.
 - The client speaks the Feb-2026 dev-mode API (`items`/`item`, `/me/library`)
   — do not "fix" it back to pre-2026 shapes. Batch ADD exists: up to 100 uris
   per playlist-items POST (probed 2026-08-23; 150 → 400). There is still no

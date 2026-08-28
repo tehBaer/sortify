@@ -6,7 +6,6 @@ import hashlib
 import html
 import json
 import logging
-import math
 import os
 import re
 import threading
@@ -399,22 +398,10 @@ def apply_naming_rename(playlist_id: str):
 
 @app.post("/api/config")
 def set_config(body: ConfigIn):
-    # Opting subsets in is unbounded — ticking all 70 {} playlists and saving
-    # would land ~90 paginated calls inside the very next /api/now poll (see
-    # SUBSET_WARM_BUDGET above). Refuse here, where the user can act on it —
-    # mark fewer, save, let them warm, then mark more — rather than silently
-    # truncating the list they asked for.
-    previously_marked = set(store.config().get("subset_ids") or [])
-    newly_marked = set(body.subset_ids) - previously_marked
-    uncached, cost = _subset_cold_cost(newly_marked)
-    if cost > SUBSET_WARM_BUDGET:
-        raise HTTPException(
-            400,
-            f"that marks {uncached} uncached subset{'s' if uncached != 1 else ''} — "
-            f"warming them would cost ~{cost} Spotify calls, over the "
-            f"{SUBSET_WARM_BUDGET}-call save budget. Mark fewer, save, let those "
-            "warm on the next poll, then mark more.",
-        )
+    # Marking subsets used to be refused past a call budget, because each new
+    # mark meant reading that playlist to build a profile for scoring. Subsets
+    # are no longer scored, so marking reads nothing and costs nothing — there
+    # is no budget left to police, and mark as many as you like.
     store.update_config(
         input_ids=body.input_ids, home_ids=body.home_ids,
         home_hints={k: v.strip() for k, v in body.home_hints.items() if v.strip()},
@@ -515,43 +502,6 @@ def _effective_input_ids(cfg: dict, playlists: list[dict]) -> set[str]:
     """
     ids = set(cfg.get("input_ids", []))
     return ids | inputsets.matched_ids(playlists, store.folders(), cfg)
-
-
-# The convention, when config does not say otherwise. Subsets are `{like
-# this}` — a shape `home_name_exclude_patterns` already refuses, so a subset
-# can never also be a home (pinned by tests/test_subsets.py).
-# Opting a subset in is a chip tap, not a bounded action like Home marking —
-# so unlike homes (guarded structurally by the ">40 candidates" check below),
-# nothing stops a user from ticking all 70 {} playlists and saving at once.
-# Each uncached one costs ceil(total/100) calls on the very next profile
-# rebuild, which for /api/now means inside a poll — the exact shape of the
-# traffic that earned this project its multi-hour quota trips (see
-# CLAUDE.md). 25 calls is comfortably under WINDOW_CAP's 12/60s while still
-# covering several median-sized (~22-track) subsets in one save.
-SUBSET_WARM_BUDGET = 25
-
-
-def _subset_cold_cost(ids: set[str]) -> tuple[int, int]:
-    """(how many of `ids` have no cached tracks, total ceil(total/100) calls).
-
-    Reads only what's already local — the cached listing (for `total`) and
-    the cached track cache (for what's already warm) — so computing this
-    costs nothing itself. A playlist absent from the cached listing is
-    treated as needing a full paginated read (total unknown -> 0 pages
-    counted, but still flagged uncached), which only undercounts a playlist
-    that hasn't even been listed yet — vanishingly rare and never the bulk
-    of a 70-playlist tick-all.
-    """
-    cache = store.cache()
-    cached_pids = set(cache.get("playlists") or {})
-    listing = (cache.get("playlist_list") or {}).get("items") or []
-    by_id = {p["id"]: p for p in listing}
-    uncached = [pid for pid in ids if pid not in cached_pids]
-    cost = sum(
-        math.ceil(((by_id.get(pid) or {}).get("total") or 0) / 100)
-        for pid in uncached
-    )
-    return len(uncached), cost
 
 
 def _effective_subset_ids(cfg: dict, playlists: list[dict]) -> set[str]:
@@ -667,31 +617,12 @@ def _ensure_profiles_locked(force: bool) -> dict:
          if isinstance(p, dict)}
     )
 
-    # Subsets: the same mechanism as homes, on an opt-in set. Snapshot-keyed
-    # like every other cached read, so warm cost is zero; the first build
-    # after opting one in pays ceil(total/100) calls for it, which is the
-    # contract homes already have.
-    subset_ids = _effective_subset_ids(cfg, all_playlists)
-    # Backstop, mirroring the homes guard above: /api/config already refuses
-    # a save that would cross SUBSET_WARM_BUDGET, but this mirrors that shape
-    # here too so no other path to this function (a stale config written
-    # some other way, a future caller) can reach the same unbounded cost.
-    uncached, cost = _subset_cold_cost(subset_ids)
-    if cost > SUBSET_WARM_BUDGET:
-        raise HTTPException(
-            400,
-            f"{uncached} opted-in subsets are uncached — warming them would cost "
-            f"~{cost} Spotify calls, over the {SUBSET_WARM_BUDGET}-call budget. "
-            "Un-mark some subsets in the Playlists view, save, let the rest warm, "
-            "then mark more.",
-        )
-    subsets = [p for p in all_playlists if p["id"] in subset_ids]
-    subset_profiles = {
-        s["id"]: sugg.build_profile(
-            _cached_tracks(s["id"], s["snapshot_id"]), tag_artists
-        )
-        for s in subsets
-    }
+    # Subsets deliberately build NO profile. They were scored like homes
+    # until 2026-08-28, when the user decided they did not want to be
+    # suggested into them — and reading a playlist is the only reason
+    # marking one ever cost anything. Without profiles a subset is purely a
+    # destination you chose, so marking is free, there is no warm budget to
+    # police, and nothing subset-shaped touches the poll path's spend.
 
     # Input contents too, so the capture chips can show membership.
     by_id = {p["id"]: p for p in all_playlists}
@@ -713,7 +644,6 @@ def _ensure_profiles_locked(force: bool) -> dict:
         playlists=all_playlists, input_ids=input_ids,
         playlist_artists=playlist_artists,
         last_added={hid: _last_added_at(tracks) for hid, tracks in home_tracks.items()},
-        subset_profiles=subset_profiles, subsets=subsets,
     )
     return _profile_state
 
@@ -738,44 +668,6 @@ def _homes_payload(state: dict, exclude: str = "") -> list[dict]:
          "last_added_at": last_added.get(h["id"])}
         for h in state["homes"] if h["id"] != exclude
     ]
-
-
-# Homes show three; a subset row appears in a "done, moving on" moment, and
-# three more decisions there work against it. (Spec §3.)
-SUBSET_TOP_N = 2
-
-
-def _subset_matches(state: dict, track: dict, tag_artists: dict,
-                    track_map: dict, artist_map: dict) -> list[dict]:
-    """Subsets worth offering for this track. Local arithmetic, zero calls.
-
-    The same scorer homes use, over the subset profiles — suggest.py is not
-    modified for this. `artist_map` is threaded straight through (the same
-    Last.fm similar-artist map the homes call gets) so subsets keep parity
-    with homes rather than silently losing that signal. Two caller-side
-    rules: no weak (sub-threshold) tier, because a guess about an optional
-    selection is noise rather than pressure to decide; and at most
-    SUBSET_TOP_N.
-    """
-    if not state.get("subset_profiles"):
-        return []
-    names = {s["id"]: s["name"] for s in state.get("subsets", [])}
-    scored = sugg.suggest(
-        track, state["subset_profiles"], tag_artists, track_map,
-        artist_map, state.get("playlist_artists") or {},
-    )
-    out = []
-    for s in scored:
-        if s.get("weak"):
-            continue
-        out.append({
-            "playlist_id": s["playlist_id"],
-            "name": names.get(s["playlist_id"], "subset"),
-            "pct": s["pct"],
-            "already": s["already"],
-            "reasons": s["reasons"],
-        })
-    return out[:SUBSET_TOP_N]
 
 
 def _subset_targets_payload(state: dict) -> list[dict]:
@@ -3651,7 +3543,6 @@ def _suggestion_payload(np: dict) -> dict:
             track, state["profiles"], tag_artists, track_map, artist_map,
             state.get("playlist_artists"),
         ) if sortable else [],
-        "subsets": _subset_matches(state, track, tag_artists, track_map, artist_map) if sortable else [],
         "subset_targets": _subset_targets_payload(state),
         "homes": _homes_payload(state),
         "inputs": [

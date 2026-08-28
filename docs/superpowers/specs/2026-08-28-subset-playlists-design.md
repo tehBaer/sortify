@@ -4,7 +4,23 @@ Design, 2026-08-28. Approved in the 2026-08-28 session. Every decision below
 was explicitly approved by the user; this document records them, it does not
 reopen them.
 
-> **Amended 2026-08-28, after first use.** The `{}` name requirement in §1 is
+> **Amended twice on 2026-08-28, both times after real use. Read these before
+> the design below, which is now substantially historical.**
+>
+> **Second amendment — §§2–4 are withdrawn.** Subsets are **not suggested at
+> all**. The user tried the feature and did not want to be proposed into a
+> curated selection; a suggestion is a question you must answer, and a
+> best-of is not a question. So there are no subset profiles, no
+> `_subset_matches`, no `SUBSET_TOP_N`, no `subsets` array on `/api/now`, and
+> no subset row on the card. §2's whole cost argument — and the
+> `SUBSET_WARM_BUDGET` guard the first amendment added — went with it:
+> building a profile was the only reason marking a subset ever cost a
+> Spotify call, so marking is now free and unbounded. What survives is §5
+> (the picker), §6 (filing into a subset is not filing, and the `/api/act`
+> guard), and §7 (the undo log). The feature is now: mark playlists you want
+> quick access to, file into them by hand.
+>
+> **First amendment — the `{}` name requirement in §1 is
 > **gone**, and with it `subset_name_pattern`, `is_subset_name`, and the
 > drift invariant in §1/§Tests. Any playlist the user owns can be marked a
 > subset; marking is the entire definition. The reason is a discoverability

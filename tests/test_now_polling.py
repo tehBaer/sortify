@@ -414,7 +414,11 @@ def test_the_sitting_lookup_on_the_poll_path_is_free(route_client):
 # the already-cached track afterwards, spending no currently-playing call of
 # its own.
 
-LIGHT_HEAVY_KEYS = ("suggestions", "subsets", "subset_targets", "homes")
+# The keys the light poll deliberately withholds and the suggest call carries.
+# `subsets` was one of them until 2026-08-28: subsets are no longer scored or
+# offered, so the key does not exist on either response any more (see
+# tests/test_subsets.py). `subset_targets` — the picker's list — stays.
+LIGHT_HEAVY_KEYS = ("suggestions", "subset_targets", "homes")
 
 
 def test_light_poll_returns_the_track_without_the_suggestion_payload(route_client):

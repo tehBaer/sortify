@@ -61,20 +61,19 @@ have to be named `{like this}`. That requirement is gone: the chip only
 appears on rows the list actually draws, 200 of your ~990 playlists, so a
 name rule meant most of your library could never be marked at all.)
 
-Subsets are scored by the same three signals as homes, against the tracks
-already in them, with two differences: they never show sub-threshold
-guesses (a guess about an optional selection is noise, not pressure to
-decide), and at most two are offered at a time.
+**Nothing on this page applies to subsets.** They are not scored, not
+ranked, and never suggested — sortify has no opinion about which of them a
+song belongs in. They were scored briefly, in August 2026, and it wasn't
+wanted: a suggestion is a question you have to answer, and a best-of is not
+a question.
 
-They appear only once the home question is settled — right after you file a
-track, or when it is already in a home. A track with no home is never
-offered a subset; the home decision comes first.
+So a subset is simply a destination you can reach quickly. **Add to
+subset…** on the Now card opens the ones you've marked, and putting a song
+in one changes nothing else — it does not count as filing, it does not take
+the song out of its input, and the song still needs its home.
 
-**Marking** a subset is what lets it propose itself, and costs one read of
-that playlist (more for a long one) on the next profile rebuild — the Save
-button tells you the price first, and refuses a save that would spend too
-much at once. **Add to subset…** on the Now card reaches the subsets you
-have marked, which is the same set the suggestions come from.
+Marking one is **free**: because nothing scores them, nothing reads them,
+and no Spotify calls are spent. Mark as many as you find useful.
 
 ## Where the data comes from
 
