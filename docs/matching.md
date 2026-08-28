@@ -50,6 +50,26 @@ are not run through the tag stoplist: whatever you write is used as-is
 Hints live in `data/config.json` under `home_hints` and take effect on the
 next suggestion after saving.
 
+## Subsets
+
+A **subset** is a `{braced}` playlist — a non-exclusive selection any song
+can join, including songs that already have a home. Best-ofs, moods,
+project lists.
+
+Subsets are scored by the same three signals as homes, against the tracks
+already in them, with two differences: they never show sub-threshold
+guesses (a guess about an optional selection is noise, not pressure to
+decide), and at most two are offered at a time.
+
+They appear only once the home question is settled — right after you file a
+track, or when it is already in a home. A track with no home is never
+offered a subset; the home decision comes first.
+
+**Opting in** (the Subset chip on the Playlists view) is what lets a subset
+propose itself, and costs one read of that playlist on the next profile
+rebuild. Every `{}` playlist stays reachable by hand through **Add to
+subset…**, opted in or not.
+
 ## Where the data comes from
 
 | Data | File | Fetched |

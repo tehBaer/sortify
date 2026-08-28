@@ -72,6 +72,9 @@ escalating penalties. Therefore:
   looks like the app being down, which it is not. Do not run ad-hoc
   `sortify` processes alongside the unit.
 - Tests: `.venv/bin/pytest -q` — keep them green; they cost zero API calls.
+  Frontend: `node tests/ui_harness.mjs` (no framework, no build step — a
+  hand-run harness of 189 checks against a stub DOM, also zero API calls).
+  Both must be green before any commit touching their surface.
 
 ## Conventions (encoded in data/config.json — don't re-derive)
 
@@ -93,6 +96,11 @@ escalating penalties. Therefore:
   segments, emoji-prefixed names (🐾/🧸 derived super/subsets), and
   `__x__`/`{x}`/`<x>` marker names. NEUE was excluded 2026-08-24: they are
   staging buckets for new finds, not filing destinations.
+- **Subsets** are `{braced}` playlists (`subset_name_pattern`): non-exclusive
+  selections, never a filing home, never an input. `subset_ids` is the
+  opt-in list of those allowed to suggest themselves — marking one costs a
+  read of it; the picker reaches all of them regardless. `suggest.py` is
+  shared with homes and was not modified for them.
 - The client speaks the Feb-2026 dev-mode API (`items`/`item`, `/me/library`)
   — do not "fix" it back to pre-2026 shapes. Batch ADD exists: up to 100 uris
   per playlist-items POST (probed 2026-08-23; 150 → 400). There is still no
