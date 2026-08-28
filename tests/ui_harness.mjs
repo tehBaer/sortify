@@ -30,6 +30,32 @@
 // app.js keeps `nowState.sitting` by reference and mutates its `decided` map
 // in place, so a shared fixture would leak one scenario's decision into the
 // next scenario's "server" answer and mask the very bug under test.
+//
+// ---- two hazards that have each cost a debugging session ------------------
+//
+// ONE LONG-LIVED CONTEXT. Every block shares one vm, one app.js instance, and
+// one set of globals; blocks run in file order and there is no reset between
+// them. So scenario N's leftovers become scenario N+1's mystery, and the
+// symptom always appears in the LATER block:
+//   - `view-now.hidden` left true makes the next block's pollNow a silent
+//     no-op, and its card assertions then read a stale card;
+//   - timers outlive their block. resumeSpotify schedules a repoll ~900ms out
+//     on a bare setTimeout that stopNowPolling cannot cancel; it lands inside
+//     whatever block is running by then and overwrites nowState with ITS
+//     fixture (this is why PV3 hides the Now view and MT waits one out);
+//   - the preview player's per-playlist position stash persists across
+//     blocks, so two blocks sharing a playlist id must also differ in the
+//     playing track uri or the second one silently resumes the first's walk.
+// Open a block by setting the state it needs rather than inheriting it, and
+// close it by restoring what it changed — in a `finally`, so a throwing block
+// does not take the rest of the file down with it.
+//
+// `playing` IS NOT `is_playing`. /api/now sets `playing: true` whenever a
+// track object exists at all and reports the transport separately as
+// `is_playing` — a paused Spotify is `playing: true, is_playing: false`. A
+// fixture that stages only `playing` is a paused player, so anything that
+// asks "was music actually running" reads false and the block passes for the
+// wrong reason. Staging a playing track means setting BOTH.
 import fs from "node:fs";
 import path from "node:path";
 import url from "node:url";
