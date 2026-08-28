@@ -689,7 +689,9 @@ async function pollNow(force = false) {
     // When the server's answer left its upstream fetch (it may have served
     // its cache) — the anchor for the "updated Ns ago" line.
     nowFetchedAt = Date.now() - (data.fetched_ago_ms || 0);
-    nowState = { ...data, homes: new Map((data.homes || []).map((h) => [h.id, h])) };
+    nowState = { ...data, homes: new Map((data.homes || []).map((h) => [h.id, h])),
+                 subsetTargets: new Map((data.subset_targets || [])
+                   .map((s) => [s.id, { id: s.id, name: s.name, total: s.total, folder: null }])) };
     // A genuinely new track re-arms the played-out refetch (declared below)
     // — and so does the SAME track started over, which is what Spotify's
     // repeat-one does. Matching on uri alone meant repeat-one armed the
@@ -1237,6 +1239,11 @@ function renderNow() {
     });
     const more = $("btn-now-more");
     if (more) more.onclick = () => openPicker(nowState.homes, nowFile, nowCreateAndFile);
+    const sub = $("btn-now-subset");
+    if (sub) sub.onclick = () => openPicker(nowState.subsetTargets, nowAddToSubset);
+    $("now-card").querySelectorAll(".sub-offer").forEach((b) => {
+      b.onclick = () => nowAddToSubset(b.dataset.subset);
+    });
     $("now-card").querySelectorAll(".in-chip").forEach((b) => {
       b.onclick = () => nowCapture(b.dataset.in);
     });
@@ -1251,9 +1258,41 @@ function renderNow() {
   }
 }
 
+// Subsets are the second question, never the first: they appear once the
+// home question is settled — either because we just filed this track, or
+// because the server says it is already in a home. A homeless track shows
+// none of this, by design.
+function subsetBlock(d, tr) {
+  const settled = !!filedUris[tr.uri] || (d.suggestions || []).some((s) => s.already);
+  if (!settled) return "";
+  const offers = (d.subsets || []).filter((s) => !s.already);
+  const already = (d.subsets || []).filter((s) => s.already);
+  let out = "";
+  for (const s of offers) {
+    out += `<button class="sub-offer" data-subset="${esc(s.playlist_id)}">
+      <span class="s-pct">${s.pct}%</span>
+      <span class="s-name">+ ${esc(s.name)}</span>
+      <span class="s-why">${esc((s.reasons || []).join(" · "))}</span>
+    </button>`;
+  }
+  for (const s of already) {
+    out += `<p class="sub-already hint">already in <b>${esc(s.name)}</b></p>`;
+  }
+  return out ? `<div class="subsets">${out}</div>` : "";
+}
+
+function subsetButtonRow() {
+  return `<div class="minor-actions">
+    <button id="btn-now-subset">Add to subset…</button>
+  </div>`;
+}
+
 function ordinaryCardBody(d, tr, ctx) {
   const filedTo = filedUris[tr.uri];
-  if (filedTo) return `<p class="done-msg">✓ filed to <b>${esc(filedTo)}</b></p>`;
+  if (filedTo) {
+    return `<p class="done-msg">✓ filed to <b>${esc(filedTo)}</b></p>` +
+           subsetBlock(d, tr) + subsetButtonRow();
+  }
   if (!tr.sortable) return '<p class="hint">Can\'t be sorted via the API (local file or episode).</p>';
 
   let body = "";
@@ -1273,9 +1312,11 @@ function ordinaryCardBody(d, tr, ctx) {
   // Remove from input lives in the playback strip now (see playbackStrip).
   body += `<div class="minor-actions">
     <button id="btn-now-more"><kbd>m</kbd> Add to…</button>
+    <button id="btn-now-subset">Add to subset…</button>
   </div>`;
   const chips = captureChips(d.inputs || []);
   if (chips) body += `<div class="capture"><span class="hint">capture to input:</span>${chips}</div>`;
+  body += subsetBlock(d, tr);
   return body;
 }
 
@@ -1332,14 +1373,21 @@ async function nowCapture(inId) {
   } catch (e) { toast(e.message); }
 }
 
-// Stub for Task 6, which replaces this with the real subset-target UI wiring.
 async function nowAddToSubset(id) {
   const tr = nowState.track;
+  const name = nowState.subsetTargets?.get(id)?.name
+    || (nowState.subsets || []).find((s) => s.playlist_id === id)?.name || "subset";
   try {
+    // from_id stays null: a song in a best-of has not been sorted, so it
+    // must not leave its input. The server refuses the other shape too.
     await api("/api/act", { action: "move", uri: tr.uri, from_id: null, to_id: id });
     nowActions++;
     nowActionLog.push({ uri: tr.uri, kind: "subset" });
-    toast("added");
+    if (nowState.subsets) {
+      const hit = nowState.subsets.find((s) => s.playlist_id === id);
+      if (hit) hit.already = true;
+    }
+    toast(`+ ${name}`);
     renderNow();
   } catch (e) { toast(e.message); }
 }

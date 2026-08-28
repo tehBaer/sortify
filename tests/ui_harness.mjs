@@ -2104,6 +2104,79 @@ run("stopNowPolling()");
         `log=${run(`JSON.stringify(nowActionLog)`)} actions=${run("nowActions")}`);
 }
 
+// ============================================================================
+// SS — subsets are offered only once the home question is settled.
+// The server cannot gate this itself: profiles carry a build-time uris set
+// that /api/act never updates, so for a few seconds after filing the server
+// still believes the track has no home. The client decides.
+// ============================================================================
+{
+  resetLog();
+  const body = (over) => ({
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri: "spotify:track:ss1", name: "Song", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: null, sitting: null,
+      suggestions: [{ playlist_id: "H1", pct: 80, reasons: [], already: false }],
+      homes: [{ id: "H1", name: "Home", folder: "" }],
+      subsets: [{ playlist_id: "S1", name: "{solfest}", pct: 70, already: false,
+                  reasons: ["2 tracks by Artist here"] },
+                { playlist_id: "S2", name: "{tøft}", pct: 60, already: true,
+                  reasons: [] }],
+      subset_targets: [{ id: "S1", name: "{solfest}", total: 4 }],
+      inputs: [],
+      ...over,
+    },
+  });
+  const html = () => $$("now-card").innerHTML;
+
+  routes["GET /api/now?force=1"] = body({});
+  routes["POST /api/act"] = { status: 200, body: {} };
+  // show("now") first — see the harness header: pollNow no-ops on a hidden view.
+  run(`show("now"); filedUris = {}; nowActions = 0; nowActionLog = [];
+       removedUri = null; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  check("SS an unfiled track is offered no subsets",
+        !html().includes("{solfest}"), `html has solfest=${html().includes("{solfest}")}`);
+  check("SS but the Add to subset button is always there",
+        html().includes('id="btn-now-subset"'), "missing btn-now-subset");
+
+  // File it to a home: the row appears for the track just filed.
+  await run(`nowFile("H1")`);
+  await tick();
+  check("SS filing to a home reveals the subset offers",
+        html().includes("{solfest}"), "no subset row after filing");
+  check("SS an already-in subset is a muted line, not a button",
+        html().includes("already in") && html().includes("{tøft}") &&
+        !html().includes('data-subset="S2"'),
+        `html=${html().slice(0, 0)}already=${html().includes("already in")}`);
+
+  // A track already in a home (server-flagged) gets the row with no filing.
+  routes["GET /api/now?force=1"] = body({
+    track: { uri: "spotify:track:ss2", name: "Other", duration_ms: 200000,
+             artists: [{ name: "Artist" }], sortable: true, image: null },
+    suggestions: [{ playlist_id: "H1", pct: 80, reasons: [], already: true }],
+  });
+  run(`filedUris = {}; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  check("SS a track already in a home gets the row without filing again",
+        html().includes("{solfest}"), "no subset row for an already-filed track");
+
+  // Adding to a subset must not put the card into its filed state.
+  await run(`nowAddToSubset("S1")`);
+  await tick();
+  check("SS adding to a subset does not consume the filed state",
+        run(`filedUris["spotify:track:ss2"] === undefined`),
+        run(`JSON.stringify(filedUris)`));
+  check("SS and it sends no from_id",
+        bodies("/api/act").slice(-1)[0].from_id === null,
+        JSON.stringify(bodies("/api/act").slice(-1)[0]));
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
