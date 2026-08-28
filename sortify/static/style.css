@@ -91,8 +91,12 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 /* Distinct fill from Home on purpose: the role invariant (a playlist can
    never be both) exists precisely so Home and Subset must never be
    confused for each other at a glance, and sharing --accent undercut that.
-   --danger is already in the palette, in both themes. */
-.chip.on-subset { background: var(--danger); color: #fff; border-color: transparent; }
+   Purple rather than --danger: red is this app's destructive colour — it is
+   what the Now card's Remove button wears — and a role marker is not a
+   warning. Three roles, three unrelated hues: In blue, Home green,
+   Subset purple. Hardcoded like .on-input's blue, for the same reason:
+   these are role identities, not theme colours. */
+.chip.on-subset { background: #7a5cd6; color: #fff; border-color: transparent; }
 .pl-sort { font-size: 1.1rem; padding: .3rem .6rem; }
 /* full-width second line inside the (flex-wrap) row, homes only */
 .pl-row { flex-wrap: wrap; }
