@@ -778,7 +778,13 @@ run("stopNowPolling()");
   check("V5 triage marks the Playlists link active",
         $$("nav-lists").classList.contains("active") === true &&
         $$("nav-now").classList.contains("active") === false, "");
+  // V6 — the input switcher and now-actions live in the merged header, shown
+  // only on the Now view; show() carries the body class that gates them.
+  check("V6 leaving Now drops the on-now body class",
+        run(`document.body.classList.contains("on-now")`) === false, "");
   run(`show("now")`);
+  check("V6 the Now view sets the on-now body class",
+        run(`document.body.classList.contains("on-now")`) === true, "");
 }
 
 {

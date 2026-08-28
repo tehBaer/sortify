@@ -28,16 +28,21 @@ body {
   font: 16px/1.45 system-ui, -apple-system, sans-serif;
   padding-bottom: env(safe-area-inset-bottom);
 }
+/* One bar: menu on the left, then the title, then the Now view's input
+   switcher, with the now-actions pushed to the right edge. The switcher and
+   actions render only under body.on-now, so other views get just menu +
+   title without the row reflowing into a second bar. */
 header {
-  display: flex; align-items: baseline; justify-content: space-between;
-  padding: .7rem 1rem; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: .6rem;
+  padding: .45rem .7rem; border-bottom: 1px solid var(--border);
   /* Stays put so the nav is always reachable mid-scroll on a phone. */
   position: sticky; top: 0; z-index: 5;
   background: color-mix(in srgb, var(--bg) 82%, transparent);
   backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
 }
-h1 { font-size: 1.15rem; margin: 0; cursor: pointer; }
-#whoami { color: var(--muted); font-size: .85rem; }
+h1 { font-size: 1.15rem; margin: 0; cursor: pointer; flex-shrink: 0; }
+body:not(.on-now) #btn-input-switch,
+body:not(.on-now) .now-top-actions { display: none; }
 nav { display: flex; gap: 1rem; }
 nav a { cursor: pointer; color: var(--muted); font-size: .95rem;
   padding-bottom: 2px; border-bottom: 2px solid transparent; }
@@ -48,15 +53,24 @@ nav a.active { color: var(--fg); font-weight: 600; border-bottom-color: var(--ac
    them for width. Deliberately the same card, radius, shadow and animation as
    #input-pop — two popovers that look and dismiss differently would cost more
    than the duplicated declarations do. */
-#btn-nav-menu { margin-left: .2rem; flex-shrink: 0; }
+#btn-nav-menu { flex-shrink: 0; }
 #btn-nav-menu.open { color: var(--accent); }
 #nav-pop {
-  position: absolute; top: calc(100% + 4px); right: .7rem; left: auto; z-index: 40;
+  /* Opens under its button — which sits at the header's LEFT edge now. */
+  position: absolute; top: calc(100% + 4px); left: .7rem; right: auto; z-index: 40;
   min-width: 11rem; flex-direction: column; gap: .1rem;
   background: var(--card); border: 1px solid var(--border); border-radius: 14px;
   box-shadow: var(--shadow-card); padding: .35rem;
   animation: card-in .18s ease-out;
 }
+/* The username's "elsewhere": a quiet footer line inside the menu — the only
+   place it was ever glanced at anyway. */
+#nav-pop #whoami {
+  display: block; padding: .5rem .8rem .3rem; margin-top: .25rem;
+  border-top: 1px solid var(--border);
+  color: var(--muted); font-size: .8rem;
+}
+#nav-pop #whoami:empty { display: none; }
 #nav-pop a {
   display: flex; align-items: center; min-height: 48px;
   padding: .3rem .8rem; border-radius: 10px;
@@ -133,11 +147,13 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
   display: flex; justify-content: space-between; align-items: center;
   gap: .5rem; margin-bottom: 1rem;
 }
-.now-top-actions { display: flex; gap: .4rem; align-items: center; flex-shrink: 0; }
+.now-top-actions { display: flex; gap: .4rem; align-items: center; flex-shrink: 0; margin-left: auto; }
 
-/* The input switcher: trigger face + floating panel replacing the <select>. */
+/* The input switcher: trigger face + floating panel replacing the <select>.
+   Narrow, not full-width: it sizes to its label up to a cap and ellipsizes
+   past it — the header row has to hold the menu, title and actions too. */
 .input-switch {
-  flex: 1; min-width: 0; min-height: 48px;
+  flex: 0 1 auto; min-width: 0; max-width: min(42vw, 12rem); min-height: 40px;
   display: inline-flex; align-items: center; gap: .35rem;
   padding: .3rem .55rem .3rem .8rem; border-radius: 12px;
   background: var(--card); text-align: left;
@@ -152,7 +168,10 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 .input-switch .ip-chev { flex-shrink: 0; color: var(--muted); transition: transform .15s ease; }
 .input-switch.open .ip-chev { transform: rotate(180deg); }
 #input-pop {
-  position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 30;
+  /* Anchored under the header (its positioned ancestor now), hugging the
+     switcher's side of the bar rather than spanning the whole window. */
+  position: absolute; top: calc(100% + 6px); left: .7rem; right: auto;
+  width: min(92vw, 24rem); z-index: 30;
   max-height: min(60vh, 26rem); overflow-y: auto; overscroll-behavior: contain;
   background: var(--card); border: 1px solid var(--border); border-radius: 14px;
   box-shadow: var(--shadow-card); padding: .35rem;

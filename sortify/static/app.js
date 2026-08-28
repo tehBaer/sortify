@@ -58,6 +58,9 @@ function show(view) {
   // keeps that link lit. Split has its own top-level tab now, and the
   // split view itself counts as part of it (opened from the picker or, still,
   // the per-row button).
+  // The input switcher and now-actions live in the merged header; this class
+  // is what shows them on the Now view and hides them everywhere else.
+  document.body.classList.toggle("on-now", view === "now");
   $("nav-now").classList.toggle("active", view === "now");
   $("nav-lists").classList.toggle("active", view === "lists" || view === "triage");
   $("nav-split").classList.toggle("active", view === "split" || view === "splitpick");
