@@ -985,6 +985,25 @@ function paintNowControls(d) {
   if (!$("input-pop").hidden) renderInputPop();
 }
 
+// Which buffer list to put on when you don't care which — the drawn pick
+// costs nothing but the one play call it ends in, because the whole pool
+// arrives with the poll that already painted the switcher. `rand` is a
+// parameter so the draw is testable rather than sampled.
+//
+// The playing list leaves the pool first: a "random" button that restarts
+// what you are already hearing reads as broken, not as a coincidence. It
+// comes back only when removing it would leave nothing to draw from — one
+// buffer list is still an answer, just a foregone one.
+function pickRandomBuffer(inputs, currentId, rand = Math.random) {
+  const pool = (inputs || []).filter(
+    (l) => l.id !== "liked" && (l.set || NOW_BUFFER_SET) === NOW_BUFFER_SET);
+  const fresh = pool.filter((l) => l.id !== currentId);
+  const from = fresh.length ? fresh : pool;
+  return from.length ? from[Math.floor(rand() * from.length)] : null;
+}
+
+const ICON_DIE = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><circle cx="9" cy="9" r="1.2" fill="currentColor" stroke="none"/><circle cx="15" cy="15" r="1.2" fill="currentColor" stroke="none"/></svg>';
+
 function renderInputPop() {
   if (!nowCtl) return;
   const d = nowCtl;
@@ -1018,6 +1037,13 @@ function renderInputPop() {
       ? "" : ` · ${shown.length} of ${lists.length}`;
     if (!(key === NOW_BUFFER_SET && bySet.size === 1))
       html += `<div class="ip-set">${esc(setLabel(key) + note)}</div>`;
+    // Heads the buffer set, because that is the set it draws from — and only
+    // when there is an actual draw to make. With one buffer list the row
+    // would be a second button for the list sitting right under it.
+    if (key === NOW_BUFFER_SET && lists.length > 1)
+      html += `<button id="ip-random" class="ip-row ip-random" ` +
+        `title="Put on one of your buffer lists at random">${ICON_DIE}` +
+        `<span class="ip-name">random buffer list</span></button>`;
     html += shown.map(row).join("");
   }
   if (hidden || nowSetsExpanded)
@@ -1029,6 +1055,14 @@ function renderInputPop() {
   // innerHTML replaced the nodes, so the bindings go per render — the same
   // reason renderNow rewires its card-internal buttons every time.
   for (const l of shownAll) $("ip-" + l.id).onclick = () => pickInput(l.id);
+  const die = $("ip-random");
+  // Drawn at click, not at render: the pool the poll last painted is the
+  // pool you meant, and a row that decided its answer minutes ago would
+  // start a list you have since moved on from.
+  if (die) die.onclick = () => {
+    const pick = pickRandomBuffer(playable, current);
+    if (pick) pickInput(pick.id, pick.name);
+  };
   const more = $("btn-now-sets");
   if (more) more.onclick = () => {
     nowSetsExpanded = !nowSetsExpanded;
@@ -1062,11 +1096,14 @@ document.addEventListener("click", (e) => {
   closeInputPop();
 });
 
-async function pickInput(id) {
+// `label` names the list in the toast. Picking a row by hand needs no such
+// echo — you just read the name you tapped — but the random draw does, or
+// the button is a black box you have to wait out the bar to decode.
+async function pickInput(id, label = null) {
   closeInputPop();
   try {
     await api("/api/player/play", { input_id: id });
-    toast("starting…");
+    toast(label ? `starting ${label}…` : "starting…");
     repollAfterPlaybackChange();
   } catch (err) {
     toast(err.message);

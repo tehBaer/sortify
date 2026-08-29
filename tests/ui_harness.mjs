@@ -1382,6 +1382,94 @@ run("stopNowPolling()");
 }
 
 // ============================================================================
+// RD — the random buffer list row. The draw is pure client-side arithmetic
+// over data the poll already carried, so the ONLY Spotify call it can ever
+// cost is the one play it starts. The properties that matter: it never draws
+// outside the buffer set, and it never hands back what is already playing —
+// a "random" button that restarts the current list reads as broken.
+// ============================================================================
+{
+  check("RD pickRandomBuffer exists",
+        run(`typeof pickRandomBuffer`) === "function",
+        String(run(`typeof pickRandomBuffer`)));
+  try {
+    const ins = [
+      { id: "in1", name: "[A]", set: "buffer" },
+      { id: "in2", name: "[B]", set: "buffer" },
+      { id: "in3", name: "[C]", set: "buffer" },
+      { id: "o1", name: "<other>", set: "other" },
+      { id: "tb", name: "Prog", set: "the-bomb" },
+      { id: "liked", name: "Liked Songs", set: "buffer" },
+    ];
+    const J = JSON.stringify(ins);
+    // rand() is injected, so the draw is checked exhaustively rather than
+    // sampled: every slot of the pool, not "it looked random twice".
+    const drawn = [0, 0.34, 0.67, 0.999].map((r) =>
+      run(`pickRandomBuffer(${J}, null, () => ${r})?.id`));
+    check("RD the pool is the buffer set only — never other, the-bomb or liked",
+          drawn.every((id) => ["in1", "in2", "in3"].includes(id)),
+          JSON.stringify(drawn));
+    check("RD and every buffer list is reachable — no slot is unreachable",
+          new Set(drawn).size === 3, JSON.stringify(drawn));
+
+    const excl = [0, 0.4, 0.9].map((r) =>
+      run(`pickRandomBuffer(${J}, "in2", () => ${r})?.id`));
+    check("RD the playing list is out of the pool, whichever slot is drawn",
+          excl.every((id) => id === "in1" || id === "in3") && !excl.includes("in2"),
+          JSON.stringify(excl));
+
+    // Excluding the current list can empty the pool. Returning null there
+    // would make the row inert exactly when it is the only list you have.
+    const solo = run(
+      `pickRandomBuffer([{ id: "in1", name: "[A]", set: "buffer" }], "in1", () => 0)?.id`);
+    check("RD the sole buffer list is still drawn when it is also the current",
+          solo === "in1", String(solo));
+    check("RD an empty pool draws nothing rather than throwing",
+          run(`pickRandomBuffer([{ id: "o1", set: "other" }], null, () => 0)`) === null,
+          String(run(`pickRandomBuffer([{ id: "o1", set: "other" }], null, () => 0)`)));
+
+    // --- the row in the popover -------------------------------------------
+    const d = { playing: true, is_playing: true,
+      context: { id: "in2", name: "[B]", is_input: true }, inputs: ins };
+    run(`nowSetsExpanded = false; paintNowControls(${JSON.stringify(d)})`);
+    run(`openInputPop()`);
+    check("RD the row renders at the head of the buffer set",
+          /ip-random/.test($$("input-pop").innerHTML)
+          && $$("input-pop").innerHTML.indexOf("ip-random")
+             < $$("input-pop").innerHTML.indexOf("ip-in1"),
+          JSON.stringify($$("input-pop").innerHTML.slice(0, 240)));
+
+    routes["POST /api/player/play"] = { ok: true };
+    resetLog();
+    await run(`$("ip-random").onclick()`);
+    await tick();
+    const started = bodies("/api/player/play")[0]?.input_id;
+    check("RD clicking it starts exactly one buffer list, never the current one",
+          posts("/api/player/play") === 1
+          && ["in1", "in3"].includes(started),
+          `${posts("/api/player/play")} POST(s), input_id=${started}`);
+    check("RD and the toast names the list it drew, so the pick is not a black box",
+          new RegExp(started === "in1" ? "\\[A\\]" : "\\[C\\]").test($$("toast").textContent),
+          JSON.stringify($$("toast").textContent));
+    check("RD the panel closes on the draw, like any other pick",
+          $$("input-pop").hidden === true, `hidden=${$$("input-pop").hidden}`);
+
+    // One buffer list makes "random" a lie — there is nothing to draw from.
+    run(`paintNowControls(${JSON.stringify({ playing: false, inputs: [
+      { id: "in1", name: "[A]", set: "buffer" },
+      { id: "o1", name: "<other>", set: "other" }] })})`);
+    run(`openInputPop()`);
+    check("RD a single buffer list hides the row instead of offering a fake draw",
+          !/ip-random/.test($$("input-pop").innerHTML)
+          && /ip-in1/.test($$("input-pop").innerHTML),
+          JSON.stringify($$("input-pop").innerHTML.slice(0, 200)));
+    run(`closeInputPop()`);
+  } catch (e) {
+    check("RD scenario ran without throwing", false, String(e));
+  }
+}
+
+// ============================================================================
 // PV — hold-to-preview: the affordance, the swallowed tap, and the ONE
 // budgeted resume call. The resume is real Spotify budget, so "exactly one"
 // is the property that matters most here.

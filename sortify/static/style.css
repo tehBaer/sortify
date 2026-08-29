@@ -198,6 +198,10 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 #input-pop .ip-dot {
   flex-shrink: 0; width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
 }
+/* The draw is an action, not one more list — muted so it never competes with
+   the names it picks from, and ruled off from them. */
+#input-pop .ip-random { color: var(--muted); border-bottom: 1px solid var(--border); border-radius: 10px 10px 0 0; }
+#input-pop .ip-random svg { flex-shrink: 0; }
 #input-pop .ip-more {
   display: block; width: 100%; min-height: 44px; margin-top: .25rem;
   border: 0; border-top: 1px solid var(--border); border-radius: 0 0 10px 10px;
