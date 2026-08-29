@@ -446,28 +446,6 @@ kbd {
 }
 #picker-list { overflow-y: auto; flex: 1; }
 #picker-list button { display: block; width: 100%; text-align: left; margin-bottom: .4rem; }
-
-/* The Now card's inline home list — the rest of the library, on the card.
-   Capped at a few rows on purpose: it has to stay short enough that there is
-   still page above and below it to grab, or the inner scroller swallows every
-   swipe on a phone. overscroll-behavior: contain stops a flick that reaches
-   the end of the list from carrying on into the page behind it (same guard
-   #input-pop uses). */
-.inline-homes { margin-top: .7rem; }
-#inline-filter {
-  width: 100%; padding: .5rem .7rem; font: inherit;
-  background: var(--card); color: inherit;
-  border: 1px solid var(--border); border-radius: 10px;
-}
-#inline-list {
-  margin-top: .4rem; max-height: min(38vh, 13rem);
-  overflow-y: auto; overscroll-behavior: contain;
-  /* A cut-off row at the bottom edge is the only honest affordance that
-     there is more below — no scrollbar renders on a touch device at rest. */
-  -webkit-overflow-scrolling: touch;
-}
-#inline-list button { display: block; width: 100%; text-align: left; margin-bottom: .4rem; }
-#inline-list .hint { margin: .3rem .2rem; }
 .picker-row { padding: .55rem .8rem; }
 /* holdable elements: no long-press text selection / iOS callout */
 .picker-row, .sugg { -webkit-touch-callout: none; user-select: none; }
