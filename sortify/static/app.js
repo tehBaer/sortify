@@ -1448,6 +1448,8 @@ function renderNow() {
     if (more) more.onclick = () => openPicker(nowState.homes, nowFile, nowCreateAndFile);
     const sub = $("btn-now-subset");
     if (sub) sub.onclick = () => openPicker(nowState.subsetTargets, nowAddToSubset);
+    const nh = $("btn-now-needs-home");
+    if (nh) nh.onclick = nowNeedsHome;
     $("now-card").querySelectorAll(".in-chip").forEach((b) => {
       b.onclick = () => nowCapture(b.dataset.in);
     });
@@ -1502,10 +1504,37 @@ function ordinaryCardBody(d, tr, ctx) {
   body += `<div class="minor-actions">
     <button id="btn-now-more"><kbd>m</kbd> Add to…</button>
     <button id="btn-now-subset">Add to subset…</button>
+    ${needsHomeButton(d) || ""}
   </div>`;
   const chips = captureChips(d.inputs || []);
   if (chips) body += `<div class="capture"><span class="hint">capture to input:</span>${chips}</div>`;
   return body;
+}
+
+// The verdict "none of my homes fit this — it needs one of its own", as a
+// move into the buffer that collects exactly those songs. A third destination
+// rather than a fourth verb: it files like any suggestion does (out of the
+// input, into somewhere), so it belongs beside Add to… and not next to the
+// strip's Remove.
+//
+// Four conditions, and all four are about not offering a move that would be
+// wrong rather than merely useless: no destination configured (see the
+// server's `_needs_home_id`), nothing to move out of, the destination IS the
+// context, or the song is already there.
+function needsHomeButton(d) {
+  if (!d.needs_home_id || !d.context?.is_input) return "";
+  if (d.context.id === d.needs_home_id) return "";
+  if ((d.inputs || []).some((l) => l.id === d.needs_home_id && l.has_track)) return "";
+  return '<button id="btn-now-needs-home">Needs a home</button>';
+}
+
+async function nowNeedsHome() {
+  const id = nowState.needs_home_id;
+  if (!id) return;
+  // Deliberately nowFile, not a variant of nowCapture: the decision is spent
+  // either way, so the card belongs in its ✓ filed state with the strip's
+  // Undo — the same shape filing to a home leaves behind.
+  await nowFile(id, "needs a new home");
 }
 
 // Capture chips, grouped by input set. 26 chips in one wall is a thing you
@@ -1527,6 +1556,11 @@ function captureChip(l) {
 function captureChips(inputs) {
   const bySet = new Map();
   for (const l of inputs) {
+    // The needs-a-home buffer has its own button, which MOVES the song there.
+    // Its chip would sit two centimetres away and only ADD it, leaving the
+    // song in the input as well — one destination with two meanings depending
+    // on which control you hit. Hidden here so there is only the one.
+    if (l.id === nowState?.needs_home_id) continue;
     const k = l.set || NOW_BUFFER_SET;
     if (!bySet.has(k)) bySet.set(k, []);
     bySet.get(k).push(l);
@@ -1575,13 +1609,17 @@ async function nowAddToSubset(id) {
   } catch (e) { toast(e.message); }
 }
 
-async function nowFile(toId) {
+// `label` names the destination on the done card and in the toast. It exists
+// because not every filing destination is a home any more: the needs-a-home
+// buffer is an input, so the `d.homes` lookup finds nothing and the card
+// would read "✓ filed to home".
+async function nowFile(toId, label) {
   const d = nowState, tr = d.track;
   const fromId = d.context?.is_input ? d.context.id : null;
   try {
     const res = await api("/api/act", { action: "move", uri: tr.uri, from_id: fromId, to_id: toId });
     nowActions++;
-    filedUris[tr.uri] = d.homes.get(toId)?.name || "home";
+    filedUris[tr.uri] = label || d.homes.get(toId)?.name || "home";
     nowActionLog.push({ uri: tr.uri, kind: "home" });
     toast(res.note || `→ ${filedUris[tr.uri]}${fromId ? " (removed from input)" : ""}`);
     renderNow();

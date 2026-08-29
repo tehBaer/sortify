@@ -248,6 +248,7 @@ function setNow(bodyOrRoute) {
       suggestions: body.suggestions || [], subsets: body.subsets || [],
       subset_targets: body.subset_targets || [], homes: body.homes || [],
       inputs: body.inputs || [],
+      needs_home_id: body.needs_home_id ?? null,
     },
   } : { status: 200, body: { playing: false } };
   routes["GET /api/now/suggest"] = sugg;
@@ -2569,6 +2570,80 @@ run("stopNowPolling()");
   check("TP a stale suggest answer is dropped, the card stays pending",
         /finding a home…/.test(html()) && !html().includes('class="sugg"'),
         JSON.stringify(html().slice(0, 160)));
+}
+
+// ============================================================================
+// NH — "Needs a home": the verdict that no home fits, as a move into the
+// buffer that collects those songs. It files (out of the input, into the
+// buffer) rather than captures, so the checks below are as much about the
+// three cases where the button must NOT appear as about the one where it does
+// — an offered move into the playlist you are already listening to, or one
+// that duplicates a song already there, is worse than no button.
+// ============================================================================
+{
+  resetLog();
+  const body = (over) => ({
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri: "spotify:track:nh1", name: "Song", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
+      suggestions: [{ playlist_id: "H1", pct: 80, reasons: [], already: false }],
+      homes: [{ id: "H1", name: "Home", folder: "" }],
+      subset_targets: [], subsets: [],
+      inputs: [{ id: "IN1", name: "[Hazy]", has_track: true, set: "buffer" },
+               { id: "NH1", name: "[Needs a home]", has_track: false, set: "buffer" }],
+      needs_home_id: "NH1",
+      ...over,
+    },
+  });
+  const html = () => $$("now-card").innerHTML;
+  const paint = async (over) => {
+    setNow(body(over));
+    run(`show("now"); filedUris = {}; nowActions = 0; nowActionLog = [];
+         removedUri = null; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+  };
+
+  routes["POST /api/act"] = { status: 200, body: {} };
+  await paint({});
+  check("NH the button is offered while playing from an input",
+        html().includes('id="btn-now-needs-home"'), `html=${html()}`);
+  check("NH and the destination gets no capture chip of its own",
+        !html().includes('data-in="NH1"') && html().includes('data-in="IN1"'),
+        `nh-chip=${html().includes('data-in="NH1"')} in-chip=${html().includes('data-in="IN1"')}`);
+
+  await run(`nowNeedsHome()`);
+  await tick();
+  const act = bodies("/api/act").slice(-1)[0];
+  check("NH pressing it moves the song out of the input it came from",
+        act.to_id === "NH1" && act.from_id === "IN1" && act.action === "move",
+        JSON.stringify(act));
+  check("NH the card lands filed, named for the buffer and not for a home",
+        run(`filedUris["spotify:track:nh1"] === "needs a new home"`) &&
+        /✓ filed to/.test(html()),
+        run(`JSON.stringify(filedUris)`));
+  check("NH and the strip offers the way back",
+        html().includes('id="btn-now-undo-remove"'), `html=${html()}`);
+
+  await paint({ needs_home_id: null });
+  check("NH no configured destination, no button",
+        !html().includes('id="btn-now-needs-home"'), `html=${html()}`);
+
+  await paint({ context: { id: "NH1", name: "[Needs a home]", is_input: true } });
+  check("NH playing from the buffer itself offers no move into it",
+        !html().includes('id="btn-now-needs-home"'), `html=${html()}`);
+
+  await paint({ inputs: [{ id: "IN1", name: "[Hazy]", has_track: true, set: "buffer" },
+                         { id: "NH1", name: "[Needs a home]", has_track: true, set: "buffer" }] });
+  check("NH a song already in the buffer is not offered it twice",
+        !html().includes('id="btn-now-needs-home"'), `html=${html()}`);
+
+  await paint({ context: null });
+  check("NH nothing to move out of, no button",
+        !html().includes('id="btn-now-needs-home"'), `html=${html()}`);
 }
 
 // ---- summary ---------------------------------------------------------------
