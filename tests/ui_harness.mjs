@@ -2696,6 +2696,73 @@ run("stopNowPolling()");
         posts("/api/act") === 0, `${posts("/api/act")} POST(s)`);
 }
 
+// ============================================================================
+// IH — the rest of the library, inline: the Now card's Add to… is replaced by
+// a scrolling list of every home the suggestions did NOT already offer, with
+// its own filter and the picker's create-and-file row. The card is re-rendered
+// on every poll, so the filter text has to be render state, not DOM state —
+// the stub memoises elements by id and would not notice a lost input value,
+// which is why the check reads the rendered value attribute instead.
+// ============================================================================
+{
+  resetLog();
+  const homes = Array.from({ length: 10 }, (_, i) => (
+    { id: `H${i + 1}`, name: `Home ${i + 1}`, folder: "ROOT" }));
+  const setup = () => {
+    setNow({
+      status: 200,
+      body: {
+        playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+        track: { uri: "spotify:track:ih1", name: "Song", duration_ms: 200000,
+                 artists: [{ name: "Artist" }], sortable: true, image: null },
+        context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
+        suggestions: Array.from({ length: 6 }, (_, i) => (
+          { playlist_id: `H${i + 1}`, pct: 90 - i * 5, reasons: [], already: false })),
+        homes, subset_targets: [], subsets: [], inputs: [], needs_home_id: null,
+      },
+    });
+  };
+  const repaint = async () => {
+    run(`show("now"); filedUris = {}; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+  };
+  const html = () => $$("now-card").innerHTML;
+  const typed = async (v) => {
+    run(`$("inline-filter").oninput({ target: { value: ${JSON.stringify(v)} } })`);
+    await tick();
+  };
+
+  setup();
+  await repaint();
+  check("IH the Now card no longer carries an Add to… button",
+        !html().includes('id="btn-now-more"'), `html=${html()}`);
+  check("IH the inline list offers the homes the suggestions did not",
+        ["H7", "H8", "H9", "H10"].every((id) => html().includes(`data-to="${id}"`)),
+        `html=${html()}`);
+  check("IH and does not repeat a home already shown as a suggestion",
+        !/class="picker-row inline-row" data-to="H[1-6]"/.test(html()), `html=${html()}`);
+
+  await typed("home 9");
+  check("IH typing narrows it to the match",
+        $$("inline-list").innerHTML.includes('data-to="H9"') &&
+        !$$("inline-list").innerHTML.includes('data-to="H7"'),
+        `list=${$$("inline-list").innerHTML}`);
+
+  await typed("nothing like this");
+  check("IH a filter that matches nothing offers create-and-file instead",
+        $$("inline-list").innerHTML.includes("inline-create"),
+        `list=${$$("inline-list").innerHTML}`);
+
+  await typed("home 9");
+  await repaint();
+  check("IH the typed filter survives the next poll's re-render",
+        html().includes('value="home 9"') && html().includes('data-to="H9"') &&
+        !html().includes('data-to="H7"'), `html=${html()}`);
+
+  run(`inlineFilter = ""`);
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

@@ -1444,8 +1444,7 @@ function renderNow() {
       previewHold.attach(b, b.dataset.to, nowState.homes.get(b.dataset.to)?.name,
         { label: "File here", run: () => nowFile(b.dataset.to) });
     });
-    const more = $("btn-now-more");
-    if (more) more.onclick = () => openPicker(nowState.homes, nowFile, nowCreateAndFile);
+    wireInlineRows(new Set((d.suggestions || []).map((s) => s.playlist_id)));
     const sub = $("btn-now-subset");
     if (sub) sub.onclick = () => openPicker(nowState.subsetTargets, nowAddToSubset);
     const nh = $("btn-now-needs-home");
@@ -1461,6 +1460,63 @@ function renderNow() {
         renderNow();
       };
     });
+  }
+}
+
+// ---- inline homes ----------------------------------------------------------
+//
+// The Now card's replacement for Add to…: every home the suggestions did not
+// already offer, in one scrolling region under them. The suggestions stay
+// OUTSIDE it — six suggestion rows are a phone screen's worth on their own,
+// and a scroller tall enough to hold them would leave nowhere to grab the
+// page itself.
+//
+// The filter is what makes this a replacement rather than a downgrade. There
+// are ~70 rows here and the picker's fast path was never scrolling, it was
+// typing; the create-and-file row lives in the same no-match state it does
+// there. Filter text is module state, not DOM state: the card re-renders on
+// every poll, and an input inside that innerHTML would be replaced mid-type.
+let inlineFilter = "";
+
+function inlineRowsHtml(homesMap, exclude) {
+  const f = inlineFilter.trim().toLowerCase();
+  const rows = sortedHomes(homesMap, f).filter((h) => !exclude.has(h.id));
+  if (!rows.length) {
+    if (!f) return '<p class="hint">Every home is already suggested above.</p>';
+    return `<button class="picker-row inline-create" id="inline-create">
+      <span class="p-name">Create home “${esc(inlineFilter.trim())}” and file this track there</span>
+      <span class="p-sub">${createPrice()}</span>
+    </button>`;
+  }
+  return rows.map((h) => `<button class="picker-row inline-row" data-to="${esc(h.id)}">
+    ${homeRowInner(h)}
+  </button>`).join("");
+}
+
+function inlineHomesHtml(homesMap, exclude) {
+  return `<div class="inline-homes">
+    <input id="inline-filter" placeholder="Filter playlists…" value="${esc(inlineFilter)}">
+    <div id="inline-list">${inlineRowsHtml(homesMap, exclude)}</div>
+  </div>`;
+}
+
+function wireInlineRows(exclude) {
+  $("now-card").querySelectorAll(".inline-row").forEach((b) => {
+    b.onclick = () => { if (previewHold.consumeClick()) return; nowFile(b.dataset.to); };
+    previewHold.attach(b, b.dataset.to, nowState.homes.get(b.dataset.to)?.name,
+      { label: "File here", run: () => nowFile(b.dataset.to) });
+  });
+  const create = $("inline-create");
+  if (create) create.onclick = () => nowCreateAndFile(inlineFilter.trim());
+  const filter = $("inline-filter");
+  if (filter) {
+    filter.oninput = (e) => {
+      inlineFilter = e.target.value;
+      // Repaint the rows alone, never the card: re-rendering the card would
+      // take the focused input down with it on every keystroke.
+      $("inline-list").innerHTML = inlineRowsHtml(nowState.homes, exclude);
+      wireInlineRows(exclude);
+    };
   }
 }
 
@@ -1499,10 +1555,13 @@ function ordinaryCardBody(d, tr, ctx) {
       <span class="s-why">${esc([home.folder, ...s.reasons].filter(Boolean).join(" · "))}</span>
     </button>`;
   });
-  if (!d.suggestions.length) body += '<p class="hint">No confident match — use Add to…</p>';
-  // Remove from input lives in the playback strip now (see playbackStrip).
+  if (!d.suggestions.length) body += '<p class="hint">No confident match — pick one below.</p>';
+  // The rest of the library continues straight on from the suggestions: same
+  // question, lower confidence, so it reads as one list and not as a second
+  // feature. Remove from input lives in the playback strip now (see
+  // playbackStrip).
+  body += inlineHomesHtml(nowState.homes, new Set(d.suggestions.map((s) => s.playlist_id)));
   body += `<div class="minor-actions">
-    <button id="btn-now-more"><kbd>m</kbd> Add to…</button>
     <button id="btn-now-subset">Add to subset…</button>
     ${needsHomeButton(d) || ""}
   </div>`;
@@ -1825,27 +1884,44 @@ $("now-card").addEventListener("click", (e) => {
 
 // ---- picker ----------------------------------------------------------------
 
+// Recency first: the home you filed into most recently is the likeliest
+// target again (ISO Zulu stamps compare fine as strings; homes never added
+// to sink to the bottom in the old folder → name order). Shared by the modal
+// picker and the Now card's inline list so the two cannot present the same
+// library in two different orders.
+function sortedHomes(homesMap, filter) {
+  return [...homesMap.values()]
+    .sort((a, b) =>
+      (b.last_added_at || "").localeCompare(a.last_added_at || "") ||
+      (a.folder || "").localeCompare(b.folder || "") || a.name.localeCompare(b.name))
+    .filter((h) => !filter ||
+      (h.name + " " + (h.folder || "")).toLowerCase().includes(filter));
+}
+
+// Name first and bold; the folder path demoted to a small second line — the
+// full "folder / name (n)" string was unscannable on a phone.
+function homeRowInner(h) {
+  const sub = [h.folder, h.total != null ? `${h.total} tracks` : ""].filter(Boolean).join(" · ");
+  return `<span class="p-name">${esc(h.name)}</span>` +
+    (sub ? `<span class="p-sub">${esc(sub)}</span>` : "");
+}
+
+// The price of create-and-file, stated truthfully: filing from an input
+// sends a remove too, so it is create + add + remove.
+function createPrice() {
+  return nowState.context?.is_input ? "3 calls" : "2 calls";
+}
+
 function openPicker(homesMap, onPick, onCreate) {
   const list = $("picker-list");
   const paint = (filter) => {
     list.innerHTML = "";
-    // Recency first: the home you filed into most recently is the likeliest
-    // target again (ISO Zulu stamps compare fine as strings; homes never
-    // added to sink to the bottom in the old folder → name order).
-    const homes = [...homesMap.values()].sort((a, b) =>
-      (b.last_added_at || "").localeCompare(a.last_added_at || "") ||
-      (a.folder || "").localeCompare(b.folder || "") || a.name.localeCompare(b.name));
     let shown = 0;
-    for (const h of homes) {
-      if (filter && !(h.name + " " + (h.folder || "")).toLowerCase().includes(filter)) continue;
+    for (const h of sortedHomes(homesMap, filter)) {
       shown++;
       const b = document.createElement("button");
       b.className = "picker-row";
-      // Name first and bold; the folder path demoted to a small second line —
-      // the full "folder / name (n)" string was unscannable on a phone.
-      const sub = [h.folder, h.total != null ? `${h.total} tracks` : ""].filter(Boolean).join(" · ");
-      b.innerHTML = `<span class="p-name">${esc(h.name)}</span>` +
-        (sub ? `<span class="p-sub">${esc(sub)}</span>` : "");
+      b.innerHTML = homeRowInner(h);
       b.onclick = () => {
         // A completed hold-preview must not also file the track: the click
         // that follows pointerup is the same gesture, so it is consumed.
@@ -1860,9 +1936,7 @@ function openPicker(homesMap, onPick, onCreate) {
     // and file in one gesture — create + add, priced as such. (Spec §5.)
     if (!shown && filter && onCreate) {
       const typed = $("picker-filter").value.trim();
-      // nowFile sends a remove too when filing from an input: create + add +
-      // remove = 3 calls, not 2 — the label must state the true cost.
-      const price = nowState.context?.is_input ? "3 calls" : "2 calls";
+      const price = createPrice();
       const b = document.createElement("button");
       b.className = "picker-row picker-create";
       b.innerHTML = `<span class="p-name">Create home “${esc(typed)}” and file this track there</span>` +
@@ -3443,7 +3517,9 @@ document.addEventListener("keydown", (e) => {
     const s = suggFor(e.key, nowState.suggestions);
     if (s) nowFile(s.playlist_id);
     else if (SUGG_KEYS.includes(e.key)) return;
-    else if (e.key === "m" && nowState.track.sortable) openPicker(nowState.homes, nowFile, nowCreateAndFile);
+    // `m` kept its meaning — "reach past the suggestions" — but the reaching
+    // is now typing into the list already on the card, not opening a picker.
+    else if (e.key === "m" && nowState.track.sortable) { const f = $("inline-filter"); if (f) f.focus(); }
     else if (e.key === "r") nowRemove();
     else if (e.key === "u") $("btn-undo-now").click();
   }
