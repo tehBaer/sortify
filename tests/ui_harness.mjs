@@ -165,6 +165,16 @@ class AudioStub {
     this.src = src; this.currentTime = 0; this.duration = 30; this.paused = false;
     AudioStub.made.push(this);
   }
+  // Setting src runs the media element's load algorithm, and an empty src
+  // resolves to the document — not a media resource — so the browser fires
+  // `error` on the RETIRED element a task later (verified in Brave). Every
+  // stop in the player clears src exactly this way, so a stub that stays
+  // silent here hides any handler left live on a clip that is already over.
+  set src(v) {
+    this.__src = v;
+    if (v === "") setTimeout(() => { if (this.onerror) this.onerror(); }, 0);
+  }
+  get src() { return this.__src; }
   play() { this.paused = false; return AudioStub.refuse ? Promise.reject(new Error("blocked")) : Promise.resolve(); }
   pause() { this.paused = true; }
 }
@@ -1943,9 +1953,9 @@ run("stopNowPolling()");
     row5d.onpointerdown({ clientX: 10, clientY: 10 });
     await new Promise((r) => setTimeout(r, 700));
     await tick();
-    AudioStub.made.at(-1).onended();     // clip A over
-    await tick();
-    AudioStub.made.at(-1).onended();     // clip B over → playlist over
+    // This popup RESUMES from the stash the dead-clip section left behind, so
+    // it opens on the last clip and one `ended` is the end of the playlist.
+    AudioStub.made.at(-1).onended();     // last clip over → playlist over
     await tick();
     const afterAuto = posts("/api/preview_resume");
     // Back a clip, with autoplay refused — the iOS case needsTap exists for.
@@ -1965,6 +1975,41 @@ run("stopNowPolling()");
     check("PV5 that tap re-arms the resume, so closing gives the music back",
           posts("/api/preview_resume") === 2,
           `${posts("/api/preview_resume")} POST(s)`);
+
+    // --- one press of next moves ONE clip ----------------------------------
+    // Retiring a clip clears its src, which is itself an `error` in a real
+    // browser. With the dead-clip handler still attached, that error read as
+    // "this clip is broken" and advanced again — and the clip THAT retired
+    // fired the next one, so a single press ran the medley to the end of the
+    // playlist. Five clips, because with two the runaway looks like an
+    // ordinary end-of-playlist.
+    resetLog();
+    run("previewHold.stop()");
+    await tick();
+    AudioStub.made.length = 0;
+    routes["GET /api/playlist_preview/h6"] = {
+      clips: [1, 2, 3, 4, 5].map((n) => ({
+        name: `Song ${n}`, artist: `Artist ${n}`, url: `https://cdn/${n}6.mp3` })),
+      next_offset: null, total: 5, tracks: [],
+    };
+    const row5e = new El("pv5-row-e");
+    ctx.__row5e = row5e;
+    run(`previewHold.attach(__row5e, "h6", "Long Home")`);
+    row5e.onpointerdown({ clientX: 10, clientY: 10 });
+    await new Promise((r) => setTimeout(r, 700));
+    await tick();
+    const opened = AudioStub.made.at(-1)?.src;
+    run(`$("pv-next").onclick()`);
+    await new Promise((r) => setTimeout(r, 30));
+    await tick();
+    check("PV5 next advances one clip, not the whole playlist",
+          opened === "https://cdn/16.mp3"
+          && AudioStub.made.at(-1)?.src === "https://cdn/26.mp3"
+          && AudioStub.made.length === 2,
+          `opened=${opened}, now=${AudioStub.made.at(-1)?.src}, made=${AudioStub.made.length}`);
+    check("PV5 and the card still names the clip it landed on",
+          /Song 2/.test($$("preview-pop").innerHTML),
+          JSON.stringify($$("preview-pop").innerHTML.slice(0, 160)));
   } catch (e) {
     check("PV5 scenario ran without throwing", false, String(e));
   } finally {

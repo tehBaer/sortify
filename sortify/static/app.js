@@ -1932,6 +1932,14 @@ const previewHold = (() => {
     audio = null;
     if (!a) return;
     clearInterval(a.__fade);
+    // A retired clip reports nothing, ever. Clearing src below runs the media
+    // element's load algorithm on an empty URL, which the browser answers with
+    // an `error` — so the dead-clip handler read a NORMAL SKIP as a broken
+    // clip and advanced again, and that advance retired another element and
+    // fired the same error, until one press of next had run the whole
+    // playlist. Detaching here, not at the call sites, because both stops end
+    // in the same src="" and only the caller's own `seq` bump ever covered it.
+    a.onerror = a.onended = a.ontimeupdate = null;
     if (hard) { a.pause(); a.src = ""; return; }
     fadeTo(a, 0, FADE_OUT_MS, () => { a.pause(); a.src = ""; });
   }
