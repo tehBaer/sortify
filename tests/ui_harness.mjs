@@ -2646,6 +2646,56 @@ run("stopNowPolling()");
         !html().includes('id="btn-now-needs-home"'), `html=${html()}`);
 }
 
+// ============================================================================
+// SD — suggestion depth: the list is six long now (sortify/suggest.py's
+// TOP_N, raised from 3 on measured accuracy), so the digit shortcuts have to
+// reach all six. `7` staying inert is half the point: the guard is a literal
+// list of keys, and a too-wide one would index past the end of a short list.
+// ============================================================================
+{
+  resetLog();
+  const sugg = (n) => Array.from({ length: n }, (_, i) => (
+    { playlist_id: `H${i + 1}`, pct: 90 - i * 5, reasons: [], already: false }));
+  const homes = (n) => Array.from({ length: n }, (_, i) => (
+    { id: `H${i + 1}`, name: `Home ${i + 1}`, folder: "" }));
+  setNow({
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri: "spotify:track:sd1", name: "Song", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
+      suggestions: sugg(6), homes: homes(6),
+      subset_targets: [], subsets: [], inputs: [], needs_home_id: null,
+    },
+  });
+  run(`show("now"); filedUris = {}; nowActions = 0; nowActionLog = [];
+       removedUri = null; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+
+  const card = $$("now-card").innerHTML;
+  check("SD all six suggestions render, none silently dropped",
+        (card.match(/class="sugg"/g) || []).length === 6, `card=${card}`);
+  check("SD each carries its own digit hint, 1 through 6",
+        [1, 2, 3, 4, 5, 6].every((i) => card.includes(`<kbd>${i}</kbd>`)), `card=${card}`);
+
+  routes["POST /api/act"] = { status: 200, body: {} };
+  resetLog();
+  fireKey("6");
+  await tick();
+  check("SD `6` files the sixth suggestion",
+        posts("/api/act") === 1 && bodies("/api/act").slice(-1)[0].to_id === "H6",
+        `${posts("/api/act")} POST(s) ${JSON.stringify(bodies("/api/act").slice(-1)[0])}`);
+
+  run(`filedUris = {}`);
+  resetLog();
+  fireKey("7");
+  await tick();
+  check("SD `7` is not a shortcut — nothing is filed past the end of the list",
+        posts("/api/act") === 0, `${posts("/api/act")} POST(s)`);
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

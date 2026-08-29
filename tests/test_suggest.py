@@ -62,6 +62,27 @@ def test_no_signal_gives_no_suggestions():
     assert res == []
 
 
+def test_confident_list_is_capped_at_top_n():
+    # Eight homes all clear MIN_SCORE on artist overlap alone (n tracks by
+    # Beach House each, so score rises with n and saturates at n=5). The cap
+    # keeps the strongest TOP_N; the two thinnest homes are the ones dropped.
+    # Measured on 300 hold-one-out pairs of the real library (2026-08-29):
+    # the true home is in the top 3 for .463 of tracks but the top 6 for
+    # .597 — the three slots below the old cut are where a seventh of all
+    # correct answers were being thrown away.
+    homes = {
+        f"P{n}": build_profile(
+            [track(f"p{n}-{i}", ["beach-house"], title=f"Song {i}") for i in range(n)],
+            ARTISTS,
+        )
+        for n in range(1, 9)
+    }
+    res = suggest(track("spotify:track:new", ["beach-house"]), homes, ARTISTS)
+    assert len(res) == suggest_mod.TOP_N == 6
+    assert {r["playlist_id"] for r in res}.isdisjoint({"P1", "P2"})
+    assert [r["score"] for r in res] == sorted((r["score"] for r in res), reverse=True)
+
+
 def test_already_in_playlist_flagged_and_first():
     res = suggest(track("spotify:track:d1", ["beach-house"]), profiles(), ARTISTS)
     assert res[0]["playlist_id"] == "dreamy"
@@ -502,7 +523,7 @@ def test_hint_tags_stay_out_of_the_organic_tag_reason():
 # ---- weak guesses: sub-threshold fill when nothing is confident ------------
 #
 # When no home clears MIN_SCORE and the track is filed nowhere, the ranking
-# that was computed anyway surfaces as up-to-TOP_N entries flagged
+# that was computed anyway surfaces as up-to-WEAK_TOP_N entries flagged
 # weak: True, each carrying at least one real reason (score > 0). The
 # confident tier is untouched: a confident list never mixes with guesses,
 # and its entries never carry the weak key. Ledger R2a ("a home matched only
@@ -533,9 +554,11 @@ def test_weak_guesses_surface_when_nothing_clears_the_threshold():
     assert any(x.startswith("artist tags:") for x in r["reasons"])
 
 
-def test_weak_guesses_ranked_and_capped_at_top_n():
-    # Four neighbour-only homes at 0.27/0.21/0.15/0.09 — only TOP_N surface,
-    # best first, all flagged weak.
+def test_weak_guesses_ranked_and_capped_at_weak_top_n():
+    # Four neighbour-only homes at 0.27/0.21/0.15/0.09 — only WEAK_TOP_N
+    # surface, best first, all flagged weak. The guess tier keeps its own cap:
+    # it is deliberately shorter than the confident TOP_N, so a fourth
+    # candidate is dropped here at a depth the confident list still shows.
     homes = {}
     track_map_similar = []
     for i, match in enumerate((0.9, 0.7, 0.5, 0.3)):

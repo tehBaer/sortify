@@ -1728,7 +1728,8 @@ async function undoStripAction() {
 // art, and the suggestion REASONS (they leak artist names) on the listening
 // surfaces (#now-card — the now view and the sitting decide card both render
 // there; triage keeps its labels). Pure client state, persisted locally.
-// Tapping any blurred field peeks it for a moment without filing anything.
+// Tapping the blurred title, artist or art peeks the card without filing
+// anything; the suggestion buttons stay live, so picking a home files it.
 
 let blindMode = localStorage.getItem("blindMode") === "1";
 // One tap on any blurred field reveals EVERYTHING for the remainder of that
@@ -1806,12 +1807,16 @@ async function doShare(track, friend) {
 // btn-share is card-internal now (rendered and wired by renderNow, like the
 // other strip controls) — there is no static element left to wire here.
 
-// Capture phase, so a peek on a suggestion's reason line never falls through
-// to the button underneath and files the track.
+// Capture phase, so the peek happens before anything underneath reacts — but
+// a blurred field inside a control is that control's, not the peek's: picking
+// a playlist in blind mode files straight away rather than spending the click
+// on a reveal. The suggestion reason (.s-why) lives inside the .sugg button,
+// so it is only ever peeked as a side effect of tapping the title, artist or
+// art — which lift every blur on the card at once.
 $("now-card").addEventListener("click", (e) => {
   if (!blindMode || document.body.classList.contains("peeked")) return;
   const el = e.target.closest(".t-name, .t-artist, .art, .s-why");
-  if (!el) return;
+  if (!el || el.closest("button")) return;
   e.stopPropagation();
   e.preventDefault();
   peekedUri = nowState?.track?.uri || null;
@@ -3380,6 +3385,15 @@ async function decideUndecide() {
 
 // ---- keyboard --------------------------------------------------------------
 
+// One key per suggestion row, and the list is TOP_N (6) long — the server's
+// cap is what decides how many of these can ever fire, so this is the same
+// number written down twice and the shared helper is where they stay in
+// step. Read as "which suggestion did they press", not "is this a digit":
+// a key past the end of a short list must resolve to nothing at all, never
+// to suggestions[undefined].
+const SUGG_KEYS = ["1", "2", "3", "4", "5", "6"];
+const suggFor = (key, list) => (SUGG_KEYS.includes(key) ? (list || [])[Number(key) - 1] : null);
+
 document.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT") return;
   if (!$("picker").hidden) { if (e.key === "Escape") closePicker(); return; }
@@ -3391,10 +3405,10 @@ document.addEventListener("keydown", (e) => {
   if (!$("view-triage").hidden && triage) {
     const tr = triage.tracks[triage.idx];
     if (!tr) return;
-    if (["1", "2", "3"].includes(e.key)) {
-      const s = tr.suggestions[Number(e.key) - 1];
-      if (s) moveTo(s.playlist_id);
-    } else if (e.key === "m" && tr.sortable) openPicker(triage.homes, moveTo);
+    const s = suggFor(e.key, tr.suggestions);
+    if (s) moveTo(s.playlist_id);
+    else if (SUGG_KEYS.includes(e.key)) return;
+    else if (e.key === "m" && tr.sortable) openPicker(triage.homes, moveTo);
     else if (e.key === "r") removeOnly();
     else if (e.key === "s") { triage.skipped++; triage.idx++; renderCard(); }
     else if (e.key === "u") $("btn-undo").click();
@@ -3411,10 +3425,10 @@ document.addEventListener("keydown", (e) => {
       const dec = nowState.sitting.decided[nowState.track.uri];
       if (dec?.action === "keep") return;  // final — nothing left to press
       if (dec?.action === "reject") { if (e.key === "u") decideUndecide(); return; }
-      if (["1", "2", "3"].includes(e.key)) {
-        const s = nowState.suggestions[Number(e.key) - 1];
-        if (s) decideKeep(s.playlist_id);
-      } else if (e.key === "m" && nowState.track.sortable) openPicker(nowState.homes, decideKeep);
+      const s = suggFor(e.key, nowState.suggestions);
+      if (s) decideKeep(s.playlist_id);
+      else if (SUGG_KEYS.includes(e.key)) return;
+      else if (e.key === "m" && nowState.track.sortable) openPicker(nowState.homes, decideKeep);
       else if (e.key === "r") decideReject();
       return;
     }
@@ -3426,10 +3440,10 @@ document.addEventListener("keydown", (e) => {
       if (b) { b.click(); return; }
     }
     if (filedUris[nowState.track.uri]) return;
-    if (["1", "2", "3"].includes(e.key)) {
-      const s = nowState.suggestions[Number(e.key) - 1];
-      if (s) nowFile(s.playlist_id);
-    } else if (e.key === "m" && nowState.track.sortable) openPicker(nowState.homes, nowFile, nowCreateAndFile);
+    const s = suggFor(e.key, nowState.suggestions);
+    if (s) nowFile(s.playlist_id);
+    else if (SUGG_KEYS.includes(e.key)) return;
+    else if (e.key === "m" && nowState.track.sortable) openPicker(nowState.homes, nowFile, nowCreateAndFile);
     else if (e.key === "r") nowRemove();
     else if (e.key === "u") $("btn-undo-now").click();
   }

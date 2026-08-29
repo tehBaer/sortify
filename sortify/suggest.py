@@ -61,7 +61,28 @@ TAG_WEIGHT = 3.0
 # `track.getTopTags`), since a track-level tag is stronger evidence than an
 # artist-level one and the two should not compete at face value.
 MIN_SCORE = 0.8
-TOP_N = 3
+# Measured 2026-08-29 on 300 hold-one-out pairs of the live library (the
+# scripts/eval_suggest.py machinery, 76 homes): the true home lands in the
+# top 3 for .463 of tracks, top 4 .527, top 5 .557, top 6 .597, top 8 .637,
+# top 10 .660. Rank 4 alone is worth +6.3 points and the knee is at 6-8;
+# past 10 it is under a point per slot. Cutting at 3 was discarding a
+# seventh of all correct answers for free — the ranking is local, so extra
+# rows cost zero Spotify calls.
+#
+# A "show more only when the extra homes score close to #1" variant was
+# measured too and is deliberately NOT what this is: at equal rows shown it
+# ranked WORSE (within 40% of #1, cap 7: .563 at 4.81 rows, vs flat top 6's
+# .597 at 5.13). The score scale is not calibrated for that test — one
+# artist match is ARTIST_BASE 3.0 immediately, while a correct home winning
+# on tags alone tops out near TAG_WEIGHT — so "close to #1" mostly measures
+# whether #1 had an artist hit, not whether #4 is any good. For the same
+# reason MIN_SCORE is no gate either: a median 23 of the 76 homes clear it.
+TOP_N = 6
+# The guess tier stays at 3. It only fires when nothing cleared MIN_SCORE
+# (5.3% of tracks in the same run), and six sub-threshold guesses is a wall
+# of noise where three is a hint — the depth measurement above is about
+# confident ranking and says nothing about this pool.
+WEAK_TOP_N = 3
 
 # Neighbours (Last.fm getSimilar): a neighbour's `match` is per-pair
 # similarity in [0, 1]; the summed matches are capped at NEIGHBOUR_SUM_CAP
@@ -431,7 +452,7 @@ def suggest(
     sites, which all pass fresh ones.
 
     When no home clears MIN_SCORE and the track is filed nowhere, the
-    sub-threshold ranking is returned instead — up to TOP_N homes with
+    sub-threshold ranking is returned instead — up to WEAK_TOP_N homes with
     score > 0 (i.e. at least one real reason), each flagged `weak: True`
     so the frontend can present them as guesses, not confidence. A track
     with an `already` home never gets guesses (the list wasn't empty), and
@@ -516,6 +537,6 @@ def suggest(
 
     if not results and weak_pool:
         weak_pool.sort(key=lambda r: -r["score"])
-        return weak_pool[:TOP_N]
+        return weak_pool[:WEAK_TOP_N]
     results.sort(key=lambda r: (not r["already"], -r["score"]))
     return results[:TOP_N]
