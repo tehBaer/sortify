@@ -67,7 +67,7 @@ LIKED_ID = "liked"  # pseudo-playlist id for the user's Liked Songs
 # sat above what actually trips the limiter. Everything here is now below it.
 # sortify's *share* of the account budget. Since Jul 2026 Spotify counts
 # quota per developer account, so this is now backed by ACCOUNT_DAILY_CAP in
-# ~/kode/spotify-ledger, which all three apps spend from — and, more
+# ~/kode/spotify/spotify-ledger, which all three apps spend from — and, more
 # importantly, by the shared cooldown recorded there. This stays as a local
 # guard so a missing ledger file still can't uncork us.
 #

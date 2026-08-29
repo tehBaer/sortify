@@ -4,7 +4,7 @@ app.py builds its Store and Spotify client at module scope, so a bare import
 would otherwise bind to the real data/ — reading tokens.json and, worse,
 writing the live budget ledger. Tests get a throwaway directory instead.
 
-The same hazard applies to the shared account ledger (~/kode/spotify-ledger):
+The same hazard applies to the shared account ledger (~/kode/spotify/spotify-ledger):
 it is one file for sortify, playlistener and spotify-autoqueuer, so a test
 suite spending against the real one would eat the day's allowance for all
 three and could park a cooldown on the account.

@@ -8,13 +8,13 @@
 
 **Tech Stack:** Python/FastAPI/pytest, existing `tags.py` Last.fm client. No new dependencies.
 
-**Spec:** `~/kode/sortify-lastfm/docs/superpowers/specs/2026-08-17-suggestion-signals-design.md` — authoritative. THIS PLAN IMPLEMENTS A SCOPED PHASE: the `tag_match` feature (artist-tag path), on-demand fetch on explicit user action, and the harness. Descriptions, user tags, `getSimilar`/neighbour, track-tag fetching, UI tag row, and Last.fm push are explicitly out of scope (later phases).
+**Spec:** `~/kode/spotify/sortify-lastfm/docs/superpowers/specs/2026-08-17-suggestion-signals-design.md` — authoritative. THIS PLAN IMPLEMENTS A SCOPED PHASE: the `tag_match` feature (artist-tag path), on-demand fetch on explicit user action, and the harness. Descriptions, user tags, `getSimilar`/neighbour, track-tag fetching, UI tag row, and Last.fm push are explicitly out of scope (later phases).
 
 ## Global Constraints
 
 - **ZERO Spotify API calls.** Last.fm calls only in Task 2's fetch path and only under its trigger rules; tests fake all clients. `data/` in this worktree is a SYMLINK to the live tree's data — never write to it; tests self-isolate via `tests/conftest.py`.
-- **Do not restart `sortify.service` or touch `~/kode/sortify` / any other worktree.** A ~1240-call queued run may be live on the server at any time.
-- Worktree: `~/kode/sortify-suggest`, branch `lastfm-suggest`, base master `16f96d3`, own venv. Baseline: **326 tests green**.
+- **Do not restart `sortify.service` or touch `~/kode/spotify/sortify` / any other worktree.** A ~1240-call queued run may be live on the server at any time.
+- Worktree: `~/kode/spotify/sortify-suggest`, branch `lastfm-suggest`, base master `16f96d3`, own venv. Baseline: **326 tests green**.
 - Both orderings after every task: `.venv/bin/pytest -q` AND `.venv/bin/pytest -q -p no:randomly $(ls -r tests/test_*.py)`. Known unrelated ~5% flake: `test_queue_worker.py::test_rate_429_halves_and_keeps_going` — rerun that file once if it fires; never modify it.
 - `data/tags.json` is permanent and write-once per artist: hygiene runs on READ (`tags.clean_tags`), never on write; existing artist entries are never overwritten; only Last.fm error code 6 is a miss (`miss: true`) — every other error is left ABSENT so it retries (spec §Fetching).
 - `tags.py` must never import `sortify.spotify`. House style throughout; commit per task, `Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>`.

@@ -18,7 +18,7 @@
 - Do NOT change `Spotify.request` retry behaviour (review finding I2 is disclosure-only). Additive observation (`last_429`) is allowed.
 - Nothing blocking may run while `_split_lock` is held. `sortify/tags.py` must never import `sortify.spotify`. `sortify/pacing.py` must import neither (pure logic).
 - No new runtime dependencies.
-- Worktree: `~/kode/sortify-lastfm`, branch `queued-materialiser`. Merges to master use `git merge-tree` to verify first, then `git merge --ff-only` where possible, `--no-ff` otherwise — master may move under you (other sessions exist).
+- Worktree: `~/kode/spotify/sortify-lastfm`, branch `queued-materialiser`. Merges to master use `git merge-tree` to verify first, then `git merge --ff-only` where possible, `--no-ff` otherwise — master may move under you (other sessions exist).
 - Commit after every task, message in house style (imperative, why-first body).
 
 ---
@@ -36,7 +36,7 @@ The pile-naming stoplist fix is commit `297fe5b` on `pile-materialise` — self-
 - [ ] **Step 1: Branch and cherry-pick**
 
 ```bash
-cd ~/kode/sortify-lastfm
+cd ~/kode/spotify/sortify-lastfm
 git checkout -b stoplist-fix master
 git cherry-pick 297fe5b
 ```
@@ -70,7 +70,7 @@ If `--ff-only` fails because master moved, re-run merge-tree against the new mas
 
 - [ ] **Step 4: CHECKPOINT — ask the user before touching the live service**
 
-The live tree (`~/kode/sortify`) has uncommitted static-file changes from the paused split-progress-bar session (task_8cb1a2a1). Merging master there and restarting `sortify.service` is a shared-state action. **Stop and ask the user** to approve: `cd ~/kode/sortify && git merge --ff-only master-branch-tip && systemctl --user restart sortify`, then a free re-cluster of `{teh bomb}` (Split view → re-cluster, or `curl -s -X POST localhost:8800/api/split/3km9EmUcfrlQKKqRincV6T -H 'content-type: application/json' -d '{}'` — 0 Spotify calls, cached tracks + tags). Do not proceed with the restart without the user's yes; the rest of the plan does not depend on it and may continue.
+The live tree (`~/kode/spotify/sortify`) has uncommitted static-file changes from the paused split-progress-bar session (task_8cb1a2a1). Merging master there and restarting `sortify.service` is a shared-state action. **Stop and ask the user** to approve: `cd ~/kode/spotify/sortify && git merge --ff-only master-branch-tip && systemctl --user restart sortify`, then a free re-cluster of `{teh bomb}` (Split view → re-cluster, or `curl -s -X POST localhost:8800/api/split/3km9EmUcfrlQKKqRincV6T -H 'content-type: application/json' -d '{}'` — 0 Spotify calls, cached tracks + tags). Do not proceed with the restart without the user's yes; the rest of the plan does not depend on it and may continue.
 
 - [ ] **Step 5: Commit state** — nothing extra to commit; record the merge hash in the SDD ledger.
 
@@ -87,7 +87,7 @@ The live tree (`~/kode/sortify`) has uncommitted static-file changes from the pa
 - [ ] **Step 1: Merge**
 
 ```bash
-cd ~/kode/sortify-lastfm && git checkout queued-materialiser
+cd ~/kode/spotify/sortify-lastfm && git checkout queued-materialiser
 git merge --no-ff master          # picks up Task 1's stoplist
 git merge --no-ff pile-materialise
 ```
@@ -1336,7 +1336,7 @@ Run `node tests/ui_harness.mjs` → the new checks FAIL (and Task 7's known-red 
 This is a separate repo with its own conventions — read its `server.py` spotify section and `tests/test_spotify.py` before writing. boxdash's house pattern: read state FILES directly, absolute paths as module constants, every reader tolerates a missing/garbled file.
 
 **Interfaces:**
-- Consumes: `~/kode/sortify/data/queue.json` and `pacing.json` (Task 3's shapes, version 1).
+- Consumes: `~/kode/spotify/sortify/data/queue.json` and `pacing.json` (Task 3's shapes, version 1).
 - Produces: `sortify_bulk` key in the `/api/spotify` payload; a card section in the spotify tab. **No POST endpoints — read-only is the contract** (spec decision 5).
 
 - [ ] **Step 1: Failing test** (append to `tests/test_spotify.py`, using its tmp-file pattern):
@@ -1389,7 +1389,7 @@ def test_sortify_bulk_absent_or_wrong_version_is_none(tmp_path, monkeypatch):
 - [ ] **Step 2: Full verification, stated with output:**
 
 ```bash
-cd ~/kode/sortify-lastfm
+cd ~/kode/spotify/sortify-lastfm
 .venv/bin/pytest -q
 .venv/bin/pytest -q -p no:randomly $(ls -r tests/test_*.py)
 node tests/ui_harness.mjs

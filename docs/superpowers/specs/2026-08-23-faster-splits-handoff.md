@@ -130,7 +130,7 @@ challenged it correctly.
 - **Update 2026-08-23:** `data/folders.json` is populated again (1010 entries,
   all 68 homes covered). It had been wiped to `{}` in the 2026-08-21 live-data
   clobber and was restored from the spotify-backup snapshot at
-  `~/kode/spotify-library/folders.json`. See "Playlist folders" in CLAUDE.md
+  `~/kode/spotify/spotify-library/folders.json`. See "Playlist folders" in CLAUDE.md
   for the full mechanism.
 - Homes are actually identified by `cfg["home_ids"]` — an explicit configured
   list — with the ALL-CAPS convention as a heuristic for *suggesting*
@@ -202,7 +202,7 @@ four-day job that will now take two minutes. Right outcome; worth naming rather
 than quietly leaving behind.
 
 **Boxdash's card reads two files and must keep working.**
-`~/kode/sortify/data/queue.json` and `pacing.json`, both `version: 1`. If
+`~/kode/spotify/sortify/data/queue.json` and `pacing.json`, both `version: 1`. If
 batching changes their shape, bump the version — boxdash treats an unknown
 version as "no card" rather than guessing, which is the correct failure but a
 silent one. Fields it relies on: `state`, `stop_reason`, `progress.{pile_id,

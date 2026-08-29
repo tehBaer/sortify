@@ -282,7 +282,7 @@ committed baseline fails.
 
 ## Coordination
 
-The splitting workstream (`lastfm-tags`, `~/kode/sortify-lastfm`) owns
+The splitting workstream (`lastfm-tags`, `~/kode/spotify/sortify-lastfm`) owns
 `sortify/tags.py`, `sortify/community.py`, `sortify/split.py`, and the
 `artists` half of `data/tags.json`. This design **reads** `tags.py`'s client
 and tag hygiene rather than writing a second Last.fm client, and reads

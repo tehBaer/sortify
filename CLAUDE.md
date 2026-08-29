@@ -28,7 +28,7 @@ escalating penalties. Therefore:
   2026-08-14 (~1.8/min) with no penalty, against sortify's 678 at ~9.7/min that
   earned ~23h. So `WINDOW_CAP` and the pacing are the real protection; the daily
   caps are runaway backstops. Do not "fix" a 429 by lowering a daily cap.
-- **One account, one ledger** (`~/kode/spotify-ledger`, symlinked in as
+- **One account, one ledger** (`~/kode/spotify/spotify-ledger`, symlinked in as
   `sortify/account_ledger.py`). Since Jul 2026 quota is counted per developer
   account, so sortify, spotify-autoqueuer and playlistener all spend from
   `~/state/spotify/account-ledger.json`. Do not decouple them.
@@ -57,7 +57,7 @@ escalating penalties. Therefore:
   instant one lifted is what earned the 2026-08-13 ban 70 minutes later.
 - **Verify locally first**: `data/cache.json`, server logs, the test suite. A live
   probe is last-resort, single-shot, never in a loop.
-- **Prior art**: `~/kode/spotify-autoqueuer/src/spotify/` (token bucket, 429
+- **Prior art**: `~/kode/spotify/spotify-autoqueuer/src/spotify/` (token bucket, 429
   circuit breaker + persisted FileBudgetGuard ledger, paced playlist walks) is
   the house pattern library for Spotify API handling — read it before changing
   this project's client. Same discipline rules in its CLAUDE.md.
@@ -135,7 +135,7 @@ escalating penalties. Therefore:
   `POST /api/folders` still accepts a tree exported on another machine.
   Both endpoints **re-mark homes** from the tree (`home_folder_prefixes`
   minus excludes, union `sticky_home_ids`), so don't trigger them casually.
-- **Known-good extract**: `~/kode/spotify-library/folders.json` (Aug 2026) is
+- **Known-good extract**: `~/kode/spotify/spotify-library/folders.json` (Aug 2026) is
   already in the stored mapping shape — copying it straight into
   `data/folders.json` restores paths without touching home marking or Spotify.
 - **Moving playlists between folders**: `.venv/bin/spfolders move "<name>"

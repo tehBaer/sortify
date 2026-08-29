@@ -6,12 +6,12 @@
 
 **Architecture:** `lastfm_tracks.json` is REBUILDABLE cache (unlike permanent tags.json), keyed `artist\x1ftitle` lowercased/whitespace-collapsed. `suggest()` gains a fourth argument (the track map); profiles gain a `track_keys` set; the neighbour score sums Last.fm `match` values of cross-artist neighbours found in the home. Track tags REPLACE artist tags when present (resolution, not mixing — reason strings distinguish `tags:` from `artist tags:`). Fetching mirrors the tags pattern: a bounded backfill script + a force-path piggyback.
 
-**Spec:** ~/kode/sortify-lastfm/docs/superpowers/specs/2026-08-17-suggestion-signals-design.md — authoritative; read §Storage, §Scoring (neighbour), §Fetching, §Evaluation. Still deferred: user tags, descriptions, Last.fm push.
+**Spec:** ~/kode/spotify/sortify-lastfm/docs/superpowers/specs/2026-08-17-suggestion-signals-design.md — authoritative; read §Storage, §Scoring (neighbour), §Fetching, §Evaluation. Still deferred: user tags, descriptions, Last.fm push.
 
 ## Global Constraints
 
 - ZERO Spotify calls anywhere. Last.fm calls only in the fetch paths, faked in every test. `data/` is a LIVE symlink — tests never write it (conftest isolates); backfill runs only with the controller's go.
-- Worktree ~/kode/sortify-suggest, branch `lastfm-similar`, base master bd90353. Baseline 383 tests green. Both orderings after every task + `node tests/ui_harness.mjs` (62) when app.py/frontend touched. Known flake: test_queue_worker.py::test_rate_429_halves_and_keeps_going — rerun once, never modify.
+- Worktree ~/kode/spotify/sortify-suggest, branch `lastfm-similar`, base master bd90353. Baseline 383 tests green. Both orderings after every task + `node tests/ui_harness.mjs` (62) when app.py/frontend touched. Known flake: test_queue_worker.py::test_rate_429_halves_and_keeps_going — rerun once, never modify.
 - tags.json rules unchanged (permanent, write-once, code-6-only miss). lastfm_tracks.json is rebuildable but follows the SAME miss discipline (code 6 → miss:true; other errors → absent/retryable) and the SAME shrink-guard merge-save pattern both writers use.
 - **The correctness requirement (spec, binding): the neighbour feature EXCLUDES same-artist neighbours entirely** — a neighbour whose artist name (case-insensitive) matches ANY of the seed track's artists scores nothing. Without this the feature re-derives artist overlap and reproduces the original complaint. This is the regression test of the whole plan.
 - Artist overlap stays primary; TAG_WEIGHT=3.0 and its pin unchanged. New NEIGHBOUR_WEIGHT placeholder 2.0, measured in T4 (1-D sweep), capped by the primacy pin like TAG_WEIGHT.

@@ -11,7 +11,7 @@ and laptop; runs as a small web app on the box.
 ## Setup (once)
 
 ```sh
-cd ~/kode/sortify
+cd ~/kode/spotify/sortify
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 ```
