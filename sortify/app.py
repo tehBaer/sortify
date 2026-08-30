@@ -3000,16 +3000,9 @@ def decide(playlist_id: str, body: DecideIn):
                     store.save_splits(payload)
                 _pending_keeps.discard((playlist_id, body.uri))
 
-    # Outside every rollback path above, deliberately. A keep that reached a
-    # home is a filing like any other and gets the same library write, but the
-    # decision is already committed by here — `_like_after_filing` swallows
-    # its own failures precisely so a library hiccup cannot reach the
-    # rollback that exists to protect a SUCCESSFUL add.
-    liked = _like_after_filing(body.uri, body.to_id) if body.action == "keep" else False
-
     return {
         "ok": True, "remaining": remaining, "changed": True,
-        "decision": {"action": body.action, "to_id": body.to_id}, "liked": liked,
+        "decision": {"action": body.action, "to_id": body.to_id},
     }
 
 
@@ -3874,7 +3867,6 @@ def act(body: ActIn):
     sweep = _sweep_targets(body.uri, exclude=body.to_id, primary=body.from_id) \
         if body.sweep_inputs else []
     note = None
-    liked = False
     if body.action == "move":
         if not body.to_id:
             raise HTTPException(400, "move needs to_id")
@@ -3885,9 +3877,6 @@ def act(body: ActIn):
                 sp.save_to_liked(body.uri)
             else:
                 _apply_snapshot(body.to_id, sp.add_to_playlist(body.to_id, body.uri))
-            # Gated on `added`: nothing was added, so nothing was filed, and
-            # pressing the same home twice must not spend a second write.
-            liked = _like_after_filing(body.uri, body.to_id)
         else:
             note = "already in destination" + (" — removed from input only" if body.from_id else "")
         if body.from_id:
@@ -3915,67 +3904,7 @@ def act(body: ActIn):
     # already in their toast. Naming them is the point: a delete from a
     # playlist that was not on screen must never be silent.
     return {"ok": True, "note": note, "can_undo": True,
-            "swept": [l["name"] for l in sweep], "liked": liked}
-
-
-def _is_home(pid: str | None) -> bool:
-    """Whether a destination is a home, without paying for a profile build.
-
-    `home_ids` is the curated answer and the one the user maintains. The
-    profile keys are the fallback for a config that has never marked any,
-    where `_resolve_homes` treats every editable playlist as a candidate —
-    without it, such a setup would silently never like anything.
-    """
-    if not pid:
-        return False
-    ids = store.config().get("home_ids") or []
-    if ids:
-        return pid in set(ids)
-    return pid in (_profile_state.get("profiles") or {})
-
-
-def _like_after_filing(uri: str, to_id: str | None) -> bool:
-    """Save a just-filed track to the library. Returns whether it was liked.
-
-    Landing a song in a home is the verdict "this is mine and it belongs
-    here", and the library is where that verdict is legible outside sortify —
-    so every path into a home does it, and only those. The Homeless buffer and
-    the capture chips are inboxes; a subset is a selection. Neither says the
-    song is worth keeping, so neither likes it.
-
-    Liked Songs as the destination is excluded because the filing IS the
-    library write already — a second one would be redundant.
-
-    Never raises. This is the softer of the two writes and it runs after the
-    filing has landed, so a library hiccup must not cost the user the decision
-    they just made. In the split path it must not even be visible: `decide`
-    rolls a failed keep back to undecided, and that contract exists to stop a
-    SUCCESSFUL add being un-decided.
-
-    Undo deliberately does not reverse this. A song can have been liked for
-    years before it was ever filed, and telling that apart costs a
-    /me/library/contains call on every single filing — so undo leaves the
-    library alone rather than spend that on all of them or strip an old like
-    off the one song that got misfiled.
-
-    OFF by default (`like_on_filing`), and likely to stay off: doing it here
-    costs a call on every single filing, and the plan that replaces it is a
-    weekly batch that likes whatever is newly added to the homes — the same
-    end state for a fraction of the traffic. The per-filing path is kept
-    behind the flag rather than deleted because it is tested and correct, and
-    because the batch may still want `_is_home` and this helper. Flip the
-    config key to turn it back on; nothing else changes.
-    """
-    if not store.config().get("like_on_filing"):
-        return False
-    if to_id == LIKED_ID or not _is_home(to_id):
-        return False
-    try:
-        sp.save_to_liked(uri)
-        return True
-    except Exception:
-        log.exception("liking %s after filing it to %s failed", uri, to_id)
-        return False
+            "swept": [l["name"] for l in sweep]}
 
 
 def _from_ids(from_id: str | None, sweep: list[dict]) -> list[str]:
@@ -3995,8 +3924,7 @@ def _sweep_targets(uri: str, exclude: str | None, primary: str | None) -> list[d
     because it cannot be (`remove_from_playlist` special-cases LIKED_ID into
     a DELETE /me/library and would work fine) but because it should not be.
     Unliking is a bigger and more surprising act than emptying an inbox, and
-    the library is where filing now PUTS things: a rule that both liked on
-    filing and unliked on sweeping would fight itself.
+    the user asked for inboxes.
 
     Reads the in-memory input membership — the same set the card's capture
     chips render from, kept current by `_sync_membership` — so consecutive

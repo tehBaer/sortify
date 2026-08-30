@@ -64,14 +64,16 @@ def no_real_deezer(monkeypatch):
 def no_real_library_write(monkeypatch):
     """No test may reach the real /me/library through `save_to_liked`.
 
-    Filing into a home writes to the library (`_like_after_filing`), and that
-    helper swallows its own failures by design — so an unmocked call does not
-    fail a test, it quietly attempts a real request and pays the rate
-    limiter's backoff. That is how one assertion about input membership came
-    to take 38 seconds.
+    Still reachable: filing to Liked Songs (`to_id == LIKED_ID`) in both
+    `act` and the split's keep. Kept after the short-lived like-on-filing
+    feature was removed, because the hazard it caught is not specific to it —
+    an unmocked library write does not fail loudly, it quietly attempts a
+    real request and pays the rate limiter's backoff. That is how one
+    assertion about input membership once took 38 seconds.
 
-    Raising here keeps it instant and local. Tests that assert on liking
-    monkeypatch `save_to_liked` themselves, which overrides this.
+    Raising here keeps it instant and local. Tests that exercise a real
+    library write monkeypatch `save_to_liked` themselves, which overrides
+    this.
     """
     import sortify.app as appmod
 
