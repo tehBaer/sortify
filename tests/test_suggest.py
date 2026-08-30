@@ -492,7 +492,7 @@ def test_hints_lift_a_home_the_organic_tags_would_miss():
     plain = build_profile([track("p1", ["unknown"])], ARTISTS)
     res = suggest(track("new", ["slowdive"]), {"quiet": quiet, "plain": plain}, ARTISTS)
     assert res and res[0]["playlist_id"] == "quiet"
-    assert any(r.startswith("your hint: shoegaze") for r in res[0]["reasons"])
+    assert any(r.startswith("hint: shoegaze") for r in res[0]["reasons"])
 
 
 def test_hint_match_never_outranks_a_real_artist_match():
@@ -513,9 +513,9 @@ def test_hint_tags_stay_out_of_the_organic_tag_reason():
     )
     res = suggest(track("new", ["slowdive"]), {"H": prof}, ARTISTS)
     assert res
-    hint_reasons = [r for r in res[0]["reasons"] if r.startswith("your hint:")]
+    hint_reasons = [r for r in res[0]["reasons"] if r.startswith("hint:")]
     tag_reasons = [r for r in res[0]["reasons"] if r.startswith("artist tags:")]
-    assert hint_reasons == ["your hint: shoegaze"]
+    assert hint_reasons == ["hint: shoegaze"]
     # dream pop is organic overlap; shoegaze must not be listed twice
     assert tag_reasons and "shoegaze" not in tag_reasons[0]
 
@@ -590,7 +590,7 @@ def test_neighbour_only_home_can_surface_as_weak_guess():
     res = suggest(seed, {"H": prof}, ARTISTS, track_map)
     assert len(res) == 1
     assert res[0]["weak"] is True
-    assert res[0]["reasons"] == ["1 similar track already here"]
+    assert res[0]["reasons"] == ["1 similar track"]
 
 
 def test_confident_results_never_carry_weak_or_mix_with_guesses():
@@ -699,7 +699,7 @@ def test_artist_sim_creates_a_guess_from_a_zero_score_home():
     amap = {"seedless": artist_record(("Slowdive", 0.8))}
     res = suggest(seed, {"H": prof}, ARTISTS, {}, amap)
     assert len(res) == 1 and res[0]["weak"] is True
-    assert res[0]["reasons"] == ["similar artists: Slowdive"]
+    assert res[0]["reasons"] == ["like Slowdive"]
     assert res[0]["score"] == round(suggest_mod.ARTIST_SIM_WEIGHT * 0.8, 2)
 
 
@@ -812,7 +812,7 @@ def test_cooc_creates_a_guess_from_a_zero_score_home():
     seed = {"uri": "n", "name": "S", "artists": [{"id": "seedless", "name": "Seedless"}]}
     res = suggest(seed, {"H": prof}, ARTISTS, {}, {}, corpus)
     assert len(res) == 1 and res[0]["weak"] is True
-    assert res[0]["reasons"] == ["filed alongside: Slowdive"]
+    assert res[0]["reasons"] == ["next to Slowdive"]
     assert res[0]["score"] == round(
         suggest_mod.COOC_WEIGHT * min(1, suggest_mod.COOC_CAP), 2
     )
@@ -861,5 +861,5 @@ def test_cooc_reason_caps_listed_names_at_two():
     })
     seed = {"uri": "n", "name": "S", "artists": [{"id": "seedless", "name": "Seedless"}]}
     res = suggest(seed, {"H": prof}, ARTISTS, {}, {}, corpus)
-    cooc_reasons = [r for r in res[0]["reasons"] if r.startswith("filed alongside:")]
-    assert cooc_reasons == ["filed alongside: Beach House, Kvelertak"]
+    cooc_reasons = [r for r in res[0]["reasons"] if r.startswith("next to")]
+    assert cooc_reasons == ["next to Beach House, Kvelertak"]

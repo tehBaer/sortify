@@ -1,12 +1,12 @@
-"""The "needs a home" destination: a buffer for songs no home fits.
+"""The "Homeless" destination: a buffer for songs no home fits.
 
 The button that files there is ordinary /api/act — a move out of the input
 into another input — so nothing new happens server-side except naming the
 destination in the now payload. What these tests pin is that naming: which
 id the client is told to aim at, and when it is told nothing at all.
 
-`needs_home_id` is a config key, not a name convention. The playlist is
-called `[Needs a home]` in the live library, which makes it a buffer input
+`homeless_id` is a config key, not a name convention. The playlist is
+called `[Homeless]` in the live library, which makes it a buffer input
 for free — but the button must not depend on that name, because renaming it
 would silently move the destination.
 
@@ -26,7 +26,7 @@ LISTING = [
      "total": 12, "snapshot_id": "s-h1", "image": None, "description": ""},
     {"id": "buf", "name": "[Hazy]", "owner": "me", "editable": True,
      "total": 3, "snapshot_id": "s-buf", "image": None, "description": ""},
-    {"id": "nh", "name": "[Needs a home]", "owner": "me", "editable": True,
+    {"id": "nh", "name": "[Homeless]", "owner": "me", "editable": True,
      "total": 0, "snapshot_id": "s-nh", "image": None, "description": ""},
 ]
 
@@ -72,7 +72,7 @@ def wired(monkeypatch):
 
 
 def test_the_now_payload_names_the_configured_destination(wired):
-    assert wired(needs_home_id="nh")["needs_home_id"] == "nh"
+    assert wired(homeless_id="nh")["homeless_id"] == "nh"
 
 
 def test_no_destination_configured_means_no_button(wired):
@@ -81,20 +81,28 @@ def test_no_destination_configured_means_no_button(wired):
     The client renders the button only when this is truthy, so None here is
     what keeps the feature invisible until the destination exists.
     """
-    assert wired()["needs_home_id"] is None
+    assert wired()["homeless_id"] is None
 
 
 def test_a_destination_that_is_not_a_resolved_input_is_withheld(wired):
     """A stale id — playlist deleted, or renamed out of the buffer pattern —
     must not be offered. Clicking it would 404 on the add, and the config key
     is the only thing standing between the button and a dead destination."""
-    assert wired(needs_home_id="ghost")["needs_home_id"] is None
-    assert wired(needs_home_id="h1")["needs_home_id"] is None
+    assert wired(homeless_id="ghost")["homeless_id"] is None
+    assert wired(homeless_id="h1")["homeless_id"] is None
+
+
+def test_a_config_written_before_the_rename_still_names_the_destination(wired):
+    """The concept was renamed Needs a home -> Homeless and the config key
+    followed it. A config file written before that names the same playlist by
+    the same id under the old key, and nothing about the destination changed —
+    so the old key is still read rather than silently resolving to no button."""
+    assert wired(needs_home_id="nh")["homeless_id"] == "nh"
 
 
 def test_the_destination_is_still_an_ordinary_input(wired):
     """It carries `has_track` like any other input, which is how the client
     knows to hide the button for a song already sitting there."""
-    inputs = {l["id"]: l for l in wired(needs_home_id="nh")["inputs"]}
+    inputs = {l["id"]: l for l in wired(homeless_id="nh")["inputs"]}
     assert inputs["nh"]["has_track"] is False
     assert inputs["buf"]["has_track"] is True

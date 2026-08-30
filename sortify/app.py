@@ -3550,22 +3550,26 @@ def _suggestion_payload(np: dict) -> dict:
              "set": l.get("set", inputsets.DEFAULT_KEY)}
             for l in state["inputs"]
         ],
-        "needs_home_id": _needs_home_id(state),
+        "homeless_id": _homeless_id(state),
     }
 
 
-def _needs_home_id(state: dict) -> str | None:
+def _homeless_id(state: dict) -> str | None:
     """The "no home fits this" destination, or None if there isn't a live one.
 
-    Config names it by id rather than by name: `[Needs a home]` is a buffer
-    input only because of what it happens to be called, and a rename must move
-    the playlist between sets — not silently redirect the button.
+    Config names it by id rather than by name: `[Homeless]` is a buffer input
+    only because of what it happens to be called, and a rename must move the
+    playlist between sets — not silently redirect the button. Which is also
+    why `needs_home_id` is still read: the concept was renamed to Homeless in
+    the UI and the config key followed, but a config written before that
+    rename still names the same playlist and must keep working.
 
     Withheld unless it resolves as an input right now. A deleted or renamed
     destination would otherwise reach the client as a button that 404s on the
     add, and this key is the only thing between the two.
     """
-    nid = store.config().get("needs_home_id")
+    cfg = store.config()
+    nid = cfg.get("homeless_id") or cfg.get("needs_home_id")
     if not nid:
         return None
     return nid if any(l["id"] == nid for l in state["inputs"]) else None

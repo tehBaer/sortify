@@ -75,6 +75,14 @@ function toast(msg, ms = 2600) {
   toastTimer = setTimeout(() => { el.hidden = true; }, ms);
 }
 
+// Folder paths run as deep as "archive / other / Previous / Old / Diverse /
+// Røde Runde / Anbefalte" — wider than a phone on their own. Under a
+// suggestion only the leaf is shown, the folder the playlist actually sits
+// in; the picker keeps the full path, having the width for it.
+function folderLeaf(f) {
+  return (f || "").split(" / ").pop();
+}
+
 function esc(s) {
   return (s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
@@ -550,7 +558,7 @@ function renderCard() {
     suggHtml += `<button class="sugg${s.already ? " already" : ""}${s.weak ? " weak" : ""}" data-to="${esc(s.playlist_id)}">
       <span class="s-pct">${s.already ? "" : s.pct + "%"}</span>
       <span class="s-name"><kbd>${i + 1}</kbd> ${esc(home.name)}</span>
-      <span class="s-why">${esc([home.folder, ...s.reasons].filter(Boolean).join(" · "))}</span>
+      <span class="s-why">${esc([folderLeaf(home.folder), ...s.reasons].filter(Boolean).join(" · "))}</span>
     </button>`;
   });
   if (!tr.suggestions.length) {
@@ -1439,17 +1447,20 @@ function renderNow() {
   if (inSitting) {
     wireSittingCard();
   } else {
-    $("now-card").querySelectorAll(".sugg").forEach((b) => {
+    // [data-to]: the Add to… row is a .sugg for layout's sake but has no
+    // destination, and a preview hold on it would have nothing to play.
+    $("now-card").querySelectorAll(".sugg[data-to]").forEach((b) => {
       b.onclick = () => { if (previewHold.consumeClick()) return; nowFile(b.dataset.to); };
       previewHold.attach(b, b.dataset.to, nowState.homes.get(b.dataset.to)?.name,
         { label: "File here", run: () => nowFile(b.dataset.to) });
     });
     const more = $("btn-now-more");
-    if (more) more.onclick = () => openPicker(nowState.homes, nowFile, nowCreateAndFile);
+    if (more) more.onclick = openNowPicker;
     const sub = $("btn-now-subset");
     if (sub) sub.onclick = () => openPicker(nowState.subsetTargets, nowAddToSubset);
-    const nh = $("btn-now-needs-home");
-    if (nh) nh.onclick = nowNeedsHome;
+    const nh = $("btn-now-homeless");
+    if (nh) nh.onclick = nowHomeless;
+    capSuggScroll();
     $("now-card").querySelectorAll(".in-chip").forEach((b) => {
       b.onclick = () => nowCapture(b.dataset.in);
     });
@@ -1462,6 +1473,25 @@ function renderNow() {
       };
     });
   }
+}
+
+// Exactly three rows visible. It has to be measured rather than assumed: a
+// reason line wraps on a narrow screen and rows stop being the same height,
+// so the only honest answer to "where do three rows end" is where the fourth
+// one starts. A list already short enough gets no cap and no scrollbar.
+function suggScrollCap(tops, visible = 3) {
+  if (tops.length <= visible) return null;
+  return tops[visible] - tops[0];
+}
+
+function capSuggScroll() {
+  const box = $("now-card").querySelector(".sugg-scroll");
+  const rows = box && box.querySelectorAll ? [...box.querySelectorAll(".sugg")] : [];
+  // offsetTop is undefined under the test harness's stub DOM, which has no
+  // layout — the arithmetic above is pinned there instead.
+  if (!rows.length || rows[0].offsetTop === undefined) return;
+  const cap = suggScrollCap(rows.map((r) => r.offsetTop));
+  box.style.maxHeight = cap == null ? "" : `${cap}px`;
 }
 
 function subsetButtonRow() {
@@ -1490,21 +1520,39 @@ function ordinaryCardBody(d, tr, ctx) {
   if (d.suggestions.length && d.suggestions[0].weak) {
     body += '<p class="hint">No confident match — closest guesses:</p>';
   }
+  // The rows go in a scrolling box of their own: the list is six long now and
+  // six full-height rows are more card than a phone screen wants at once.
+  // About three show, the fourth is cut off at the edge — which is the only
+  // honest affordance that there is more, since a touch device renders no
+  // scrollbar at rest. The lead-in hint above stays OUTSIDE the box: it says
+  // what the whole list is, so scrolling it away would be losing the label.
+  let rows = "";
   d.suggestions.forEach((s, i) => {
     const home = nowState.homes.get(s.playlist_id);
     if (!home) return;
-    body += `<button class="sugg${s.already ? " already" : ""}${s.weak ? " weak" : ""}" data-to="${esc(s.playlist_id)}" style="--pct:${s.already ? 100 : s.pct}%">
+    rows += `<button class="sugg${s.already ? " already" : ""}${s.weak ? " weak" : ""}" data-to="${esc(s.playlist_id)}" style="--pct:${s.already ? 100 : s.pct}%">
       <span class="s-pct">${s.already ? '<span class="s-badge">already there</span>' : s.pct + "%"}</span>
       <span class="s-name"><kbd>${i + 1}</kbd> ${esc(home.name)}</span>
-      <span class="s-why">${esc([home.folder, ...s.reasons].filter(Boolean).join(" · "))}</span>
+      <span class="s-why">${esc([folderLeaf(home.folder), ...s.reasons].filter(Boolean).join(" · "))}</span>
     </button>`;
   });
-  if (!d.suggestions.length) body += '<p class="hint">No confident match — use Add to…</p>';
+  // Add to… ends the list rather than sitting under it as a button: reaching
+  // past the suggestions is the same question the suggestions ask, so it is
+  // the last and least confident answer to it, not a different control. It
+  // keeps the rows' three-column shape so the list still scans as one column,
+  // and takes a look of its own so it does not read as a seventh home. No
+  // data-to and no --pct: nothing to file, nothing to be confident about.
+  rows += `<button class="sugg sugg-more" id="btn-now-more">
+    <span class="s-pct"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></span>
+    <span class="s-name"><kbd>m</kbd> Add to…</span>
+    <span class="s-why">any of your homes — search by name, or create one</span>
+  </button>`;
+  body += `<div class="sugg-scroll">${rows}</div>`;
+  if (!d.suggestions.length) body += '<p class="hint">No confident match — Add to… above.</p>';
   // Remove from input lives in the playback strip now (see playbackStrip).
   body += `<div class="minor-actions">
-    <button id="btn-now-more"><kbd>m</kbd> Add to…</button>
     <button id="btn-now-subset">Add to subset…</button>
-    ${needsHomeButton(d) || ""}
+    ${homelessButton(d) || ""}
   </div>`;
   const chips = captureChips(d.inputs || []);
   if (chips) body += `<div class="capture"><span class="hint">capture to input:</span>${chips}</div>`;
@@ -1519,22 +1567,27 @@ function ordinaryCardBody(d, tr, ctx) {
 //
 // Four conditions, and all four are about not offering a move that would be
 // wrong rather than merely useless: no destination configured (see the
-// server's `_needs_home_id`), nothing to move out of, the destination IS the
-// context, or the song is already there.
-function needsHomeButton(d) {
-  if (!d.needs_home_id || !d.context?.is_input) return "";
-  if (d.context.id === d.needs_home_id) return "";
-  if ((d.inputs || []).some((l) => l.id === d.needs_home_id && l.has_track)) return "";
-  return '<button id="btn-now-needs-home">Needs a home</button>';
+// server's `_homeless_id`), nothing to move out of, the destination IS the
+// context, or the song is already there. Split from the button because the
+// picker offers the same verdict and must agree about when it applies.
+function homelessTarget(d) {
+  if (!d?.homeless_id || !d.context?.is_input) return null;
+  if (d.context.id === d.homeless_id) return null;
+  if ((d.inputs || []).some((l) => l.id === d.homeless_id && l.has_track)) return null;
+  return d.homeless_id;
 }
 
-async function nowNeedsHome() {
-  const id = nowState.needs_home_id;
+function homelessButton(d) {
+  return homelessTarget(d) ? '<button id="btn-now-homeless">Homeless</button>' : "";
+}
+
+async function nowHomeless() {
+  const id = nowState.homeless_id;
   if (!id) return;
   // Deliberately nowFile, not a variant of nowCapture: the decision is spent
   // either way, so the card belongs in its ✓ filed state with the strip's
   // Undo — the same shape filing to a home leaves behind.
-  await nowFile(id, "needs a new home");
+  await nowFile(id, "Homeless");
 }
 
 // Capture chips, grouped by input set. 26 chips in one wall is a thing you
@@ -1556,11 +1609,11 @@ function captureChip(l) {
 function captureChips(inputs) {
   const bySet = new Map();
   for (const l of inputs) {
-    // The needs-a-home buffer has its own button, which MOVES the song there.
+    // The Homeless buffer has its own button, which MOVES the song there.
     // Its chip would sit two centimetres away and only ADD it, leaving the
     // song in the input as well — one destination with two meanings depending
     // on which control you hit. Hidden here so there is only the one.
-    if (l.id === nowState?.needs_home_id) continue;
+    if (l.id === nowState?.homeless_id) continue;
     const k = l.set || NOW_BUFFER_SET;
     if (!bySet.has(k)) bySet.set(k, []);
     bySet.get(k).push(l);
@@ -1610,7 +1663,7 @@ async function nowAddToSubset(id) {
 }
 
 // `label` names the destination on the done card and in the toast. It exists
-// because not every filing destination is a home any more: the needs-a-home
+// because not every filing destination is a home any more: the Homeless
 // buffer is an input, so the `d.homes` lookup finds nothing and the card
 // would read "✓ filed to home".
 async function nowFile(toId, label) {
@@ -1825,10 +1878,29 @@ $("now-card").addEventListener("click", (e) => {
 
 // ---- picker ----------------------------------------------------------------
 
-function openPicker(homesMap, onPick, onCreate) {
+// The Now card's picker, wired through the one place that knows whether the
+// Homeless verdict applies right now. Both the button and `m` go through it,
+// so the picker cannot end up offering a move the card itself withholds.
+function openNowPicker() {
+  openPicker(nowState.homes, nowFile, nowCreateAndFile,
+             homelessTarget(nowState) ? nowHomeless : null);
+}
+
+function openPicker(homesMap, onPick, onCreate, onHomeless) {
   const list = $("picker-list");
   const paint = (filter) => {
     list.innerHTML = "";
+    // Pinned above the homes and never filtered out: "none of these fit" is
+    // the one answer a filter matching nothing does not rule out — it is the
+    // case that makes it likeliest.
+    if (onHomeless) {
+      const b = document.createElement("button");
+      b.className = "picker-row picker-homeless";
+      b.innerHTML = '<span class="p-name">Homeless</span>' +
+        '<span class="p-sub">no home fits — park it in the buffer</span>';
+      b.onclick = () => { closePicker(); onHomeless(); };
+      list.appendChild(b);
+    }
     // Recency first: the home you filed into most recently is the likeliest
     // target again (ISO Zulu stamps compare fine as strings; homes never
     // added to sink to the bottom in the old folder → name order).
@@ -3275,7 +3347,7 @@ function sittingCardBody(tr, srvSitting) {
       html += `<button class="sugg${s.already ? " already" : ""}${s.weak ? " weak" : ""}" data-keep="${esc(s.playlist_id)}" style="--pct:${s.already ? 100 : s.pct}%">
         <span class="s-pct">${s.already ? '<span class="s-badge">already there</span>' : s.pct + "%"}</span>
         <span class="s-name"><kbd>${i + 1}</kbd> Keep → ${esc(home.name)}</span>
-        <span class="s-why">${esc([home.folder, ...s.reasons].filter(Boolean).join(" · "))}</span>
+        <span class="s-why">${esc([folderLeaf(home.folder), ...s.reasons].filter(Boolean).join(" · "))}</span>
       </button>`;
     });
     if (!nowState.suggestions.length) html += '<p class="hint">No confident match — use Keep to… below.</p>';
@@ -3443,7 +3515,7 @@ document.addEventListener("keydown", (e) => {
     const s = suggFor(e.key, nowState.suggestions);
     if (s) nowFile(s.playlist_id);
     else if (SUGG_KEYS.includes(e.key)) return;
-    else if (e.key === "m" && nowState.track.sortable) openPicker(nowState.homes, nowFile, nowCreateAndFile);
+    else if (e.key === "m" && nowState.track.sortable) openNowPicker();
     else if (e.key === "r") nowRemove();
     else if (e.key === "u") $("btn-undo-now").click();
   }

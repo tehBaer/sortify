@@ -329,4 +329,4 @@ def test_now_suggestions_use_cooc_evidence_from_cached_playlists(monkeypatch):
     suggestions = resp["suggestions"]
     assert suggestions and suggestions[0]["playlist_id"] == "home1"
     assert suggestions[0]["weak"] is True
-    assert "filed alongside: Home Artist" in suggestions[0]["reasons"]
+    assert "next to Home Artist" in suggestions[0]["reasons"]

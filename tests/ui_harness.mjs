@@ -248,7 +248,7 @@ function setNow(bodyOrRoute) {
       suggestions: body.suggestions || [], subsets: body.subsets || [],
       subset_targets: body.subset_targets || [], homes: body.homes || [],
       inputs: body.inputs || [],
-      needs_home_id: body.needs_home_id ?? null,
+      homeless_id: body.homeless_id ?? null,
     },
   } : { status: 200, body: { playing: false } };
   routes["GET /api/now/suggest"] = sugg;
@@ -2573,7 +2573,7 @@ run("stopNowPolling()");
 }
 
 // ============================================================================
-// NH — "Needs a home": the verdict that no home fits, as a move into the
+// HL — "Homeless": the verdict that no home fits, as a move into the
 // buffer that collects those songs. It files (out of the input, into the
 // buffer) rather than captures, so the checks below are as much about the
 // three cases where the button must NOT appear as about the one where it does
@@ -2593,8 +2593,8 @@ run("stopNowPolling()");
       homes: [{ id: "H1", name: "Home", folder: "" }],
       subset_targets: [], subsets: [],
       inputs: [{ id: "IN1", name: "[Hazy]", has_track: true, set: "buffer" },
-               { id: "NH1", name: "[Needs a home]", has_track: false, set: "buffer" }],
-      needs_home_id: "NH1",
+               { id: "NH1", name: "[Homeless]", has_track: false, set: "buffer" }],
+      homeless_id: "NH1",
       ...over,
     },
   });
@@ -2609,41 +2609,41 @@ run("stopNowPolling()");
 
   routes["POST /api/act"] = { status: 200, body: {} };
   await paint({});
-  check("NH the button is offered while playing from an input",
-        html().includes('id="btn-now-needs-home"'), `html=${html()}`);
-  check("NH and the destination gets no capture chip of its own",
+  check("HL the button is offered while playing from an input",
+        html().includes('id="btn-now-homeless"'), `html=${html()}`);
+  check("HL and the destination gets no capture chip of its own",
         !html().includes('data-in="NH1"') && html().includes('data-in="IN1"'),
         `nh-chip=${html().includes('data-in="NH1"')} in-chip=${html().includes('data-in="IN1"')}`);
 
-  await run(`nowNeedsHome()`);
+  await run(`nowHomeless()`);
   await tick();
   const act = bodies("/api/act").slice(-1)[0];
-  check("NH pressing it moves the song out of the input it came from",
+  check("HL pressing it moves the song out of the input it came from",
         act.to_id === "NH1" && act.from_id === "IN1" && act.action === "move",
         JSON.stringify(act));
-  check("NH the card lands filed, named for the buffer and not for a home",
-        run(`filedUris["spotify:track:nh1"] === "needs a new home"`) &&
+  check("HL the card lands filed, named for the buffer and not for a home",
+        run(`filedUris["spotify:track:nh1"] === "Homeless"`) &&
         /✓ filed to/.test(html()),
         run(`JSON.stringify(filedUris)`));
-  check("NH and the strip offers the way back",
+  check("HL and the strip offers the way back",
         html().includes('id="btn-now-undo-remove"'), `html=${html()}`);
 
-  await paint({ needs_home_id: null });
-  check("NH no configured destination, no button",
-        !html().includes('id="btn-now-needs-home"'), `html=${html()}`);
+  await paint({ homeless_id: null });
+  check("HL no configured destination, no button",
+        !html().includes('id="btn-now-homeless"'), `html=${html()}`);
 
-  await paint({ context: { id: "NH1", name: "[Needs a home]", is_input: true } });
-  check("NH playing from the buffer itself offers no move into it",
-        !html().includes('id="btn-now-needs-home"'), `html=${html()}`);
+  await paint({ context: { id: "NH1", name: "[Homeless]", is_input: true } });
+  check("HL playing from the buffer itself offers no move into it",
+        !html().includes('id="btn-now-homeless"'), `html=${html()}`);
 
   await paint({ inputs: [{ id: "IN1", name: "[Hazy]", has_track: true, set: "buffer" },
-                         { id: "NH1", name: "[Needs a home]", has_track: true, set: "buffer" }] });
-  check("NH a song already in the buffer is not offered it twice",
-        !html().includes('id="btn-now-needs-home"'), `html=${html()}`);
+                         { id: "NH1", name: "[Homeless]", has_track: true, set: "buffer" }] });
+  check("HL a song already in the buffer is not offered it twice",
+        !html().includes('id="btn-now-homeless"'), `html=${html()}`);
 
   await paint({ context: null });
-  check("NH nothing to move out of, no button",
-        !html().includes('id="btn-now-needs-home"'), `html=${html()}`);
+  check("HL nothing to move out of, no button",
+        !html().includes('id="btn-now-homeless"'), `html=${html()}`);
 }
 
 // ============================================================================
@@ -2666,7 +2666,7 @@ run("stopNowPolling()");
                artists: [{ name: "Artist" }], sortable: true, image: null },
       context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
       suggestions: sugg(6), homes: homes(6),
-      subset_targets: [], subsets: [], inputs: [], needs_home_id: null,
+      subset_targets: [], subsets: [], inputs: [], homeless_id: null,
     },
   });
   run(`show("now"); filedUris = {}; nowActions = 0; nowActionLog = [];
@@ -2694,6 +2694,173 @@ run("stopNowPolling()");
   await tick();
   check("SD `7` is not a shortcut — nothing is filed past the end of the list",
         posts("/api/act") === 0, `${posts("/api/act")} POST(s)`);
+}
+
+// ============================================================================
+// SC — the suggestion block scrolls: six rows is more card than a phone
+// screen wants, so the list is capped at roughly three and the rest is a
+// swipe away. The cap itself is CSS and out of this harness's reach; what is
+// pinned here is the structure the cap depends on — which rows are inside
+// the scrolling box, and which text deliberately stays outside it.
+// ============================================================================
+{
+  resetLog();
+  const paint = async (suggestions) => {
+    setNow({
+      status: 200,
+      body: {
+        playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+        track: { uri: "spotify:track:sc1", name: "Song", duration_ms: 200000,
+                 artists: [{ name: "Artist" }], sortable: true, image: null },
+        context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
+        suggestions,
+        homes: Array.from({ length: 6 }, (_, i) => (
+          { id: `H${i + 1}`, name: `Home ${i + 1}`, folder: "" })),
+        subset_targets: [], subsets: [], inputs: [], homeless_id: null,
+      },
+    });
+    run(`show("now"); filedUris = {}; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+    return $$("now-card").innerHTML;
+  };
+  const six = Array.from({ length: 6 }, (_, i) => (
+    { playlist_id: `H${i + 1}`, pct: 90 - i * 5, reasons: ["why"], already: false }));
+
+  let card = await paint(six);
+  const box = card.match(/<div class="sugg-scroll">([\s\S]*?)<\/div>/);
+  check("SC every suggestion sits inside the scrolling box",
+        !!box && (box[1].match(/class="sugg"/g) || []).length === 6, `card=${card}`);
+  check("SC and the buttons keep their handles, so clicks still wire up",
+        !!box && ["H1", "H6"].every((id) => box[1].includes(`data-to="${id}"`)), `card=${card}`);
+
+  // Add to… living in the list means the box is never empty — with nothing
+  // suggested it holds that one row, which is exactly the case where the user
+  // needs it most.
+  card = await paint([]);
+  const empty = card.match(/<div class="sugg-scroll">([\s\S]*?)<\/div>\s*<p class="hint">/);
+  check("SC nothing suggested, and the box holds Add to… by itself",
+        !!empty && (empty[1].match(/class="sugg/g) || []).length === 1 &&
+        empty[1].includes("sugg-more"), `card=${card}`);
+
+  card = await paint(six.slice(0, 2).map((s) => ({ ...s, weak: true })));
+  check("SC the guesses lead-in stays outside the box, not scrolled away",
+        card.indexOf("closest guesses") !== -1 &&
+        card.indexOf("closest guesses") < card.indexOf("sugg-scroll"), `card=${card}`);
+
+  // The cap is measured, not assumed: a reason line that wraps makes rows
+  // different heights, so "exactly three" can only come from where the fourth
+  // row actually starts. The measuring is layout and out of reach here; the
+  // arithmetic that turns offsets into a cap is not.
+  check("SC three rows deep, the cap is where the fourth row begins",
+        run("suggScrollCap([0, 44, 88, 132, 180])") === 132, "");
+  check("SC uneven rows (a wrapped reason) still cut at the fourth",
+        run("suggScrollCap([0, 44, 106, 150, 194])") === 150, "");
+  check("SC a list that already fits gets no cap at all, and so no scrollbar",
+        run("suggScrollCap([0, 44, 88])") === null, "");
+
+  card = await paint(six);
+  const box2 = card.match(/<div class="sugg-scroll">([\s\S]*?)<\/div>\s*<div class="minor-actions">/);
+  check("SC Add to… is the last row of the list, not a button below it",
+        !!box2 && box2[1].includes('id="btn-now-more"') &&
+        box2[1].lastIndexOf('id="btn-now-more"') > box2[1].lastIndexOf('data-to="H6"'),
+        `card=${card}`);
+  check("SC it looks like its own thing, not a seventh suggestion",
+        !!box2 && box2[1].includes("sugg-more"), `card=${card}`);
+  check("SC and carries no data-to, so the file wiring cannot pick it up",
+        !!box2 && !/id="btn-now-more"[^>]*data-to=/.test(box2[1]), `card=${card}`);
+  check("SC the minor actions no longer offer it a second time",
+        (card.match(/id="btn-now-more"/g) || []).length === 1, `card=${card}`);
+}
+
+// ============================================================================
+// SW — the reason line is one line. The clamp itself is CSS, but half of what
+// used to overflow was the folder path: real ones run seven segments deep
+// ("archive / other / Previous / Old / Diverse / Røde Runde / Anbefalte"),
+// which alone is wider than a phone. Only the leaf is shown — the folder the
+// playlist actually sits in — and the full path stays in the picker, which
+// has the width for it.
+// ============================================================================
+{
+  resetLog();
+  setNow({
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri: "spotify:track:sw1", name: "Song", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
+      suggestions: [{ playlist_id: "H1", pct: 80, reasons: ["3× Beach House"], already: false }],
+      homes: [{ id: "H1", name: "Home", folder: "archive / other / Previous / Old / Diverse" }],
+      subset_targets: [], subsets: [], inputs: [], homeless_id: null,
+    },
+  });
+  run(`show("now"); filedUris = {}; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  const why = $$("now-card").innerHTML.match(/class="s-why">([^<]*)</);
+
+  check("SW the reason line names the folder the playlist is in, not the path to it",
+        !!why && why[1].includes("Diverse") && !why[1].includes("archive"), `why=${why && why[1]}`);
+  check("SW and keeps the evidence beside it",
+        !!why && why[1].includes("3× Beach House"), `why=${why && why[1]}`);
+  check("SW a home at the top level still reads cleanly",
+        run(`folderLeaf("samlemappe")`) === "samlemappe" &&
+        run(`folderLeaf("")`) === "" && run(`folderLeaf(null)`) === "", "");
+}
+
+// ============================================================================
+// HP — Homeless inside the picker. The verdict "none of these fit" is most
+// often reached while looking through the homes, not before opening them, so
+// it has to be reachable from in there without backing out first. It pins to
+// the top and survives filtering: a filter that matches nothing is the
+// clearest statement of the case it exists for.
+// ============================================================================
+{
+  resetLog();
+  const rows = () => $$("picker-list").children.map((c) => c.className);
+  const openWith = async (over) => {
+    setNow({
+      status: 200,
+      body: {
+        playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+        track: { uri: "spotify:track:hp1", name: "Song", duration_ms: 200000,
+                 artists: [{ name: "Artist" }], sortable: true, image: null },
+        context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
+        suggestions: [], homes: [{ id: "H1", name: "Home", folder: "" }],
+        subset_targets: [], subsets: [],
+        inputs: [{ id: "IN1", name: "[Hazy]", has_track: true, set: "buffer" },
+                 { id: "HL1", name: "[Homeless]", has_track: false, set: "buffer" }],
+        homeless_id: "HL1",
+        ...over,
+      },
+    });
+    run(`show("now"); filedUris = {}; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+    run(`openNowPicker()`);
+  };
+
+  await openWith({});
+  check("HP the picker leads with Homeless when the card would offer it",
+        rows()[0] && rows()[0].includes("picker-homeless"), `rows=${rows()}`);
+  check("HP and the homes follow it",
+        rows().slice(1).some((c) => c === "picker-row"), `rows=${rows()}`);
+
+  run(`$("picker-filter").oninput({ target: { value: "nothing matches this" } })`);
+  check("HP a filter that matches nothing keeps it — that is its whole case",
+        rows()[0] && rows()[0].includes("picker-homeless"), `rows=${rows()}`);
+
+  run("closePicker()");
+  await openWith({ context: { id: "H1", name: "Home", is_input: false } });
+  check("HP playing outside an input, there is nothing to move out of, and no row",
+        !rows().some((c) => c.includes("picker-homeless")), `rows=${rows()}`);
+
+  run("closePicker()");
+  await openWith({ homeless_id: null });
+  check("HP no destination configured, no row",
+        !rows().some((c) => c.includes("picker-homeless")), `rows=${rows()}`);
+  run("closePicker()");
 }
 
 // ---- summary ---------------------------------------------------------------

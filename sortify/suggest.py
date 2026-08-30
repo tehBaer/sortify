@@ -1,6 +1,12 @@
 """Score how well a track fits each home playlist.
 
 Three signals, all explainable to the user:
+  Reason strings are deliberately terse ("3\u00d7 Beach House", "next to
+  Slowdive", "like Slowdive"). They are read on one truncated line under a
+  suggestion on a phone, where a wrapped second line cost more than the words
+  saved — the card clamps them to one line, so length spent here is
+  information lost at the ellipsis, not information shown.
+
   - artist overlap: the playlist already contains tracks by this artist
   - tag similarity: cosine between the track's tags and the playlist's tag
     profile. Track-level Last.fm tags (`track.getTopTags`) REPLACE the
@@ -477,7 +483,7 @@ def suggest(
             n = prof["artist_counts"].get(a.get("id"), 0)
             if n:
                 score += ARTIST_BASE + ARTIST_PER_TRACK * min(n, 5)
-                reasons.append(f"{n} track{'s' if n > 1 else ''} by {a['name']} here")
+                reasons.append(f"{n}\u00d7 {a['name']}")
 
         sim = _cosine(track_tags, prof["tag_counts"])
         if sim > 0.05:
@@ -485,7 +491,7 @@ def suggest(
             hints = prof.get("hints") or set()
             hint_hits = sorted(t for t in track_tags if t in hints)
             if hint_hits:
-                reasons.append("your hint: " + ", ".join(hint_hits[:3]))
+                reasons.append("hint: " + ", ".join(hint_hits[:3]))
             # Hint matches get their own line above; listing them again here
             # would double-credit one signal in the user's eyes.
             overlap = sorted(
@@ -494,13 +500,13 @@ def suggest(
                 reverse=True,
             )
             if overlap:
-                reasons.append(tag_reason_prefix + ", ".join(overlap[:3]))
+                reasons.append(tag_reason_prefix + ", ".join(overlap[:2]))
 
         neighbour_sum, neighbour_count = _neighbour_score(track, prof, track_map)
         if neighbour_count:
             score += NEIGHBOUR_WEIGHT * min(neighbour_sum, NEIGHBOUR_SUM_CAP)
             reasons.append(
-                f"{neighbour_count} similar track{'s' if neighbour_count > 1 else ''} already here"
+                f"{neighbour_count} similar track{'s' if neighbour_count > 1 else ''}"
             )
 
         already = track["uri"] in prof["uris"]
@@ -518,11 +524,11 @@ def suggest(
             sim_sum, sim_count, sim_names = _artist_sim_score(track, prof, artist_map)
             if sim_count:
                 score += ARTIST_SIM_WEIGHT * min(sim_sum, ARTIST_SIM_CAP)
-                reasons.append("similar artists: " + ", ".join(sim_names[:2]))
+                reasons.append("like " + ", ".join(sim_names[:2]))
             cooc_count, cooc_names = _cooc_score(track, pid, prof, playlist_artists)
             if cooc_count:
                 score += COOC_WEIGHT * min(cooc_count, COOC_CAP)
-                reasons.append("filed alongside: " + ", ".join(cooc_names[:2]))
+                reasons.append("next to " + ", ".join(cooc_names[:2]))
             if score > 0:
                 weak_pool.append(
                     {

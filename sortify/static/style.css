@@ -380,8 +380,45 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
   border-radius: 0 999px 999px 0;
 }
 .sugg:hover { border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+/* Six suggestions is more card than a phone shows at once, so the block is
+   capped at about three rows and scrolls for the rest. The cap is deliberately
+   NOT a whole number of rows: a row cut off at the bottom edge is what tells
+   you there is more, and no scrollbar renders at rest on a touch device.
+   overscroll-behavior: contain keeps a flick that reaches the end from
+   carrying on into the page behind it (the same guard #input-pop uses).
+   Rows are ~4.4rem with a one-line reason and grow when it wraps, so this is
+   "roughly three", not exactly three — vh keeps it sane on a short screen. */
+.sugg-scroll {
+  /* No max-height here: capSuggScroll() measures where the fourth row starts
+     and sets it, because rows stop being equal height as soon as a reason
+     line wraps. If that never runs the list simply shows in full, which is
+     the safe way round to degrade. overscroll-behavior keeps a flick that
+     hits the end from carrying on into the page behind it (#input-pop uses
+     the same guard). */
+  overflow-y: auto; overscroll-behavior: contain;
+  padding-right: 2px;
+}
+/* Add to… ends the list, so it has to read as an exit from it rather than as
+   one more home: no card fill, a dashed edge, and the muted weight of a
+   fallback. The dash going solid on hover is the only state change it needs. */
+.sugg-more {
+  background: transparent; border: 1px dashed var(--border);
+  color: var(--muted);
+}
+.sugg-more:hover {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.sugg-more .s-name { color: var(--fg); }
+.sugg-more .s-pct { float: right; line-height: 0; margin-top: .15rem; }
 .sugg .s-name { font-weight: 650; }
-.sugg .s-why { display: block; color: var(--muted); font-size: .8rem; margin-top: .15rem; }
+/* One line, always. The wording upstream is terse enough that the ellipsis
+   rarely fires, but the clamp is what makes rows a uniform height — which is
+   what lets capSuggScroll() cut the list at exactly three. */
+.sugg .s-why {
+  display: block; color: var(--muted); font-size: .8rem; margin-top: .15rem;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .sugg.already::after { background: color-mix(in srgb, var(--accent) 30%, transparent); }
 /* a guess, not a match: dimmed until pointed at, dashed to say "tentative" */
 .sugg.weak { opacity: .65; border: 1px dashed var(--border); }
@@ -447,6 +484,16 @@ kbd {
 #picker-list { overflow-y: auto; flex: 1; }
 #picker-list button { display: block; width: 100%; text-align: left; margin-bottom: .4rem; }
 .picker-row { padding: .55rem .8rem; }
+/* Homeless heads the picker as a verdict rather than a destination, so it
+   takes the same dashed, unfilled treatment Add to… has at the end of the
+   suggestions — the two are the same kind of row in two places. */
+.picker-homeless {
+  background: transparent; border: 1px dashed var(--border); margin-bottom: .6rem;
+}
+.picker-homeless:hover {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
 /* holdable elements: no long-press text selection / iOS callout */
 .picker-row, .sugg { -webkit-touch-callout: none; user-select: none; }
 /* hold-to-preview: one floating card shared by the picker rows and the
@@ -536,7 +583,10 @@ body.blind:not(.peeked) #now-card .t-name,
 body.blind:not(.peeked) #now-card .t-artist { filter: blur(8px); }
 body.blind:not(.peeked) #now-card .art img,
 body.blind:not(.peeked) #now-card .art .noimg { filter: blur(18px) grayscale(1) brightness(.7); }
-body.blind:not(.peeked) #now-card .s-why { filter: blur(5px); }
+/* Reasons leak artist names, so they blur — but Add to…'s line is a
+   description of the control, not evidence about the track, and blurring it
+   only made the way out of blind mode unreadable. */
+body.blind:not(.peeked) #now-card .sugg:not(.sugg-more) .s-why { filter: blur(5px); }
 #btn-blind.on { color: var(--accent); }
 
 #toast {
