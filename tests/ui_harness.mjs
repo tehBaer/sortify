@@ -3169,6 +3169,63 @@ run("stopNowPolling()");
         JSON.stringify($$("toast").textContent.slice(0, 90)));
 }
 
+// ============================================================================
+// LK — the card says when filing also liked the song. The library write is a
+// second, invisible effect of one press; saying so is what keeps it from
+// being a surprise found later in Spotify.
+// ============================================================================
+{
+  const body = {
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri: "spotify:track:lk1", name: "Song", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[A]", is_input: true }, sitting: null,
+      suggestions: [], homes: [{ id: "H1", name: "Home", folder: "" }],
+      subset_targets: [], subsets: [],
+      inputs: [{ id: "IN1", name: "[A]", has_track: true, set: "buffer" }],
+      homeless_id: "HL1",
+    },
+  };
+  const paint = async () => {
+    setNow(body);
+    run(`filedUris = {}; removedUri = null; nowActions = 0; nowActionLog = []; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+  };
+
+  routes["POST /api/act"] = { status: 200, body: { ok: true, swept: [], liked: true } };
+  await paint();
+  $$("toast").textContent = "";
+  run(`nowFile("H1")`);
+  await tick();
+  check("LK filing into a home says the song was liked too",
+        /liked/.test($$("toast").textContent),
+        JSON.stringify($$("toast").textContent.slice(0, 90)));
+
+  // Homeless files into an INPUT, so the server likes nothing and the card
+  // must not claim otherwise.
+  routes["POST /api/act"] = { status: 200, body: { ok: true, swept: [], liked: false } };
+  await paint();
+  $$("toast").textContent = "";
+  run(`nowFile("HL1", "Homeless")`);
+  await tick();
+  check("LK a destination that was not liked says nothing about liking",
+        !/liked/.test($$("toast").textContent),
+        JSON.stringify($$("toast").textContent.slice(0, 90)));
+
+  // Both effects at once read as one sentence, not two competing suffixes.
+  routes["POST /api/act"] = { status: 200, body: { ok: true, swept: ["[B]"], liked: true } };
+  await paint();
+  $$("toast").textContent = "";
+  run(`nowFile("H1")`);
+  await tick();
+  check("LK a sweep and a like both get said, in one line",
+        /\[B\]/.test($$("toast").textContent) && /liked/.test($$("toast").textContent),
+        JSON.stringify($$("toast").textContent.slice(0, 90)));
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

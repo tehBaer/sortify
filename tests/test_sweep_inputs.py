@@ -81,6 +81,11 @@ def swept(monkeypatch):
                         lambda pid, uri: added.append(pid) or f"s-{pid}-new")
     monkeypatch.setattr(appmod.sp, "remove_from_playlist",
                         lambda pid, uri: removed.append(pid) or f"s-{pid}-new")
+    # Filing into a home now writes to the library too (`_like_after_filing`).
+    # It swallows its own failures, so an unmocked one does not fail a test —
+    # it just spends the rate limiter's backoff in silence, which is how this
+    # file once took 38s to assert something unrelated.
+    monkeypatch.setattr(appmod.sp, "save_to_liked", lambda uri: None)
     monkeypatch.setattr(appmod, "_lastfm_client", lambda: None)
 
     appmod._profile_state.clear()

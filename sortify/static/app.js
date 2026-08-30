@@ -594,7 +594,7 @@ async function moveTo(toId) {
     const res = await api("/api/act", { action: "move", uri: tr.uri, from_id: t.id, to_id: toId });
     t.history.push({ track: tr, idx: t.idx });
     t.sorted++;
-    toast(res.note || `→ ${t.homes.get(toId)?.name ?? "moved"}`);
+    toast((res.note || `→ ${t.homes.get(toId)?.name ?? "moved"}`) + actSuffix(res));
     t.tracks.splice(t.idx, 1);
     renderCard();
   } catch (e) { toast(e.message); }
@@ -1792,6 +1792,15 @@ function sweptSuffix(swept) {
   return swept.length === 1 ? ` + ${swept[0]}` : ` + ${swept.length} more inputs`;
 }
 
+// One press can now have three effects — the filing, the sweep, and a library
+// write — and the two invisible ones are exactly the ones worth saying out
+// loud. `liked` is the server's answer, not a guess from the destination:
+// only it knows whether the track was actually added (a song already in the
+// home is not re-liked) and whether the write succeeded.
+function actSuffix(res) {
+  return sweptSuffix(res.swept) + (res.liked ? " + liked" : "");
+}
+
 async function nowFile(toId, label) {
   const d = nowState, tr = d.track;
   const fromId = d.context?.is_input ? d.context.id : null;
@@ -1805,7 +1814,7 @@ async function nowFile(toId, label) {
     filedUris[tr.uri] = label || d.homes.get(toId)?.name || "home";
     nowActionLog.push({ uri: tr.uri, kind: "home" });
     toast((res.note || `→ ${filedUris[tr.uri]}${fromId ? " (removed from input)" : ""}`) +
-          sweptSuffix(res.swept));
+          actSuffix(res));
     renderNow();
   } catch (e) { toast(e.message); }
 }

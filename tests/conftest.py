@@ -58,3 +58,25 @@ def no_real_deezer(monkeypatch):
         raise AssertionError("test reached the real Deezer client — fake appmod._deezer_client")
 
     monkeypatch.setattr(appmod, "_deezer_client", _blocked)
+
+
+@pytest.fixture(autouse=True)
+def no_real_library_write(monkeypatch):
+    """No test may reach the real /me/library through `save_to_liked`.
+
+    Filing into a home writes to the library (`_like_after_filing`), and that
+    helper swallows its own failures by design — so an unmocked call does not
+    fail a test, it quietly attempts a real request and pays the rate
+    limiter's backoff. That is how one assertion about input membership came
+    to take 38 seconds.
+
+    Raising here keeps it instant and local. Tests that assert on liking
+    monkeypatch `save_to_liked` themselves, which overrides this.
+    """
+    import sortify.app as appmod
+
+    def _blocked(uri):
+        raise AssertionError(
+            "test reached the real library write — monkeypatch sp.save_to_liked")
+
+    monkeypatch.setattr(appmod.sp, "save_to_liked", _blocked)
