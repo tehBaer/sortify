@@ -103,7 +103,7 @@ def test_profile_counts_cleaned_artist_tags():
     assert "genre_counts" not in prof
 
 
-def test_tag_match_scores_and_says_artist_level():
+def test_tag_match_scores_and_names_the_shared_tags():
     # home full of cumbia; playing track's artist tagged cumbia but NOT in the home
     home_tracks = [
         {"uri": f"u{i}", "artists": [{"id": f"h{i}", "name": f"H{i}"}]}
@@ -119,8 +119,27 @@ def test_tag_match_scores_and_says_artist_level():
     results = suggest(new_track, profs, new_tags)
     assert results
     r = results[0]
-    assert any(x.startswith("artist tags:") for x in r["reasons"])
+    assert "cumbia" in r["reasons"]
     assert r["score"] > 0
+
+
+def test_tag_reason_lists_the_three_strongest_shared_tags():
+    # Four tags overlap; the line has room for three. Which three is not
+    # arbitrary — they are ranked by how much weight each carries in the home
+    # (t1 in three of its tracks, t2 in two, t3 and t4 in one each), so the
+    # tag that says the most about the match is the one that survives the cap.
+    ta = {
+        "a1": tag_entry("t1", name="A1"), "a2": tag_entry("t2", name="A2"),
+        "a3": tag_entry("t3", name="A3"), "a4": tag_entry("t4", name="A4"),
+        "seed": tag_entry("t1", "t2", "t3", "t4", name="Seed"),
+    }
+    home = ([track(f"x{i}", ["a1"]) for i in range(3)] +
+            [track(f"y{i}", ["a2"]) for i in range(2)] +
+            [track("z0", ["a3"]), track("w0", ["a4"])])
+    res = suggest(track("new", ["seed"]), {"H": build_profile(home, ta)}, ta)
+    assert res
+    tag_reasons = [r for r in res[0]["reasons"] if r.startswith("t")]
+    assert tag_reasons == ["t1, t2, t3"]
 
 
 def test_artist_overlap_still_outranks_a_perfect_tag_match():
@@ -246,12 +265,12 @@ def test_a_freshly_fetched_artists_tags_lag_in_the_home_profile():
     # dict that was already computed.
     res = suggest(playing, {"dreamy": stale_profile}, fresh_tag_artists)
     assert res and res[0]["playlist_id"] == "dreamy"
-    assert "artist tags" not in " ".join(res[0]["reasons"])  # no tag-similarity reason yet
+    assert "shoegaze" not in " ".join(res[0]["reasons"])  # no tag-similarity reason yet
 
     # Only a rebuilt profile (what actually happens after PROFILE_TTL) picks it up.
     rebuilt_profile = build_profile(home_tracks, fresh_tag_artists)
     res_after_rebuild = suggest(playing, {"dreamy": rebuilt_profile}, fresh_tag_artists)
-    assert any("artist tags" in r for r in res_after_rebuild[0]["reasons"])
+    assert any("shoegaze" in r for r in res_after_rebuild[0]["reasons"])
 
 
 # ---- Task 2: neighbour scoring + track-tag resolution ---------------------
@@ -440,7 +459,7 @@ def test_resolve_tags_ignores_a_miss_record():
     assert level == "artist"
 
 
-def test_suggest_track_level_tags_replace_artist_and_switch_reason_wording():
+def test_suggest_track_level_tags_replace_artist_tags():
     ta = {**ARTISTS, "h-artist": tag_entry("ambient", name="H Artist")}
     home_track = track("h1", ["h-artist"], title="Home Song")
     prof = build_profile([home_track], ta)
@@ -452,8 +471,9 @@ def test_suggest_track_level_tags_replace_artist_and_switch_reason_wording():
 
     res = suggest(seed, {"H": prof}, ta, track_map)
     assert res
-    assert any(r.startswith("tags:") for r in res[0]["reasons"])
-    assert not any(r.startswith("artist tags:") for r in res[0]["reasons"])
+    # The reason no longer says which level the tags came from, so the
+    # evidence is the tag itself: "ambient" exists only in the track record.
+    assert any("ambient" in r for r in res[0]["reasons"])
 
 
 def test_neighbour_score_finds_record_under_any_credited_artist_key():
@@ -514,7 +534,7 @@ def test_hint_tags_stay_out_of_the_organic_tag_reason():
     res = suggest(track("new", ["slowdive"]), {"H": prof}, ARTISTS)
     assert res
     hint_reasons = [r for r in res[0]["reasons"] if r.startswith("hint:")]
-    tag_reasons = [r for r in res[0]["reasons"] if r.startswith("artist tags:")]
+    tag_reasons = [r for r in res[0]["reasons"] if not r.startswith("hint:")]
     assert hint_reasons == ["hint: shoegaze"]
     # dream pop is organic overlap; shoegaze must not be listed twice
     assert tag_reasons and "shoegaze" not in tag_reasons[0]
@@ -551,7 +571,7 @@ def test_weak_guesses_surface_when_nothing_clears_the_threshold():
     assert r["already"] is False
     assert 0 < r["score"] < suggest_mod.MIN_SCORE
     assert r["pct"] == round(r["score"] * 10)
-    assert any(x.startswith("artist tags:") for x in r["reasons"])
+    assert "t1" in r["reasons"]
 
 
 def test_weak_guesses_ranked_and_capped_at_weak_top_n():

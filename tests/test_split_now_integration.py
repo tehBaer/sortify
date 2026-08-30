@@ -218,7 +218,7 @@ def test_now_survives_a_wrong_version_tags_json(monkeypatch):
     assert resp["playing"] is True
     suggestions = resp["suggestions"]
     assert suggestions and suggestions[0]["playlist_id"] == "home1"
-    assert all("artist tags:" not in r for r in suggestions[0]["reasons"])
+    assert all("dream pop" not in r for r in suggestions[0]["reasons"])
     assert any("Artist One" in r for r in suggestions[0]["reasons"])
 
 
