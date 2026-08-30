@@ -3091,6 +3091,84 @@ run("stopNowPolling()");
         `toast=${JSON.stringify($$("toast").textContent.slice(0, 80))}`);
 }
 
+// ============================================================================
+// SW — filing and removing ask the server to sweep every input; adding to a
+// subset does not. A song put in a best-of has not been sorted, so its copies
+// in the inboxes are still waiting for a real decision.
+// ============================================================================
+{
+  const body = {
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri: "spotify:track:sw1", name: "Song", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[A]", is_input: true }, sitting: null,
+      suggestions: [], homes: [{ id: "H1", name: "Home", folder: "" }],
+      subset_targets: [{ id: "S1", name: "best of", folder: "" }], subsets: [],
+      inputs: [{ id: "IN1", name: "[A]", has_track: true, set: "buffer" }],
+      homeless_id: null,
+    },
+  };
+  const paint = async () => {
+    setNow(body);
+    run(`filedUris = {}; removedUri = null; nowActions = 0; nowActionLog = []; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+  };
+  const lastAct = () => bodies("/api/act").slice(-1)[0];
+
+  routes["POST /api/act"] = { status: 200, body: { ok: true, swept: [] } };
+  await paint();
+  resetLog();
+  run(`nowFile("H1")`);
+  await tick();
+  check("SW filing asks for the sweep",
+        lastAct()?.sweep_inputs === true, JSON.stringify(lastAct()));
+
+  await paint();
+  resetLog();
+  run(`nowRemove()`);
+  await tick();
+  check("SW removing asks for the sweep",
+        lastAct()?.sweep_inputs === true, JSON.stringify(lastAct()));
+
+  await paint();
+  resetLog();
+  run(`nowAddToSubset("S1")`);
+  await tick();
+  check("SW adding to a subset does NOT sweep — it is not a filing decision",
+        !lastAct()?.sweep_inputs && lastAct()?.from_id === null, JSON.stringify(lastAct()));
+
+  // A delete from a playlist the user was not looking at must not be silent.
+  routes["POST /api/act"] = { status: 200, body: { ok: true, swept: ["[B]"] } };
+  await paint();
+  $$("toast").textContent = "";
+  run(`nowRemove()`);
+  await tick();
+  check("SW the toast names the one other input it emptied",
+        $$("toast").textContent.includes("[A]") && $$("toast").textContent.includes("[B]"),
+        JSON.stringify($$("toast").textContent.slice(0, 90)));
+
+  routes["POST /api/act"] = { status: 200, body: { ok: true, swept: ["[B]", "[C]", "[D]"] } };
+  await paint();
+  $$("toast").textContent = "";
+  run(`nowFile("H1")`);
+  await tick();
+  check("SW several get counted rather than listed",
+        /3 more inputs/.test($$("toast").textContent),
+        JSON.stringify($$("toast").textContent.slice(0, 90)));
+
+  routes["POST /api/act"] = { status: 200, body: { ok: true, swept: [] } };
+  await paint();
+  $$("toast").textContent = "";
+  run(`nowFile("H1")`);
+  await tick();
+  check("SW an empty sweep says nothing extra — the 98.7% case stays quiet",
+        !/more inputs|\+ \[/.test($$("toast").textContent),
+        JSON.stringify($$("toast").textContent.slice(0, 90)));
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

@@ -222,6 +222,24 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
   display: inline-flex; align-items: center; justify-content: center;
 }
 .icon-btn.spinning svg { animation: spin .8s linear infinite; }
+/* In the header the disc is 40px, not 48: the input switcher beside it is
+   40px tall, and three circles standing proud of it made the bar read as two
+   rows of controls rather than one line. The touch target does NOT shrink
+   with the paint — ::after puts it back, unpainted. 4px top and bottom
+   restores the full 48px height; only 2px each side, because the row's gap
+   is .4rem (6.4px) and expanding 4px per side would make neighbouring hit
+   areas overlap by more than the gap. 48x44 is still past the platform
+   minimum in both axes.
+
+   Scoped to the header deliberately: the preview popover's icon buttons are
+   not part of this row and keep the plain disc. */
+header .icon-btn {
+  position: relative;
+  min-height: 40px; min-width: 40px; padding: .2rem .45rem;
+}
+header .icon-btn::after {
+  content: ""; position: absolute; inset: -4px -2px; border-radius: inherit;
+}
 .mode-chip {
   min-height: 48px; padding: .3rem .8rem; border-radius: 999px;
   font-size: .8rem; color: var(--muted);

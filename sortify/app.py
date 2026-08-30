@@ -101,6 +101,10 @@ class ActIn(BaseModel):
     uri: str
     from_id: str | None = None  # None = just add to the home, no removal
     to_id: str | None = None
+    # Opt-in: also empty every OTHER input holding this uri (see `act`). Off by
+    # default so the split decide path and anything else filing through here
+    # keeps its old, single-playlist shape.
+    sweep_inputs: bool = False
 
 
 @app.exception_handler(AuthNeeded)
@@ -2973,7 +2977,7 @@ def decide(playlist_id: str, body: DecideIn):
             # it looks up-to-date forever, and both a later `/api/act`
             # re-add and the suggestion engine's home profiles never learn
             # the track landed.
-            _cache_move(body.uri, None, body.to_id)
+            _cache_move(body.uri, [], body.to_id)
         finally:
             # Disk first, THEN memory — not the other order. If the save
             # here fails (a disk hiccup, no crash needed), clearing
@@ -3781,8 +3785,13 @@ def share_targets_endpoint():
 # ---- actions ---------------------------------------------------------------
 
 
-def _cache_move(uri: str, from_id: str | None, to_id: str | None) -> dict | None:
-    """Mirror a move in the local cache; returns the track dict if we had it."""
+def _cache_move(uri: str, from_ids: list[str] | None, to_id: str | None) -> dict | None:
+    """Mirror a move in the local cache; returns the track dict if we had it.
+
+    `from_ids` is a list because one decision can now empty several playlists
+    at once (the input sweep, see `act`) — and they have to be mirrored in one
+    read-modify-write, or each save would clobber the last one's removal.
+    """
     cache = store.cache()
     track = None
     for pid in cache["playlists"]:
@@ -3792,9 +3801,10 @@ def _cache_move(uri: str, from_id: str | None, to_id: str | None) -> dict | None
                 break
         if track:
             break
-    if from_id and from_id in cache["playlists"]:
-        entry = cache["playlists"][from_id]
-        entry["tracks"] = [t for t in entry["tracks"] if t["uri"] != uri]
+    for from_id in from_ids or []:
+        if from_id in cache["playlists"]:
+            entry = cache["playlists"][from_id]
+            entry["tracks"] = [t for t in entry["tracks"] if t["uri"] != uri]
     if to_id and to_id in cache["playlists"]:
         if track:
             dest = cache["playlists"][to_id]["tracks"]
@@ -3845,6 +3855,17 @@ def act(body: ActIn):
                 "that destination is a subset — adding to a subset must not "
                 "remove the track from its input; send from_id: null",
             )
+    # The sweep. One decision — filed, or rejected — answers the question for
+    # the song, so the song leaves every inbox holding it and not merely the
+    # one that happened to be playing. Without it a copy in another buffer
+    # came round in a later session and had to be decided a second time.
+    #
+    # Rare and therefore cheap: 29 of 2244 cached input tracks sat in more
+    # than one input when this was written, one of them in three. It is a
+    # no-op for the other 98.7%, and there is no batch delete, so each extra
+    # input costs one call.
+    sweep = _sweep_targets(body.uri, exclude=body.to_id, primary=body.from_id) \
+        if body.sweep_inputs else []
     note = None
     if body.action == "move":
         if not body.to_id:
@@ -3860,24 +3881,66 @@ def act(body: ActIn):
             note = "already in destination" + (" — removed from input only" if body.from_id else "")
         if body.from_id:
             _apply_snapshot(body.from_id, sp.remove_from_playlist(body.from_id, body.uri))
-        _cache_move(body.uri, body.from_id, body.to_id)
+        _sweep_remove(body.uri, sweep)
+        _cache_move(body.uri, _from_ids(body.from_id, sweep), body.to_id)
         undo_stack.append(
-            {"uri": body.uri, "from_id": body.from_id, "to_id": body.to_id, "added": added}
+            {"uri": body.uri, "from_id": body.from_id, "to_id": body.to_id, "added": added,
+             "also_from": [l["id"] for l in sweep]}
         )
     elif body.action == "remove":
         if not body.from_id:
             raise HTTPException(400, "remove needs from_id")
         _apply_snapshot(body.from_id, sp.remove_from_playlist(body.from_id, body.uri))
-        _cache_move(body.uri, body.from_id, None)
-        undo_stack.append({"uri": body.uri, "from_id": body.from_id, "to_id": None, "added": False})
+        _sweep_remove(body.uri, sweep)
+        _cache_move(body.uri, _from_ids(body.from_id, sweep), None)
+        undo_stack.append({"uri": body.uri, "from_id": body.from_id, "to_id": None,
+                           "added": False, "also_from": [l["id"] for l in sweep]})
     else:
         raise HTTPException(400, f"unknown action {body.action!r}")
-    _sync_membership(body.uri, add_to=body.to_id, remove_from=body.from_id)
+    _sync_membership(body.uri, add_to=body.to_id,
+                     remove_from=_from_ids(body.from_id, sweep))
     del undo_stack[:-20]
-    return {"ok": True, "note": note, "can_undo": True}
+    # `swept` names the EXTRA lists only — the one the user was looking at is
+    # already in their toast. Naming them is the point: a delete from a
+    # playlist that was not on screen must never be silent.
+    return {"ok": True, "note": note, "can_undo": True,
+            "swept": [l["name"] for l in sweep]}
 
 
-def _sync_membership(uri: str, add_to: str | None, remove_from: str | None) -> None:
+def _from_ids(from_id: str | None, sweep: list[dict]) -> list[str]:
+    """Every playlist one act request removed from, primary first."""
+    return ([from_id] if from_id else []) + [l["id"] for l in sweep]
+
+
+def _sweep_targets(uri: str, exclude: str | None, primary: str | None) -> list[dict]:
+    """The inputs a sweep should empty: every one holding `uri`, minus the one
+    already being removed from and minus the destination.
+
+    Excluding the destination is not a nicety. The Homeless button files INTO
+    an input, so a sweep blind to `to_id` would delete the track the same
+    request had just added — and report success.
+
+    Liked Songs is never swept even when it is configured as an input. There
+    is no `remove_from_liked` (only `save_to_liked`), so the delete would go
+    out as a playlist call against a pseudo-id; and unliking a song is a
+    bigger, more surprising act than emptying an inbox, which is not what the
+    user asked for when they asked for this.
+
+    Reads the in-memory input membership — the same set the card's capture
+    chips render from, kept current by `_sync_membership` — so consecutive
+    sweeps see each other's work without a profile rebuild.
+    """
+    return [l for l in _profile_state.get("inputs", [])
+            if l["id"] not in (exclude, primary, LIKED_ID) and uri in l["uris"]]
+
+
+def _sweep_remove(uri: str, sweep: list[dict]) -> None:
+    """One DELETE per swept input — there is still no batch delete."""
+    for l in sweep:
+        _apply_snapshot(l["id"], sp.remove_from_playlist(l["id"], uri))
+
+
+def _sync_membership(uri: str, add_to: str | None, remove_from: list[str] | None) -> None:
     """Keep the in-memory membership sets current — inputs AND home profiles.
 
     Inputs alone used to be synced, and homes were left to the next profile
@@ -3898,16 +3961,18 @@ def _sync_membership(uri: str, add_to: str | None, remove_from: str | None) -> N
     at its build-time values: one track cannot meaningfully move a home's
     profile, and the next rebuild reconciles it from the real listing anyway.
     """
+    gone = set(remove_from or [])
     for l in _profile_state.get("inputs", []):
         if l["id"] == add_to:
             l["uris"].add(uri)
-        if l["id"] == remove_from:
+        if l["id"] in gone:
             l["uris"].discard(uri)
     profiles = _profile_state.get("profiles") or {}
     if add_to in profiles:
         profiles[add_to]["uris"].add(uri)
-    if remove_from in profiles:
-        profiles[remove_from]["uris"].discard(uri)
+    for pid in gone:
+        if pid in profiles:
+            profiles[pid]["uris"].discard(uri)
 
 
 @app.post("/api/undo")
@@ -3917,18 +3982,28 @@ def undo():
     entry = undo_stack.pop()
     if entry["to_id"] and entry["added"]:
         _apply_snapshot(entry["to_id"], sp.remove_from_playlist(entry["to_id"], entry["uri"]))
+    # The sweep was ONE decision, so it costs one undo and has to be undone
+    # whole: an undo that put the song back in a third of the inboxes it
+    # emptied would be worse than no undo at all.
+    also = entry.get("also_from") or []
     if entry["from_id"] == LIKED_ID:
         sp.save_to_liked(entry["uri"])
     elif entry["from_id"]:
         _apply_snapshot(entry["from_id"], sp.add_to_playlist(entry["from_id"], entry["uri"]))
+    for pid in also:
+        _apply_snapshot(pid, sp.add_to_playlist(pid, entry["uri"]))
     # If the move never added anything (track pre-existed in dest), the dest
     # cache must keep it on undo.
-    _cache_move(entry["uri"], entry["to_id"] if entry["added"] else None, entry["from_id"])
+    _cache_move(entry["uri"], [entry["to_id"]] if entry["added"] else [], entry["from_id"])
+    for pid in also:
+        _cache_move(entry["uri"], [], pid)
     _sync_membership(
         entry["uri"],
         add_to=entry["from_id"],
-        remove_from=entry["to_id"] if entry["added"] else None,
+        remove_from=[entry["to_id"]] if entry["added"] else [],
     )
+    for pid in also:
+        _sync_membership(entry["uri"], add_to=pid, remove_from=[])
     return {"ok": True, "restored_to": entry["from_id"]}
 
 

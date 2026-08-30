@@ -1784,15 +1784,28 @@ async function nowAddToSubset(id) {
 // because not every filing destination is a home any more: the Homeless
 // buffer is an input, so the `d.homes` lookup finds nothing and the card
 // would read "filed to home".
+// Names the other inboxes a sweep emptied. A delete from a playlist that was
+// not on screen must never be silent — but the names are playlist names, so
+// one is named outright and several are counted rather than listed.
+function sweptSuffix(swept) {
+  if (!swept || !swept.length) return "";
+  return swept.length === 1 ? ` + ${swept[0]}` : ` + ${swept.length} more inputs`;
+}
+
 async function nowFile(toId, label) {
   const d = nowState, tr = d.track;
   const fromId = d.context?.is_input ? d.context.id : null;
   try {
-    const res = await api("/api/act", { action: "move", uri: tr.uri, from_id: fromId, to_id: toId });
+    // sweep_inputs: filing answers the question for this song, so it leaves
+    // every inbox holding it — not just the one being played. Without it a
+    // copy in another buffer came round later and had to be decided twice.
+    const res = await api("/api/act", { action: "move", uri: tr.uri, from_id: fromId,
+                                        to_id: toId, sweep_inputs: true });
     nowActions++;
     filedUris[tr.uri] = label || d.homes.get(toId)?.name || "home";
     nowActionLog.push({ uri: tr.uri, kind: "home" });
-    toast(res.note || `→ ${filedUris[tr.uri]}${fromId ? " (removed from input)" : ""}`);
+    toast((res.note || `→ ${filedUris[tr.uri]}${fromId ? " (removed from input)" : ""}`) +
+          sweptSuffix(res.swept));
     renderNow();
   } catch (e) { toast(e.message); }
 }
@@ -1823,7 +1836,10 @@ async function nowRemove() {
   if (npPending) return;
   setNpPending("remove", tr.uri);
   try {
-    await api("/api/act", { action: "remove", uri: tr.uri, from_id: d.context.id });
+    // Same sweep as filing, same reason: rejecting a song is as final a
+    // decision as giving it a home.
+    const res = await api("/api/act", { action: "remove", uri: tr.uri,
+                                        from_id: d.context.id, sweep_inputs: true });
     nowActions++;
     // The input's own name: the card pairs it with "removed from", so the
     // label is the place it left rather than a sentence about nowhere.
@@ -1842,7 +1858,7 @@ async function nowRemove() {
     // Names the list. "removed from input" said only that something happened;
     // the card beside it already names the place, and the toast disagreeing
     // with it by being vaguer is a wasted line.
-    toast(`removed from ${d.context.name || "input"}`);
+    toast(`removed from ${d.context.name || "input"}` + sweptSuffix(res.swept));
   } catch (e) { toast(e.message); }
   finally { clearNpPending(); renderNow(); }
 }
