@@ -67,7 +67,12 @@ def filing(monkeypatch):
     store.save_cache(cache)
     store.save_config({**original_config, "home_ids": ["h1"], "input_ids": ["inA", "homeless"],
                        "subset_ids": ["sub1"], "homeless_id": "homeless",
-                       "input_name_pattern": r"^\[.+\]$"})
+                       "input_name_pattern": r"^\[.+\]$",
+                       # Opt in explicitly: the feature ships OFF (see
+                       # `test_it_is_off_unless_the_config_asks_for_it`), so
+                       # every assertion below is about what it does WHEN
+                       # enabled, not about what happens by default.
+                       "like_on_filing": True})
 
     liked, unliked = [], []
     monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: LISTING)
@@ -99,6 +104,18 @@ def _file(client, to_id, **over):
     body = {"action": "move", "uri": TRACK["uri"], "from_id": "inA", "to_id": to_id}
     body.update(over)
     return client.post("/api/act", json=body)
+
+
+def test_it_is_off_unless_the_config_asks_for_it(filing):
+    """The default. Liking on every filing costs a call per filing, and the
+    plan that replaces it is a weekly batch over what the homes gained — so
+    the per-filing write stays behind a flag that is off."""
+    cfg = appmod.store.config()
+    appmod.store.save_config({**cfg, "like_on_filing": False})
+    res = _file(filing, "h1")
+    assert res.status_code == 200, res.text
+    assert filing.liked == []
+    assert res.json()["liked"] is False
 
 
 def test_filing_into_a_home_likes_the_song(filing):

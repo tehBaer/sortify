@@ -3957,7 +3957,17 @@ def _like_after_filing(uri: str, to_id: str | None) -> bool:
     /me/library/contains call on every single filing — so undo leaves the
     library alone rather than spend that on all of them or strip an old like
     off the one song that got misfiled.
+
+    OFF by default (`like_on_filing`), and likely to stay off: doing it here
+    costs a call on every single filing, and the plan that replaces it is a
+    weekly batch that likes whatever is newly added to the homes — the same
+    end state for a fraction of the traffic. The per-filing path is kept
+    behind the flag rather than deleted because it is tested and correct, and
+    because the batch may still want `_is_home` and this helper. Flip the
+    config key to turn it back on; nothing else changes.
     """
+    if not store.config().get("like_on_filing"):
+        return False
     if to_id == LIKED_ID or not _is_home(to_id):
         return False
     try:
