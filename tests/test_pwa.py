@@ -32,7 +32,8 @@ def test_manifest_is_valid_and_its_icons_exist():
     assert manifest["start_url"] == "/"
     sizes = set()
     for icon in manifest["icons"]:
-        path = STATIC / icon["src"].removeprefix("/static/")
+        # src carries a ?v= cache-buster so phones refetch after a redraw
+        path = STATIC / icon["src"].removeprefix("/static/").split("?")[0]
         w, h = png_size(path)
         assert f"{w}x{h}" == icon["sizes"]
         sizes.add(icon["sizes"])
