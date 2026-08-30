@@ -430,6 +430,10 @@ run("stopNowPolling()");
   await tick();
   check("I2 baseline: `1` keeps while the live card is on screen",
         posts("/api/split/PL5/decide") === 1, `${posts("/api/split/PL5/decide")} POST(s)`);
+  check("I2 the kept card celebrates with the same big drawn check",
+        $$("now-card").innerHTML.includes('class="done-mark"') &&
+        /kept to/.test($$("now-card").innerHTML),
+        `mark=${$$("now-card").innerHTML.includes('class="done-mark"')}`);
 
   // Re-poll first: the keep above wrote `decided` into nowState.sitting, and
   // a decided track short-circuits the keyboard for a legitimate reason
@@ -2105,8 +2109,13 @@ run("stopNowPolling()");
   await tick();
   run("stopNowPolling()");
 
-  check("RB no remove button when the context is not an input",
-        at('id="btn-now-remove"') === -1, `index ${at('id="btn-now-remove"')}`);
+  // Was "no remove button when the context is not an input" — the button used
+  // to vanish. It is drawn and greyed now (see RG for the full matrix); what
+  // this check still owns is that it is NOT offered as a live destructive
+  // control outside an input context.
+  check("RB the remove button is not live when the context is not an input",
+        at('np-danger') === -1 && at('id="btn-now-remove"') !== -1,
+        `danger@${at('np-danger')} remove@${at('id="btn-now-remove"')}`);
   // The slot stays so play/pause and Next never shift sideways when the
   // context changes — the same instinct as 1f8ae2c.
   check("RB the reserved slot survives so the transport never shifts",
@@ -2623,8 +2632,14 @@ run("stopNowPolling()");
         JSON.stringify(act));
   check("HL the card lands filed, named for the buffer and not for a home",
         run(`filedUris["spotify:track:nh1"] === "Homeless"`) &&
-        /✓ filed to/.test(html()),
+        /filed to/.test(html()),
         run(`JSON.stringify(filedUris)`));
+  check("HL the filed card celebrates with the big drawn check",
+        html().includes('class="done-mark"') && html().includes("<svg"),
+        `mark=${html().includes('class="done-mark"')}`);
+  check("HL the check draws left to right (path starts at the left tail)",
+        html().includes('points="4 12 9 17 20 6"'),
+        `points=${(html().match(/points="[^"]*"/) || ["none"])[0]}`);
   check("HL and the strip offers the way back",
         html().includes('id="btn-now-undo-remove"'), `html=${html()}`);
 
@@ -2748,16 +2763,17 @@ run("stopNowPolling()");
         card.indexOf("closest guesses") !== -1 &&
         card.indexOf("closest guesses") < card.indexOf("sugg-scroll"), `card=${card}`);
 
-  // The cap is measured, not assumed: a reason line that wraps makes rows
-  // different heights, so "exactly three" can only come from where the fourth
-  // row actually starts. The measuring is layout and out of reach here; the
-  // arithmetic that turns offsets into a cap is not.
-  check("SC three rows deep, the cap is where the fourth row begins",
-        run("suggScrollCap([0, 44, 88, 132, 180])") === 132, "");
-  check("SC uneven rows (a wrapped reason) still cut at the fourth",
-        run("suggScrollCap([0, 44, 106, 150, 194])") === 150, "");
-  check("SC a list that already fits gets no cap at all, and so no scrollbar",
-        run("suggScrollCap([0, 44, 88])") === null, "");
+  // The box is one size, always — three rows of whatever a row measures. It
+  // used to be sized from where the fourth row started, which meant a card
+  // with two suggestions drew a shorter box than one with six and the whole
+  // card jumped on every track change. The measuring is layout and out of
+  // reach here; the arithmetic on top of it is not.
+  check("SC three rows tall, from one row's pitch",
+        run("suggScrollHeight(56)") === 168, "");
+  check("SC a row's pitch counts the gap under it, not just its box",
+        run("suggRowPitch(46, 10)") === 56, "");
+  check("SC too few rows to fill it changes nothing — that is the point",
+        run("suggScrollHeight(suggRowPitch(46, 10))") === 168, "");
 
   card = await paint(six);
   const box2 = card.match(/<div class="sugg-scroll">([\s\S]*?)<\/div>\s*<div class="minor-actions">/);
@@ -2861,6 +2877,218 @@ run("stopNowPolling()");
   check("HP no destination configured, no row",
         !rows().some((c) => c.includes("picker-homeless")), `rows=${rows()}`);
   run("closePicker()");
+}
+
+// ============================================================================
+// XM — a removal is not an achievement. Filing a song and taking it out of an
+// input both leave the card in its done state, but they are opposite outcomes
+// and the card said "filed to nowhere (removed from input)" for the second
+// one, under the same green check as the first. Red cross, and it says what
+// happened.
+// ============================================================================
+{
+  resetLog();
+  const paint = async () => {
+    setNow({
+      status: 200,
+      body: {
+        playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+        track: { uri: "spotify:track:xm1", name: "Song", duration_ms: 200000,
+                 artists: [{ name: "Artist" }], sortable: true, image: null },
+        context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
+        suggestions: [], homes: [{ id: "H1", name: "Home", folder: "" }],
+        subset_targets: [], subsets: [],
+        inputs: [{ id: "IN1", name: "[Hazy]", has_track: true, set: "buffer" }],
+        homeless_id: null,
+      },
+    });
+    run(`show("now"); filedUris = {}; removedUri = null; nowActionLog = []; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+  };
+  const html = () => $$("now-card").innerHTML;
+
+  routes["POST /api/act"] = { status: 200, body: {} };
+  await paint();
+  await run(`nowRemove()`);
+  await tick();
+  check("XM a removed track gets the cross, not the check",
+        html().includes("gone-mark") && !html().includes("done-mark"), `html=${html()}`);
+  check("XM and the card says it was removed, and from where",
+        /removed from/.test(html()) && html().includes("[Hazy]"), `html=${html()}`);
+  check("XM no 'filed to nowhere' left anywhere on it",
+        !/filed to/.test(html()), `html=${html()}`);
+
+  await paint();
+  await run(`nowFile("H1")`);
+  await tick();
+  check("XM filing is untouched — still the check, still 'filed to'",
+        html().includes("done-mark") && !html().includes("gone-mark") &&
+        /filed to/.test(html()), `html=${html()}`);
+}
+
+// ============================================================================
+// RG — Remove is always drawn, and greyed when it cannot act.
+//
+// It used to vanish whenever the context stopped being an input, which taught
+// the eye that the verb comes and goes and answered nothing when it was
+// missing. Worse, it stayed live and red for a song that had already LEFT the
+// input (file it, reload, and the strip still offered to remove it) — a button
+// that lied. Drawn-and-dead fixes both: the slot always holds the same verb,
+// and the dead state can say why when pressed.
+//
+// aria-disabled, not the disabled attribute: a disabled button swallows the
+// tap, and being pressable is the whole point of the dead state.
+// ============================================================================
+{
+  const nowBody = ({ isInput = true, hasTrack = true, withInputs = true, sitting = null }) => ({
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri: "spotify:track:rg1", name: "Song", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[Grey]", is_input: isInput },
+      sitting,
+      suggestions: [], homes: [{ id: "H1", name: "Home", folder: "" }],
+      subset_targets: [], subsets: [],
+      inputs: withInputs ? [{ id: "IN1", name: "[Grey]", has_track: hasTrack, set: "buffer" }] : [],
+      homeless_id: null,
+    },
+  });
+  const html = () => $$("now-card").innerHTML;
+  // The button's own tag, so a class check cannot be satisfied by some other
+  // element on the card that happens to carry the same word.
+  const removeTag = () => (html().match(/<button id="btn-now-remove"[^>]*>/) || [""])[0];
+  const paint = async (opts) => {
+    setNow(nowBody(opts));
+    run(`filedUris = {}; removedUri = null; nowActions = 0; nowActionLog = []; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+  };
+
+  await paint({ isInput: true, hasTrack: true });
+  check("RG playing from an input that holds the song: live and destructive",
+        removeTag().includes("np-danger") && !removeTag().includes("aria-disabled"),
+        `tag=${removeTag()}`);
+
+  await paint({ isInput: false });
+  check("RG not playing from an input: still drawn, no longer missing",
+        removeTag() !== "", `html=${html().slice(0, 200)}`);
+  check("RG ...and drawn dead, not destructive",
+        removeTag().includes("np-dead") && !removeTag().includes("np-danger"),
+        `tag=${removeTag()}`);
+  check("RG ...as aria-disabled, so the tap still reaches a handler",
+        removeTag().includes('aria-disabled="true"') && !/\sdisabled/.test(removeTag()),
+        `tag=${removeTag()}`);
+  check("RG the reserved slot still survives so the transport never shifts",
+        html().includes("np-remove-slot"), `html=${html().slice(0, 200)}`);
+
+  // The case that shipped as a lying button: the context IS the input, but the
+  // song has already been filed out of it. Only the membership flag knows.
+  await paint({ isInput: true, hasTrack: false });
+  check("RG playing from an input the song has already left: dead",
+        removeTag().includes("np-dead") && !removeTag().includes("np-danger"),
+        `tag=${removeTag()}`);
+  check("RG ...and the dead title names the list it is no longer in",
+        /title="[^"]*\[Grey\]/.test(removeTag()), `tag=${removeTag()}`);
+
+  // Phase 1 carries context.is_input but no membership at all. Treating a
+  // missing row as "the song left" flashed a grey button for the second the
+  // suggest phase takes.
+  await paint({ isInput: true, withInputs: true, hasTrack: true });
+  const live1 = run(`removeState({context: {id: "IN1", name: "[Grey]", is_input: true}}).live`);
+  check("RG phase 1 (no inputs payload yet) stays live rather than flashing grey",
+        live1 === true, `live=${live1}`);
+
+  // A sitting renders the strip too, and an input context never occurs there,
+  // so an always-drawn button could only ever be dead weight.
+  await paint({ isInput: false, sitting: { split_id: "S1", pile_id: "p1", pile_name: "x",
+                                           uris: ["spotify:track:rg1"], decided: {} } });
+  check("RG a sitting keeps the slot empty — the verb can never apply there",
+        !html().includes('id="btn-now-remove"'), `html=${html().slice(0, 200)}`);
+
+  // Pressing the dead button explains itself instead of doing nothing.
+  await paint({ isInput: false });
+  resetLog();
+  $$("toast").textContent = "";
+  run(`$("btn-now-remove").onclick()`);
+  await tick();
+  check("RG pressing it while dead says why, and spends nothing",
+        /input list/i.test($$("toast").textContent) && posts("/api/act") === 0,
+        `toast=${JSON.stringify($$("toast").textContent.slice(0, 80))} posts=${posts("/api/act")}`);
+}
+
+// ============================================================================
+// NP — the press-to-effect gap, made visible on the two verbs.
+//
+// Next posted, re-enabled itself immediately, and only swapped the card ~900ms
+// later when the settle repoll landed. For that second the card looked
+// untouched and the button looked ready — so a second press skipped a second
+// track. Remove had the same silent moment while /api/act was in flight.
+// ============================================================================
+{
+  const body = (uri) => ({
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri, name: "Song", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[Pend]", is_input: true }, sitting: null,
+      suggestions: [], homes: [{ id: "H1", name: "Home", folder: "" }],
+      subset_targets: [], subsets: [],
+      inputs: [{ id: "IN1", name: "[Pend]", has_track: true, set: "buffer" }],
+      homeless_id: null,
+    },
+  });
+  const html = () => $$("now-card").innerHTML;
+  const nextTag = () => (html().match(/<button id="btn-now-next"[^>]*>/) || [""])[0];
+
+  setNow(body("spotify:track:np1"));
+  routes["POST /api/player/next"] = { status: 200, body: { ok: true } };
+  run(`filedUris = {}; removedUri = null; nowActions = 0; nowActionLog = []; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  check("NP Next is ordinary before the press",
+        nextTag() !== "" && !nextTag().includes("np-busy"), `tag=${nextTag()}`);
+
+  resetLog();
+  run(`playerNext()`);
+  await tick();
+  check("NP pressing Next puts the button in its busy state",
+        nextTag().includes("np-busy"), `tag=${nextTag()}`);
+  check("NP ...and disables it, so the press cannot be repeated",
+        /\sdisabled/.test(nextTag()), `tag=${nextTag()}`);
+
+  // The whole point: the old code re-enabled instantly and a second press
+  // skipped two tracks.
+  run(`playerNext()`);
+  await tick();
+  check("NP a second press while pending spends nothing more",
+        posts("/api/player/next") === 1, `posts=${posts("/api/player/next")}`);
+
+  // The arrival of a DIFFERENT track is the completion signal — that is what
+  // the press was for, and it works whichever poll happens to bring it.
+  setNow(body("spotify:track:np2"));
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  check("NP the new track clears the busy state",
+        nextTag() !== "" && !nextTag().includes("np-busy"), `tag=${nextTag()}`);
+
+  // Remove's toast names the list, so the feedback says WHAT happened and not
+  // merely that something did.
+  setNow(body("spotify:track:np3"));
+  routes["POST /api/act"] = { status: 200, body: {} };
+  run(`filedUris = {}; removedUri = null; nowActionLog = []; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  $$("toast").textContent = "";
+  run(`nowRemove()`);
+  await tick();
+  check("NP the removal toast names the list it left",
+        /removed from/i.test($$("toast").textContent) &&
+        $$("toast").textContent.includes("[Pend]"),
+        `toast=${JSON.stringify($$("toast").textContent.slice(0, 80))}`);
 }
 
 // ---- summary ---------------------------------------------------------------

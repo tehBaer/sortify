@@ -33,8 +33,14 @@ body {
    actions render only under body.on-now, so other views get just menu +
    title without the row reflowing into a second bar. */
 header {
+  /* No top padding and no bottom rule: on a phone the bar sits against the
+     ceiling and reads as part of the page rather than as a chrome strip laid
+     over it. The blur behind it is what separates bar from content now, which
+     only shows when there is content to scroll under it — a divider that
+     appears exactly when it is needed. The controls keep their 48px touch
+     targets, so the glyphs still centre inside them. */
   display: flex; align-items: center; gap: .6rem;
-  padding: .45rem .7rem; border-bottom: 1px solid var(--border);
+  padding: 0 .7rem .3rem;
   /* Stays put so the nav is always reachable mid-scroll on a phone. */
   position: sticky; top: 0; z-index: 5;
   background: color-mix(in srgb, var(--bg) 82%, transparent);
@@ -82,7 +88,9 @@ nav a.active { color: var(--fg); font-weight: 600; border-bottom-color: var(--ac
 /* The open view names itself here instead of via the underline the old inline
    nav used — there is no row left to underline. */
 #nav-pop a.active { background: var(--card2); color: var(--accent); font-weight: 600; }
-main { max-width: 640px; margin: 0 auto; padding: 1rem; }
+/* Tight to the bar above it — the header no longer draws a line, so a full
+   1rem of air under it read as a gap rather than as separation. */
+main { max-width: 640px; margin: 0 auto; padding: .45rem 1rem 1rem; }
 h2 { font-size: 1.05rem; }
 a { color: var(--accent); }
 .hint { color: var(--muted); font-size: .85rem; }
@@ -244,6 +252,7 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 @media (prefers-reduced-motion: reduce) {
   .track-card { animation: none; }
   .sugg-loading { animation: none; }
+  .done-mark, .done-mark polyline { animation: none; }
   button:active { transform: none; }
 }
 .track-card .art { position: relative; display: inline-block; line-height: 0; }
@@ -358,6 +367,28 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
   border: 2px solid var(--danger);
 }
 .np-round.np-danger:hover { border-color: var(--danger); opacity: .8; }
+/* Drawn but dead. Remove is always in its slot now, so the unavailable state
+   needs a look of its own — neutral, not a washed-out red: a destructive
+   colour at 40% still reads as a warning and there is nothing here to warn
+   about. It is aria-disabled rather than truly disabled (a disabled button
+   swallows the tap, and pressing it is how you learn why it cannot act), so
+   the dead look has to be spelled out here instead of falling out of
+   button:disabled. */
+.np-round.np-dead {
+  background: transparent; color: var(--muted);
+  border: 2px solid var(--border); opacity: .55; cursor: default;
+}
+.np-round.np-dead:hover { border-color: var(--border); opacity: .55; }
+.np-round.np-dead:active { transform: none; }
+/* In flight. The icon spins where it stands — the same keyframes as the
+   triage spinner, so the app has one rotation vocabulary — and the dimming
+   carries the state on its own when motion is reduced. */
+.np-round.np-busy { opacity: .7; cursor: default; }
+.np-round.np-busy svg { animation: spin .8s linear infinite; }
+.np-round.np-busy:active { transform: none; }
+@media (prefers-reduced-motion: reduce) {
+  .np-round.np-busy svg { animation: none; }
+}
 /* The undo that replaces it: same footprint, neutral rather than alarming —
    taking it back is not itself a destructive act. */
 .np-round.np-undo {
@@ -367,8 +398,12 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 .np-round.np-undo:hover { border-color: var(--fg); opacity: .8; }
 
 .sugg {
-  display: block; width: 100%; text-align: left; margin-bottom: .5rem;
-  padding: .7rem .9rem .8rem; border-radius: 12px;
+  /* Roomier than the text strictly needs. Clamping the reason to one line
+     took roughly a line's height off every row, and the rows had been sized
+     by that wrap — so the space comes back as padding rather than as more
+     words: a bigger tap target on a phone, and the same card it was. */
+  display: block; width: 100%; text-align: left; margin-bottom: .6rem;
+  padding: 1rem 1rem 1.05rem; border-radius: 12px;
   background: var(--card2); border-color: transparent;
   position: relative; overflow: hidden;
 }
@@ -380,21 +415,16 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
   border-radius: 0 999px 999px 0;
 }
 .sugg:hover { border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
-/* Six suggestions is more card than a phone shows at once, so the block is
-   capped at about three rows and scrolls for the rest. The cap is deliberately
-   NOT a whole number of rows: a row cut off at the bottom edge is what tells
-   you there is more, and no scrollbar renders at rest on a touch device.
-   overscroll-behavior: contain keeps a flick that reaches the end from
-   carrying on into the page behind it (the same guard #input-pop uses).
-   Rows are ~4.4rem with a one-line reason and grow when it wraps, so this is
-   "roughly three", not exactly three — vh keeps it sane on a short screen. */
+/* Six suggestions is more card than a phone shows at once, so the block shows
+   exactly three and scrolls for the rest. */
 .sugg-scroll {
   /* No max-height here: capSuggScroll() measures where the fourth row starts
-     and sets it, because rows stop being equal height as soon as a reason
-     line wraps. If that never runs the list simply shows in full, which is
-     the safe way round to degrade. overscroll-behavior keeps a flick that
-     hits the end from carrying on into the page behind it (#input-pop uses
-     the same guard). */
+     and sets it. That is also why the row sizing above needs no matching
+     change here — the cap is read off the rows themselves, so making them
+     taller moves the box with them. If the measuring never runs the list
+     simply shows in full, which is the safe way round to degrade.
+     overscroll-behavior keeps a flick that hits the end from carrying on
+     into the page behind it (#input-pop uses the same guard). */
   overflow-y: auto; overscroll-behavior: contain;
   padding-right: 2px;
 }
@@ -411,12 +441,12 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 }
 .sugg-more .s-name { color: var(--fg); }
 .sugg-more .s-pct { float: right; line-height: 0; margin-top: .15rem; }
-.sugg .s-name { font-weight: 650; }
+.sugg .s-name { font-weight: 650; font-size: 1.05rem; }
 /* One line, always. The wording upstream is terse enough that the ellipsis
    rarely fires, but the clamp is what makes rows a uniform height — which is
    what lets capSuggScroll() cut the list at exactly three. */
 .sugg .s-why {
-  display: block; color: var(--muted); font-size: .8rem; margin-top: .15rem;
+  display: block; color: var(--muted); font-size: .8rem; margin-top: .35rem;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .sugg.already::after { background: color-mix(in srgb, var(--accent) 30%, transparent); }
@@ -439,6 +469,36 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 .in-chip.has { border-color: var(--accent); color: var(--accent); opacity: .75; }
 .danger { color: var(--danger); }
 .done-msg { text-align: center; padding: 3rem 0; color: var(--muted); }
+.done-msg p { margin: 0; }
+/* The resolved-card check: big enough to feel like a reward, in the accent
+   green. It draws itself in left to right (dash sweep — the polyline's points
+   start at the left tail on purpose) and settles from a slight shrink — one
+   shot, ~a third of a second, nothing moves afterwards. */
+.done-mark {
+  display: block; width: 72px; height: 72px; margin: 0 auto .6rem;
+  color: var(--accent);
+  animation: mark-settle .35s ease-out backwards;
+}
+.done-mark polyline { stroke-dasharray: 24; animation: mark-draw .35s ease-out backwards; }
+/* The removal's mark: the check's geometry and draw-on, in the destructive
+   colour. The second stroke follows the first so it reads as a cross being
+   drawn rather than as two lines appearing. Deliberately a separate rule
+   rather than a second selector on .done-mark above — that block is being
+   edited in another session as this is written, and duplicating six
+   declarations costs less than two sessions editing one line. Fold them
+   together once both landed. */
+.gone-mark {
+  display: block; width: 72px; height: 72px; margin: 0 auto .6rem;
+  color: var(--danger);
+  animation: mark-settle .35s ease-out backwards;
+}
+.gone-mark polyline { stroke-dasharray: 24; animation: mark-draw .35s ease-out backwards; }
+.gone-mark polyline:last-child { animation-delay: .12s; }
+@media (prefers-reduced-motion: reduce) {
+  .gone-mark, .gone-mark polyline { animation: none; }
+}
+@keyframes mark-draw { from { stroke-dashoffset: 24; } }
+@keyframes mark-settle { from { transform: scale(.85); opacity: 0; } }
 
 /* full-page states (nothing playing, reauth): centered in the viewport
    instead of a text strip floating over 60% dead whitespace */

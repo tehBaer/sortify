@@ -1134,20 +1134,59 @@ function repollAfterPlaybackChange(prevUri = null) {
   }, 900);
 }
 
+// The press-to-effect gap on the two verbs, made visible.
+//
+// Both take a moment the card cannot hide: Next waits ~900ms for Spotify to
+// settle before the repoll can show the new track, and Remove waits on
+// /api/act. Until this existed, Next disabled its button for the length of
+// the POST and re-enabled it immediately — so for about a second the card sat
+// unchanged with a ready-looking button, which reads as "nothing happened",
+// and a second press skipped a second track.
+//
+// Rendered state, not a DOM flag: every poll re-runs renderNow and rebuilds
+// these buttons, so a `btn.disabled` set by hand survives only until the next
+// poll lands. It carries the uri it was pressed on because that is how Next
+// completes — see renderNow.
+let npPending = null;        // {verb: "next"|"remove", uri} while one is in flight
+let npPendingTimer = null;
+
+function setNpPending(verb, uri) {
+  npPending = { verb, uri };
+  clearTimeout(npPendingTimer);
+  // A stuck spinner is worse than no spinner. If the track never changes —
+  // Spotify not advancing, an answer that never lands — the button has to
+  // come back rather than stay dead until something else happens to render.
+  npPendingTimer = setTimeout(() => {
+    if (npPending?.verb === verb && npPending?.uri === uri) { npPending = null; renderNow(); }
+  }, 6000);
+  renderNow();
+}
+
+function clearNpPending() {
+  if (!npPending) return;
+  npPending = null;
+  clearTimeout(npPendingTimer);
+  npPendingTimer = null;
+}
+
 // Card-internal control (re-created by every renderNow), so it's wired per
 // render rather than once at load like the static controls below.
 async function playerNext() {
-  const btn = $("btn-now-next");
-  if (btn) btn.disabled = true;
+  // The guard is the rendered state, not the button's own disabled attribute:
+  // the keyboard reaches this function directly, bypassing the button.
+  if (npPending) return;
   const prevUri = nowState?.track?.uri || null;
+  setNpPending("next", prevUri);
   try {
     await api("/api/player/next", {});
+    // Deliberately NOT cleared here. The POST returning only means Spotify
+    // accepted the skip; the press is not finished until the new track is on
+    // screen, which is what the settle repoll brings (and renderNow clears on).
     repollAfterPlaybackChange(prevUri);
   } catch (e) {
+    clearNpPending();
+    renderNow();
     toast(e.message);
-  } finally {
-    const b = $("btn-now-next");
-    if (b) b.disabled = false;
   }
 }
 
@@ -1304,21 +1343,61 @@ function playbackStrip(d, tr) {
   const removeBtn = undoable
     ? `<button id="btn-now-undo-remove" class="np-round np-wide np-undo"
                title="Undo the last action for this track (u)" aria-label="Undo the last action for this track">${ICON_UNDO}<span class="np-verb-label">Undo</span></button>`
-    : d.context?.is_input
-    ? `<button id="btn-now-remove" class="np-round np-wide np-danger"
-               title="Remove from input (r)" aria-label="Remove from input">${ICON_REMOVE}<span class="np-verb-label">Remove</span></button>`
-    : "";
+    // A sitting renders this strip too, and an input context never occurs
+    // there — an always-drawn Remove could only ever be dead weight, so the
+    // one place the slot still empties is the one place the verb can never
+    // apply.
+    : d.sitting ? "" : removeButton(d);
   // The verb row is the two buttons the loop actually presses, as an equal
   // pair of pills centred on the card: Remove left, Next right, a deliberate
   // gap between them (removal is undoable now, but a mis-tap is still a
-  // mis-tap). Each half of the grid is reserved even when Remove is absent,
-  // so Next never slides when the context stops being an input.
+  // mis-tap). Each half of the grid is reserved even when Remove is absent
+  // (a sitting), so Next never slides when the mode changes.
+  const nextBusy = npPending?.verb === "next";
   return `${bar}<div class="np-buttons">
     <span class="np-slot np-remove-slot">${removeBtn}</span>
     <span class="np-slot np-next-slot">
-      <button id="btn-now-next" class="np-round np-wide np-next" title="Skip to the next track">${ICON_NEXT}<span class="np-verb-label">Next</span></button>
+      <button id="btn-now-next" class="np-round np-wide np-next${nextBusy ? " np-busy" : ""}"${nextBusy ? " disabled" : ""} title="${nextBusy ? "Skipping…" : "Skip to the next track"}">${ICON_NEXT}<span class="np-verb-label">${nextBusy ? "Skipping…" : "Next"}</span></button>
     </span>
   </div>`;
+}
+
+// Whether Remove can act right now, and what to say when it can't.
+//
+// Two ways it can't. You are not playing from an input at all — there is no
+// list for the verb to remove from. Or you are, but the song has already left
+// it: file a track and reload, and the strip used to keep offering to remove
+// a song the input no longer held. Only the membership flag knows that, which
+// is why the payload's `inputs` row is consulted and not just the context.
+//
+// Phase 1 is the subtlety. The light poll carries `context.is_input` but no
+// membership — `inputs` arrives with the suggest phase a second later — so a
+// missing row means "not known yet", never "the song left". Treating the two
+// alike flashed a grey button on every fresh card.
+function removeState(d) {
+  if (!d?.context?.is_input)
+    return { live: false, why: "Not playing from an input list — nothing to remove from" };
+  const row = (d.inputs || []).find((l) => l.id === d.context.id);
+  if (row && !row.has_track)
+    return { live: false, why: `No longer in ${d.context.name || "that list"}` };
+  return { live: true, why: null };
+}
+
+// Drawn even when it cannot act. An empty slot taught the eye that the verb
+// comes and goes and answered nothing when it was missing; greyed, it stays
+// where the thumb expects it and can say why.
+//
+// aria-disabled rather than the `disabled` attribute, deliberately: a
+// disabled button swallows the tap, and being pressable — so `nowRemove` can
+// toast the reason — is the entire point of the dead state.
+function removeButton(d) {
+  const { live, why } = removeState(d);
+  const busy = npPending?.verb === "remove";
+  const title = busy ? "Removing…" : live ? "Remove from input (r)" : why;
+  return `<button id="btn-now-remove" class="np-round np-wide ${
+    live ? "np-danger" : "np-dead"}${busy ? " np-busy" : ""}"${
+    live ? "" : ' aria-disabled="true"'} title="${esc(title)}" aria-label="${esc(title)}">${
+    ICON_REMOVE}<span class="np-verb-label">${busy ? "Removing…" : "Remove"}</span></button>`;
 }
 
 // Keeps the client-side `sitting` convenience global roughly in step with
@@ -1353,6 +1432,10 @@ function renderNow() {
   }
   // Same expiry, same reason: the strip's undo offer belongs to one track.
   if (removedUri && d.track?.uri !== removedUri) removedUri = null;
+  // Next's completion signal. What the press was FOR is a different track, so
+  // its arrival is the finish line — no callback to thread through the settle
+  // repoll, and it works whichever poll happens to bring the new song.
+  if (npPending && d.track?.uri && d.track.uri !== npPending.uri) clearNpPending();
   // The server is authoritative here (see /api/now's `sitting` field): if it
   // says this poll's context is a sitting, it is one, regardless of what
   // this client remembers from before a reload. `/api/undo` knows nothing
@@ -1475,24 +1558,53 @@ function renderNow() {
   }
 }
 
-// Exactly three rows visible. It has to be measured rather than assumed: a
-// reason line wraps on a narrow screen and rows stop being the same height,
-// so the only honest answer to "where do three rows end" is where the fourth
-// one starts. A list already short enough gets no cap and no scrollbar.
-function suggScrollCap(tops, visible = 3) {
-  if (tops.length <= visible) return null;
-  return tops[visible] - tops[0];
+// Three rows tall, always — the same height whether the card has one
+// suggestion or six. Sizing it to where the fourth row happened to start meant
+// a short list drew a short box, so the card's whole lower half moved every
+// time a track changed; a fixed frame with room to spare below two rows is
+// worth more than the space it wastes. Still measured rather than declared in
+// CSS, because a row's real height depends on the rendered font.
+const SUGG_VISIBLE = 3;
+
+function suggRowPitch(height, marginBottom) {
+  return height + marginBottom;
+}
+
+function suggScrollHeight(pitch, visible = SUGG_VISIBLE) {
+  return pitch * visible;
 }
 
 function capSuggScroll() {
   const box = $("now-card").querySelector(".sugg-scroll");
   const rows = box && box.querySelectorAll ? [...box.querySelectorAll(".sugg")] : [];
-  // offsetTop is undefined under the test harness's stub DOM, which has no
-  // layout — the arithmetic above is pinned there instead.
-  if (!rows.length || rows[0].offsetTop === undefined) return;
-  const cap = suggScrollCap(rows.map((r) => r.offsetTop));
-  box.style.maxHeight = cap == null ? "" : `${cap}px`;
+  // No layout under the test harness's stub DOM — the arithmetic above is
+  // pinned there instead. Measure an ordinary suggestion in preference to the
+  // Add to… row, whose dashed border makes it a couple of pixels taller.
+  if (!rows.length || rows[0].offsetHeight === undefined) return;
+  if (typeof getComputedStyle !== "function") return;
+  const row = rows.find((r) => !r.className.includes("sugg-more")) || rows[0];
+  const pitch = suggRowPitch(row.offsetHeight,
+                             parseFloat(getComputedStyle(row).marginBottom) || 0);
+  box.style.height = `${suggScrollHeight(pitch)}px`;
 }
+
+// The big grey check a card earns when its track is resolved — Feather's
+// `check` in the house stroke style, drawn on by CSS (.done-mark). pathLength
+// pins the polyline to 24 units so the dash animation needs no measuring.
+const DONE_MARK = `<svg class="done-mark" viewBox="0 0 24 24" fill="none"
+  stroke="currentColor" stroke-width="2.5" stroke-linecap="round"
+  stroke-linejoin="round" aria-hidden="true">
+  <polyline points="4 12 9 17 20 6" pathLength="24"></polyline></svg>`;
+
+// Its opposite, for a track that left an input instead of finding a home.
+// Same stroke, same size, same draw-on; red, and a cross. A removal ends the
+// card the way filing does, but it is not the same outcome and should not
+// wear the same mark. Two polylines so the animation draws both strokes.
+const GONE_MARK = `<svg class="gone-mark" viewBox="0 0 24 24" fill="none"
+  stroke="currentColor" stroke-width="2.5" stroke-linecap="round"
+  stroke-linejoin="round" aria-hidden="true">
+  <polyline points="6 6 18 18" pathLength="24"></polyline>
+  <polyline points="18 6 6 18" pathLength="24"></polyline></svg>`;
 
 function subsetButtonRow() {
   return `<div class="minor-actions">
@@ -1506,7 +1618,13 @@ function ordinaryCardBody(d, tr, ctx) {
     // The filed card keeps Add to subset… — a song that just found its home
     // is exactly when you might also want it in a selection — but nothing
     // proposes one: subsets are destinations you choose, not suggestions.
-    return `<p class="done-msg">✓ filed to <b>${esc(filedTo)}</b></p>` +
+    // `removedUri` is already the strip's "this track was taken out and can
+    // be put back" flag, so the card reads the removal off the same state
+    // rather than sniffing the label for it.
+    const removed = removedUri === tr.uri;
+    return `<div class="done-msg${removed ? " gone-msg" : ""}">` +
+           `${removed ? GONE_MARK : DONE_MARK}` +
+           `<p>${removed ? "removed from" : "filed to"} <b>${esc(filedTo)}</b></p></div>` +
            subsetButtonRow();
   }
   if (!tr.sortable) return '<p class="hint">Can\'t be sorted via the API (local file or episode).</p>';
@@ -1665,7 +1783,7 @@ async function nowAddToSubset(id) {
 // `label` names the destination on the done card and in the toast. It exists
 // because not every filing destination is a home any more: the Homeless
 // buffer is an input, so the `d.homes` lookup finds nothing and the card
-// would read "✓ filed to home".
+// would read "filed to home".
 async function nowFile(toId, label) {
   const d = nowState, tr = d.track;
   const fromId = d.context?.is_input ? d.context.id : null;
@@ -1697,11 +1815,19 @@ async function nowCreateAndFile(name) {
 
 async function nowRemove() {
   const d = nowState, tr = d.track;
-  if (!d.context?.is_input) return;
+  // Says why instead of returning in silence. Reached from the greyed button
+  // (aria-disabled, so the tap still lands here) and from the `r` key, which
+  // has no button to consult at all.
+  const { live, why } = removeState(d);
+  if (!live) { toast(why); return; }
+  if (npPending) return;
+  setNpPending("remove", tr.uri);
   try {
     await api("/api/act", { action: "remove", uri: tr.uri, from_id: d.context.id });
     nowActions++;
-    filedUris[tr.uri] = "nowhere (removed from input)";
+    // The input's own name: the card pairs it with "removed from", so the
+    // label is the place it left rather than a sentence about nowhere.
+    filedUris[tr.uri] = d.context.name || "the input";
     nowActionLog.push({ uri: tr.uri, kind: "home" });
     // Blind mode blurred this track so the ear would decide, not the name.
     // That decision is spent the moment it leaves the input, so say what left
@@ -1713,9 +1839,12 @@ async function nowRemove() {
       document.body.classList.add("peeked");
     }
     removedUri = tr.uri;
-    toast("removed from input");
-    renderNow();
+    // Names the list. "removed from input" said only that something happened;
+    // the card beside it already names the place, and the toast disagreeing
+    // with it by being vaguer is a wasted line.
+    toast(`removed from ${d.context.name || "input"}`);
   } catch (e) { toast(e.message); }
+  finally { clearNpPending(); renderNow(); }
 }
 
 // The strip's own undo, offered only for the track it was removed from. The
@@ -3324,8 +3453,8 @@ function sittingCardBody(tr, srvSitting) {
   const dec = srvSitting.decided[tr.uri];
   if (dec?.action === "keep") {
     const homeName = dec.to_id === "liked" ? "Liked Songs" : (nowState.homes.get(dec.to_id)?.name || dec.to_id);
-    return `<p class="done-msg">✓ kept to <b>${esc(homeName)}</b><br>
-      <span class="hint">final — edit it from the home playlist if that was wrong</span></p>`;
+    return `<div class="done-msg">${DONE_MARK}<p>kept to <b>${esc(homeName)}</b><br>
+      <span class="hint">final — edit it from the home playlist if that was wrong</span></p></div>`;
   }
   if (dec?.action === "reject") {
     return `<p class="hint">✗ rejected.</p>
