@@ -3872,18 +3872,42 @@ def act(body: ActIn):
         undo_stack.append({"uri": body.uri, "from_id": body.from_id, "to_id": None, "added": False})
     else:
         raise HTTPException(400, f"unknown action {body.action!r}")
-    _sync_input_membership(body.uri, add_to=body.to_id, remove_from=body.from_id)
+    _sync_membership(body.uri, add_to=body.to_id, remove_from=body.from_id)
     del undo_stack[:-20]
     return {"ok": True, "note": note, "can_undo": True}
 
 
-def _sync_input_membership(uri: str, add_to: str | None, remove_from: str | None) -> None:
-    """Keep the in-memory input membership (capture chips) current."""
+def _sync_membership(uri: str, add_to: str | None, remove_from: str | None) -> None:
+    """Keep the in-memory membership sets current — inputs AND home profiles.
+
+    Inputs alone used to be synced, and homes were left to the next profile
+    rebuild. That is up to PROFILE_TTL (10 min) away, so for ten minutes after
+    filing a song the server kept answering "no, that home doesn't hold it":
+    `suggest`'s `already` flag reads `profiles[pid]["uris"]`, and that set is a
+    build-time snapshot. The client hid it — the ✓ filed card is `filedUris` in
+    app.js — right up until a reload wiped that, and the card came back
+    offering the home the song had just been filed into as a fresh guess.
+
+    A mirror, not an invalidation: dropping `built_at` would make the next
+    poll rebuild every profile, and a rebuild re-reads any home whose snapshot
+    has moved — which `_apply_snapshot` guarantees for the one just written
+    to. That is a Spotify call per filed home, landing on the polling path.
+    Two set operations cost nothing and say the same true thing.
+
+    Only `uris` is mirrored. The scoring profile (artist and tag counts) stays
+    at its build-time values: one track cannot meaningfully move a home's
+    profile, and the next rebuild reconciles it from the real listing anyway.
+    """
     for l in _profile_state.get("inputs", []):
         if l["id"] == add_to:
             l["uris"].add(uri)
         if l["id"] == remove_from:
             l["uris"].discard(uri)
+    profiles = _profile_state.get("profiles") or {}
+    if add_to in profiles:
+        profiles[add_to]["uris"].add(uri)
+    if remove_from in profiles:
+        profiles[remove_from]["uris"].discard(uri)
 
 
 @app.post("/api/undo")
@@ -3900,7 +3924,7 @@ def undo():
     # If the move never added anything (track pre-existed in dest), the dest
     # cache must keep it on undo.
     _cache_move(entry["uri"], entry["to_id"] if entry["added"] else None, entry["from_id"])
-    _sync_input_membership(
+    _sync_membership(
         entry["uri"],
         add_to=entry["from_id"],
         remove_from=entry["to_id"] if entry["added"] else None,
