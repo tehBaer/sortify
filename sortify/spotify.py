@@ -53,6 +53,12 @@ SCOPES = " ".join(
         # playback rather than read it. Tokens issued before this was added
         # get 401 "Permissions missing" and need a fresh login to fix.
         "user-modify-playback-state",
+        # Repeat is the one playback FACT the currently-playing endpoint does
+        # not carry: it lives on /me/player, behind this scope. Asked for so
+        # the loop toggle can show the truth rather than only what it last
+        # set — and it costs no extra call, because /me/player answers
+        # everything currently-playing does (see `currently_playing`).
+        "user-read-playback-state",
     ]
 )
 
@@ -383,6 +389,14 @@ class Spotify:
             tokens.pop("pending", None)
         tokens["access_token"] = payload["access_token"]
         tokens["expires_at"] = time.time() + payload.get("expires_in", 3600) - 60
+        # What this token may actually do. SCOPES is what we ASKED for; a
+        # token minted before a scope was added does not carry it, and the
+        # only way to tell without spending a 403 is to record what came
+        # back. A login also clears the degrade flag below: whatever made
+        # /me/player unusable last time deserves one more try.
+        if payload.get("scope"):
+            tokens["scope"] = payload["scope"]
+            tokens.pop("no_me_player", None)
         # Spotify rotates refresh tokens on PKCE refresh; keep the newest.
         if payload.get("refresh_token"):
             tokens["refresh_token"] = payload["refresh_token"]
@@ -695,6 +709,16 @@ class Spotify:
         # button wants.
         self.request("POST", "/me/player/previous")
 
+    def seek(self, position_ms: int) -> None:
+        """Move the play head within the current track. One call, and the
+        caller already knows the answer it produces — see `player_seek`, which
+        patches the now-cache from it rather than re-reading what it set."""
+        self.request("PUT", "/me/player/seek", params={"position_ms": int(position_ms)})
+
+    def set_repeat(self, state: str) -> None:
+        """Loop the context, loop the track, or neither. One call."""
+        self.request("PUT", "/me/player/repeat", params={"state": state})
+
     def pause_playback(self) -> None:
         self.request("PUT", "/me/player/pause")
 
@@ -709,10 +733,52 @@ class Spotify:
             "PUT", "/me/player/play", json={"context_uri": f"spotify:playlist:{playlist_id}"}
         )
 
+    def has_scope(self, scope: str) -> bool:
+        """Whether the CURRENT token carries a scope — not whether we asked.
+
+        Adding a scope to SCOPES changes the next login, not the token on
+        disk, so anything gated on one has to read what was granted. An
+        unrecorded scope string (a token from before this was saved) reads as
+        "no", which degrades to the old behaviour rather than to a 403.
+        """
+        return scope in (self.store.tokens().get("scope") or "").split()
+
+    def _now_playing_path(self) -> str:
+        """Which endpoint answers "what's playing" — a choice, not a constant.
+
+        /me/player returns everything /me/player/currently-playing does AND
+        `repeat_state`, for the same one call. It needs a scope the app only
+        started asking for in Aug 2026, so the endpoint follows the token: with
+        the scope, the richer answer; without it, exactly what we polled
+        before. `no_me_player` is the one-way degrade for an account where the
+        richer endpoint turns out not to work at all (see currently_playing) —
+        cleared by the next login, which is the only thing that could change
+        the answer.
+        """
+        tokens = self.store.tokens()
+        if tokens.get("no_me_player") or not self.has_scope("user-read-playback-state"):
+            return "/me/player/currently-playing"
+        return "/me/player"
+
     def currently_playing(self) -> dict | None:
         """The user's playing track, or None. Includes the playlist context
-        when they're listening to a playlist."""
-        data = self.request("GET", "/me/player/currently-playing")
+        when they're listening to a playlist, and the repeat mode when the
+        token can see it."""
+        path = self._now_playing_path()
+        try:
+            data = self.request("GET", path)
+        except SpotifyError as e:
+            # The richer endpoint answering 401/403/404 means this account
+            # cannot use it — a missing scope Spotify disagrees with us about,
+            # or dev mode not serving it at all. Degrade once, permanently,
+            # and say so: the alternative is every poll spending a call to
+            # rediscover the same no. The caller gets the same None it would
+            # get from a quiet moment; the next poll uses the old endpoint.
+            if path == "/me/player" and e.status in (401, 403, 404):
+                log.warning("/me/player unusable (%s) — falling back to currently-playing", e.status)
+                self.store.save_tokens({**self.store.tokens(), "no_me_player": True})
+                return None
+            raise
         if not data or not data.get("item"):
             return None
         t = data["item"]
@@ -737,6 +803,10 @@ class Spotify:
             "is_playing": data.get("is_playing", False),
             "progress_ms": data.get("progress_ms"),
             "context_playlist_id": ctx_uri.rsplit(":", 1)[-1] if ctx.get("type") == "playlist" else None,
+            # "off" | "context" | "track", or None from the endpoint that does
+            # not report it. None is "unknown", never "off" — the toggle draws
+            # itself differently for the two.
+            "repeat": data.get("repeat_state"),
         }
 
     # ---- mutations --------------------------------------------------------

@@ -90,7 +90,11 @@ nav a.active { color: var(--fg); font-weight: 600; border-bottom-color: var(--ac
 #nav-pop a.active { background: var(--card2); color: var(--accent); font-weight: 600; }
 /* Tight to the bar above it — the header no longer draws a line, so a full
    1rem of air under it read as a gap rather than as separation. */
-main { max-width: 640px; margin: 0 auto; padding: .45rem 1rem 1rem; }
+/* The vertical padding here and on .track-card below is where the page's
+   spare height lives: ~15px of it came out in Aug 2026 so the Now view fits
+   without scrolling. Roughly 9px from this rule and 6px from the card — tune
+   these two together, they are the whole budget. */
+main { max-width: 640px; margin: 0 auto; padding: .3rem 1rem .55rem; }
 h2 { font-size: 1.05rem; }
 a { color: var(--accent); }
 .hint { color: var(--muted); font-size: .85rem; }
@@ -259,18 +263,21 @@ header .icon-btn::after {
      whitespace flanking the cover, costing the layout no height */
   position: relative;
   background: var(--card); border: 1px solid var(--border); border-radius: 18px;
-  padding: 1.25rem 1.1rem 1.1rem; text-align: center;
+  padding: 1.05rem 1.1rem .95rem; text-align: center;
   box-shadow: var(--shadow-card);
-  animation: card-in .18s ease-out;
 }
+/* The slide-in is opt-in (see enterOnce in app.js): every poll rebuilds this
+   card's markup, so an animation declared unconditionally replayed on each of
+   them — and again the moment the suggestions landed, which read as the card
+   reloading rather than filling in. Only a card for a new track gets it. */
+.track-card.card-fresh { animation: card-in .18s ease-out; }
 @keyframes card-in { from { opacity: .4; transform: translateY(5px); } }
 /* Phase 1 of the two-phase card: the track is up, suggestions still computing. */
 .sugg-loading { animation: sugg-pulse 1.2s ease-in-out infinite; }
 @keyframes sugg-pulse { 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) {
-  .track-card { animation: none; }
+  .track-card.card-fresh { animation: none; }
   .sugg-loading { animation: none; }
-  .done-mark, .done-mark polyline { animation: none; }
   button:active { transform: none; }
 }
 .track-card .art { position: relative; display: inline-block; line-height: 0; }
@@ -317,9 +324,24 @@ header .icon-btn::after {
   /* No overflow:hidden — the fill rounds itself, and the last-update marker
      deliberately pokes past the track's 4px so it reads as a tick. */
   position: relative;   /* anchors the last-update marker */
+  cursor: pointer;
+  /* The browser must not claim the gesture as a scroll — a drag along a 4px
+     strip is exactly what it would otherwise take for one. */
+  touch-action: none;
+}
+/* 4px is a line to look at, not a target to hit. The bar keeps its height and
+   grows an invisible 22px-tall grab area around it, which is what the finger
+   actually lands on. */
+.np-bar::before {
+  content: ""; position: absolute; left: 0; right: 0; top: -11px; bottom: -11px;
 }
 #np-fill { display: block; height: 100%; background: var(--accent); border-radius: 999px;
            transition: width 1s linear; }
+/* Under the finger the fill must not ease: the 1s transition above exists to
+   smooth the once-a-second ticker, and during a drag it makes the bar lag the
+   thumb by a whole second. */
+.np-bar.seeking #np-fill { transition: none; }
+.np-bar.seeking { background: color-mix(in srgb, var(--fg) 22%, transparent); }
 /* The freshness signal: a thin yellow line inside the green at the position
    Spotify last confirmed. The green running ahead of it is the local ticker
    extrapolating, so marker-to-tip distance is how old the answer is — and a
@@ -340,6 +362,19 @@ header .icon-btn::after {
 }
 .np-mini:hover { border-color: var(--muted); color: var(--fg); }
 .np-mini svg { display: block; width: 18px; height: 18px; }
+/* Lit when the list comes round again. The accent, not a fill: this is a
+   mode the transport is in, not a destination — and it sits beside two
+   controls that must stay quieter than the verbs below them. */
+.np-loop.on { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+.np-loop.on:hover { color: var(--accent); }
+.np-loop { position: relative; }
+/* Repeat-one, which nothing here offers but Spotify may already be in: said
+   out loud rather than shown as an indistinguishable "on". */
+.np-loop .loop-one {
+  position: absolute; right: 5px; bottom: 4px;
+  font-size: .6rem; font-weight: 700; line-height: 1;
+  background: var(--card); border-radius: 999px; padding: 0 .1rem;
+}
 /* No duration (local file / episode): no bar between them, but the quiet
    controls hold their ends of the line. */
 .np-progress-bare { justify-content: space-between; min-height: 34px; }
@@ -398,15 +433,15 @@ header .icon-btn::after {
 }
 .np-round.np-dead:hover { border-color: var(--border); opacity: .55; }
 .np-round.np-dead:active { transform: none; }
-/* In flight. The icon spins where it stands — the same keyframes as the
-   triage spinner, so the app has one rotation vocabulary — and the dimming
-   carries the state on its own when motion is reduced. */
+/* In flight. The dimming and the label ("Skipping…", "Removing…") carry the
+   state on their own; the icon holds still. These glyphs used to rotate on
+   the triage spinner's keyframes, for the sake of one rotation vocabulary
+   across the app — but a skip arrow or a list spun about its own centre reads
+   as a glitch rather than as progress, and these are the two buttons pressed
+   all day. The spin stays where a shape was drawn for it (.icon-btn.spinning
+   and the round .spinner). */
 .np-round.np-busy { opacity: .7; cursor: default; }
-.np-round.np-busy svg { animation: spin .8s linear infinite; }
 .np-round.np-busy:active { transform: none; }
-@media (prefers-reduced-motion: reduce) {
-  .np-round.np-busy svg { animation: none; }
-}
 /* The undo that replaces it: same footprint, neutral rather than alarming —
    taking it back is not itself a destructive act. */
 .np-round.np-undo {
@@ -480,40 +515,82 @@ header .icon-btn::after {
 
 .minor-actions { display: flex; gap: .5rem; margin-top: .8rem; }
 .minor-actions button { flex: 1; white-space: nowrap; }
+/* "The list ran out and Spotify carried on by itself" — the one state where
+   the card is up, everything works, and none of it is doing anything. It sits
+   at the top of the card, above the art, because it is a fact about the whole
+   session rather than about this song; and it is bordered in the accent
+   rather than filled in red, because nothing has gone wrong — you have simply
+   finished, which is good news wearing an unfamiliar hat. */
+.np-adrift {
+  display: flex; flex-direction: column; align-items: center; gap: .25rem;
+  margin: -.35rem 0 .9rem; padding: .7rem .6rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+.np-adrift .ad-head {
+  display: flex; align-items: center; gap: .4rem;
+  color: var(--accent); font-size: .95rem;
+}
+.np-adrift .ad-sub { color: var(--muted); font-size: .8rem; }
+.np-adrift .ad-back { margin-top: .35rem; }
+
 .capture {
   display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; justify-content: center;
   margin-top: .9rem; padding-top: .8rem; border-top: 1px solid var(--border);
 }
-.in-chip.has { border-color: var(--accent); color: var(--accent); opacity: .75; }
+/* The capture row: which of your inputs already hold this song, then the one
+   control that puts it in another one. The membership chips are spans rather
+   than buttons — they were buttons only because this row used to double as
+   the capture surface, and an unpressable chip is the honest shape for a
+   fact. Which means the border they used to inherit from `button` has to be
+   spelled out here. */
+.in-chip.has {
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--accent);
+}
+/* Its opposite number in the same row, and the only thing in it you press.
+   Dashed and muted — the language the Add to… row already speaks for "leave
+   this list and go searching" — so it never reads as a third input the song
+   happens to be in. */
+.cap-more {
+  display: inline-flex; align-items: center; gap: .3rem;
+  border: 1px dashed var(--border); color: var(--muted); background: transparent;
+}
+.cap-more:hover { border-style: solid; color: var(--fg); }
 .danger { color: var(--danger); }
 .done-msg { text-align: center; padding: 3rem 0; color: var(--muted); }
 .done-msg p { margin: 0; }
 /* The resolved-card check: big enough to feel like a reward, in the accent
-   green. It draws itself in left to right (dash sweep — the polyline's points
-   start at the left tail on purpose) and settles from a slight shrink — one
-   shot, ~a third of a second, nothing moves afterwards. */
-.done-mark {
+   green. Its opposite, .gone-mark, is the same mark in the destructive colour
+   for a track that left an input instead of finding a home — a removal ends
+   the card the way filing does, but it is not the same outcome and should not
+   wear the same one. (Two duplicated blocks while two sessions were editing
+   this file; folded together now that both have landed.) */
+.done-mark, .gone-mark {
   display: block; width: 72px; height: 72px; margin: 0 auto .6rem;
-  color: var(--accent);
+}
+.done-mark { color: var(--accent); }
+.gone-mark { color: var(--danger); }
+/* The draw-on, granted by the one render that first puts the mark up (see
+   enterOnce in app.js): it sweeps in left to right — the polylines' points
+   start at the left tail on purpose — and settles from a slight shrink. One
+   shot, ~a third of a second, nothing moves afterwards. Gated on .mark-in
+   because every poll rebuilds the whole card, and a check that redrew itself
+   on each of them read as the filing happening again — pressing Next after
+   filing replayed it, which is exactly when nothing new has happened. */
+.mark-in .done-mark, .mark-in .gone-mark {
   animation: mark-settle .35s ease-out backwards;
 }
-.done-mark polyline { stroke-dasharray: 24; animation: mark-draw .35s ease-out backwards; }
-/* The removal's mark: the check's geometry and draw-on, in the destructive
-   colour. The second stroke follows the first so it reads as a cross being
-   drawn rather than as two lines appearing. Deliberately a separate rule
-   rather than a second selector on .done-mark above — that block is being
-   edited in another session as this is written, and duplicating six
-   declarations costs less than two sessions editing one line. Fold them
-   together once both landed. */
-.gone-mark {
-  display: block; width: 72px; height: 72px; margin: 0 auto .6rem;
-  color: var(--danger);
-  animation: mark-settle .35s ease-out backwards;
+.mark-in .done-mark polyline, .mark-in .gone-mark polyline {
+  stroke-dasharray: 24; animation: mark-draw .35s ease-out backwards;
 }
-.gone-mark polyline { stroke-dasharray: 24; animation: mark-draw .35s ease-out backwards; }
-.gone-mark polyline:last-child { animation-delay: .12s; }
+/* The cross's second stroke follows the first, so it reads as one mark being
+   drawn rather than as two lines appearing. */
+.mark-in .gone-mark polyline:last-child { animation-delay: .12s; }
 @media (prefers-reduced-motion: reduce) {
-  .gone-mark, .gone-mark polyline { animation: none; }
+  .mark-in .done-mark, .mark-in .gone-mark,
+  .mark-in .done-mark polyline, .mark-in .gone-mark polyline { animation: none; }
 }
 @keyframes mark-draw { from { stroke-dashoffset: 24; } }
 @keyframes mark-settle { from { transform: scale(.85); opacity: 0; } }
@@ -780,10 +857,3 @@ body.blind:not(.peeked) #now-card .sugg:not(.sugg-more) .s-why { filter: blur(5p
 .pl-set > summary:hover { color: var(--fg); }
 .pl-set[open] > summary { margin-bottom: .3rem; color: var(--fg); }
 
-/* Set toggles among the capture chips: visually a chip, but it opens a
-   folded set rather than filing the track — muted and dashed so it never
-   reads as a destination you might hit by mistake. */
-.in-chip.set-chip, .set-chip {
-  border-style: dashed; color: var(--muted); opacity: .9;
-}
-.set-chip:hover { color: var(--fg); }

@@ -96,6 +96,14 @@ class PlayIn(BaseModel):
     input_id: str
 
 
+class SeekIn(BaseModel):
+    position_ms: int
+
+
+class RepeatIn(BaseModel):
+    state: str  # "off" | "context" | "track"
+
+
 class ActIn(BaseModel):
     action: str  # "move" | "remove"
     uri: str
@@ -3620,6 +3628,9 @@ def now_playing(force: bool = False, light: bool = False):
         "progress_ms": np["progress_ms"],
         "track": {**track, "sortable": sortable},
         "sitting": _sitting_for_context(ctx_id),
+        # None when the token cannot see it — the toggle draws "unknown"
+        # rather than guessing "off" (see Spotify.currently_playing).
+        "repeat": np.get("repeat"),
     }
     if light:
         # Even `force=1` spends nothing extra here: force is forwarded to the
@@ -3710,6 +3721,57 @@ def player_previous():
     if prev_uri:
         with _now_lock:
             _skip_settle.update(uri=prev_uri, until=time.time() + NOW_SKIP_SETTLE_WINDOW)
+    return out
+
+
+@app.post("/api/player/seek")
+def player_seek(body: SeekIn):
+    """Move within the playing track — one call, and no poll behind it.
+
+    `_playback_call` drops the now-cache, which is right for a skip (nobody
+    can predict the next track) and wrong here: the only thing that changed is
+    a number we chose ourselves. So the answer goes back with the new position
+    and a TTL recomputed from it, and the client re-anchors its own ticker the
+    same way. A seek therefore costs exactly the one call it makes, and the
+    poll schedule — whose whole basis is the track's remaining runtime — stays
+    honest across it.
+    """
+    if body.position_ms < 0:
+        raise HTTPException(400, "position_ms must not be negative")
+    with _now_lock:
+        before = _now_cache["value"]
+    out = _playback_call(sp.seek, body.position_ms)
+    if before and before.get("track"):
+        patched = {**before, "progress_ms": body.position_ms}
+        with _now_lock:
+            _now_cache.update(value=patched, at=time.time(), ttl=_now_ttl(patched))
+    return out
+
+
+REPEAT_STATES = ("off", "context", "track")
+
+
+@app.post("/api/player/repeat")
+def player_repeat(body: RepeatIn):
+    """Loop the list, loop the song, or neither.
+
+    Like seeking, the answer is known in advance — we are the ones setting it
+    — so the now-cache is repositioned rather than dropped. Dropping it would
+    make a press of the loop button cost the poll behind it as well, and the
+    poll would only tell us the thing we just said.
+    """
+    if body.state not in REPEAT_STATES:
+        raise HTTPException(400, f"repeat state must be one of {', '.join(REPEAT_STATES)}")
+    with _now_lock:
+        before = _now_cache["value"]
+        ttl = _now_cache["ttl"]
+        at = _now_cache["at"]
+    out = _playback_call(sp.set_repeat, body.state)
+    if before and before.get("track"):
+        with _now_lock:
+            # `at` and the TTL are left exactly as they were: repeat changes
+            # nothing about how long the rest of the answer stays true.
+            _now_cache.update(value={**before, "repeat": body.state}, at=at, ttl=ttl)
     return out
 
 

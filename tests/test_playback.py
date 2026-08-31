@@ -36,7 +36,8 @@ def record(sp, monkeypatch, response=None):
     sent = {}
 
     def fake_request(method, url, **kwargs):
-        sent.update(method=method, url=url, json=kwargs.get("json"))
+        sent.update(method=method, url=url, json=kwargs.get("json"),
+                    params=kwargs.get("params"))
         return response or FakeResponse()
 
     monkeypatch.setattr(sp.http, "request", fake_request)
@@ -65,6 +66,16 @@ def test_skip_previous_asks_spotify_for_the_previous_track(sp, monkeypatch):
 
     assert sent["method"] == "POST"
     assert sent["url"].endswith("/me/player/previous")
+
+
+def test_seek_moves_the_play_head_within_the_track(sp, monkeypatch):
+    sent = record(sp, monkeypatch)
+
+    sp.seek(42_000)
+
+    assert sent["method"] == "PUT"
+    assert sent["url"].endswith("/me/player/seek")
+    assert sent["params"] == {"position_ms": 42_000}
 
 
 def test_pause_stops_playback(sp, monkeypatch):
@@ -285,3 +296,222 @@ def test_a_success_with_no_json_body_is_not_a_crash(sp, monkeypatch):
     )()
 
     assert sp.skip_next() is None
+
+
+def test_seek_endpoint_moves_the_head(appmod, monkeypatch):
+    called = []
+    monkeypatch.setattr(appmod.sp, "seek", lambda ms: called.append(ms))
+
+    assert appmod.player_seek(appmod.SeekIn(position_ms=42_000))["ok"] is True
+    assert called == [42_000]
+
+
+def test_seeking_keeps_the_now_cache_instead_of_dropping_it(appmod, monkeypatch):
+    """The one playback call whose result we can predict exactly.
+
+    Skipping drops the cache because nobody knows what plays next. A seek
+    changes one number, and it is a number we chose — so the cached answer is
+    put back with the new position rather than thrown away, and the seek costs
+    the one call it makes instead of one plus the poll behind it.
+    """
+    monkeypatch.setattr(appmod.sp, "seek", lambda ms: None)
+    appmod._now_cache.update(
+        at=9_999_999.0, ttl=300,
+        value={"is_playing": True, "progress_ms": 1_000,
+               "track": {"uri": "spotify:track:s1", "duration_ms": 200_000}})
+
+    appmod.player_seek(appmod.SeekIn(position_ms=120_000))
+
+    assert appmod._now_cache["at"] > 0.0, "the answer was dropped, not repositioned"
+    assert appmod._now_cache["value"]["progress_ms"] == 120_000
+
+
+def test_seeking_re_times_the_poll_schedule(appmod, monkeypatch):
+    """The TTL *is* the track's remaining runtime, so moving the head moves
+    the moment the client should come back. Seek to 40s before the end and the
+    next poll must be due in ~40s, not at the old position's ~199s."""
+    monkeypatch.setattr(appmod.sp, "seek", lambda ms: None)
+    appmod._now_cache.update(
+        at=9_999_999.0, ttl=300,
+        value={"is_playing": True, "progress_ms": 1_000,
+               "track": {"uri": "spotify:track:s1", "duration_ms": 200_000}})
+
+    appmod.player_seek(appmod.SeekIn(position_ms=160_000))
+
+    assert appmod._now_cache["ttl"] == pytest.approx(41.0)
+
+
+def test_seeking_with_nothing_cached_does_not_invent_an_answer(appmod, monkeypatch):
+    """No cached track means nothing to reposition — and a fabricated cache
+    entry would be worse than the extra poll it saves."""
+    monkeypatch.setattr(appmod.sp, "seek", lambda ms: None)
+    appmod._now_cache.update(at=9_999_999.0, ttl=300, value=None)
+
+    appmod.player_seek(appmod.SeekIn(position_ms=5_000))
+
+    assert appmod._now_cache["value"] is None
+    assert appmod._now_cache["at"] == 0.0   # _playback_call's drop stands
+
+
+def test_a_negative_seek_is_refused_before_it_costs_a_call(appmod, monkeypatch):
+    called = []
+    monkeypatch.setattr(appmod.sp, "seek", lambda ms: called.append(ms))
+
+    with pytest.raises(appmod.HTTPException) as e:
+        appmod.player_seek(appmod.SeekIn(position_ms=-1))
+    assert e.value.status_code == 400
+    assert called == []
+
+
+# ---- repeat, and the endpoint that can see it ------------------------------
+#
+# Repeat is the one playback fact /me/player/currently-playing does not
+# report. /me/player does, for the same single call — behind a scope the app
+# only started asking for in Aug 2026. So the endpoint follows the TOKEN, not
+# the constant: every check below is about degrading to the old behaviour
+# rather than to a 403 on a polling path.
+
+
+def test_the_token_asks_to_read_playback_state():
+    assert "user-read-playback-state" in SCOPES
+
+
+def test_a_login_records_what_spotify_actually_granted(sp):
+    """SCOPES is what we asked for; the token carries what we got. Only the
+    second one can gate anything."""
+    sp._store_token_response({"access_token": "a", "expires_in": 3600,
+                              "scope": "user-modify-playback-state"})
+
+    assert sp.has_scope("user-modify-playback-state")
+    assert not sp.has_scope("user-read-playback-state")
+
+
+def test_an_unrecorded_scope_reads_as_absent(sp):
+    """A token from before the scope string was saved must degrade quietly,
+    not claim permissions it may not have."""
+    sp.store.save_tokens({"access_token": "a", "expires_at": 9e9})
+
+    assert not sp.has_scope("user-read-playback-state")
+
+
+def test_without_the_scope_we_poll_exactly_what_we_always_did(sp):
+    sp.store.save_tokens({"scope": "user-modify-playback-state"})
+
+    assert sp._now_playing_path() == "/me/player/currently-playing"
+
+
+def test_with_the_scope_the_richer_endpoint_answers_instead(sp):
+    """Same one call, and it carries repeat_state — there is no cheaper way
+    to know the loop state, and no more expensive one either."""
+    sp.store.save_tokens({"scope": "user-read-playback-state"})
+
+    assert sp._now_playing_path() == "/me/player"
+
+
+def test_repeat_state_comes_back_with_the_track(sp, monkeypatch):
+    sp.store.save_tokens({"scope": "user-read-playback-state"})
+    payload = {
+        "item": {"uri": "spotify:track:x", "id": "x", "name": "X", "type": "track",
+                 "artists": [], "duration_ms": 1000, "album": {"name": "A", "images": []}},
+        "is_playing": True, "progress_ms": 0, "repeat_state": "context",
+    }
+    record(sp, monkeypatch, FakeResponse(200, payload))
+
+    assert sp.currently_playing()["repeat"] == "context"
+
+
+def test_the_old_endpoint_reports_repeat_as_unknown(sp, monkeypatch):
+    """None is "we cannot see it", which the UI draws differently from "off" —
+    a toggle that shows off when it means unknown is a toggle that lies."""
+    sp.store.save_tokens({"scope": "user-modify-playback-state"})
+    payload = {
+        "item": {"uri": "spotify:track:x", "id": "x", "name": "X", "type": "track",
+                 "artists": [], "duration_ms": 1000, "album": {"name": "A", "images": []}},
+        "is_playing": True, "progress_ms": 0,
+    }
+    record(sp, monkeypatch, FakeResponse(200, payload))
+
+    assert sp.currently_playing()["repeat"] is None
+
+
+def test_an_unusable_player_endpoint_degrades_once_and_stays_degraded(sp, monkeypatch):
+    """If /me/player cannot be used on this account — dev mode not serving it,
+    or Spotify disagreeing about the scope — every poll must not spend a call
+    rediscovering that. One no, remembered."""
+    sp.store.save_tokens({"scope": "user-read-playback-state"})
+    record(sp, monkeypatch, FakeResponse(403, text="Forbidden"))
+
+    assert sp.currently_playing() is None
+    assert sp._now_playing_path() == "/me/player/currently-playing"
+
+
+def test_logging_in_again_gives_the_richer_endpoint_another_chance(sp):
+    """The degrade is one-way per token, not forever: a fresh login is exactly
+    the event that could change the answer."""
+    sp.store.save_tokens({"scope": "user-read-playback-state", "no_me_player": True})
+    assert sp._now_playing_path() == "/me/player/currently-playing"
+
+    sp._store_token_response({"access_token": "a", "expires_in": 3600,
+                              "scope": "user-read-playback-state"})
+
+    assert sp._now_playing_path() == "/me/player"
+
+
+def test_a_real_failure_is_not_swallowed_as_a_degrade(sp, monkeypatch):
+    """Only the three "you cannot use this" statuses degrade. Anything else —
+    a 500, a rate limit — must reach the caller: turning it into "nothing is
+    playing" would hide a real outage behind an empty card, and would give up
+    the richer endpoint over a blip."""
+    sp.store.save_tokens({"scope": "user-read-playback-state"})
+    record(sp, monkeypatch, FakeResponse(500, text="upstream"))
+
+    with pytest.raises(SpotifyError):
+        sp.currently_playing()
+    assert not sp.store.tokens().get("no_me_player")
+    assert sp._now_playing_path() == "/me/player"
+
+
+def test_set_repeat_asks_for_the_mode_by_name(sp, monkeypatch):
+    sent = record(sp, monkeypatch)
+
+    sp.set_repeat("context")
+
+    assert sent["method"] == "PUT"
+    assert sent["url"].endswith("/me/player/repeat")
+    assert sent["params"] == {"state": "context"}
+
+
+def test_repeat_endpoint_sets_the_mode(appmod, monkeypatch):
+    called = []
+    monkeypatch.setattr(appmod.sp, "set_repeat", lambda st: called.append(st))
+
+    assert appmod.player_repeat(appmod.RepeatIn(state="context"))["ok"] is True
+    assert called == ["context"]
+
+
+def test_an_unknown_repeat_mode_is_refused_before_it_costs_a_call(appmod, monkeypatch):
+    called = []
+    monkeypatch.setattr(appmod.sp, "set_repeat", lambda st: called.append(st))
+
+    with pytest.raises(appmod.HTTPException) as e:
+        appmod.player_repeat(appmod.RepeatIn(state="sideways"))
+    assert e.value.status_code == 400
+    assert called == []
+
+
+def test_setting_repeat_repositions_the_now_cache_rather_than_dropping_it(appmod, monkeypatch):
+    """We are the ones setting it, so the cached answer can be corrected in
+    place. Dropping it would make the press cost the poll behind it too — and
+    that poll would only report what we just said."""
+    monkeypatch.setattr(appmod.sp, "set_repeat", lambda st: None)
+    appmod._now_cache.update(
+        at=9_999_999.0, ttl=123.0,
+        value={"is_playing": True, "progress_ms": 1_000, "repeat": "off",
+               "track": {"uri": "spotify:track:r1", "duration_ms": 200_000}})
+
+    appmod.player_repeat(appmod.RepeatIn(state="context"))
+
+    assert appmod._now_cache["value"]["repeat"] == "context"
+    assert appmod._now_cache["at"] == 9_999_999.0
+    # Looping changes nothing about how long the rest of the answer stays true.
+    assert appmod._now_cache["ttl"] == 123.0

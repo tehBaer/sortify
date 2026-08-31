@@ -802,7 +802,15 @@ async function pollNow(force = false) {
     // changes when config or the listing changes — never per track. Rebuilt
     // empty here, tapping Add to subset… during the light phase would open
     // an empty picker.
-    nowState = { ...data, homes: new Map(),
+    // `homes` and `homeless_id` ride along on the same argument, and for the
+    // same payoff one step further: they are what the card needs to draw Add
+    // to… and Homeless, so carrying them is what lets the whole card go up in
+    // phase 1 with only the suggested rows still to come (see
+    // ordinaryCardBody). Neither is per-track — `_homes_payload` and
+    // `_homeless_id` read the listing and the config, nothing about the song.
+    nowState = { ...data,
+                 homes: nowState?.homes || new Map(),
+                 homeless_id: data.homeless_id ?? nowState?.homeless_id ?? null,
                  subsetTargets: nowState?.subsetTargets || new Map(),
                  suggestions: [],
                  inputs: data.inputs || nowState?.inputs || [] };
@@ -1258,6 +1266,82 @@ function startNowTicker(d, tr) {
   }, 1000);
 }
 
+// Tap or drag the progress bar to move within the song.
+//
+// The call goes on RELEASE, and only on release. A seek per pointermove would
+// turn one gesture into dozens of them and walk straight into WINDOW_CAP
+// (12/60s, shared with the polls) — so the drag is pure local paint and the
+// gesture spends exactly one call, the same as Next.
+//
+// Rewired by every renderNow along with the rest of the strip, because the
+// node it binds to is rebuilt every time.
+function wireSeekBar(tr) {
+  const bar = $("np-bar");
+  // No geometry under the test harness's stub DOM, and nothing to seek within
+  // a local file or an episode.
+  if (!bar || !tr.duration_ms || typeof bar.getBoundingClientRect !== "function") return;
+  let dragging = false;
+  const at = (e) => {
+    const r = bar.getBoundingClientRect();
+    if (!r.width) return null;
+    return Math.round(Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * tr.duration_ms);
+  };
+  // Local paint only — the same two nodes the ticker writes to.
+  const paint = (ms) => {
+    const fill = $("np-fill"), elapsed = $("np-elapsed");
+    if (fill) fill.style.width = ((ms / tr.duration_ms) * 100).toFixed(2) + "%";
+    if (elapsed) elapsed.textContent = fmtTime(ms);
+  };
+  bar.onpointerdown = (e) => {
+    const ms = at(e);
+    if (ms === null) return;
+    dragging = true;
+    // The ticker would fight the finger, repainting the old position every
+    // second while you drag. It comes back anchored to wherever you land.
+    stopNowTicker();
+    bar.setPointerCapture?.(e.pointerId);
+    bar.classList?.add("seeking");
+    paint(ms);
+  };
+  bar.onpointermove = (e) => { if (dragging) { const ms = at(e); if (ms !== null) paint(ms); } };
+  bar.onpointercancel = () => {
+    if (!dragging) return;
+    dragging = false;
+    bar.classList?.remove("seeking");
+    startNowTicker(nowState, tr);   // put the clock back where it was
+  };
+  bar.onpointerup = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    bar.classList?.remove("seeking");
+    const ms = at(e);
+    if (ms === null) { startNowTicker(nowState, tr); return; }
+    nowSeek(ms, tr);
+  };
+}
+
+async function nowSeek(ms, tr) {
+  try {
+    await api("/api/player/seek", { position_ms: ms });
+    // Re-anchor locally rather than poll: we know where we just put the head,
+    // and the server patched its own cached answer with the same number (see
+    // player_seek), so nothing has to be asked. A seek costs one call, total.
+    if (nowState) {
+      nowState.progress_ms = ms;
+      // The bar's last-update mark described the old position and would sit
+      // on the wrong side of the fill now. The next poll re-establishes it.
+      nowFetchedProgress = null;
+      startNowTicker(nowState, tr);
+      renderNow();
+    }
+  } catch (e) {
+    toast(e.message);
+    // Whatever Spotify is actually doing, the local bar no longer knows —
+    // repaint from the last poll and let the schedule sort it out.
+    if (nowState) startNowTicker(nowState, tr);
+  }
+}
+
 // The card believes the song just played out. In auto mode the server's
 // schedule lands on this same moment, so only manual mode has to act — and
 // this is manual mode's ONE exception to "no automatic fetches": the song is
@@ -1295,9 +1379,76 @@ const ICON_PLAY = '<svg viewBox="0 0 24 24" width="22" height="22" fill="current
 const ICON_PAUSE = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M7 5h3.6v14H7zM13.4 5H17v14h-3.6z"/></svg>';
 const ICON_NEXT = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M6 5.5v13l8.5-6.5zM16.5 5.5h2v13h-2z"/></svg>';
 const ICON_PREV = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M18 5.5v13L9.5 12zM5.5 5.5h2v13h-2z"/></svg>';
+// Feather's `repeat`: two arrows chasing each other round the list.
+const ICON_LOOP = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>';
+
 // A list losing a line — "take this out of the input", not "delete the song".
 const ICON_REMOVE = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M3 6h12v2H3zM3 11h12v2H3zM3 16h8v2H3zM14.5 15h7v2h-7z"/></svg>';
+// The magnifier the card uses wherever a control opens a searchable list —
+// Add to… wears the 18px one inline; this is the chip-sized twin.
+const ICON_SEARCH_SM = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>';
 const ICON_UNDO = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9h10a5 5 0 0 1 0 10H9"/><path d="M8 5 4 9l4 4"/></svg>';
+
+// The input you were last playing from. Persisted, because the moment you
+// most want it named is a reload in the middle of an autoplay tail — the
+// context is gone from the poll by then, and the session's memory of it with
+// it. Id AND name: the name is what the banner says, the id is what the
+// button plays.
+let lastInput = null;
+try { lastInput = JSON.parse(localStorage.getItem("sortify-lastinput") || "null"); } catch (_) {}
+
+function rememberInput(ctx) {
+  if (!ctx?.is_input || !ctx.id) return;
+  if (lastInput?.id === ctx.id && lastInput?.name === ctx.name) return;
+  lastInput = { id: ctx.id, name: ctx.name || "" };
+  try { localStorage.setItem("sortify-lastinput", JSON.stringify(lastInput)); } catch (_) {}
+}
+
+// "The list ran out and Spotify carried on by itself."
+//
+// Deliberately narrow, because a banner that cries wolf gets ignored. All
+// four conditions are about being sure the app has nothing to do with what is
+// playing: you are not playing from an input, and the song is in none of your
+// inputs and none of your homes. Put a home on deliberately, or play anything
+// you have already filed, and this stays silent — the case it catches is the
+// one where the tool is running but no longer sorting anything.
+//
+// The suggest phase gates it because membership is exactly what that phase
+// answers: during phase 1 `suggestions` is empty, and reading that as "in no
+// home" would flash the banner onto every fresh card.
+function adrift(d) {
+  if (!d.playing || d.suggPending || d.suggError) return false;
+  if (d.context?.is_input) return false;
+  if ((d.inputs || []).some((l) => l.has_track)) return false;
+  if ((d.suggestions || []).some((s) => s.already)) return false;
+  return true;
+}
+
+// A list running dry, drawn as one: the rows stop and the arrow carries on
+// past where they ended.
+const ICON_ADRIFT = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h10M4 11h7M4 16h4"/><path d="M14 19h6m-3-3 3 3-3 3"/></svg>';
+
+function adriftBanner(d) {
+  if (!adrift(d)) return "";
+  const name = lastInput?.name;
+  // Two ways to be out here, and the banner should not guess. No playlist
+  // context at all is the autoplay tail — Spotify carrying on past the end of
+  // the list — and naming the list that ran out is the useful half of that. A
+  // context that IS a playlist, just not one of yours, is a different fact and
+  // gets stated as one. (An album or a single track played from search also
+  // arrives with no playlist context, so the first line can overstate the
+  // autoplay case; the sub-line under it — nothing here is being filed — is
+  // true either way, and it is the part that matters.)
+  const head = d.context
+    ? `Playing ${esc(d.context.name || "something else")} — not one of your inputs`
+    : name ? `${esc(name)} ran out — autoplay took over`
+           : "Not playing from an input — autoplay took over";
+  return `<div class="np-adrift">
+    <span class="ad-head">${ICON_ADRIFT}<b>${head}</b></span>
+    <span class="ad-sub">nothing you play here is being filed</span>
+    ${name ? `<button id="btn-now-back" class="ad-back">Play ${esc(name)} again</button>` : ""}
+  </div>`;
+}
 
 // The strip under the title: the progress line (elapsed / bar / total) with
 // the two quiet controls tucked at its right end, then the verb row.
@@ -1313,6 +1464,7 @@ function playbackStrip(d, tr) {
         title="Back to the previous track" aria-label="Back to the previous track">${ICON_PREV}</button>`;
   const pauseBtn = `<button id="btn-now-toggle" class="np-mini"
         title="${d.is_playing ? "Pause" : "Play"}" aria-label="${d.is_playing ? "Pause" : "Play"}">${d.is_playing ? ICON_PAUSE : ICON_PLAY}</button>`;
+  const loopBtn = loopButton(d);
   // The last-update marker: pinned where the server's answer put the track,
   // regardless of what a local re-render (pause toggle, filing) has done to
   // d.progress_ms since. Only rendered for the track it was measured on.
@@ -1323,13 +1475,16 @@ function playbackStrip(d, tr) {
     ? `<div class="np-progress">
       ${prevBtn}
       <span id="np-elapsed" class="np-time">${fmtTime(d.progress_ms || 0)}</span>
-      <span class="np-bar"><span id="np-fill" style="width:${Math.min(100, ((d.progress_ms || 0) / tr.duration_ms) * 100).toFixed(2)}%"></span>${
+      <span id="np-bar" class="np-bar" role="slider" tabindex="-1"
+            aria-label="Position in the track" aria-valuemin="0"
+            aria-valuemax="${tr.duration_ms}" aria-valuenow="${d.progress_ms || 0}"
+            title="Tap or drag to move within the song"><span id="np-fill" style="width:${Math.min(100, ((d.progress_ms || 0) / tr.duration_ms) * 100).toFixed(2)}%"></span>${
         markPct !== null ? `<span id="np-fill-mark" style="left:${markPct}%"></span>` : ""
       }</span>
       <span class="np-time">${fmtTime(tr.duration_ms)}</span>
-      ${pauseBtn}
+      ${pauseBtn}${loopBtn}
     </div>`
-    : `<div class="np-progress np-progress-bare">${prevBtn}${pauseBtn}</div>`;
+    : `<div class="np-progress np-progress-bare">${prevBtn}${pauseBtn}${loopBtn}</div>`;
   // Once this track has been removed — or filed, or captured, or added to a
   // subset: any action of its own sitting on top of the undo stack — the
   // slot offers the way back instead. The undo belongs where the hand
@@ -1360,6 +1515,51 @@ function playbackStrip(d, tr) {
       <button id="btn-now-next" class="np-round np-wide np-next${nextBusy ? " np-busy" : ""}"${nextBusy ? " disabled" : ""} title="${nextBusy ? "Skipping…" : "Skip to the next track"}">${ICON_NEXT}<span class="np-verb-label">${nextBusy ? "Skipping…" : "Next"}</span></button>
     </span>
   </div>`;
+}
+
+// The loop toggle, and the one case where it is not drawn at all.
+//
+// `repeat` is null when the answer is unknown — a token minted before the
+// read-playback-state scope existed, or an account where /me/player turned
+// out to be unusable (see Spotify.currently_playing). A toggle that cannot
+// read the state can only show what it last SET, which is a button that lies
+// after any change made in Spotify itself. So it stays away until the answer
+// is real: log in again and it appears.
+//
+// Two states to press between, off and looping-the-list, because that is the
+// question being asked here — "does this inbox run out or come round again".
+// Spotify's third mode, repeat-one, is shown honestly if something else set
+// it (the 1 badge) and pressing turns it off, but nothing here offers it.
+function loopButton(d) {
+  if (d.repeat == null) return "";
+  const on = d.repeat === "context" || d.repeat === "track";
+  const one = d.repeat === "track";
+  const title = one ? "Repeating this track — press to stop looping"
+              : on ? "Looping the list — press to stop"
+                   : "Loop the list";
+  return `<button id="btn-now-loop" class="np-mini np-loop${on ? " on" : ""}"
+        title="${title}" aria-label="${title}" aria-pressed="${on}">${ICON_LOOP}${
+    one ? '<span class="loop-one">1</span>' : ""}</button>`;
+}
+
+async function nowLoop() {
+  const d = nowState;
+  if (!d || d.repeat == null) return;
+  const before = d.repeat;
+  const next = before === "off" ? "context" : "off";
+  // Optimistic: the button is the kind of control that must answer the press
+  // immediately, and the server patches its cached answer with the same value
+  // rather than re-reading it (see player_repeat), so there is nothing to
+  // wait for that we do not already know.
+  d.repeat = next;
+  renderNow();
+  try {
+    await api("/api/player/repeat", { state: next });
+  } catch (e) {
+    d.repeat = before;
+    renderNow();
+    toast(e.message);
+  }
 }
 
 // Whether Remove can act right now, and what to say when it can't.
@@ -1500,9 +1700,14 @@ function renderNow() {
       </button>`
     : "";
 
+  rememberInput(d.context);
   nowProblem = false;  // a real card for a real track is about to go up
-  $("now-card").innerHTML = `<div class="track-card${d.is_playing ? "" : " is-paused"}">
+  // Fresh only for a track this card has not drawn yet: a re-render (a poll,
+  // a pause toggle, the suggestions arriving) is not an arrival.
+  const cardFresh = enterOnce("card", tr.uri) ? " card-fresh" : "";
+  $("now-card").innerHTML = `<div class="track-card${cardFresh}${d.is_playing ? "" : " is-paused"}">
     ${shareBtn}
+    ${adriftBanner(d)}
     <div class="art">${img}${d.is_playing ? "" : '<span class="paused-chip">paused</span>'}</div>
     <div class="t-name">${esc(tr.name)}</div>
     <div class="t-artist">${esc(artists)}${tr.album ? " — " + esc(tr.album) : ""}</div>
@@ -1515,6 +1720,8 @@ function renderNow() {
   if (nxt) nxt.onclick = playerNext;
   const prv = $("btn-now-prev");
   if (prv) prv.onclick = playerPrev;
+  const loop = $("btn-now-loop");
+  if (loop) loop.onclick = nowLoop;
   // Wired with the other strip controls rather than in the ordinary-card
   // branch below: the button is part of the strip now, and the strip renders
   // for the sitting card too (where an input context — and so this button —
@@ -1525,7 +1732,10 @@ function renderNow() {
   if (undoRem) undoRem.onclick = undoStripAction;
   const sh = $("btn-share");
   if (sh) sh.onclick = openSharePop;
+  const back = $("btn-now-back");
+  if (back) back.onclick = () => pickInput(lastInput.id, lastInput.name);
   startNowTicker(d, tr);
+  wireSeekBar(tr);
 
   if (inSitting) {
     wireSittingCard();
@@ -1544,17 +1754,10 @@ function renderNow() {
     const nh = $("btn-now-homeless");
     if (nh) nh.onclick = nowHomeless;
     capSuggScroll();
-    $("now-card").querySelectorAll(".in-chip").forEach((b) => {
-      b.onclick = () => nowCapture(b.dataset.in);
-    });
-    $("now-card").querySelectorAll(".set-chip").forEach((b) => {
-      b.onclick = () => {
-        const k = b.dataset.set;
-        captureSetsOpen[k] = !captureSetsOpen[k];
-        try { localStorage.setItem("sortify-capsets", JSON.stringify(captureSetsOpen)); } catch (_) {}
-        renderNow();
-      };
-    });
+    // The chips are inert markers now — the only control in that row is the
+    // one that opens the picker.
+    const cap = $("btn-now-capture");
+    if (cap) cap.onclick = openCapturePicker;
   }
 }
 
@@ -1586,6 +1789,22 @@ function capSuggScroll() {
   const pitch = suggRowPitch(row.offsetHeight,
                              parseFloat(getComputedStyle(row).marginBottom) || 0);
   box.style.height = `${suggScrollHeight(pitch)}px`;
+}
+
+// Entry animations, granted once each.
+//
+// Every poll rebuilds the Now card's innerHTML from scratch, so any CSS
+// animation on a fresh node replays on each of them: the card slid in again
+// every poll, and a filed track's check redrew itself whenever anything
+// touched the card — pressing Next after filing most visibly, which is the
+// one moment nothing new has happened. So the animating class is granted, not
+// declared: `enterOnce(key, token)` answers true exactly once per token
+// (normally the track uri), and passing null arms it again for next time.
+const entered = {};
+function enterOnce(key, token) {
+  if (entered[key] === token) return false;
+  entered[key] = token;
+  return token !== null;
 }
 
 // The big grey check a card earns when its track is resolved — Feather's
@@ -1622,58 +1841,86 @@ function ordinaryCardBody(d, tr, ctx) {
     // be put back" flag, so the card reads the removal off the same state
     // rather than sniffing the label for it.
     const removed = removedUri === tr.uri;
-    return `<div class="done-msg${removed ? " gone-msg" : ""}">` +
+    // Drawn on by the render that first puts it up, and only that one.
+    const fresh = enterOnce("mark", `${tr.uri}:${removed ? "gone" : "done"}`) ? " mark-in" : "";
+    return `<div class="done-msg${removed ? " gone-msg" : ""}${fresh}">` +
            `${removed ? GONE_MARK : DONE_MARK}` +
            `<p>${removed ? "removed from" : "filed to"} <b>${esc(filedTo)}</b></p></div>` +
            subsetButtonRow();
   }
+  // Nothing resolved on screen — arm the draw for whatever this card resolves
+  // to next, including a re-filing of this same track after an undo.
+  enterOnce("mark", null);
   if (!tr.sortable) return '<p class="hint">Can\'t be sorted via the API (local file or episode).</p>';
 
-  // Phase 1 of the two-phase card: the track is up, the suggestion side is
-  // still computing. No buttons yet — homes and inputs arrive with it.
-  if (d.suggPending) return '<p class="hint sugg-loading">finding a home…</p>';
-  if (d.suggError) return `<p class="hint">suggestions failed: ${esc(d.suggError)} — refresh to retry.</p>`;
-
+  // What phase 2 of the two-phase card actually adds is the SUGGESTED ROWS,
+  // and from here down only they wait for it. Everything around them —
+  // Add to…, Add to subset…, Homeless, the capture chips — is answerable from
+  // what the light poll already carries (homes, inputs and homeless_id ride
+  // across it; none of the three is per-track — see pollNow), so the card goes
+  // up whole and one box inside it says it is still thinking. It used to
+  // return here with a lone "finding a home…" line and nothing else, and the
+  // entire lower half of the card dropped in a second later.
   let body = "";
-  if (d.suggestions.length && d.suggestions[0].weak) {
-    body += '<p class="hint">No confident match — closest guesses:</p>';
-  }
-  // The rows go in a scrolling box of their own: the list is six long now and
-  // six full-height rows are more card than a phone screen wants at once.
-  // About three show, the fourth is cut off at the edge — which is the only
-  // honest affordance that there is more, since a touch device renders no
-  // scrollbar at rest. The lead-in hint above stays OUTSIDE the box: it says
-  // what the whole list is, so scrolling it away would be losing the label.
   let rows = "";
-  d.suggestions.forEach((s, i) => {
-    const home = nowState.homes.get(s.playlist_id);
-    if (!home) return;
-    rows += `<button class="sugg${s.already ? " already" : ""}${s.weak ? " weak" : ""}" data-to="${esc(s.playlist_id)}" style="--pct:${s.already ? 100 : s.pct}%">
-      <span class="s-pct">${s.already ? '<span class="s-badge">already there</span>' : s.pct + "%"}</span>
-      <span class="s-name"><kbd>${i + 1}</kbd> ${esc(home.name)}</span>
-      <span class="s-why">${esc([folderLeaf(home.folder), ...s.reasons].filter(Boolean).join(" · "))}</span>
-    </button>`;
-  });
+  if (d.suggError) {
+    body += `<p class="hint">suggestions failed: ${esc(d.suggError)} — refresh to retry.</p>`;
+  } else if (d.suggPending) {
+    // Inside the scrolling box, where the rows themselves will appear: the
+    // wait is shown where the thing being waited for goes.
+    rows += '<p class="hint sugg-loading">finding a home…</p>';
+  } else {
+    if (d.suggestions.length && d.suggestions[0].weak) {
+      body += '<p class="hint">No confident match — closest guesses:</p>';
+    }
+    // The rows go in a scrolling box of their own: the list is six long now
+    // and six full-height rows are more card than a phone screen wants at
+    // once. About three show, the fourth is cut off at the edge — which is
+    // the only honest affordance that there is more, since a touch device
+    // renders no scrollbar at rest. The lead-in hint above stays OUTSIDE the
+    // box: it says what the whole list is, so scrolling it away would be
+    // losing the label.
+    d.suggestions.forEach((s, i) => {
+      const home = nowState.homes.get(s.playlist_id);
+      if (!home) return;
+      rows += `<button class="sugg${s.already ? " already" : ""}${s.weak ? " weak" : ""}" data-to="${esc(s.playlist_id)}" style="--pct:${s.already ? 100 : s.pct}%">
+        <span class="s-pct">${s.already ? '<span class="s-badge">already there</span>' : s.pct + "%"}</span>
+        <span class="s-name"><kbd>${i + 1}</kbd> ${esc(home.name)}</span>
+        <span class="s-why">${esc([folderLeaf(home.folder), ...s.reasons].filter(Boolean).join(" · "))}</span>
+      </button>`;
+    });
+  }
   // Add to… ends the list rather than sitting under it as a button: reaching
   // past the suggestions is the same question the suggestions ask, so it is
   // the last and least confident answer to it, not a different control. It
   // keeps the rows' three-column shape so the list still scans as one column,
   // and takes a look of its own so it does not read as a seventh home. No
   // data-to and no --pct: nothing to file, nothing to be confident about.
-  rows += `<button class="sugg sugg-more" id="btn-now-more">
+  // Withheld in exactly one case: a first card of the session, still in phase
+  // 1, where no suggest answer has ever landed and `homes` is genuinely empty
+  // — the row would open a picker with nothing in it. Every later phase 1 has
+  // the carried copy and draws it.
+  if (!d.suggPending || nowState.homes.size) rows += `<button class="sugg sugg-more" id="btn-now-more">
     <span class="s-pct"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></span>
     <span class="s-name"><kbd>m</kbd> Add to…</span>
     <span class="s-why">any of your homes — search by name, or create one</span>
   </button>`;
   body += `<div class="sugg-scroll">${rows}</div>`;
-  if (!d.suggestions.length) body += '<p class="hint">No confident match — Add to… above.</p>';
+  if (!d.suggPending && !d.suggError && !d.suggestions.length) {
+    body += '<p class="hint">No confident match — Add to… above.</p>';
+  }
   // Remove from input lives in the playback strip now (see playbackStrip).
   body += `<div class="minor-actions">
     <button id="btn-now-subset">Add to subset…</button>
     ${homelessButton(d) || ""}
   </div>`;
+  // Always drawn, even with no chips in it: the button is the row's reason to
+  // exist, and a control that comes and goes with the song's membership would
+  // be missing exactly when you reach for it.
   const chips = captureChips(d.inputs || []);
-  if (chips) body += `<div class="capture"><span class="hint">capture to input:</span>${chips}</div>`;
+  body += `<div class="capture">${chips ? `<span class="hint">in:</span>${chips}` : ""}` +
+    `<button id="btn-now-capture" class="chip cap-more" title="Put this song in one of your inputs — it stays where it is too">${
+      ICON_SEARCH_SM} capture to…</button></div>`;
   return body;
 }
 
@@ -1716,38 +1963,29 @@ async function nowHomeless() {
 // the playing track always shows, folded set or not. That is the whole point
 // of these chips — telling you where the track already lives — and hiding
 // that would make a folded set actively misleading rather than merely terse.
-let captureSetsOpen = {};
-try { captureSetsOpen = JSON.parse(localStorage.getItem("sortify-capsets") || "{}"); } catch (_) {}
 
+
+// A membership marker, not a button: this row answers "where is this song
+// already", and the answer is not something you click.
 function captureChip(l) {
-  return `<button class="chip in-chip${l.has_track ? " has" : ""}" data-in="${esc(l.id)}"` +
-    `${l.has_track ? " disabled" : ""}>${l.has_track ? "✓" : "+"} ${esc(l.name)}</button>`;
+  return `<span class="chip in-chip has" data-in="${esc(l.id)}">${esc(l.name)}</span>`;
 }
 
+// The lists this song is already in — and nothing else.
+//
+// This row used to render every buffer input, opted in or not, with the ones
+// holding the song merely tinted: a wall of a dozen chips whose only real
+// information was which two were highlighted, and which grew with the number
+// of inboxes. Membership is the question the row answers, so membership is
+// all it draws. Putting the song somewhere NEW is a different question and it
+// goes through the picker beside them (see openCapturePicker) — the same
+// shape the card already uses for homes, where a long list also belongs
+// behind a search box rather than in front of one.
+//
+// Sets no longer group anything here: with only the matching lists left there
+// is nothing to fold, and the per-set expanders went with the wall.
 function captureChips(inputs) {
-  const bySet = new Map();
-  for (const l of inputs) {
-    // The Homeless buffer has its own button, which MOVES the song there.
-    // Its chip would sit two centimetres away and only ADD it, leaving the
-    // song in the input as well — one destination with two meanings depending
-    // on which control you hit. Hidden here so there is only the one.
-    if (l.id === nowState?.homeless_id) continue;
-    const k = l.set || NOW_BUFFER_SET;
-    if (!bySet.has(k)) bySet.set(k, []);
-    bySet.get(k).push(l);
-  }
-  let out = "";
-  for (const [key, lists] of bySet) {
-    const open = key === NOW_BUFFER_SET || !!captureSetsOpen[key];
-    const shown = open ? lists : lists.filter((l) => l.has_track);
-    const folded = lists.length - shown.length;
-    if (key !== NOW_BUFFER_SET && (folded || open)) {
-      out += `<button class="chip set-chip" data-set="${esc(key)}">` +
-        `${open ? "−" : "+"} ${esc(setLabel(key))}${folded ? ` ${folded}` : ""}</button>`;
-    }
-    out += shown.map(captureChip).join("");
-  }
-  return out;
+  return inputs.filter((l) => l.has_track).map(captureChip).join("");
 }
 
 async function nowCapture(inId) {
@@ -2032,7 +2270,25 @@ function openNowPicker() {
              homelessTarget(nowState) ? nowHomeless : null);
 }
 
-function openPicker(homesMap, onPick, onCreate, onHomeless) {
+// Capture: put the song in an input as well as wherever it already is. Every
+// input the song is NOT already in — the ones it is in are the chips beside
+// the button, and offering them here would be offering a no-op. `inputs`
+// carries no folder path, so the set label stands in as the grey sub-line,
+// which is what tells two similarly-named inboxes apart.
+function openCapturePicker() {
+  const map = new Map((nowState.inputs || [])
+    // The Homeless buffer stays out, as it always has: its own button MOVES
+    // the song there, and an offer to ADD it two centimetres away would give
+    // one destination two meanings depending on which control you hit. The
+    // membership chips no longer hide it, because a chip is a fact about
+    // where the song is rather than an offer to put it somewhere.
+    .filter((l) => !l.has_track && l.id !== nowState.homeless_id)
+    .map((l) => [l.id, { id: l.id, name: l.name,
+                         folder: setLabel(l.set || NOW_BUFFER_SET) }]));
+  openPicker(map, nowCapture, null, null, "Capture here");
+}
+
+function openPicker(homesMap, onPick, onCreate, onHomeless, verb = "File here") {
   const list = $("picker-list");
   const paint = (filter) => {
     list.innerHTML = "";
@@ -2071,7 +2327,7 @@ function openPicker(homesMap, onPick, onCreate, onHomeless) {
         closePicker(); onPick(h.id);
       };
       previewHold.attach(b, h.id, h.name,
-        { label: "File here", run: () => { closePicker(); onPick(h.id); } });
+        { label: verb, run: () => { closePicker(); onPick(h.id); } });
       list.appendChild(b);
     }
     // The moment of need: the right playlist doesn't exist yet. Create it
@@ -3470,9 +3726,11 @@ function sittingCardBody(tr, srvSitting) {
   const dec = srvSitting.decided[tr.uri];
   if (dec?.action === "keep") {
     const homeName = dec.to_id === "liked" ? "Liked Songs" : (nowState.homes.get(dec.to_id)?.name || dec.to_id);
-    return `<div class="done-msg">${DONE_MARK}<p>kept to <b>${esc(homeName)}</b><br>
+    const fresh = enterOnce("mark", `${tr.uri}:keep`) ? " mark-in" : "";
+    return `<div class="done-msg${fresh}">${DONE_MARK}<p>kept to <b>${esc(homeName)}</b><br>
       <span class="hint">final — edit it from the home playlist if that was wrong</span></p></div>`;
   }
+  enterOnce("mark", null);
   if (dec?.action === "reject") {
     return `<p class="hint">✗ rejected.</p>
       <div class="minor-actions"><button id="btn-decide-unreject">Undo reject (free)</button></div>`;
@@ -3499,7 +3757,8 @@ function sittingCardBody(tr, srvSitting) {
     if (!nowState.suggestions.length) html += '<p class="hint">No confident match — use Keep to… below.</p>';
   }
   html += `<div class="minor-actions">
-    ${tr.sortable && !nowState.suggPending ? `<button id="btn-decide-more"><kbd>m</kbd> Keep to…</button>` : ""}
+    ${tr.sortable && (!nowState.suggPending || nowState.homes.size)
+      ? `<button id="btn-decide-more"><kbd>m</kbd> Keep to…</button>` : ""}
     <button id="btn-decide-reject" class="danger"><kbd>r</kbd> Reject (free)</button>
   </div>`;
   return html;

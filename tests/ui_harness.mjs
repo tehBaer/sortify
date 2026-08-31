@@ -2544,6 +2544,17 @@ run("stopNowPolling()");
         JSON.stringify(html().slice(0, 160)));
   check("TP no suggestion buttons render while pending",
         !html().includes('class="sugg"'), "");
+  check("TP the wait sits inside the row box, where the rows themselves land",
+        /<div class="sugg-scroll">\s*<p class="hint sugg-loading">/.test(html()),
+        JSON.stringify(html().slice(html().indexOf("sugg-scroll") - 20, 200)));
+  // The point of the phase: everything that does NOT depend on the suggest
+  // answer is on the card already, so the lower half does not drop in later.
+  check("TP the new track's card is granted the slide-in",
+        html().includes("card-fresh"), `html=${html().slice(0, 80)}`);
+  check("TP the rest of the card is up in phase 1 — Add to…, subset, chips",
+        html().includes('id="btn-now-more"') && html().includes('id="btn-now-subset"') &&
+        html().includes('class="chip in-chip'),
+        `more=${html().includes('id="btn-now-more"')} sub=${html().includes('id="btn-now-subset"')} chips=${html().includes('class="chip in-chip')}`);
   check("TP the playback strip is live while pending (Remove included)",
         html().includes('id="btn-now-next"') && html().includes('id="btn-now-remove"'),
         `next=${html().includes('id="btn-now-next"')} remove=${html().includes('id="btn-now-remove"')}`);
@@ -2553,6 +2564,11 @@ run("stopNowPolling()");
         html().includes('class="sugg"') && html().includes("Home") &&
         !/finding a home…/.test(html()),
         JSON.stringify(html().slice(0, 200)));
+  // The rows arriving is a fill-in, not an arrival: re-running the card's
+  // slide-in here made phase 2 look like the card reloading.
+  check("TP ...without the card sliding in a second time",
+        html().includes("track-card") && !html().includes("card-fresh"),
+        `html=${html().slice(0, 80)}`);
   run("stopNowPolling()");
 
   // An unchanged track re-poll answers the suggestion side from the cache.
@@ -2579,6 +2595,26 @@ run("stopNowPolling()");
   check("TP a stale suggest answer is dropped, the card stays pending",
         /finding a home…/.test(html()) && !html().includes('class="sugg"'),
         JSON.stringify(html().slice(0, 160)));
+
+  // Cold start — no suggest answer has ever landed, so `homes` is genuinely
+  // empty and Add to… would open a picker with nothing in it. That one row is
+  // all phase 1 still withholds.
+  run("nowState = null; nowSuggestCache = null");
+  let release2;
+  const gate2 = new Promise((r) => { release2 = r; });
+  setNow(tpBody("spotify:track:tp3"));   // rewrites the suggest routes...
+  const suggRoute3 = routes["GET /api/now/suggest?force=1"];   // ...so gate after
+  routes["GET /api/now/suggest?force=1"] = () => gate2.then(() => suggRoute3);
+  run(`pollNow(true)`);
+  await tick();
+  check("TP a cold phase 1 withholds Add to… — an empty picker helps nobody",
+        !html().includes('id="btn-now-more"') && html().includes('id="btn-now-subset"'),
+        `more=${html().includes('id="btn-now-more"')}`);
+  release2();
+  await tick();
+  run("stopNowPolling()");
+  check("TP ...and it is there the moment the homes land",
+        html().includes('id="btn-now-more"'), "");
 }
 
 // ============================================================================
@@ -2888,12 +2924,12 @@ run("stopNowPolling()");
 // ============================================================================
 {
   resetLog();
-  const paint = async () => {
+  const paint = async (uri = "spotify:track:xm1") => {
     setNow({
       status: 200,
       body: {
         playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
-        track: { uri: "spotify:track:xm1", name: "Song", duration_ms: 200000,
+        track: { uri, name: "Song", duration_ms: 200000,
                  artists: [{ name: "Artist" }], sortable: true, image: null },
         context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
         suggestions: [], homes: [{ id: "H1", name: "Home", folder: "" }],
@@ -2925,6 +2961,21 @@ run("stopNowPolling()");
   check("XM filing is untouched — still the check, still 'filed to'",
         html().includes("done-mark") && !html().includes("gone-mark") &&
         /filed to/.test(html()), `html=${html()}`);
+
+  // The draw-on is granted by the render that first shows the mark and by no
+  // other. Every poll — and every press of Next — rebuilds this card, and the
+  // check used to redraw itself each time, as if the song had just been filed
+  // again.
+  check("XM the check draws itself on the render that files",
+        html().includes("mark-in"), `html=${html()}`);
+  run("renderNow()");
+  check("XM ...and a re-render leaves it standing, undrawn",
+        html().includes("done-mark") && !html().includes("mark-in"), `html=${html()}`);
+  // Undoing and re-filing the same track is a new mark, and does draw.
+  run("filedUris = {}; renderNow(); filedUris = { 'spotify:track:xm1': 'Home' }; renderNow()");
+  check("XM re-filing the same track after an undo draws again",
+        html().includes("mark-in"), `html=${html()}`);
+
 }
 
 // ============================================================================
@@ -3167,6 +3218,264 @@ run("stopNowPolling()");
   check("SW an empty sweep says nothing extra — the 98.7% case stays quiet",
         !/more inputs|\+ \[/.test($$("toast").textContent),
         JSON.stringify($$("toast").textContent.slice(0, 90)));
+}
+
+// ============================================================================
+// CR — the capture row. It used to list every buffer input, opted in or not,
+// with the ones holding the song merely tinted: a wall whose only real
+// information was which two were highlighted, and which grew with the number
+// of inboxes. Now the chips ARE the information — where this song already is
+// — and putting it somewhere new goes through the picker, the same shape the
+// card already uses for homes.
+// ============================================================================
+{
+  resetLog();
+  const html = () => $$("now-card").innerHTML;
+  const rows = () => $$("picker-list").children.map((c) => c.innerHTML);
+  const paint = async (over) => {
+    setNow({
+      status: 200,
+      body: {
+        playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+        track: { uri: "spotify:track:cr1", name: "Song", duration_ms: 200000,
+                 artists: [{ name: "Artist" }], sortable: true, image: null },
+        context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
+        suggestions: [], homes: [{ id: "H1", name: "Home", folder: "" }],
+        subset_targets: [], subsets: [],
+        inputs: [{ id: "IN1", name: "[Hazy]", has_track: true, set: "buffer" },
+                 { id: "IN2", name: "[Late night]", has_track: false, set: "buffer" },
+                 { id: "IN3", name: "[Sunday]", has_track: false, set: "buffer" },
+                 { id: "HL1", name: "[Homeless]", has_track: false, set: "buffer" }],
+        homeless_id: "HL1",
+        ...over,
+      },
+    });
+    run(`show("now"); filedUris = {}; removedUri = null; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+  };
+
+  await paint({});
+  check("CR only the input holding the song gets a chip",
+        html().includes('data-in="IN1"') && !html().includes('data-in="IN2"') &&
+        !html().includes('data-in="IN3"'),
+        `in1=${html().includes('data-in="IN1"')} in2=${html().includes('data-in="IN2"')}`);
+  // A fact, not an offer: the row is where the song IS, and the only thing in
+  // it you can press is the one that opens the picker.
+  check("CR the chip is inert — a span, not a button",
+        /<span class="chip in-chip has" data-in="IN1"/.test(html()),
+        JSON.stringify(html().slice(html().indexOf("in-chip") - 30, 120)));
+  check("CR the capture control is there beside it",
+        html().includes('id="btn-now-capture"'), "");
+
+  await paint({ inputs: [{ id: "IN1", name: "[Hazy]", has_track: false, set: "buffer" }] });
+  check("CR a song in no input shows no chips at all",
+        !html().includes("in-chip"), "");
+  check("CR ...but the capture control stays — it is the row's reason to exist",
+        html().includes('id="btn-now-capture"'), "");
+
+  await paint({});
+  run(`openCapturePicker()`);
+  check("CR the picker offers the inputs the song is NOT in",
+        rows().some((r) => r.includes("Late night")) &&
+        rows().some((r) => r.includes("Sunday")), `rows=${rows()}`);
+  check("CR ...and never the one it is already in",
+        !rows().some((r) => r.includes("Hazy")), `rows=${rows()}`);
+  // Homeless has its own button, which MOVES the song there. An offer to ADD
+  // it two centimetres away would give one destination two meanings.
+  check("CR ...nor the Homeless buffer, which has a button of its own",
+        !rows().some((r) => r.includes("Homeless")), `rows=${rows()}`);
+  check("CR the set label stands in for the folder path inputs do not carry",
+        rows().some((r) => r.includes("buffer")), `rows=${rows()}`);
+
+  resetLog();
+  routes["POST /api/act"] = { status: 200, body: {} };
+  // The whole gesture, in the order a browser delivers it. The pointerdown
+  // matters: a completed hold-preview leaves a flag that the next click
+  // consumes instead of acting on (previewHold.consumeClick), and pressing a
+  // row is what clears it. Firing the click alone leaves an earlier block's
+  // hold to swallow this one.
+  run(`{
+    const row = $("picker-list").children.find((c) => c.innerHTML.includes("Late night"));
+    row.onpointerdown({ clientX: 0, clientY: 0 });
+    row.onpointerup({ clientX: 0, clientY: 0 });
+    row.onclick();
+  }`);
+  await tick();
+  const cap = bodies("/api/act").slice(-1)[0];
+  check("CR picking one captures the song into it — an add, not a move",
+        cap && cap.to_id === "IN2" && cap.from_id === null && cap.action === "move",
+        JSON.stringify(cap) + " log=" + JSON.stringify(log.map((c) => c.method + " " + c.path)));
+}
+
+// ============================================================================
+// AD — "the list ran out and Spotify carried on by itself". The one state
+// where the card is up, everything works, and none of it is doing anything.
+//
+// Every check here is as much about the silence as about the banner: it fires
+// only when the app has provably nothing to do with what is playing, because
+// a banner that cries wolf is a banner nobody reads.
+// ============================================================================
+{
+  resetLog();
+  const html = () => $$("now-card").innerHTML;
+  const paint = async (over) => {
+    setNow({
+      status: 200,
+      body: {
+        playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+        track: { uri: "spotify:track:ad1", name: "Song", duration_ms: 200000,
+                 artists: [{ name: "Artist" }], sortable: true, image: null },
+        context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
+        suggestions: [], homes: [{ id: "H1", name: "Home", folder: "" }],
+        subset_targets: [], subsets: [],
+        inputs: [{ id: "IN1", name: "[Hazy]", has_track: true, set: "buffer" }],
+        homeless_id: null,
+        ...over,
+      },
+    });
+    run(`show("now"); filedUris = {}; removedUri = null; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+  };
+  const adrift = { context: null,
+                   inputs: [{ id: "IN1", name: "[Hazy]", has_track: false, set: "buffer" }] };
+
+  // Playing from the input is the normal case, and it also teaches the client
+  // which list to name when that list later runs out.
+  await paint({});
+  check("AD playing from an input says nothing", !html().includes("np-adrift"), "");
+  check("AD ...and the input is remembered for when it runs dry",
+        run(`lastInput && lastInput.id`) === "IN1", `lastInput=${run("JSON.stringify(lastInput)")}`);
+
+  await paint(adrift);
+  check("AD out of the input with the song in nothing: the banner is up",
+        html().includes("np-adrift"), `html=${html().slice(0, 200)}`);
+  check("AD ...it names the list that ran out",
+        /\[Hazy\] ran out/.test(html()), `html=${html().slice(0, 300)}`);
+  check("AD ...and offers it back",
+        html().includes('id="btn-now-back"'), "");
+
+  resetLog();
+  run(`$("btn-now-back").onclick()`);
+  await tick();
+  const play = bodies("/api/player/play").slice(-1)[0];
+  check("AD pressing it starts that input again — one call, the existing one",
+        play && play.input_id === "IN1", JSON.stringify(play));
+
+  // The three silences.
+  await paint({ context: null,
+                inputs: [{ id: "IN1", name: "[Hazy]", has_track: true, set: "buffer" }] });
+  check("AD a song still sitting in an input is not adrift",
+        !html().includes("np-adrift"), "");
+
+  await paint({ ...adrift,
+                suggestions: [{ playlist_id: "H1", pct: 100, reasons: [], already: true }] });
+  check("AD a song already in one of your homes is not adrift either",
+        !html().includes("np-adrift"), "");
+
+  // A playlist that is not one of your inputs is a different fact from the
+  // autoplay tail, and the banner says which — it never claims autoplay for
+  // something you deliberately put on.
+  await paint({ ...adrift, context: { id: "PL9", name: "Discover Weekly", is_input: false } });
+  check("AD a non-input playlist gets named rather than called autoplay",
+        html().includes("np-adrift") && /Discover Weekly/.test(html()) &&
+        !/autoplay took over/.test(html()), JSON.stringify(html().slice(0, 400)));
+  check("AD ...and the useful half is still said out loud",
+        /nothing you play here is being filed/.test(html()), "");
+
+  // Phase 1 has no membership yet — suggestions are empty because they have
+  // not been computed, not because the song is homeless. Reading the one as
+  // the other would flash the banner onto every fresh card.
+  run(`nowState.suggPending = true; renderNow()`);
+  check("AD the banner never fires while the suggestion side is still pending",
+        !html().includes("np-adrift"), "");
+}
+
+// ============================================================================
+// LP — the loop toggle. Reading the repeat state needs a scope the app only
+// started asking for in Aug 2026, so the control's first duty is to be absent
+// when it cannot tell the truth: a toggle showing what it last SET goes wrong
+// the moment you change repeat in Spotify itself.
+// ============================================================================
+{
+  resetLog();
+  const html = () => $$("now-card").innerHTML;
+  const loopTag = () => (html().match(/<button id="btn-now-loop"[^>]*>/) || [""])[0];
+  const paint = async (over) => {
+    setNow({
+      status: 200,
+      body: {
+        playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+        track: { uri: "spotify:track:lp1", name: "Song", duration_ms: 200000,
+                 artists: [{ name: "Artist" }], sortable: true, image: null },
+        context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
+        suggestions: [], homes: [{ id: "H1", name: "Home", folder: "" }],
+        subset_targets: [], subsets: [],
+        inputs: [{ id: "IN1", name: "[Hazy]", has_track: true, set: "buffer" }],
+        homeless_id: null,
+        ...over,
+      },
+    });
+    run(`show("now"); filedUris = {}; removedUri = null; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+  };
+
+  await paint({});
+  check("LP no repeat state means no button — it would only be able to lie",
+        loopTag() === "", `tag=${loopTag()}`);
+
+  await paint({ repeat: "off" });
+  check("LP a token that can read the state gets the button",
+        loopTag() !== "", `tag=${loopTag()}`);
+  check("LP ...unlit while the list runs out",
+        !loopTag().includes("np-loop on") && loopTag().includes('aria-pressed="false"'),
+        `tag=${loopTag()}`);
+
+  resetLog();
+  run(`$("btn-now-loop").onclick()`);
+  await tick();
+  const on = bodies("/api/player/repeat").slice(-1)[0];
+  check("LP pressing it loops the list — one call, and the context, not the track",
+        on && on.state === "context", JSON.stringify(on));
+  check("LP the button answers the press without waiting for a poll",
+        loopTag().includes("np-loop on"), `tag=${loopTag()}`);
+  check("LP ...and no poll is spent confirming what we just set",
+        gets("/api/now?light=1") === 0 && gets("/api/now?light=1&force=1") === 0,
+        `${gets("/api/now?light=1") + gets("/api/now?light=1&force=1")} poll(s)`);
+
+  resetLog();
+  run(`$("btn-now-loop").onclick()`);
+  await tick();
+  check("LP pressing it again turns looping off",
+        (bodies("/api/player/repeat").slice(-1)[0] || {}).state === "off",
+        JSON.stringify(bodies("/api/player/repeat").slice(-1)[0]));
+
+  // Spotify's third mode. Nothing here offers it, but if something else set
+  // it the button says so rather than showing an indistinguishable "on".
+  await paint({ repeat: "track" });
+  check("LP repeat-one is shown as itself",
+        loopTag().includes("np-loop on") && html().includes("loop-one"), `tag=${loopTag()}`);
+  resetLog();
+  run(`$("btn-now-loop").onclick()`);
+  await tick();
+  check("LP ...and pressing it stops looping rather than cycling onwards",
+        (bodies("/api/player/repeat").slice(-1)[0] || {}).state === "off",
+        JSON.stringify(bodies("/api/player/repeat").slice(-1)[0]));
+
+  // A refused press must not leave the button showing a state Spotify is not
+  // in — the optimistic paint is a promise, and this is it being kept.
+  await paint({ repeat: "off" });
+  routes["POST /api/player/repeat"] = { status: 400, body: { detail: "no active device" } };
+  run(`$("btn-now-loop").onclick()`);
+  await tick();
+  check("LP a refused press puts the button back where it was",
+        !loopTag().includes("np-loop on"), `tag=${loopTag()}`);
+  check("LP ...and says why",
+        /no active device/.test($$("toast").textContent),
+        JSON.stringify($$("toast").textContent.slice(0, 80)));
+  routes["POST /api/player/repeat"] = { status: 200, body: { ok: true } };
 }
 
 // ---- summary ---------------------------------------------------------------
