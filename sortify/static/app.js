@@ -1155,7 +1155,7 @@ function repollAfterPlaybackChange(prevUri = null) {
 // these buttons, so a `btn.disabled` set by hand survives only until the next
 // poll lands. It carries the uri it was pressed on because that is how Next
 // completes — see renderNow.
-let npPending = null;        // {verb: "next"|"remove", uri} while one is in flight
+let npPending = null;        // {verb: "next"|"remove"|"both", uri} while one is in flight
 let npPendingTimer = null;
 
 function setNpPending(verb, uri) {
@@ -1493,26 +1493,41 @@ function playbackStrip(d, tr) {
   // track starts; removedUri has its own expiry in renderNow). Sittings are
   // excluded: their decisions have no /api/undo.
   const lastAct = nowActionLog[nowActionLog.length - 1];
-  const undoable = (removedUri && removedUri === tr.uri) ||
-    (!d.sitting && lastAct && lastAct.uri === tr.uri);
+  // While a combined press is settling, the trio below must hold: the remove
+  // leg has already landed (removedUri is set), and without this suppression
+  // the strip would flash its Undo swap for the second the skip leg takes.
+  const bothBusy = npPending?.verb === "both" && npPending.uri === tr.uri;
+  const undoable = !bothBusy && ((removedUri && removedUri === tr.uri) ||
+    (!d.sitting && lastAct && lastAct.uri === tr.uri));
+  const nextBusy = npPending?.verb === "next";
+  const nextBtn = (shape) => `<button id="btn-now-next" class="${shape}${
+    nextBusy ? " np-busy" : ""}"${nextBusy ? " disabled" : ""} title="${
+    nextBusy ? "Skipping…" : "Skip to the next track"}">${ICON_NEXT}<span class="np-verb-label">${
+    nextBusy ? "Skipping…" : "Next"}</span></button>`;
+  // The verb row is the notched trio: Remove and Next extended toward each
+  // other, each ending in a concave cradle, with the combined Remove+Next
+  // circle in the notch — the moat around the circle IS the mis-tap buffer
+  // the old column gap used to be. It renders exactly when the left slot
+  // holds a Remove; the circle mirrors that button's live/dead state. With
+  // an Undo on offer, or in a sitting, combining is moot and the row falls
+  // back to the two-slot layout below, so Next keeps its place either way.
+  if (!undoable && !d.sitting) {
+    return `${bar}<div class="np-buttons"><div class="np-trio">
+      ${removeButton(d)}${bothButton(d)}${nextBtn("np-nshape np-nnext")}
+    </div></div>`;
+  }
+  // A sitting renders this strip too, and an input context never occurs
+  // there — an always-drawn Remove could only ever be dead weight, so the
+  // one place the slot still empties is the one place the verb can never
+  // apply.
   const removeBtn = undoable
     ? `<button id="btn-now-undo-remove" class="np-round np-wide np-undo"
                title="Undo the last action for this track (u)" aria-label="Undo the last action for this track">${ICON_UNDO}<span class="np-verb-label">Undo</span></button>`
-    // A sitting renders this strip too, and an input context never occurs
-    // there — an always-drawn Remove could only ever be dead weight, so the
-    // one place the slot still empties is the one place the verb can never
-    // apply.
-    : d.sitting ? "" : removeButton(d);
-  // The verb row is the two buttons the loop actually presses, as an equal
-  // pair of pills centred on the card: Remove left, Next right, a deliberate
-  // gap between them (removal is undoable now, but a mis-tap is still a
-  // mis-tap). Each half of the grid is reserved even when Remove is absent
-  // (a sitting), so Next never slides when the mode changes.
-  const nextBusy = npPending?.verb === "next";
+    : "";
   return `${bar}<div class="np-buttons">
     <span class="np-slot np-remove-slot">${removeBtn}</span>
     <span class="np-slot np-next-slot">
-      <button id="btn-now-next" class="np-round np-wide np-next${nextBusy ? " np-busy" : ""}"${nextBusy ? " disabled" : ""} title="${nextBusy ? "Skipping…" : "Skip to the next track"}">${ICON_NEXT}<span class="np-verb-label">${nextBusy ? "Skipping…" : "Next"}</span></button>
+      ${nextBtn("np-round np-wide np-next")}
     </span>
   </div>`;
 }
@@ -1590,14 +1605,36 @@ function removeState(d) {
 // aria-disabled rather than the `disabled` attribute, deliberately: a
 // disabled button swallows the tap, and being pressable — so `nowRemove` can
 // toast the reason — is the entire point of the dead state.
+// The outline that clip-path cannot draw: clipping a bordered button cuts
+// the border away along the cradle, so the notched Remove paints its own
+// edge as a stroked path. Geometry shared with the clip-paths in style.css
+// (keep the two in step): a 56px circle (r 28) plus an 8px moat cuts a
+// 36px-radius cradle out of each 164px pill end; the cut crosses the pill's
+// straight edges 22.6px from the trio's 150px centre (sqrt(36² − 28²)).
+const NP_REMOVE_EDGE = '<svg class="np-edge" viewBox="0 0 164 56" aria-hidden="true"><path d="M28 0 L127.4 0 A36 36 0 0 0 127.4 56 L28 56 A28 28 0 0 1 28 0 Z"/></svg>';
+
 function removeButton(d) {
   const { live, why } = removeState(d);
   const busy = npPending?.verb === "remove";
   const title = busy ? "Removing…" : live ? "Remove from input (r)" : why;
-  return `<button id="btn-now-remove" class="np-round np-wide ${
+  return `<button id="btn-now-remove" class="np-nshape np-nremove ${
     live ? "np-danger" : "np-dead"}${busy ? " np-busy" : ""}"${
     live ? "" : ' aria-disabled="true"'} title="${esc(title)}" aria-label="${esc(title)}">${
-    ICON_REMOVE}<span class="np-verb-label">${busy ? "Removing…" : "Remove"}</span></button>`;
+    NP_REMOVE_EDGE}${ICON_REMOVE}<span class="np-verb-label">${busy ? "Removing…" : "Remove"}</span></button>`;
+}
+
+// The circle in the notch: the Remove verb plus a skip, one press. It
+// mirrors Remove's live/dead matrix — and like Remove it is aria-disabled
+// rather than disabled when dead, because being pressable is the point: the
+// tap reaches nowBoth, which says why it cannot act.
+function bothButton(d) {
+  const { live, why } = removeState(d);
+  const busy = npPending?.verb === "both";
+  const title = busy ? "Removing…"
+              : live ? "Remove from input and skip to the next track" : why;
+  return `<button id="btn-now-both" class="np-both${live ? "" : " np-dead"}${
+    busy ? " np-busy" : ""}"${live ? "" : ' aria-disabled="true"'} title="${
+    esc(title)}" aria-label="${esc(title)}">${ICON_REMOVE}${ICON_NEXT}</button>`;
 }
 
 // Keeps the client-side `sitting` convenience global roughly in step with
@@ -1728,6 +1765,8 @@ function renderNow() {
   // simply never occurs).
   const rem = $("btn-now-remove");
   if (rem) rem.onclick = nowRemove;
+  const both = $("btn-now-both");
+  if (both) both.onclick = nowBoth;
   const undoRem = $("btn-now-undo-remove");
   if (undoRem) undoRem.onclick = undoStripAction;
   const sh = $("btn-share");
@@ -2065,6 +2104,35 @@ async function nowCreateAndFile(name) {
   } catch (e) { toast(e.message); }
 }
 
+// The remove leg shared by Remove and the combined circle: the /api/act call
+// and every piece of bookkeeping a successful removal owes the card. Toasts
+// its own success; a failure propagates — the caller decides what it aborts.
+async function removeFromInput(d, tr) {
+  // Same sweep as filing, same reason: rejecting a song is as final a
+  // decision as giving it a home.
+  const res = await api("/api/act", { action: "remove", uri: tr.uri,
+                                      from_id: d.context.id, sweep_inputs: true });
+  nowActions++;
+  // The input's own name: the card pairs it with "removed from", so the
+  // label is the place it left rather than a sentence about nowhere.
+  filedUris[tr.uri] = d.context.name || "the input";
+  nowActionLog.push({ uri: tr.uri, kind: "home" });
+  // Blind mode blurred this track so the ear would decide, not the name.
+  // That decision is spent the moment it leaves the input, so say what left
+  // — otherwise the input quietly loses a track you never got to see. It is
+  // the same peek a tap sets, so renderNow expires it when the next track
+  // starts and the following one is blind again.
+  if (blindMode) {
+    peekedUri = tr.uri;
+    document.body.classList.add("peeked");
+  }
+  removedUri = tr.uri;
+  // Names the list. "removed from input" said only that something happened;
+  // the card beside it already names the place, and the toast disagreeing
+  // with it by being vaguer is a wasted line.
+  toast(`removed from ${d.context.name || "input"}` + sweptSuffix(res.swept));
+}
+
 async function nowRemove() {
   const d = nowState, tr = d.track;
   // Says why instead of returning in silence. Reached from the greyed button
@@ -2075,31 +2143,41 @@ async function nowRemove() {
   if (npPending) return;
   setNpPending("remove", tr.uri);
   try {
-    // Same sweep as filing, same reason: rejecting a song is as final a
-    // decision as giving it a home.
-    const res = await api("/api/act", { action: "remove", uri: tr.uri,
-                                        from_id: d.context.id, sweep_inputs: true });
-    nowActions++;
-    // The input's own name: the card pairs it with "removed from", so the
-    // label is the place it left rather than a sentence about nowhere.
-    filedUris[tr.uri] = d.context.name || "the input";
-    nowActionLog.push({ uri: tr.uri, kind: "home" });
-    // Blind mode blurred this track so the ear would decide, not the name.
-    // That decision is spent the moment it leaves the input, so say what left
-    // — otherwise the input quietly loses a track you never got to see. It is
-    // the same peek a tap sets, so renderNow expires it when the next track
-    // starts and the following one is blind again.
-    if (blindMode) {
-      peekedUri = tr.uri;
-      document.body.classList.add("peeked");
-    }
-    removedUri = tr.uri;
-    // Names the list. "removed from input" said only that something happened;
-    // the card beside it already names the place, and the toast disagreeing
-    // with it by being vaguer is a wasted line.
-    toast(`removed from ${d.context.name || "input"}` + sweptSuffix(res.swept));
+    await removeFromInput(d, tr);
   } catch (e) { toast(e.message); }
   finally { clearNpPending(); renderNow(); }
+}
+
+// The circle's press: remove, then skip — in that order, and the skip only
+// after the removal has landed. Skipping a track that was NOT removed would
+// lose it un-decided, so a failed remove leg aborts the whole press.
+async function nowBoth() {
+  const d = nowState, tr = d.track;
+  const { live, why } = removeState(d);
+  if (!live) { toast(why); return; }
+  if (npPending) return;
+  setNpPending("both", tr.uri);
+  try {
+    await removeFromInput(d, tr);
+  } catch (e) {
+    toast(e.message);
+    clearNpPending();
+    renderNow();
+    return;
+  }
+  try {
+    await api("/api/player/next", {});
+    // As for Next alone: the POST returning only means Spotify accepted the
+    // skip. The press finishes when the new track is on screen, which is
+    // what the settle repoll brings — renderNow clears the pending when the
+    // track changes, and setNpPending's timeout backstops a skip that never
+    // lands.
+    repollAfterPlaybackChange(tr.uri);
+  } catch (e) {
+    toast(e.message);
+    clearNpPending();
+    renderNow();
+  }
 }
 
 // The strip's own undo, offered only for the track it was removed from. The

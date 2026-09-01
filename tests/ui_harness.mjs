@@ -2065,12 +2065,14 @@ run("stopNowPolling()");
         at('id="btn-now-remove"') !== -1 &&
         at('id="btn-now-remove"') < at('minor-actions'),
         `remove@${at('id="btn-now-remove"')} minor@${at('minor-actions')}`);
+  // The verb row is the notched trio now: Remove and Next extend toward each
+  // other and the combined Remove+Next circle sits in the notch between them.
   check("RB it is inside the transport button group",
         at('np-buttons') !== -1 &&
         at('np-buttons') < at('id="btn-now-remove"') &&
-        at('id="btn-now-remove"') < at('np-next-slot'),
+        at('id="btn-now-remove"') < at('id="btn-now-both"'),
         `buttons@${at('np-buttons')} remove@${at('id="btn-now-remove"')} ` +
-        `next-slot@${at('np-next-slot')}`);
+        `both@${at('id="btn-now-both"')}`);
   // The freshness signal is the bar itself now: a thin yellow marker sits
   // inside the green fill at the position the server last confirmed, and the
   // fill running ahead of it is local extrapolation — the gap IS the age.
@@ -2081,14 +2083,14 @@ run("stopNowPolling()");
         at('id="np-fill"') !== -1 && at('id="np-fill-mark"') !== -1 &&
         at('id="np-fill"') < at('id="np-fill-mark"'),
         `fill@${at('id="np-fill"')} mark@${at('id="np-fill-mark"')}`);
-  // The verb row is a centred pair: Remove left of Next, each in its own
-  // slot with the deliberate gap between them, so the two most-pressed
-  // buttons read as equals.
-  check("RB remove sits left of Next in the verb pair",
+  // The verb row is a centred trio: Remove left, Next right, the combined
+  // circle notched between them — the moat around the circle is the mis-tap
+  // buffer the old column gap used to be.
+  check("RB remove sits left of Next in the verb trio",
         at('id="btn-now-remove"') < at('id="btn-now-next"') &&
-        at('np-remove-slot') !== -1,
+        at('np-trio') !== -1,
         `remove@${at('id="btn-now-remove"')} next@${at('id="btn-now-next"')} ` +
-        `slot@${at('np-remove-slot')}`);
+        `trio@${at('np-trio')}`);
   // The quiet controls flank the progress bar — previous at its left end
   // (back = left), pause at its right — and both stay out of the verb row.
   check("RB previous flanks the bar's left end, pause its right",
@@ -2116,10 +2118,10 @@ run("stopNowPolling()");
   check("RB the remove button is not live when the context is not an input",
         at('np-danger') === -1 && at('id="btn-now-remove"') !== -1,
         `danger@${at('np-danger')} remove@${at('id="btn-now-remove"')}`);
-  // The slot stays so play/pause and Next never shift sideways when the
-  // context changes — the same instinct as 1f8ae2c.
-  check("RB the reserved slot survives so the transport never shifts",
-        at('np-remove-slot') !== -1, `slot@${at('np-remove-slot')}`);
+  // The trio stays so Next never shifts sideways when the context changes —
+  // the same instinct as 1f8ae2c, carried into the notched layout.
+  check("RB the trio survives so the transport never shifts",
+        at('np-trio') !== -1, `trio@${at('np-trio')}`);
 }
 
 // ============================================================================
@@ -3031,8 +3033,8 @@ run("stopNowPolling()");
   check("RG ...as aria-disabled, so the tap still reaches a handler",
         removeTag().includes('aria-disabled="true"') && !/\sdisabled/.test(removeTag()),
         `tag=${removeTag()}`);
-  check("RG the reserved slot still survives so the transport never shifts",
-        html().includes("np-remove-slot"), `html=${html().slice(0, 200)}`);
+  check("RG the trio still survives so the transport never shifts",
+        html().includes("np-trio"), `html=${html().slice(0, 200)}`);
 
   // The case that shipped as a lying button: the context IS the input, but the
   // song has already been filed out of it. Only the membership flag knows.
@@ -3476,6 +3478,168 @@ run("stopNowPolling()");
         /no active device/.test($$("toast").textContent),
         JSON.stringify($$("toast").textContent.slice(0, 80)));
   routes["POST /api/player/repeat"] = { status: 200, body: { ok: true } };
+}
+
+// ============================================================================
+// NC — the verb row is a notched trio: Remove and Next extend toward each
+// other and a combined Remove+Next circle sits in the notch between them,
+// carved free by a moat (the moat IS the mis-tap buffer the old column gap
+// used to be). The circle is the Remove verb plus a skip — one press, both
+// legs, remove first — so it mirrors Remove's live/dead matrix exactly, and
+// it dissolves back to the two-slot layout in the states where combining is
+// moot: an Undo on offer, or a sitting. Direction chosen 2026-09-01 from the
+// "Remove + Next Overlap" mockups.
+// ============================================================================
+{
+  const nowBody = (opts = {}) => ({
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri: opts.uri || "spotify:track:nc1", name: "Song",
+               duration_ms: 200000, artists: [{ name: "Artist" }],
+               sortable: true, image: null },
+      context: { id: "IN1", name: "[Notch]", is_input: opts.isInput !== false },
+      sitting: opts.sitting || null, suggestions: [],
+      homes: [{ id: "H1", name: "Home", folder: "" }],
+      subset_targets: [], subsets: [],
+      inputs: [{ id: "IN1", name: "[Notch]", has_track: true, set: "buffer" }],
+      homeless_id: null,
+    },
+  });
+  const html = () => $$("now-card").innerHTML;
+  const at = (needle) => html().indexOf(needle);
+  const has = (needle) => html().includes(needle);
+  const bothTag = () => (html().match(/<button id="btn-now-both"[^>]*>/) || [""])[0];
+  const removeTag = () => (html().match(/<button id="btn-now-remove"[^>]*>/) || [""])[0];
+  const paint = async (opts) => {
+    setNow(nowBody(opts));
+    run(`filedUris = {}; removedUri = null; nowActions = 0; nowActionLog = []; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+  };
+  try {
+    // Open by setting the state the block needs: a hidden Now view makes
+    // pollNow a silent no-op and every assertion below would read whatever
+    // card the previous block left behind.
+    $$("view-now").hidden = false;
+    routes["POST /api/act"] = { status: 200, body: {} };
+    routes["POST /api/player/next"] = { status: 200, body: { ok: true } };
+    await paint({ uri: "spotify:track:nc1" });
+
+    check("NC an input context renders the notched trio, not the slot pair",
+          at("np-trio") !== -1 && at("np-remove-slot") === -1 && at("np-next-slot") === -1,
+          `trio@${at("np-trio")} rslot@${at("np-remove-slot")} nslot@${at("np-next-slot")}`);
+    check("NC order: Remove, then the circle, then Next",
+          at('id="btn-now-remove"') !== -1 &&
+          at('id="btn-now-remove"') < at('id="btn-now-both"') &&
+          at('id="btn-now-both"') < at('id="btn-now-next"'),
+          `remove@${at('id="btn-now-remove"')} both@${at('id="btn-now-both"')} ` +
+          `next@${at('id="btn-now-next"')}`);
+    check("NC the live circle is live — no dead class, no aria-disabled, both legs named",
+          bothTag() !== "" && !bothTag().includes("np-dead") &&
+          !bothTag().includes("aria-disabled") && /skip/i.test(bothTag()),
+          `tag=${bothTag()}`);
+    check("NC remove keeps its danger identity inside the trio",
+          at("np-trio") !== -1 && removeTag().includes("np-danger"),
+          `trio@${at("np-trio")} tag=${removeTag()}`);
+
+    // One press, both legs, remove first. The wiring is a failed check, not
+    // an exception that takes the rest of the block down.
+    resetLog();
+    const wired = run(`typeof $("btn-now-both")?.onclick === "function"`);
+    check("NC the circle is wired", !!wired, `onclick=${wired}`);
+    if (wired) { run(`$("btn-now-both").onclick()`); await tick(); }
+    const actIdx = log.findIndex((c) => c.path === "/api/act");
+    const nextIdx = log.findIndex((c) => c.path === "/api/player/next");
+    check("NC one press spends the remove leg, then the skip, in that order",
+          posts("/api/act") === 1 && posts("/api/player/next") === 1 &&
+          actIdx !== -1 && nextIdx !== -1 && actIdx < nextIdx,
+          `act@${actIdx} next@${nextIdx} acts=${posts("/api/act")} skips=${posts("/api/player/next")}`);
+    const actBody = bodies("/api/act")[0] || {};
+    check("NC the remove leg is Remove itself — same action, same sweep",
+          actBody.action === "remove" && actBody.from_id === "IN1" &&
+          actBody.sweep_inputs === true, JSON.stringify(actBody));
+    // While the press is settling, a re-render must hold the trio: the
+    // removal has already landed (removedUri is set), and without the hold
+    // the strip would flash its Undo swap for the second the skip takes.
+    run("renderNow()");
+    check("NC in flight the circle is busy and the trio holds — no Undo flash",
+          bothTag().includes("np-busy") && has("np-trio") &&
+          !has('id="btn-now-undo-remove"'),
+          `tag=${bothTag()} undo=${has('id="btn-now-undo-remove"')}`);
+    if (wired) { run(`$("btn-now-both").onclick()`); await tick(); }
+    check("NC a second press while pending spends nothing",
+          posts("/api/act") === 1 && posts("/api/player/next") === 1,
+          `acts=${posts("/api/act")} skips=${posts("/api/player/next")}`);
+
+    // The new track is the finish line, exactly as for Next alone: pending
+    // clears, the undo offer expires with the track it was about, and the
+    // fresh card gets a fresh trio.
+    setNow(nowBody({ uri: "spotify:track:nc2" }));
+    run(`pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+    check("NC the settling track clears the pending and the undo offer",
+          run("npPending") === null && run("removedUri") === null &&
+          has("np-trio") && has('id="btn-now-both"') &&
+          !has('id="btn-now-undo-remove"'),
+          `pending=${JSON.stringify(run("npPending"))} undo=${has('id="btn-now-undo-remove"')}`);
+
+    // The circle mirrors Remove's matrix: outside an input it is drawn dead —
+    // aria-disabled, not disabled, so the tap still reaches the explanation.
+    await paint({ isInput: false, uri: "spotify:track:nc3" });
+    check("NC outside an input the circle is drawn dead",
+          bothTag().includes("np-dead") && bothTag().includes('aria-disabled="true"') &&
+          !/\sdisabled/.test(bothTag()), `tag=${bothTag()}`);
+    resetLog();
+    $$("toast").textContent = "";
+    const deadWired = run(`typeof $("btn-now-both")?.onclick === "function"`);
+    if (deadWired) { run(`$("btn-now-both").onclick()`); await tick(); }
+    check("NC pressing the dead circle says why, and spends nothing",
+          /input list/i.test($$("toast").textContent) &&
+          posts("/api/act") === 0 && posts("/api/player/next") === 0,
+          `toast=${JSON.stringify($$("toast").textContent.slice(0, 80))} ` +
+          `acts=${posts("/api/act")} skips=${posts("/api/player/next")}`);
+
+    // A failed remove leg aborts the skip: removing is the decision, skipping
+    // is only its consequence, and skipping a track that was NOT removed
+    // would lose it un-decided.
+    await paint({ uri: "spotify:track:nc4" });
+    routes["POST /api/act"] = { status: 500, body: { error: "nope" } };
+    resetLog();
+    const wired4 = run(`typeof $("btn-now-both")?.onclick === "function"`);
+    if (wired4) { run(`$("btn-now-both").onclick()`); await tick(); }
+    check("NC a failed remove leg aborts the skip and releases the press",
+          has('id="btn-now-both"') && posts("/api/act") === 1 &&
+          posts("/api/player/next") === 0 && run("npPending") === null,
+          `acts=${posts("/api/act")} skips=${posts("/api/player/next")} ` +
+          `pending=${JSON.stringify(run("npPending"))}`);
+
+    // A lone Remove dissolves the trio: the Undo takes the old two-slot
+    // layout, because a combined verb for an already-removed track is moot.
+    routes["POST /api/act"] = { status: 200, body: {} };
+    await paint({ uri: "spotify:track:nc5" });
+    await run(`nowRemove()`);
+    await tick();
+    check("NC a lone Remove dissolves the trio back to the slot pair",
+          !has('id="btn-now-both"') && !has("np-trio") &&
+          has("np-remove-slot") && has('id="btn-now-undo-remove"'),
+          `both=${has('id="btn-now-both"')} trio=${has("np-trio")} ` +
+          `undo=${has('id="btn-now-undo-remove"')}`);
+
+    // A sitting never has an input context, so it gets neither circle nor
+    // trio — the old empty-slot layout, unchanged.
+    await paint({ isInput: false, uri: "spotify:track:nc6",
+                  sitting: { split_id: "S1", pile_id: "p1", pile_name: "x",
+                             uris: ["spotify:track:nc6"], decided: {} } });
+    check("NC a sitting draws neither circle nor trio",
+          !has('id="btn-now-both"') && !has("np-trio") && has("np-remove-slot"),
+          `both=${has('id="btn-now-both"')} trio=${has("np-trio")}`);
+  } finally {
+    routes["POST /api/act"] = { status: 200, body: {} };
+    run("stopNowPolling()");
+    $$("view-now").hidden = false;
+  }
 }
 
 // ---- summary ---------------------------------------------------------------

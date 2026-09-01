@@ -410,29 +410,6 @@ header .icon-btn::after {
   width: 136px; height: 56px; border-radius: 999px;
   gap: .5rem; padding: 0; font-size: .95rem; font-weight: 600;
 }
-/* Outline, not filled: Remove is Next's equal in the pair, but it is still
-   the destructive half, and a filled red pill mirroring a filled dark one
-   would invite pressing them interchangeably. MUST stay after .np-wide —
-   both are (0,2,0), so source order alone decides, and placed any earlier
-   the filled background silently wins (which is exactly what happened). */
-.np-round.np-danger {
-  background: transparent; color: var(--danger);
-  border: 2px solid var(--danger);
-}
-.np-round.np-danger:hover { border-color: var(--danger); opacity: .8; }
-/* Drawn but dead. Remove is always in its slot now, so the unavailable state
-   needs a look of its own — neutral, not a washed-out red: a destructive
-   colour at 40% still reads as a warning and there is nothing here to warn
-   about. It is aria-disabled rather than truly disabled (a disabled button
-   swallows the tap, and pressing it is how you learn why it cannot act), so
-   the dead look has to be spelled out here instead of falling out of
-   button:disabled. */
-.np-round.np-dead {
-  background: transparent; color: var(--muted);
-  border: 2px solid var(--border); opacity: .55; cursor: default;
-}
-.np-round.np-dead:hover { border-color: var(--border); opacity: .55; }
-.np-round.np-dead:active { transform: none; }
 /* In flight. The dimming and the label ("Skipping…", "Removing…") carry the
    state on their own; the icon holds still. These glyphs used to rotate on
    the triage spinner's keyframes, for the sake of one rotation vocabulary
@@ -449,6 +426,82 @@ header .icon-btn::after {
   border: 2px solid var(--border);
 }
 .np-round.np-undo:hover { border-color: var(--fg); opacity: .8; }
+
+/* The notched trio: Remove and Next extend toward each other and the
+   combined Remove+Next circle sits in the notch between them, carved free by
+   a moat — the moat IS the mis-tap buffer the old 2.4rem column gap used to
+   be, so a tap that misses the circle lands on nothing rather than on a
+   verb. Geometry (shared with NP_REMOVE_EDGE in app.js — keep in step): the
+   56px circle (r 28) plus an 8px moat cuts a 36px-radius cradle out of each
+   164px pill end; the cut crosses the pills' straight edges 22.6px from the
+   trio's 150px centre (sqrt(36² − 28²) = 22.6). clip-path does double duty:
+   it draws Next's shape and, on both buttons, clips the HIT area to the
+   shape, so the moat is genuinely dead space. */
+.np-trio { position: relative; width: 300px; height: 56px; margin: 0 auto; }
+.np-nshape {
+  position: absolute; top: 0; width: 164px; height: 56px;
+  min-height: 0; padding: 0; border: 0; border-radius: 0; background: transparent;
+  display: inline-flex; align-items: center; justify-content: center; gap: .5rem;
+  font-size: .95rem; font-weight: 600;
+}
+.np-nshape svg { display: block; }
+.np-nremove {
+  left: 0; padding-right: 50px;
+  clip-path: path("M28 0 L127.4 0 A36 36 0 0 0 127.4 56 L28 56 A28 28 0 0 1 28 0 Z");
+}
+/* Remove's outline is drawn, not bordered: a clipped border vanishes along
+   the cradle, so the edge is the stroked path the button carries
+   (NP_REMOVE_EDGE). Stroke 4, centred on the clip boundary: the outer half
+   is clipped away, leaving the same 2px the old border drew. */
+.np-nremove .np-edge { position: absolute; inset: 0; }
+.np-nremove .np-edge path { fill: none; stroke: currentColor; stroke-width: 4; }
+/* Outline, not filled: Remove is Next's equal in the trio, but it is still
+   the destructive third, and a filled red shape mirroring the filled dark
+   one would invite pressing them interchangeably. */
+.np-nshape.np-danger { background: transparent; color: var(--danger); border: 0; }
+.np-nnext {
+  right: 0; padding-left: 50px;
+  clip-path: path("M136 0 L36.6 0 A36 36 0 0 1 36.6 56 L136 56 A28 28 0 0 0 136 0 Z");
+  background: var(--fg); color: var(--bg);
+}
+.np-nshape:hover { opacity: .88; border: 0; }
+/* Drawn but dead: neutral, not a washed-out red — a destructive colour at
+   40% still reads as a warning and there is nothing here to warn about. It
+   is aria-disabled rather than truly disabled (a disabled button swallows
+   the tap, and pressing it is how you learn why it cannot act), so the dead
+   look is spelled out here instead of falling out of button:disabled. */
+.np-nshape.np-dead {
+  background: transparent; color: var(--muted); opacity: .55; cursor: default;
+  border: 0;
+}
+.np-nshape.np-dead .np-edge path { stroke: var(--border); }
+.np-nshape.np-dead:hover { opacity: .55; }
+.np-nshape.np-dead:active { transform: none; }
+.np-nshape.np-busy { opacity: .7; cursor: default; }
+.np-nshape.np-busy:active { transform: none; }
+/* The circle: both verbs at once, so it wears both looks at once — a blend
+   running from Remove's red to Next's fill. var(--fg) is the light pill in
+   dark mode, so the blend runs red-to-light there and the glyphs (--bg)
+   flip dark with it, exactly as the mockup settled. */
+.np-both {
+  position: absolute; left: 122px; top: 0; width: 56px; height: 56px;
+  min-height: 0; padding: 0; border: 0; border-radius: 50%;
+  background: linear-gradient(135deg, var(--danger) 0%,
+    color-mix(in srgb, var(--danger) 55%, var(--fg)) 46%, var(--fg) 100%);
+  color: var(--bg); box-shadow: 0 3px 10px rgba(0, 0, 0, .25);
+  display: inline-flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 3px;
+}
+.np-both svg { display: block; width: 14px; height: 14px; }
+.np-both:hover { opacity: .88; border: 0; }
+.np-both.np-dead {
+  background: transparent; border: 2px solid var(--border); color: var(--muted);
+  opacity: .55; box-shadow: none; cursor: default;
+}
+.np-both.np-dead:hover { opacity: .55; border-color: var(--border); }
+.np-both.np-dead:active { transform: none; }
+.np-both.np-busy { opacity: .7; cursor: default; }
+.np-both.np-busy:active { transform: none; }
 
 .sugg {
   /* Roomier than the text strictly needs. Clamping the reason to one line
