@@ -432,9 +432,9 @@ header .icon-btn::after {
    a moat — the moat IS the mis-tap buffer the old 2.4rem column gap used to
    be, so a tap that misses the circle lands on nothing rather than on a
    verb. Geometry (shared with NP_REMOVE_EDGE in app.js — keep in step): the
-   56px circle (r 28) plus an 8px moat cuts a 36px-radius cradle out of each
-   164px pill end; the cut crosses the pills' straight edges 22.6px from the
-   trio's 150px centre (sqrt(36² − 28²) = 22.6). clip-path does double duty:
+   56px circle (r 28) plus an 11px moat cuts a 39px-radius cradle out of each
+   164px pill end; the cut crosses the pills' straight edges 27.1px from the
+   trio's 150px centre (sqrt(39² − 28²) = 27.1). clip-path does double duty:
    it draws Next's shape and, on both buttons, clips the HIT area to the
    shape, so the moat is genuinely dead space. */
 /* The wrapper's two-column grid is for the slot pair below; the trio must
@@ -450,8 +450,8 @@ header .icon-btn::after {
 }
 .np-nshape svg { display: block; }
 .np-nremove {
-  left: 0; padding-right: 50px;
-  clip-path: path("M28 0 L127.4 0 A36 36 0 0 0 127.4 56 L28 56 A28 28 0 0 1 28 0 Z");
+  left: 0; padding-right: 53px;
+  clip-path: path("M28 0 L122.9 0 A39 39 0 0 0 122.9 56 L28 56 A28 28 0 0 1 28 0 Z");
 }
 /* Remove's outline is drawn, not bordered: a clipped border vanishes along
    the cradle, so the edge is the stroked path the button carries
@@ -464,8 +464,8 @@ header .icon-btn::after {
    one would invite pressing them interchangeably. */
 .np-nshape.np-danger { background: transparent; color: var(--danger); border: 0; }
 .np-nnext {
-  right: 0; padding-left: 50px;
-  clip-path: path("M136 0 L36.6 0 A36 36 0 0 1 36.6 56 L136 56 A28 28 0 0 0 136 0 Z");
+  right: 0; padding-left: 53px;
+  clip-path: path("M136 0 L41.1 0 A39 39 0 0 1 41.1 56 L136 56 A28 28 0 0 0 136 0 Z");
   background: var(--fg); color: var(--bg);
 }
 .np-nshape:hover { opacity: .88; border: 0; }

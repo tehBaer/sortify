@@ -1610,10 +1610,10 @@ function removeState(d) {
 // The outline that clip-path cannot draw: clipping a bordered button cuts
 // the border away along the cradle, so the notched Remove paints its own
 // edge as a stroked path. Geometry shared with the clip-paths in style.css
-// (keep the two in step): a 56px circle (r 28) plus an 8px moat cuts a
-// 36px-radius cradle out of each 164px pill end; the cut crosses the pill's
-// straight edges 22.6px from the trio's 150px centre (sqrt(36² − 28²)).
-const NP_REMOVE_EDGE = '<svg class="np-edge" viewBox="0 0 164 56" aria-hidden="true"><path d="M28 0 L127.4 0 A36 36 0 0 0 127.4 56 L28 56 A28 28 0 0 1 28 0 Z"/></svg>';
+// (keep the two in step): a 56px circle (r 28) plus an 11px moat cuts a
+// 39px-radius cradle out of each 164px pill end; the cut crosses the pill's
+// straight edges 27.1px from the trio's 150px centre (sqrt(39² − 28²)).
+const NP_REMOVE_EDGE = '<svg class="np-edge" viewBox="0 0 164 56" aria-hidden="true"><path d="M28 0 L122.9 0 A39 39 0 0 0 122.9 56 L28 56 A28 28 0 0 1 28 0 Z"/></svg>';
 
 function removeButton(d) {
   const { live, why } = removeState(d);
