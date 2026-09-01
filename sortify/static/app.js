@@ -1512,7 +1512,9 @@ function playbackStrip(d, tr) {
   // an Undo on offer, or in a sitting, combining is moot and the row falls
   // back to the two-slot layout below, so Next keeps its place either way.
   if (!undoable && !d.sitting) {
-    return `${bar}<div class="np-buttons"><div class="np-trio">
+    // np-buttons-trio: the wrapper's grid is for the slot pair — a trio left
+    // inside it lands in the first 1fr column, ~25px left of centre.
+    return `${bar}<div class="np-buttons np-buttons-trio"><div class="np-trio">
       ${removeButton(d)}${bothButton(d)}${nextBtn("np-nshape np-nnext")}
     </div></div>`;
   }

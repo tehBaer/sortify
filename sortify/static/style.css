@@ -437,6 +437,10 @@ header .icon-btn::after {
    trio's 150px centre (sqrt(36² − 28²) = 22.6). clip-path does double duty:
    it draws Next's shape and, on both buttons, clips the HIT area to the
    shape, so the moat is genuinely dead space. */
+/* The wrapper's two-column grid is for the slot pair below; the trio must
+   opt out of it or it lands in the first 1fr column, ~25px left of the
+   card's centre. */
+.np-buttons.np-buttons-trio { display: flex; justify-content: center; }
 .np-trio { position: relative; width: 300px; height: 56px; margin: 0 auto; }
 .np-nshape {
   position: absolute; top: 0; width: 164px; height: 56px;

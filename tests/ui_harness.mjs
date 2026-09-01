@@ -3529,6 +3529,12 @@ run("stopNowPolling()");
     check("NC an input context renders the notched trio, not the slot pair",
           at("np-trio") !== -1 && at("np-remove-slot") === -1 && at("np-next-slot") === -1,
           `trio@${at("np-trio")} rslot@${at("np-remove-slot")} nslot@${at("np-next-slot")}`);
+    // .np-buttons is a two-column grid for the slot pair; a trio left inside
+    // it lands in the first column and sits ~25px left of the card's centre.
+    // The modifier is what opts the wrapper out, so the markup must carry it.
+    check("NC the trio's wrapper opts out of the two-column grid, so it centres",
+          has("np-buttons np-buttons-trio"),
+          `wrapper=${(html().match(/<div class="np-buttons[^"]*"/) || [""])[0]}`);
     check("NC order: Remove, then the circle, then Next",
           at('id="btn-now-remove"') !== -1 &&
           at('id="btn-now-remove"') < at('id="btn-now-both"') &&
@@ -3623,6 +3629,7 @@ run("stopNowPolling()");
     await tick();
     check("NC a lone Remove dissolves the trio back to the slot pair",
           !has('id="btn-now-both"') && !has("np-trio") &&
+          !has("np-buttons-trio") &&
           has("np-remove-slot") && has('id="btn-now-undo-remove"'),
           `both=${has('id="btn-now-both"')} trio=${has("np-trio")} ` +
           `undo=${has('id="btn-now-undo-remove"')}`);
