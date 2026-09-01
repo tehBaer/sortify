@@ -483,25 +483,42 @@ header .icon-btn::after {
 .np-nshape.np-dead:active { transform: none; }
 .np-nshape.np-busy { opacity: .7; cursor: default; }
 .np-nshape.np-busy:active { transform: none; }
-/* The circle: both verbs at once, so it wears both looks at once — a blend
-   running from Remove's red to Next's fill. var(--fg) is the light pill in
-   dark mode, so the blend runs red-to-light there and the glyphs (--bg)
-   flip dark with it, exactly as the mockup settled. */
+/* The circle: both verbs at once, hollow like the outlined Remove — but the
+   ring keeps both identities, a blend running from Remove's red to Next's
+   fill on the same diagonal the filled circle wore. var(--fg) is the light
+   pill in dark mode, so the blend runs red-to-light there. */
 .np-both {
   position: absolute; left: 122px; top: 0; width: 56px; height: 56px;
   min-height: 0; padding: 0; border: 0; border-radius: 50%;
-  background: linear-gradient(135deg, var(--danger) 0%,
-    color-mix(in srgb, var(--danger) 55%, var(--fg)) 46%, var(--fg) 100%);
-  color: var(--bg); box-shadow: 0 3px 10px rgba(0, 0, 0, .25);
+  background: transparent;
   display: inline-flex; flex-direction: column; align-items: center;
   justify-content: center; gap: 3px;
 }
+/* A border cannot carry a gradient around a curve, so the ring is a masked
+   pseudo-element: the blend painted as a disc, everything but the outer 2px
+   masked away. On the element itself a mask would take the glyphs with it. */
+.np-both::before {
+  content: ""; position: absolute; inset: 0; border-radius: 50%;
+  background: linear-gradient(135deg, var(--danger) 0%,
+    color-mix(in srgb, var(--danger) 55%, var(--fg)) 46%, var(--fg) 100%);
+  -webkit-mask: radial-gradient(closest-side,
+    transparent calc(100% - 2.5px), #000 calc(100% - 1.5px));
+  mask: radial-gradient(closest-side,
+    transparent calc(100% - 2.5px), #000 calc(100% - 1.5px));
+}
 .np-both svg { display: block; width: 14px; height: 14px; }
+/* The glyphs split the identities the ring blends: remove wears the danger
+   half, next the fill half. */
+.np-both svg:first-of-type { color: var(--danger); }
+.np-both svg:last-of-type { color: var(--fg); }
 .np-both:hover { opacity: .88; border: 0; }
 .np-both.np-dead {
-  background: transparent; border: 2px solid var(--border); color: var(--muted);
-  opacity: .55; box-shadow: none; cursor: default;
+  border: 2px solid var(--border);
+  opacity: .55; cursor: default;
 }
+.np-both.np-dead::before { content: none; }
+/* After the split rules, same specificity: source order greys both glyphs. */
+.np-both.np-dead svg { color: var(--muted); }
 .np-both.np-dead:hover { opacity: .55; border-color: var(--border); }
 .np-both.np-dead:active { transform: none; }
 .np-both.np-busy { opacity: .7; cursor: default; }
