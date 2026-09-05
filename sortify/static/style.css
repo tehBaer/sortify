@@ -555,6 +555,33 @@ header .icon-btn::after {
   overflow-y: auto; overscroll-behavior: contain;
   padding-right: 2px;
 }
+/* Inboxes go two to a row. A home suggestion is a ranked guess and its
+   sub-line is the reason to trust it, so it earns the full width; an inbox
+   row is a name and a size, and what you want from that list is all of it in
+   view at once rather than a ranking to scroll.
+   Only a COLUMN gap is added: the rows keep their own margin-bottom, so the
+   grid's row pitch is exactly the pitch capSuggScroll measures and the box
+   stays the same height — it simply holds six inboxes where it held three
+   homes. */
+.sugg-scroll.cap-grid {
+  display: grid; grid-template-columns: 1fr 1fr;
+  column-gap: .5rem; align-content: start;
+}
+/* Add to… spans both columns: it is the way out of the list, not an entry
+   in it, and half a row wide it would read as one more inbox. Both shapes are
+   named because the row has two: a bare button, and a wrapped pair once it
+   carries a search half beside it. Matching only the wrapper would silently
+   drop the span back to one column if that pairing ever goes away. */
+.sugg-scroll.cap-grid > .sugg-wrap,
+.sugg-scroll.cap-grid > .sugg-more { grid-column: 1 / -1; }
+/* At half width a long playlist name has to clip rather than wrap — a wrapped
+   name makes one row taller than the one beside it, which breaks both the
+   grid's alignment and the uniform pitch capSuggScroll depends on. The
+   sub-line already clamps this way; at this width the name needs it too. */
+.sugg-capture { padding-left: .75rem; padding-right: .75rem; }
+.sugg-capture .s-name {
+  display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 /* Add to… ends the list, so it has to read as an exit from it rather than as
    one more home: no card fill, a dashed edge, and the muted weight of a
    fallback. The dash going solid on hover is the only state change it needs. */
@@ -814,8 +841,12 @@ body.blind:not(.peeked) #now-card .art img,
 body.blind:not(.peeked) #now-card .art .noimg { filter: blur(18px) grayscale(1) brightness(.7); }
 /* Reasons leak artist names, so they blur — but Add to…'s line is a
    description of the control, not evidence about the track, and blurring it
-   only made the way out of blind mode unreadable. */
-body.blind:not(.peeked) #now-card .sugg:not(.sugg-more) .s-why { filter: blur(5px); }
+   only made the way out of blind mode unreadable. An inbox row's line is the
+   same kind of thing (its set and its size), and it is the whole card on an
+   adrift song, so it is excluded for the same reason rather than a new one. */
+body.blind:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
+  filter: blur(5px);
+}
 #btn-blind.on { color: var(--accent); }
 
 #toast {

@@ -1416,13 +1416,25 @@ function rememberInput(ctx) {
 // The suggest phase gates it because membership is exactly what that phase
 // answers: during phase 1 `suggestions` is empty, and reading that as "in no
 // home" would flash the banner onto every fresh card.
-function adrift(d) {
+function unfiled(d) {
   if (!d.playing || d.suggPending || d.suggError) return false;
   if (d.context?.is_input) return false;
   if ((d.inputs || []).some((l) => l.has_track)) return false;
   if ((d.suggestions || []).some((s) => s.already)) return false;
   return true;
 }
+
+// The banner is strictly narrower than the rows, and the two must not be
+// confused again. Being unfiled is a fact about the SONG — it is in no inbox
+// and no home — and the inbox rows answer it wherever it occurs, including on
+// a playlist you deliberately put on. The banner is about PLAYBACK having
+// drifted out of an inbox on its own: the list ran out and Spotify carried
+// on. Choosing to play Discover Weekly is not drift, and telling you it is
+// "not one of your inputs" is a complaint about a decision you just made.
+//
+// No playlist context at all is the signature. (It also covers an album or a
+// single track played from search, which is why the head line hedges.)
+function adrift(d) { return unfiled(d) && !d.context; }
 
 // A list running dry, drawn as one: the rows stop and the arrow carries on
 // past where they ended.
@@ -1431,21 +1443,22 @@ const ICON_ADRIFT = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none"
 function adriftBanner(d) {
   if (!adrift(d)) return "";
   const name = lastInput?.name;
-  // Two ways to be out here, and the banner should not guess. No playlist
-  // context at all is the autoplay tail — Spotify carrying on past the end of
-  // the list — and naming the list that ran out is the useful half of that. A
-  // context that IS a playlist, just not one of yours, is a different fact and
-  // gets stated as one. (An album or a single track played from search also
-  // arrives with no playlist context, so the first line can overstate the
-  // autoplay case; the sub-line under it — nothing here is being filed — is
-  // true either way, and it is the part that matters.)
-  const head = d.context
-    ? `Playing ${esc(d.context.name || "something else")} — not one of your inputs`
-    : name ? `${esc(name)} ran out — autoplay took over`
-           : "Not playing from an input — autoplay took over";
+  // Only the autoplay tail reaches here now (see adrift), so the banner names
+  // the list that ran out when it knows it and stays vague when it does not.
+  // The old third branch — "Playing <X> — not one of your inputs" — is gone
+  // with the condition that produced it: it fired on any playlist that was
+  // not an input, which meant deliberately putting on Discover Weekly got a
+  // banner scolding you for it. Worse, it could rarely name the playlist,
+  // because a Spotify-owned one is absent from the cached listing both
+  // `_light_context` and the suggest payload read, so it usually read
+  // "Playing something else" — a complaint that could not even say about
+  // what. Naming those costs an API call per unknown playlist; not
+  // complaining costs nothing.
+  const head = name ? `${esc(name)} ran out — autoplay took over`
+                    : "Not playing from an input — autoplay took over";
   return `<div class="np-adrift">
     <span class="ad-head">${ICON_ADRIFT}<b>${head}</b></span>
-    <span class="ad-sub">nothing you play here is being filed</span>
+    <span class="ad-sub">not in any of your inboxes — pick one below</span>
     ${name ? `<button id="btn-now-back" class="ad-back">Play ${esc(name)} again</button>` : ""}
   </div>`;
 }
@@ -1788,6 +1801,13 @@ function renderNow() {
       previewHold.attach(b, b.dataset.to, nowState.homes.get(b.dataset.to)?.name,
         { label: "File here", run: () => nowFile(b.dataset.to) });
     });
+    // The adrift card's inbox rows. No previewHold: these are inboxes, and
+    // hearing what is already in one tells you nothing about whether a song
+    // you have not judged belongs there — the hold is for homes, where the
+    // pile IS the answer to "does this fit".
+    $("now-card").querySelectorAll(".sugg[data-cap]").forEach((b) => {
+      b.onclick = () => nowCapture(b.dataset.cap);
+    });
     const more = $("btn-now-more");
     if (more) more.onclick = openNowPicker;
     const sub = $("btn-now-subset");
@@ -1904,12 +1924,43 @@ function ordinaryCardBody(d, tr, ctx) {
   // entire lower half of the card dropped in a second later.
   let body = "";
   let rows = "";
+  // A new song is a different question, and the card asks that one instead.
+  // `unfiled`, not `adrift`: the rows follow the song, not the playback. A
+  // song you meet on Discover Weekly is exactly the case this is for, and
+  // that has a playlist context, which is what keeps the banner off it.
+  // Computed once — three places below turn on it, and unfiled() is cheap but
+  // not free (it walks inputs and suggestions).
+  const isUnfiled = unfiled(d);
+  // Phase 1 can already tell a new song from a filing, and does not have to
+  // wait to say so. The rows need the list of inboxes — not per-track, and
+  // carried across the phase boundary by pollNow — plus the one question
+  // "am I playing out of an inbox", which the light payload's own
+  // context.is_input answers. Membership (in a home, in an inbox) is the only
+  // thing phase 2 adds here, and that is what the BANNER turns on, not these.
+  //
+  // The bet this makes: playing from something that is not an inbox is
+  // overwhelmingly a new song. When it is not — playing a home playlist
+  // directly — phase 2 replaces the rows with that home marked "already
+  // there", which is a correction rather than a wrong answer left standing.
+  const provisional = !!(d.suggPending && !d.suggError && d.playing &&
+                         !d.context?.is_input);
+  const showingInboxes = isUnfiled || provisional;
   if (d.suggError) {
     body += `<p class="hint">suggestions failed: ${esc(d.suggError)} — refresh to retry.</p>`;
+  } else if (provisional) {
+    rows += captureRows(d, true);
   } else if (d.suggPending) {
     // Inside the scrolling box, where the rows themselves will appear: the
     // wait is shown where the thing being waited for goes.
     rows += '<p class="hint sugg-loading">finding a home…</p>';
+  } else if (isUnfiled) {
+    // Deliberately instead of the suggestions, not above them. The app has
+    // established this song is in no inbox and no home, so the home list is
+    // answering a question that has not been reached yet — and a weak guess
+    // offered to a song that was never triaged is worse than no guess, because
+    // it invites filing something you have not decided to keep. The homes stay
+    // reachable through the Add to… row that follows, for when you do know.
+    rows += captureRows(d);
   } else {
     if (d.suggestions.length && d.suggestions[0].weak) {
       body += '<p class="hint">No confident match — closest guesses:</p>';
@@ -1946,8 +1997,16 @@ function ordinaryCardBody(d, tr, ctx) {
     <span class="s-name"><kbd>m</kbd> Add to…</span>
     <span class="s-why">any of your homes — search by name, or create one</span>
   </button>`;
-  body += `<div class="sugg-scroll">${rows}</div>`;
-  if (!d.suggPending && !d.suggError && !d.suggestions.length) {
+  // Two columns for inboxes, one for homes. A home suggestion is a ranked
+  // guess whose sub-line is the reason to trust it, so it earns the full
+  // width; an inbox row is a name and a size, and what you want from that
+  // list is to see all of it at once. capSuggScroll's arithmetic is untouched
+  // by the grid — the rows keep their own margin and only a column gap is
+  // added — so the box stays exactly as tall and simply holds twice as many.
+  body += `<div class="sugg-scroll${showingInboxes ? " cap-grid" : ""}">${rows}</div>`;
+  // Not on an adrift card: no home was proposed because none was asked for,
+  // which is not the same fact as none fitting.
+  if (!showingInboxes && !d.suggPending && !d.suggError && !d.suggestions.length) {
     body += '<p class="hint">No confident match — Add to… above.</p>';
   }
   // Remove from input lives in the playback strip now (see playbackStrip).
@@ -1958,10 +2017,15 @@ function ordinaryCardBody(d, tr, ctx) {
   // Always drawn, even with no chips in it: the button is the row's reason to
   // exist, and a control that comes and goes with the song's membership would
   // be missing exactly when you reach for it.
-  const chips = captureChips(d.inputs || []);
-  body += `<div class="capture">${chips ? `<span class="hint">in:</span>${chips}` : ""}` +
-    `<button id="btn-now-capture" class="chip cap-more" title="Put this song in one of your inputs — it stays where it is too">${
-      ICON_SEARCH_SM} capture to…</button></div>`;
+  // Stood down while the main row is already this offer at full size, and the
+  // chips are provably empty anyway — unfiled REQUIRES that no input holds the
+  // song, so there is no membership left for them to report.
+  if (!showingInboxes) {
+    const chips = captureChips(d.inputs || []);
+    body += `<div class="capture">${chips ? `<span class="hint">in:</span>${chips}` : ""}` +
+      `<button id="btn-now-capture" class="chip cap-more" title="Put this song in one of your inputs — it stays where it is too">${
+        ICON_SEARCH_SM} capture to…</button></div>`;
+  }
   return body;
 }
 
@@ -2027,6 +2091,43 @@ function captureChip(l) {
 // is nothing to fold, and the per-set expanders went with the wall.
 function captureChips(inputs) {
   return inputs.filter((l) => l.has_track).map(captureChip).join("");
+}
+
+// The rows an adrift card shows where the home suggestions normally go: the
+// inboxes this song can be parked in. Same shape as a .sugg so the scroll
+// box's measured row pitch (capSuggScroll) still works, and same two-column
+// layout as the Add to… row, which is the other row here with nothing to be
+// confident about — there is no score to show, because inboxes are not
+// scored and nothing profiles them.
+//
+// The exclusions are openCapturePicker's, deliberately, so the two offers
+// cannot drift apart: an inbox already holding the song is a no-op (and its
+// holding the song is exactly what would stop the card being adrift), and
+// Homeless stays out because it is a verdict you reach by filing, not
+// somewhere you park a song you have not judged yet.
+//
+// Buffer set first: it is the day-to-day one, and the sets below it are
+// older lists being reworked. Server order is kept within each group.
+// `provisional` is the phase-1 draw. The light payload sends no inputs while
+// playing, so the has_track flags the client carried over describe the
+// PREVIOUS track — not evidence about this one, and acting on it would hide
+// whichever inbox the last song happened to sit in, which on this app's main
+// loop is the inbox you are filing out of. So phase 1 ignores membership
+// entirely and phase 2 starts applying the real flags. Rows are only ever
+// added by that correction, never pulled out from under a thumb: a song that
+// is genuinely new is in no inbox, so the filter removes nothing.
+function captureRows(d, provisional = false) {
+  const inboxes = (d.inputs || []).filter(
+    (l) => l.id !== d.homeless_id && (provisional || !l.has_track));
+  const isBuffer = (l) => (l.set || NOW_BUFFER_SET) === NOW_BUFFER_SET;
+  return [...inboxes.filter(isBuffer), ...inboxes.filter((l) => !isBuffer(l))].map((l) => {
+    const sub = [setLabel(l.set || NOW_BUFFER_SET),
+                 l.total == null ? "" : `${l.total} songs`].filter(Boolean).join(" · ");
+    return `<button class="sugg sugg-capture" data-cap="${esc(l.id)}">
+      <span class="s-name">${esc(l.name)}</span>
+      <span class="s-why">${esc(sub)}</span>
+    </button>`;
+  }).join("");
 }
 
 async function nowCapture(inId) {

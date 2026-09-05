@@ -3376,15 +3376,24 @@ run("stopNowPolling()");
   check("AD a song already in one of your homes is not adrift either",
         !html().includes("np-adrift"), "");
 
-  // A playlist that is not one of your inputs is a different fact from the
-  // autoplay tail, and the banner says which — it never claims autoplay for
-  // something you deliberately put on.
+  // Deliberately putting a playlist on is not drift, and the banner stays out
+  // of it. This used to draw a third head line — "Playing <X> — not one of
+  // your inputs" — which was a complaint about a choice the user had just
+  // made, and one it could seldom even name: a Spotify-owned playlist like
+  // Discover Weekly is in neither the cached listing `_light_context` reads
+  // nor the suggest payload's, so `name` came back null and it rendered
+  // "Playing something else". The song still gets its inbox rows (see AN);
+  // it is only the banner that stands down.
   await paint({ ...adrift, context: { id: "PL9", name: "Discover Weekly", is_input: false } });
-  check("AD a non-input playlist gets named rather than called autoplay",
-        html().includes("np-adrift") && /Discover Weekly/.test(html()) &&
-        !/autoplay took over/.test(html()), JSON.stringify(html().slice(0, 400)));
-  check("AD ...and the useful half is still said out loud",
-        /nothing you play here is being filed/.test(html()), "");
+  check("AD a playlist you deliberately put on draws no banner at all",
+        !html().includes("np-adrift"), JSON.stringify(html().slice(0, 400)));
+  check("AD ...and the unnameable case it used to botch is gone with it",
+        !/something else/.test(html()), JSON.stringify(html().slice(0, 400)));
+
+  // The autoplay tail still says the useful half out loud.
+  await paint(adrift);
+  check("AD ...while the real drift still explains itself",
+        /not in any of your inboxes/.test(html()), "");
 
   // Phase 1 has no membership yet — suggestions are empty because they have
   // not been computed, not because the song is homeless. Reading the one as
@@ -3647,6 +3656,193 @@ run("stopNowPolling()");
     run("stopNowPolling()");
     $$("view-now").hidden = false;
   }
+}
+
+// ============================================================================
+// AN — a new song, and the question that actually fits it. Adrift is the app
+// having established that this track is in no inbox and in no home, so "which
+// of your homes" is the wrong question to lead with: the song has never been
+// triaged at all. The card asks the one that applies — which inbox does this
+// go in — and leaves the home list one tap below as the rarer answer.
+//
+// The fixture keeps a weak home suggestion in play throughout. That is what
+// makes these checks falsifiable: without the branch the card would happily
+// draw that row, so "no home row" is a real assertion rather than an artifact
+// of an empty suggestions array.
+// ============================================================================
+{
+  resetLog();
+  const html = () => $$("now-card").innerHTML;
+  const paint = async (over) => {
+    setNow({
+      status: 200,
+      body: {
+        playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+        track: { uri: "spotify:track:an1", name: "Song", duration_ms: 200000,
+                 artists: [{ name: "Artist" }], sortable: true, image: null },
+        context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
+        suggestions: [], homes: [{ id: "H1", name: "Home", folder: "" }],
+        subset_targets: [], subsets: [],
+        inputs: [{ id: "IN1", name: "[Hazy]", has_track: true, set: "buffer", total: 4 }],
+        homeless_id: null,
+        ...over,
+      },
+    });
+    run(`show("now"); filedUris = {}; removedUri = null; nowActions = 0;
+         nowActionLog = []; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+  };
+  const weak = [{ playlist_id: "H1", pct: 12, reasons: ["thin"], already: false, weak: true }];
+  // Adrift: playing outside any input, and in none of them. Three inboxes
+  // across two sets, so ordering and set labelling are both observable.
+  const adrift = {
+    context: null,
+    suggestions: weak,
+    inputs: [{ id: "IN2", name: "[Deep]", has_track: false, set: "buffer", total: 9 },
+             { id: "OT1", name: "<Old>", has_track: false, set: "other", total: 2 },
+             { id: "IN1", name: "[Hazy]", has_track: false, set: "buffer", total: 4 }],
+  };
+
+  // The ordinary path is untouched — playing from an inbox still asks homes.
+  await paint({ suggestions: weak });
+  check("AN filing from an inbox still offers homes",
+        html().includes('data-to="H1"') && !html().includes("data-cap"),
+        `html=${html().slice(0, 200)}`);
+  check("AN ...one to a row, because a ranked guess needs its reason read",
+        !/cap-grid/.test(html()), `html=${html().slice(0, 200)}`);
+
+  await paint(adrift);
+  check("AN a new song is offered inboxes instead",
+        html().includes('data-cap="IN1"') && html().includes('data-cap="IN2"') &&
+        html().includes('data-cap="OT1"'), `html=${html().slice(0, 500)}`);
+  check("AN ...and the home suggestion it would otherwise have drawn is gone",
+        !html().includes('data-to="H1"'), `html=${html().slice(0, 500)}`);
+  check("AN ...with the buffer set first, whatever order the server sent",
+        html().indexOf('data-cap="IN2"') < html().indexOf('data-cap="OT1"') &&
+        html().indexOf('data-cap="IN1"') < html().indexOf('data-cap="OT1"'),
+        `html=${html().slice(0, 500)}`);
+  check("AN ...and every inbox named",
+        /\[Hazy\]/.test(html()) && /\[Deep\]/.test(html()) && /&lt;Old&gt;/.test(html()),
+        `html=${html().slice(0, 500)}`);
+
+  // The homes are still reachable, just demoted: this row is untouched code,
+  // and the check exists to catch a branch that swallowed it.
+  check("AN the home list stays one tap below",
+        html().includes('id="btn-now-more"'), `html=${html().slice(0, 500)}`);
+
+  // Two inboxes to a row. An inbox row is a name and a short sub-line, not a
+  // ranked guess with a reason to read, so it does not need the width a home
+  // suggestion does — and this is the one list where you want every option in
+  // view at once instead of scrolling a ranking. The box keeps its height and
+  // shows twice as many.
+  check("AN the inbox list lays out two to a row",
+        /class="sugg-scroll cap-grid"/.test(html()), `html=${html().slice(0, 500)}`);
+
+  // The capture chip row is the same offer in miniature; with the main row
+  // doing it, drawing it twice two centimetres apart is just noise. Nothing
+  // is lost — adrift means no inbox holds the song, so its membership chips
+  // are empty by definition.
+  check("AN the capture chip row stands down while the main row does its job",
+        !html().includes('id="btn-now-capture"'), `html=${html().slice(0, 500)}`);
+  check("AN ...and the hint pointing at Add to… goes with it",
+        !/No confident match/.test(html()), `html=${html().slice(0, 500)}`);
+
+  // The banner stops claiming nothing is being filed — that was true when the
+  // card was a dead end and is a lie the moment it offers a destination.
+  check("AN the banner is still up, and stops saying nothing can be done",
+        html().includes("np-adrift") && !/nothing you play here is being filed/.test(html()),
+        `html=${html().slice(0, 500)}`);
+
+  // The case the whole feature is for, and the one that forced the rows and
+  // the banner apart. Discover Weekly is where new songs come FROM, so it must
+  // get the inbox rows — and it must not get the banner, because putting it on
+  // is a choice rather than playback drifting out of an inbox on its own.
+  await paint({ ...adrift,
+                context: { id: "PL9", name: "Discover Weekly", is_input: false } });
+  check("AN a song met on Discover Weekly still gets its inboxes",
+        html().includes('data-cap="IN1"') && html().includes('data-cap="IN2"'),
+        `html=${html().slice(0, 500)}`);
+  check("AN ...and is not scolded for being there",
+        !html().includes("np-adrift"), `html=${html().slice(0, 500)}`);
+  check("AN ...and the home suggestion is still withheld",
+        !html().includes('data-to="H1"'), `html=${html().slice(0, 500)}`);
+
+  // A context with no name is the same case — that is how Discover Weekly
+  // actually arrives, since it is absent from the cached listing the server
+  // names contexts from. It must not fall back to the banner.
+  await paint({ ...adrift, context: { id: "PL9", name: null, is_input: false } });
+  check("AN an unnameable playlist behaves the same, not like autoplay",
+        html().includes('data-cap="IN1"') && !html().includes("np-adrift"),
+        `html=${html().slice(0, 500)}`);
+
+  // The act itself: an ADD, never a move. A song playing out in the wild has
+  // no input to be taken out of, and from_id must stay null — the same shape
+  // nowCapture has always sent (see CR). Above all it must not sweep: sweeping
+  // is how a FILING settles a song across every inbox, and doing it here would
+  // empty the inboxes on the way to putting the song into one.
+  //
+  // Called directly rather than through the row, because the stub's
+  // querySelectorAll only models "button" (see O1) — the rows' wiring is out
+  // of reach here exactly as the home rows' is. What the markup carries is
+  // pinned above; this pins what the tap does.
+  resetLog();
+  await run(`nowCapture("IN2")`);
+  await tick();
+  const cap = bodies("/api/act").slice(-1)[0];
+  check("AN tapping one captures the song into that inbox — an add, not a move",
+        cap && cap.to_id === "IN2" && cap.from_id === null && cap.action === "move" &&
+        !cap.sweep_inputs, JSON.stringify(cap));
+
+  // Homeless is a verdict reached by filing, not an inbox you park a stranger
+  // in, and openCapturePicker has always excluded it. The rows agree.
+  await paint({ ...adrift, homeless_id: "IN2" });
+  check("AN the Homeless buffer is not offered as a destination",
+        !html().includes('data-cap="IN2"') && html().includes('data-cap="IN1"'),
+        `html=${html().slice(0, 500)}`);
+
+  // An inbox already holding the song would be a no-op offer — and its
+  // presence is what makes the song not adrift in the first place.
+  await paint({ ...adrift, suggestions: weak,
+                inputs: [{ id: "IN1", name: "[Hazy]", has_track: false, set: "buffer", total: 4 }] });
+  check("AN one inbox left is still a row, not a special case",
+        html().includes('data-cap="IN1"'), `html=${html().slice(0, 500)}`);
+
+  // Phase 1. The rows do NOT wait for the suggestion phase, unlike the
+  // banner — and the difference is what each one needs to know. The banner
+  // needs membership, which only phase 2 answers. The rows need the list of
+  // inboxes, which is not per-track at all and rides across the phase
+  // boundary already (see pollNow's carry-over). "Am I playing out of an
+  // inbox" is answered by the light payload's own context.is_input, so a new
+  // song can be offered its inboxes the moment the card goes up.
+  run(`nowState.suggPending = true; renderNow()`);
+  check("AN a new song gets its inboxes in phase 1, without waiting",
+        html().includes('data-cap="IN1"'), `html=${html().slice(0, 300)}`);
+  check("AN ...while the banner still waits for membership",
+        !html().includes("np-adrift"), `html=${html().slice(0, 300)}`);
+
+  // The other half of that bet: playing OUT of an inbox is the ordinary
+  // filing case, and it must not flash inbox rows on the way to the homes it
+  // is actually going to show.
+  await paint({ suggestions: weak });
+  run(`nowState.suggPending = true; renderNow()`);
+  check("AN filing from an inbox still waits, and says so",
+        !html().includes("data-cap") && /finding a home/.test(html()),
+        `html=${html().slice(0, 300)}`);
+
+  // has_track carried into phase 1 describes the PREVIOUS track — the light
+  // payload sends no inputs at all while playing — so it is not evidence
+  // about this song and must not hide an inbox. Phase 2 brings the real
+  // flags and the filter starts applying again.
+  await paint({ ...adrift,
+                inputs: [{ id: "IN1", name: "[Hazy]", has_track: true, set: "buffer", total: 4 },
+                         { id: "IN2", name: "[Deep]", has_track: false, set: "buffer", total: 9 }] });
+  run(`nowState.suggPending = true; renderNow()`);
+  check("AN phase 1 ignores stale membership rather than hiding an inbox",
+        html().includes('data-cap="IN1"') && html().includes('data-cap="IN2"'),
+        `html=${html().slice(0, 300)}`);
+
+  run(`show("lists")`);
 }
 
 // ---- summary ---------------------------------------------------------------
