@@ -413,18 +413,22 @@ function renderNaming(rows) {
   }
 }
 
-// The only thing that re-reads the listing from Spotify. It is slow on
-// purpose — ~21 paginated calls paced by the rolling-window throttle — so the
+// The only thing that re-reads the listing from Spotify. Slow on purpose —
+// one page per 50 playlists, paced by the rolling-window throttle — so the
 // button says so and stays disabled until it lands.
+//
+// It re-reads the listing and nothing more. Until 2026-09-18 it also forced
+// a profile rebuild, which measured 424s and 90 calls against this promise
+// of "about a minute"; the home re-reads now fall to the next reader.
 $("btn-refresh-lists").onclick = async () => {
   const btn = $("btn-refresh-lists");
   btn.disabled = true;
   btn.textContent = "Refreshing…";
-  $("pl-age").textContent = "re-reading from Spotify — this takes about a minute";
+  $("pl-age").textContent = "re-reading the playlist list from Spotify — a minute or two";
   try {
     const res = await api("/api/refresh", {});
     await loadLists();
-    toast(`refreshed — ${res.calls_spent} Spotify calls spent`, 4000);
+    toast(`refreshed ${res.playlists} playlists — ${res.calls_spent} Spotify calls spent`, 4000);
   } catch (e) {
     toast(e.message);
     $("pl-age").textContent = "";

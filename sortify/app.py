@@ -584,14 +584,61 @@ _profile_lock = threading.Lock()
 
 
 def _ensure_profiles(force: bool = False) -> dict:
+    """The cached profiles, rebuilding them if stale.
+
+    The rebuild runs OUTSIDE `_profile_lock` and is swapped in under it. The
+    lock used to wrap the whole thing, which meant it was held across every
+    home re-read — and a Refresh measured on 2026-09-18 held it for ~5.5
+    minutes while it spent 70 calls, during which /api/now/suggest never
+    returned. Suggestions are a polling endpoint; they must never queue
+    behind a rebuild's network I/O.
+
+    A caller that arrives mid-rebuild is served the profile already in hand.
+    That is deliberately a stale read: a profile a few minutes old answers
+    "which home does this track belong in" just as well, and the alternative
+    is the freeze this replaced. Only the first-ever build, with nothing
+    cached to serve, still makes callers wait.
+    """
     with _profile_lock:
-        return _ensure_profiles_locked(force)
+        fresh = (_profile_state.get("profiles")
+                 and time.time() - _profile_state["built_at"] < PROFILE_TTL)
+        if fresh and not force:
+            return _profile_state
+        # Someone else is already paying for this one. With a profile in hand
+        # we serve it; without one there is nothing to serve, so fall through
+        # and let the lock below serialise us.
+        if _profile_state.get("building") and _profile_state.get("profiles"):
+            return _profile_state
+        if not _profile_state.get("building"):
+            _profile_state["building"] = True
+            mine = True
+        else:
+            mine = False
 
+    if not mine:
+        # First-ever build, contended: wait for the winner rather than start
+        # a second full fetch of the same thing.
+        with _profile_lock:
+            return _profile_state
 
-def _ensure_profiles_locked(force: bool) -> dict:
-    now = time.time()
-    if not force and _profile_state.get("profiles") and now - _profile_state["built_at"] < PROFILE_TTL:
+    try:
+        built = _build_profiles()
+    finally:
+        with _profile_lock:
+            _profile_state["building"] = False
+
+    with _profile_lock:
+        _profile_state.update(built)
         return _profile_state
+
+
+def _build_profiles() -> dict:
+    """Fetch and compute a fresh profile set. Holds no lock; may take minutes.
+
+    Returns the fields `_profile_state` is updated with, rather than mutating
+    it, so the swap is a single dict update under the lock.
+    """
+    now = time.time()
     cfg = store.config()
     all_playlists = sp.my_playlists()
     input_ids = _effective_input_ids(cfg, all_playlists)
@@ -651,13 +698,12 @@ def _ensure_profiles_locked(force: bool) -> dict:
                     or inputsets.DEFAULT_KEY),
         })
 
-    _profile_state.update(
-        built_at=now, profiles=profiles, homes=homes, inputs=inputs,
+    return dict(
+        built_at=time.time(), profiles=profiles, homes=homes, inputs=inputs,
         playlists=all_playlists, input_ids=input_ids,
         playlist_artists=playlist_artists,
         last_added={hid: _last_added_at(tracks) for hid, tracks in home_tracks.items()},
     )
-    return _profile_state
 
 
 def _last_added_at(tracks: list[dict]) -> str | None:
@@ -705,18 +751,31 @@ def _subset_targets_payload(state: dict) -> list[dict]:
 def refresh_profiles():
     """The Refresh button: the one place the playlist listing is re-read.
 
-    Everything else runs off the cached list, so this has to invalidate it
-    before rebuilding — otherwise the button would spin and change nothing.
+    The listing and nothing else. Its cost is bounded and knowable in
+    advance — one page per 50 playlists, ~20 calls for this account — which
+    is what lets the UI promise a duration it can keep.
+
+    It used to force a profile rebuild in the same request, and that is what
+    made the button unusable. Measured 2026-09-18: **424.7 seconds and 90
+    Spotify calls**, against a UI promising "about a minute". Only ~20 of
+    those calls were the listing; the other ~70 were a re-read of every home
+    whose snapshot_id had moved in the 19 days the list sat frozen. Those
+    re-reads are real work, but they belong to whoever next needs a profile,
+    paced by PROFILE_TTL — not to a button press the user is watching.
+
+    Invalidating (rather than rebuilding) is what keeps the button honest:
+    the next read rebuilds off the fresh listing, and since that rebuild no
+    longer holds `_profile_lock` while it fetches, it blocks nobody.
     """
     before = sp.budget_spent()
-    sp.my_playlists(refresh=True)
-    state = _ensure_profiles(force=True)
-    # This is the one user action that can burst: the listing itself, plus a
-    # re-read of every home whose snapshot_id moved while the list sat frozen.
-    # Report the cost rather than let it disappear into the ledger.
+    items = sp.my_playlists(refresh=True)
+    # The fresh listing carries new snapshot_ids, so every cached profile is
+    # now suspect. Clearing built_at (the same move set_config makes) hands
+    # the rebuild to the next reader instead of doing it here.
+    _profile_state["built_at"] = 0.0
     return {
         "ok": True,
-        "homes": len(state["homes"]),
+        "playlists": len(items),
         "calls_spent": sp.budget_spent() - before,
     }
 
@@ -732,7 +791,7 @@ def triage(playlist_id: str):
         raise HTTPException(404, "unknown playlist")
 
     input_tracks = _cached_tracks(playlist_id, by_id.get(playlist_id, {}).get("snapshot_id"))
-    # Guard-on-read (see _ensure_profiles_locked) — triage must stay usable
+    # Guard-on-read (see _build_profiles) — triage must stay usable
     # even with a stale/bad-version tags.json; the split flow is where that
     # fails loud. lastfm_track_map() gets the same fresh-on-every-request
     # treatment as tag_artists, for the same reason: it's a local JSON read
