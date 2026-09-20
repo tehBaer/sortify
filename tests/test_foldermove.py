@@ -2,7 +2,9 @@ import sys
 
 import pytest
 
-from sortify.foldermove import ResolveError, resolve_folder, resolve_playlist
+from sortify.foldermove import (
+    ResolveError, _check_leaf_unique, resolve_folder, resolve_playlist,
+)
 
 TREE = {
     "type": "folder",
@@ -20,6 +22,8 @@ TREE = {
             ]},
             {"name": "Vault", "type": "folder",
              "uri": "spotify:user:u:folder:dd", "children": []},
+            {"name": "Attic", "type": "folder",
+             "uri": "spotify:user:u:folder:ee", "children": []},
             {"type": "playlist", "uri": "spotify:playlist:pl_haze"},
         ]},
         {"type": "playlist", "uri": "spotify:playlist:pl_loose"},
@@ -90,8 +94,8 @@ from sortify.foldermove import MovePlan, plan_move, verify_move
 
 
 def test_plan_move_into_folder():
-    p = plan_move(ITEMS, TREE, "HAZE", "Y'no")
-    assert p == MovePlan("pl_haze", "HAZE", "ROOT", "ROOT / Y'no")
+    p = plan_move(ITEMS, TREE, "HAZE", "Attic")
+    assert p == MovePlan("pl_haze", "HAZE", "ROOT", "ROOT / Attic")
 
 
 def test_plan_move_out_to_top_level():
@@ -100,6 +104,8 @@ def test_plan_move_out_to_top_level():
 
 
 def test_plan_move_noop_refused():
+    # Checked before the search-ambiguity guard: being already there is a
+    # better answer than "that folder cannot be targeted".
     with pytest.raises(ResolveError) as e:
         plan_move(ITEMS, TREE, "LITE", "Y'no")
     assert "already" in str(e.value)
@@ -111,9 +117,17 @@ def test_plan_move_out_when_already_loose_refused():
 
 
 def test_plan_move_unique_leaf_destination_still_resolves():
-    # "Y'no" is a unique leaf in TREE — planning into it must still work.
-    p = plan_move(ITEMS, TREE, "HAZE", "Y'no")
-    assert p.to_path == "ROOT / Y'no"
+    # "Attic" is uniquely named and holds no folders — the one shape the
+    # client's search returns exactly one row for.
+    p = plan_move(ITEMS, TREE, "HAZE", "Attic")
+    assert p.to_path == "ROOT / Attic"
+
+
+def test_plan_move_into_a_folder_with_subfolders_is_refused():
+    # "Y'no" holds "Vault", whose row would carry "Y'no" on its parent line.
+    with pytest.raises(ResolveError) as e:
+        plan_move(ITEMS, TREE, "HAZE", "Y'no")
+    assert "Vault" in str(e.value)
 
 
 def test_plan_move_ambiguous_leaf_destination_refused():
@@ -124,8 +138,57 @@ def test_plan_move_ambiguous_leaf_destination_refused():
         plan_move(ITEMS, TREE, "HAZE", "ROOT / Vault")
     msg = str(e.value)
     assert "Vault" in msg
-    assert "ROOT / Vault" in msg
     assert "ROOT / Y'no / Vault" in msg
+
+
+# The client's folder search matches a folder's NAME and its ANCESTRY, and
+# draws each hit as two lines — the name, and the parent path under it. So
+# typing a leaf can put another folder's row first, and the mover clicks the
+# first match it sees. Live on 2026-09-20: filing into "input" typed "input",
+# matched the parent line of "input / inputlister / matra-esque", and moved
+# the playlist in there. Every refusal below is a move that would otherwise
+# land somewhere nobody asked for.
+SEARCH_TREE = {
+    "type": "folder",
+    "children": [
+        {"name": "input", "type": "folder", "uri": "spotify:user:u:folder:i1",
+         "children": [
+            {"name": "inputlister", "type": "folder", "uri": "spotify:user:u:folder:i2",
+             "children": [
+                {"name": "matra-esque", "type": "folder",
+                 "uri": "spotify:user:u:folder:i3", "children": []},
+             ]},
+         ]},
+        {"name": "solo", "type": "folder", "uri": "spotify:user:u:folder:s1",
+         "children": []},
+    ],
+}
+
+
+def test_a_leaf_that_is_part_of_another_folders_name_is_refused():
+    with pytest.raises(ResolveError) as e:
+        _check_leaf_unique(SEARCH_TREE, "input")
+    msg = str(e.value)
+    assert "inputlister" in msg
+
+
+def test_a_folder_holding_other_folders_is_refused():
+    # Searching "inputlister" also returns matra-esque, whose row shows
+    # "input · inputlister" as its parent — a candidate the mover can hit.
+    with pytest.raises(ResolveError) as e:
+        _check_leaf_unique(SEARCH_TREE, "input / inputlister")
+    assert "matra-esque" in str(e.value)
+
+
+def test_a_uniquely_named_folder_with_no_subfolders_is_still_targetable():
+    _check_leaf_unique(SEARCH_TREE, "solo")
+    _check_leaf_unique(SEARCH_TREE, "input / inputlister / matra-esque")
+
+
+def test_the_refusal_says_what_to_do_instead():
+    with pytest.raises(ResolveError) as e:
+        _check_leaf_unique(SEARCH_TREE, "input")
+    assert "by hand" in str(e.value)
 
 
 def test_verify_move_checks_tree_truth():

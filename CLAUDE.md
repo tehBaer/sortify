@@ -171,3 +171,14 @@ escalating penalties. Therefore:
   OCR-guided, zero API calls) and verifies against the rootlist; `--dry-run`
   to preview. It shares a lock with the refresh button. After moves, re-run
   the folder re-import to update `data/folders.json`.
+- **Not every folder can be targeted, and that is a client limit.** The mover
+  types the destination's leaf into "Move to folder" and clicks the first
+  match. That search matches folder names AND their ancestry, and draws each
+  hit as name-over-parent-path — so the query text appears on other folders'
+  rows and the wanted row need not be first, or even on screen. Filing into
+  `input` on 2026-09-20 hit the parent line of `input / inputlister /
+  matra-esque` and moved the playlist in there. `_check_leaf_unique` now
+  refuses any destination another row could match: another folder whose name
+  contains the leaf, or the target having subfolders. On this account that
+  leaves 52 of 88 folders targetable; the rest have to be moved by hand.
+  Don't narrow the guard without a mover that can identify the row it clicks.

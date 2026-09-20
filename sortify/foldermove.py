@@ -87,23 +87,43 @@ def resolve_folder(tree: dict, path_query: str) -> str:
 
 
 def _check_leaf_unique(tree: dict, dest_path: str) -> None:
-    """Refuse a destination whose leaf folder name is not unique.
+    """Refuse a destination the client's folder search cannot single out.
 
-    The desktop client's "Move to folder" search box (clientui.py) types
-    only the destination's LEAF name and clicks the first match — it has
-    no way to disambiguate on the parent path. If two or more folders in
-    the tree share a leaf, sortify cannot tell the client which one to
-    target, so the move is refused at plan time rather than risking a
-    silent misfile into the wrong one.
+    The mover types the destination's LEAF name into the "Move to folder"
+    search box and clicks the first match (clientui.move_playlist_ui). That
+    search does two things this has to respect, both seen live on
+    2026-09-20 when filing into "input" put the playlist in
+    "input / inputlister / matra-esque" instead:
+
+    - it matches a folder's NAME **and its ancestry**, so every descendant
+      of the target is a hit too;
+    - it draws each hit as two lines, the folder name above its parent
+      path, so the query text appears on OTHER folders' rows.
+
+    The click therefore cannot be trusted whenever more than one row can
+    match — which is any of: another folder whose name contains the leaf,
+    a folder whose name IS the leaf twice over, or the target having
+    subfolders of its own. The move is refused at plan time; a wrong one is
+    a silent misfile the user has to notice and undo by hand.
     """
     leaf = dest_path.split(" / ")[-1]
-    competitors = [p for p in _folder_paths(tree) if p.split(" / ")[-1].lower() == leaf.lower()]
-    if len(competitors) > 1:
-        listing = "\n  ".join(competitors)
+    low = leaf.lower()
+    paths = _folder_paths(tree)
+    # Rows the search would return: any folder whose name contains the
+    # query (substring, because the client highlights partial matches), and
+    # any folder below one of those — its parent line carries the text.
+    hits = [p for p in paths
+            if p != dest_path
+            and (low in p.split(" / ")[-1].lower()
+                 or any(low in seg.lower() for seg in p.split(" / ")[:-1]))]
+    if hits:
+        listing = "\n  ".join(hits)
         raise ResolveError(
-            f"folder name {leaf!r} is not unique — the desktop client's "
-            "folder search matches on leaf name only, so sortify cannot "
-            f"safely target one of:\n  {listing}"
+            f"the client's folder search cannot single out {leaf!r} — it "
+            "matches folder names and their parent paths, and these would "
+            f"be offered alongside it:\n  {listing}\n"
+            "Move this one by hand in the Spotify client; sortify will pick "
+            "the change up on the next folder re-import."
         )
 
 
@@ -121,11 +141,13 @@ def plan_move(
     mapping = extract_folder_map(tree)
     pid, name, current = resolve_playlist(items, mapping, playlist_query)
     dest = resolve_folder(tree, dest_query) if dest_query is not None else None
-    if dest is not None:
-        _check_leaf_unique(tree, dest)
+    # Being already there is checked BEFORE the search-ambiguity guard: it
+    # is the more useful answer, and no move is needed to act on it.
     if current == dest:
         where = f"in {dest!r}" if dest else "at the top level"
         raise ResolveError(f"{name} is already {where}")
+    if dest is not None:
+        _check_leaf_unique(tree, dest)
     return MovePlan(pid, name, current, dest)
 
 
