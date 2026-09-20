@@ -34,14 +34,23 @@ class Deezer:
             raise DeezerError(str(data["error"]))
         return data if isinstance(data, dict) else {}
 
-    def _search_one(self, q: str) -> dict | None:
-        """The first search hit that actually carries a clip, else None."""
-        hits = self._get("/search", {"q": q, "limit": 1}).get("data") or []
-        if not hits or not hits[0].get("id") or not hits[0].get("preview"):
-            return None
-        return hits[0]
+    # Five, not one. The extra rows cost nothing — same single request — and
+    # they are what makes a rejected match recoverable: the runner-up is
+    # usually the recording the user actually wanted.
+    SEARCH_LIMIT = 5
 
-    def fetch_preview(self, artist: str, title: str) -> dict:
+    def _search_one(self, q: str, exclude: frozenset[int] = frozenset()) -> dict | None:
+        """The first search hit that carries a clip and is not excluded."""
+        hits = self._get("/search", {"q": q, "limit": self.SEARCH_LIMIT}).get("data") or []
+        for hit in hits:
+            if not hit.get("id") or not hit.get("preview"):
+                continue
+            if int(hit["id"]) in exclude:
+                continue
+            return hit
+        return None
+
+    def fetch_preview(self, artist: str, title: str, exclude=()) -> dict:
         """{"url", "deezer_id"} for a 30s preview clip, or {"miss": True}.
 
         Search results carry `preview` directly. The field-scoped query is
@@ -53,11 +62,20 @@ class Deezer:
         recovers most of them, and only runs when the strict form found
         nothing, so a clean hit still costs exactly one request.
 
+        `exclude` is the set of Deezer ids the user has marked as the wrong
+        recording for this track. It is applied HERE rather than to the
+        answer, because filtering afterwards would spend the search and
+        still hand back nothing — the point is to reach the next candidate,
+        which is very often the right one. Everything excluded means a
+        genuine miss: the text fallback below is the correct place for it to
+        end up, not another search.
+
         The URL's CDN token EXPIRES after a while, so callers must not
         persist it — cache at most for minutes.
         """
-        hit = (self._search_one(f'artist:"{artist}" track:"{title}"')
-               or self._search_one(f"{artist} {title}"))
+        ex = frozenset(int(i) for i in exclude)
+        hit = (self._search_one(f'artist:"{artist}" track:"{title}"', ex)
+               or self._search_one(f"{artist} {title}", ex))
         if hit is None:
             return {"miss": True}
         return {"url": hit["preview"], "deezer_id": int(hit["id"])}

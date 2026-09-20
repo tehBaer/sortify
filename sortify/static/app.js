@@ -69,6 +69,10 @@ function show(view) {
 let toastTimer = null;
 function toast(msg, ms = 2600) {
   const el = $("toast");
+  // Explicitly, not as a side effect of assigning textContent: a plain toast
+  // has no action, and the one it replaces may have had one (toastUndo).
+  el.innerHTML = "";
+  el.classList.remove("has-action");
   el.textContent = msg;
   el.hidden = false;
   clearTimeout(toastTimer);
@@ -79,6 +83,38 @@ function toast(msg, ms = 2600) {
 // Røde Runde / Anbefalte" — wider than a phone on their own. Under a
 // suggestion only the leaf is shown, the folder the playlist actually sits
 // in; the picker keeps the full path, having the width for it.
+// A toast you can act on, for the one case that needs it: the actions that do
+// NOT spend the song's decision — a subset add, a capture, taking it back out
+// of a home — keep Remove in the strip (see playbackStrip's `spent`), and
+// #btn-undo-now is display:none by request. Without this their only way back
+// is the `u` key, and a phone has no `u`.
+//
+// Longer-lived than a plain toast: a message you are meant to reach for
+// cannot be gone in 2.6 seconds.
+//
+// Guarded on the stack it was raised for. If anything else has acted since,
+// the press refuses rather than popping the top of the undo stack blind —
+// taking back somebody else's decision is worse than not undoing at all.
+// `esc` because the message carries playlist names.
+function toastUndo(msg, uri, ms = 6000) {
+  const el = $("toast");
+  const at = nowActionLog.length;
+  el.innerHTML = `<span>${esc(msg)}</span>` +
+    `<button id="toast-action" class="t-action">Undo</button>`;
+  el.classList.add("has-action");
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.hidden = true; }, ms);
+  $("toast-action").onclick = () => {
+    if (nowActionLog.length !== at || nowActionLog[at - 1]?.uri !== uri) {
+      toast("too late — something else has happened since");
+      return;
+    }
+    el.hidden = true;
+    undoLastNowAction();
+  };
+}
+
 function folderLeaf(f) {
   return (f || "").split(" / ").pop();
 }
@@ -164,6 +200,9 @@ async function loadLists() {
     // than present a stale list as current.
     $("pl-age").textContent = ageText(data.fetched_at);
     renderOrphans(data.sitting_orphans || []);
+    folderPaths = data.folder_paths || [];
+    createFolders = data.create_folders || {};
+    renderFolderChoices();
     loadNaming();
     renderLists();
   } catch (e) {
@@ -485,27 +524,106 @@ $("btn-save-config").onclick = async () => {
   } catch (e) { toast(e.message); }
 };
 
-// Creating a home from here is 1 call; the row appears in place, already
-// marked Home, with no Refresh. The folder path stays blank until the next
-// desktop-client folder export — not an error, homes work without one.
-async function createHome(name) {
-  const res = await api("/api/playlists/create", { name, role: "home" });
+// Creating a playlist from here is 1 call; the row appears in place, already
+// marked, with no Refresh. The folder path stays blank until the next
+// desktop-client folder export — not an error, neither role needs one.
+//
+// `role` is the server's business as much as this one's: a subset is marked
+// `subset_ids` and never home/sticky, or the Add to… picker would offer it as
+// a filing destination on the next request. Keeping the Lists view's own
+// state in step here costs nothing when that view has never been opened —
+// playlistData starts as an array either way.
+async function createPlaylist(name, role = "home", folder) {
+  // Three states, not two. A string files it there, null is the top level,
+  // and LEAVING THE ARGUMENT OUT omits the field entirely — which the server
+  // reads as "this role's stored default". The create row always passes a
+  // value (its dropdown has a top-level option, and choosing it must beat
+  // the old default); the Now card passes nothing, so a home created while
+  // filing a song lands in the same folder as the ones created in Lists.
+  const res = await api("/api/playlists/create", { name, role, folder });
   const p = res.playlist;
   playlistData.unshift(p);
-  roles[p.id] = "home";
-  return { p, note: res.note };
+  roles[p.id] = role;
+  return { p, note: res.note, filing: !!res.filing };
+}
+
+// The destinations the create row can offer, and the folder last used for
+// each role. Both come from /api/playlists — the view that creates
+// playlists is the view that loads them, so neither needs its own request.
+// Only folders that already hold a playlist are known here: the mapping is
+// derived from the last folder re-import, which is the only thing on this
+// box that has ever seen the tree.
+let folderPaths = [];
+let createFolders = {};
+
+const FOLDER_TOP_LEVEL = "— top level —";
+
+function renderFolderChoices() {
+  const role = $("new-pl-role").value || "home";
+  const def = createFolders[role] || "";
+  const paths = folderPaths.includes(def) || !def ? folderPaths : [def, ...folderPaths];
+  $("new-pl-folder").innerHTML =
+    [`<option value="">${esc(FOLDER_TOP_LEVEL)}</option>`]
+      .concat(paths.map((f) => `<option value="${esc(f)}">${esc(f)}</option>`))
+      .join("");
+  $("new-pl-folder").value = def;
+}
+
+$("new-pl-role").onchange = () => renderFolderChoices();
+
+// Filing drives the desktop client for about a minute, so the create call
+// returns first and this watches the job. It is never silent: a failure
+// leaves a REAL playlist at the top level, and saying nothing about it
+// would read as the playlist having gone missing.
+const FILING_POLL_MS = 3000;
+
+async function pollFiling(id, name) {
+  for (;;) {
+    let st;
+    try {
+      st = await api(`/api/playlists/filing/${id}`);
+    } catch (e) {
+      $("new-pl-filing").hidden = true;
+      toast(`created "${name}", but the filing status is unreadable: ${e.message}`, 6000);
+      return;
+    }
+    if (st.state === "filed") {
+      $("new-pl-filing").hidden = true;
+      const row = playlistData.find((p) => p.id === id);
+      if (row) row.folder = st.folder;
+      renderLists();
+      toast(`"${name}" filed into ${st.folder}`, 4000);
+      return;
+    }
+    if (st.state === "failed" || st.state === "idle") {
+      $("new-pl-filing").hidden = true;
+      toast(`"${name}" was created but stayed at the top level — ${st.error || "the move never started"}`, 8000);
+      return;
+    }
+    await new Promise((r) => setTimeout(r, FILING_POLL_MS));
+  }
 }
 
 $("btn-new-home").onclick = async () => {
   const name = $("new-home-name").value.trim();
   if (!name) return;
   const btn = $("btn-new-home");
+  const role = $("new-pl-role").value || "home";
+  const folder = $("new-pl-folder").value || null;
+  const what = role === "input" ? "buffer" : "home";
   btn.disabled = true;
   try {
-    const { p, note } = await createHome(name);
+    const { p, note, filing } = await createPlaylist(name, role, folder);
     $("new-home-name").value = "";
+    createFolders[role] = folder;
     renderLists();
-    toast(note ? `created home "${p.name}" — ${note}` : `created home "${p.name}"`, note ? 5000 : undefined);
+    toast(note ? `created ${what} "${p.name}" — ${note}` : `created ${what} "${p.name}"`, note ? 5000 : undefined);
+    if (filing) {
+      $("new-pl-filing").hidden = false;
+      $("new-pl-filing").textContent =
+        `filing "${p.name}" into ${folder} — this drives the Spotify client, about a minute…`;
+      pollFiling(p.id, p.name);
+    }
   } catch (e) { toast(e.message); } finally { btn.disabled = false; }
 };
 
@@ -572,7 +690,8 @@ function renderCard() {
   $("card").innerHTML = `<div class="track-card">
     ${img}
     <div class="t-name">${esc(tr.name)}</div>
-    <div class="t-artist">${esc(artists)}${tr.album ? " — " + esc(tr.album) : ""}</div>
+    <div class="t-artist">${esc(artists)}</div>
+    <div class="t-album">${tr.album ? esc(tr.album) : ""}</div>
     ${suggHtml}
     <div class="minor-actions">
       ${tr.sortable ? `<button id="btn-more"><kbd>m</kbd> More…</button>` : ""}
@@ -996,9 +1115,18 @@ function paintNowControls(d) {
   // The trigger's face doubles as the old "playing from …" context line:
   // whatever is true about the playing context is what the button says.
   const ctx = d.context;
+  // How much is left in the list you are working through — the one number
+  // the bar was missing, and free: it rides in on the poll that already
+  // painted this button. Only for an input you are actually playing from;
+  // there is nothing to count down anywhere else. Phase 1 of the two-phase
+  // card has no `inputs` yet, so the count appears a beat after the name
+  // rather than the name waiting for it.
+  const playingRow = d.playing && ctx?.is_input
+    ? playable.find((l) => l.id === ctx.id) : null;
+  const left = playingRow && playingRow.total != null ? ` · ${playingRow.total}` : "";
   $("input-switch-label").textContent = d.playing
     ? (ctx?.name
-        ? (ctx.is_input ? ctx.name : `${ctx.name} (not an input)`)
+        ? (ctx.is_input ? `${ctx.name}${left}` : `${ctx.name} (not an input)`)
         : "not playing from a playlist")
     : "start an input…";
   $("btn-input-switch").classList.toggle("placeholder", !(d.playing && ctx?.is_input));
@@ -1036,9 +1164,14 @@ function renderInputPop() {
     if (!bySet.has(k)) bySet.set(k, []);
     bySet.get(k).push(l);
   }
+  // The count is what the list is worth working through, so it belongs on
+  // every row and not only on the one playing. Withheld rather than zeroed
+  // when the server sends null (Liked Songs, whose size the idle payload
+  // cannot know without spending a call) — "0 tracks" would be a lie.
   const row = (l) =>
     `<button id="ip-${esc(l.id)}" class="ip-row${l.id === current ? " current" : ""}">` +
     `<span class="ip-name">${esc(l.name)}</span>` +
+    (l.total == null ? "" : `<span class="ip-count">${l.total}</span>`) +
     (l.has_track ? `<span class="ip-dot" title="already contains this track"></span>` : "") +
     `</button>`;
 
@@ -1391,6 +1524,10 @@ const ICON_REMOVE = '<svg viewBox="0 0 24 24" width="22" height="22" fill="curre
 // The magnifier the card uses wherever a control opens a searchable list —
 // Add to… wears the 18px one inline; this is the chip-sized twin.
 const ICON_SEARCH_SM = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>';
+// Take this song back out of a home it is already in. A minus rather than an
+// ✕: the song is not being deleted, it is being un-filed, and the row it sits
+// on goes back to being an ordinary guess.
+const ICON_EJECT = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M8.5 12h7"/></svg>';
 const ICON_UNDO = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9h10a5 5 0 0 1 0 10H9"/><path d="M8 5 4 9l4 4"/></svg>';
 
 // The input you were last playing from. Persisted, because the moment you
@@ -1502,20 +1639,29 @@ function playbackStrip(d, tr) {
       ${pauseBtn}${loopBtn}
     </div>`
     : `<div class="np-progress np-progress-bare">${prevBtn}${pauseBtn}${loopBtn}</div>`;
-  // Once this track has been removed — or filed, or captured, or added to a
-  // subset: any action of its own sitting on top of the undo stack — the
+  // Once this track's decision is SPENT — filed to a home, or removed — the
   // slot offers the way back instead. The undo belongs where the hand
   // already is, not in the top bar, and it lasts exactly as long as the
   // track does (the log's top entry stops matching the moment the next
   // track starts; removedUri has its own expiry in renderNow). Sittings are
   // excluded: their decisions have no /api/undo.
+  //
+  // "Spent" is the whole point, and it used to be "any action at all". Three
+  // of them leave the song exactly where it was in its inbox: adding it to a
+  // subset (a selection is not a filing — the song still needs a home),
+  // capturing it into another input, and taking it back out of a home. After
+  // any of those the song is still undecided, so Remove still has work to do
+  // and taking its slot away was simply wrong. Removals ride the same
+  // predicate: nowRemove logs kind "home" too, so one test covers both, and
+  // removedUri stays in the condition for its own per-track expiry.
   const lastAct = nowActionLog[nowActionLog.length - 1];
   // While a combined press is settling, the trio below must hold: the remove
   // leg has already landed (removedUri is set), and without this suppression
   // the strip would flash its Undo swap for the second the skip leg takes.
   const bothBusy = npPending?.verb === "both" && npPending.uri === tr.uri;
+  const spent = lastAct && lastAct.uri === tr.uri && lastAct.kind === "home";
   const undoable = !bothBusy && ((removedUri && removedUri === tr.uri) ||
-    (!d.sitting && lastAct && lastAct.uri === tr.uri));
+    (!d.sitting && spent));
   const nextBusy = npPending?.verb === "next";
   const nextBtn = (shape) => `<button id="btn-now-next" class="${shape}${
     nextBusy ? " np-busy" : ""}"${nextBusy ? " disabled" : ""} title="${
@@ -1766,7 +1912,8 @@ function renderNow() {
     ${adriftBanner(d)}
     <div class="art">${img}${d.is_playing ? "" : '<span class="paused-chip">paused</span>'}</div>
     <div class="t-name">${esc(tr.name)}</div>
-    <div class="t-artist">${esc(artists)}${tr.album ? " — " + esc(tr.album) : ""}</div>
+    <div class="t-artist">${esc(artists)}</div>
+    <div class="t-album">${tr.album ? esc(tr.album) : ""}</div>
     ${playbackStrip(d, tr)}
     ${body}
   </div>`;
@@ -1805,6 +1952,9 @@ function renderNow() {
       previewHold.attach(b, b.dataset.to, nowState.homes.get(b.dataset.to)?.name,
         { label: "File here", run: () => nowFile(b.dataset.to) });
     });
+    $("now-card").querySelectorAll(".sugg-eject").forEach((b) => {
+      b.onclick = () => nowUnfile(b.dataset.out);
+    });
     // The adrift card's inbox rows. No previewHold: these are inboxes, and
     // hearing what is already in one tells you nothing about whether a song
     // you have not judged belongs there — the hold is for homes, where the
@@ -1813,9 +1963,13 @@ function renderNow() {
       b.onclick = () => nowCapture(b.dataset.cap);
     });
     const more = $("btn-now-more");
-    if (more) more.onclick = openNowPicker;
+    if (more) more.onclick = () => openNowPicker(false);
+    const search = $("btn-now-search");
+    if (search) search.onclick = () => openNowPicker(true);
     const sub = $("btn-now-subset");
-    if (sub) sub.onclick = () => openPicker(nowState.subsetTargets, nowAddToSubset);
+    if (sub) sub.onclick = () => openPicker(
+      nowState.subsetTargets, nowAddToSubset, nowCreateSubsetAndAdd, null,
+      "Add here", "subset");
     const nh = $("btn-now-homeless");
     if (nh) nh.onclick = nowHomeless;
     capSuggScroll();
@@ -1979,11 +2133,25 @@ function ordinaryCardBody(d, tr, ctx) {
     d.suggestions.forEach((s, i) => {
       const home = nowState.homes.get(s.playlist_id);
       if (!home) return;
-      rows += `<button class="sugg${s.already ? " already" : ""}${s.weak ? " weak" : ""}" data-to="${esc(s.playlist_id)}" style="--pct:${s.already ? 100 : s.pct}%">
+      const btn = `<button class="sugg${s.already ? " already" : ""}${s.weak ? " weak" : ""}" data-to="${esc(s.playlist_id)}" style="--pct:${s.already ? 100 : s.pct}%">
         <span class="s-pct">${s.already ? '<span class="s-badge">already there</span>' : s.pct + "%"}</span>
         <span class="s-name"><kbd>${i + 1}</kbd> ${esc(home.name)}</span>
         <span class="s-why">${esc([folderLeaf(home.folder), ...s.reasons].filter(Boolean).join(" · "))}</span>
       </button>`;
+      // A home the song is already in gets a second, much smaller control:
+      // take it back out. The row's own tap keeps its meaning — "yes, it
+      // belongs there, so clear the inboxes" — because that is a real answer
+      // and the one you give far more often; a gesture that did both
+      // depending on where your thumb landed would be neither.
+      //
+      // The wrapper exists because a button cannot nest inside a button. It
+      // is a flex row and the .sugg keeps its own margin, so the scroll box's
+      // measured row pitch (capSuggScroll) is unchanged by the wrapping.
+      rows += s.already
+        ? `<div class="sugg-wrap">${btn}<button class="sugg-eject" data-out="${
+            esc(s.playlist_id)}" title="Take this song out of ${esc(home.name)}" aria-label="${
+            esc("Take this song out of " + home.name)}">${ICON_EJECT}</button></div>`
+        : btn;
     });
   }
   // Add to… ends the list rather than sitting under it as a button: reaching
@@ -1996,11 +2164,19 @@ function ordinaryCardBody(d, tr, ctx) {
   // 1, where no suggest answer has ever landed and `homes` is genuinely empty
   // — the row would open a picker with nothing in it. Every later phase 1 has
   // the carried copy and draws it.
-  if (!d.suggPending || nowState.homes.size) rows += `<button class="sugg sugg-more" id="btn-now-more">
-    <span class="s-pct"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></span>
-    <span class="s-name"><kbd>m</kbd> Add to…</span>
-    <span class="s-why">any of your homes — search by name, or create one</span>
-  </button>`;
+  // Two targets, not one. Opening the picker used to focus its filter, so
+  // reaching for the list threw the keyboard over the half of it you wanted
+  // to read. The wide button opens it to scroll; the magnifier beside it
+  // opens it ready to type. The `m` hint went with the split — it named a key
+  // that does not exist on the device this runs on.
+  if (!d.suggPending || nowState.homes.size) rows += `<div class="sugg-wrap">
+    <button class="sugg sugg-more" id="btn-now-more">
+      <span class="s-name">Add to…</span>
+      <span class="s-why">any of your homes — scroll the list</span>
+    </button>
+    <button class="sugg-search" id="btn-now-search" title="Search your homes by name" aria-label="Search your homes by name">${
+      ICON_SEARCH_SM}</button>
+  </div>`;
   // Two columns for inboxes, one for homes. A home suggestion is a ranked
   // guess whose sub-line is the reason to trust it, so it earns the full
   // width; an inbox row is a name and a size, and what you want from that
@@ -2145,7 +2321,7 @@ async function nowCapture(inId) {
     nowActionLog.push({ uri: tr.uri, kind: "input" });
     const entry = d.inputs.find((l) => l.id === inId);
     if (entry) entry.has_track = true;
-    toast(res.note || `+ ${entry?.name || "input"}`);
+    toastUndo(res.note || `+ ${entry?.name || "input"}`, tr.uri);
     renderNow();
   } catch (e) { toast(e.message); }
 }
@@ -2159,7 +2335,7 @@ async function nowAddToSubset(id) {
     await api("/api/act", { action: "move", uri: tr.uri, from_id: null, to_id: id });
     nowActions++;
     nowActionLog.push({ uri: tr.uri, kind: "subset" });
-    toast(`+ ${name}`);
+    toastUndo(`+ ${name}`, tr.uri);
     renderNow();
   } catch (e) { toast(e.message); }
 }
@@ -2199,7 +2375,8 @@ async function nowFile(toId, label) {
 // `m` keyboard shortcut get the create row (previously only the button did).
 async function nowCreateAndFile(name) {
   try {
-    const { p, note } = await createHome(name);
+    const { p, note, filing } = await createPlaylist(name);
+    if (filing) pollFiling(p.id, p.name);
     // Stamped now: it just received this track, so the recency sort keeps it
     // on top until the next profile rebuild reports the real value.
     nowState.homes.set(p.id, { id: p.id, name: p.name, image: null, total: 0, folder: null,
@@ -2207,6 +2384,57 @@ async function nowCreateAndFile(name) {
     await nowFile(p.id);  // lands the card in its ordinary ✓ filed state; nowFile's
     // own toast covers that. The server's duplicate-name note is separate and
     // would otherwise be silently dropped, so surface it too.
+    if (note) toast(note, 5000);
+  } catch (e) { toast(e.message); }
+}
+
+// Take the song back out of a home it is already in — the misfile you notice
+// while the song is still playing.
+//
+// Deliberately NOT the strip's Remove wearing a second hat. That verb sweeps
+// every inbox, because rejecting a song settles it; this one is the opposite
+// — the filing was wrong, so the song goes back to being undecided and the
+// inboxes must be left exactly as they were. Hence no sweep_inputs and no
+// to_id: one DELETE, on one playlist.
+//
+// And no done-card either, for the same reason. A song that just left a home
+// still needs one, so the card stays live with its suggestions up; the row
+// that said "already there" simply becomes an ordinary guess again. That flip
+// is done locally rather than waited for: `already` comes from the server's
+// profile membership, which /api/act has already corrected, but the next poll
+// can be a whole track away and a row still claiming "already there" would be
+// stale for minutes.
+async function nowUnfile(homeId) {
+  const d = nowState, tr = d.track;
+  if (!homeId || !tr) return;
+  const name = d.homes.get(homeId)?.name || "that home";
+  try {
+    await api("/api/act", { action: "remove", uri: tr.uri, from_id: homeId,
+                            sweep_inputs: false });
+    nowActions++;
+    // `kind` is neither "home" nor "subset": undoLastNowAction deletes a
+    // filedUris badge for "home", and this action never wrote one. The home
+    // id rides along so the undo can put the row's badge back — see there.
+    nowActionLog.push({ uri: tr.uri, kind: "unfile", homeId });
+    const row = (d.suggestions || []).find((x) => x.playlist_id === homeId);
+    if (row) row.already = false;
+    toastUndo(`took it out of ${name}`, tr.uri);
+    renderNow();
+  } catch (e) { toast(e.message); }
+}
+
+// The subset that does not exist yet — the moment of need, the same one the
+// home picker's create row answers. Two calls: create, then add. Never three:
+// adding to a subset removes nothing, so the song stays in its input and
+// still has to find a home.
+async function nowCreateSubsetAndAdd(name) {
+  try {
+    const { p, note } = await createPlaylist(name, "subset");
+    // Seeded locally so the picker and the toast can name it now; the next
+    // poll replaces this entry with the server's own (the create cleared the
+    // profile cache, so that poll already knows about it).
+    nowState.subsetTargets.set(p.id, { id: p.id, name: p.name, total: 0, folder: null });
+    await nowAddToSubset(p.id);
     if (note) toast(note, 5000);
   } catch (e) { toast(e.message); }
 }
@@ -2328,6 +2556,14 @@ async function undoLastNowAction() {
     // track's badge.
     const last = nowActionLog.pop();
     if (last && last.kind === "home") delete filedUris[last.uri];
+    // Un-filing flipped the row's "already there" badge off locally rather
+    // than waiting a poll for it (see nowUnfile); undoing it has to put the
+    // badge back on the same terms, or the row spends the rest of the track
+    // offering to file a song that is already there.
+    if (last && last.kind === "unfile" && last.uri === nowState?.track?.uri) {
+      const row = (nowState.suggestions || []).find((x) => x.playlist_id === last.homeId);
+      if (row) row.already = true;
+    }
     if (last && last.uri === removedUri) removedUri = null;
     toast(res.restored_to ? "undone — restored to input" : "undone");
     renderNow();
@@ -2437,7 +2673,7 @@ async function doShare(track, friend) {
 // art — which lift every blur on the card at once.
 $("now-card").addEventListener("click", (e) => {
   if (!blindMode || document.body.classList.contains("peeked")) return;
-  const el = e.target.closest(".t-name, .t-artist, .art, .s-why");
+  const el = e.target.closest(".t-name, .t-artist, .t-album, .art, .s-why");
   if (!el || el.closest("button")) return;
   e.stopPropagation();
   e.preventDefault();
@@ -2450,9 +2686,10 @@ $("now-card").addEventListener("click", (e) => {
 // The Now card's picker, wired through the one place that knows whether the
 // Homeless verdict applies right now. Both the button and `m` go through it,
 // so the picker cannot end up offering a move the card itself withholds.
-function openNowPicker() {
+function openNowPicker(focus = true) {
   openPicker(nowState.homes, nowFile, nowCreateAndFile,
-             homelessTarget(nowState) ? nowHomeless : null);
+             homelessTarget(nowState) ? nowHomeless : null,
+             "File here", "home", { focus });
 }
 
 // Capture: put the song in an input as well as wherever it already is. Every
@@ -2473,7 +2710,15 @@ function openCapturePicker() {
   openPicker(map, nowCapture, null, null, "Capture here");
 }
 
-function openPicker(homesMap, onPick, onCreate, onHomeless, verb = "File here") {
+// `opts.focus: false` opens the picker WITHOUT putting the cursor in the
+// filter. On a phone — which is the only place this app is used — focusing
+// throws the on-screen keyboard over the list you meant to scroll, so it has
+// to be a choice the caller makes rather than something the picker does to
+// you. An options object rather than a seventh positional argument: the
+// signature is already at six and the next flag would make call sites
+// unreadable.
+function openPicker(homesMap, onPick, onCreate, onHomeless, verb = "File here",
+                    role = "home", opts = {}) {
   const list = $("picker-list");
   const paint = (filter) => {
     list.innerHTML = "";
@@ -2517,16 +2762,41 @@ function openPicker(homesMap, onPick, onCreate, onHomeless, verb = "File here") 
     }
     // The moment of need: the right playlist doesn't exist yet. Create it
     // and file in one gesture — create + add, priced as such. (Spec §5.)
-    if (!shown && filter && onCreate) {
+    //
+    // WHEN it is offered differs by role, and the difference is the whole
+    // reason this is a parameter. For homes it is a last resort: you have
+    // dozens, the filter matching nothing is the signal that none of them
+    // fit, and a create row standing under every search would be noise.
+    // Subsets are the opposite — you make one the moment you want it, and
+    // gating it on "nothing matched" made it unreachable for anyone who had
+    // ever marked one: nine marked subsets meant nine rows, so `shown` was
+    // never 0 and the row never drew. It is always offered for a subset now,
+    // including when the typed name matches an existing one (wanting a
+    // second "best of" is a legitimate answer, and Spotify allows it).
+    const subset = role === "subset";
+    if (onCreate && (subset || (!shown && filter))) {
       const typed = $("picker-filter").value.trim();
       // nowFile sends a remove too when filing from an input: create + add +
-      // remove = 3 calls, not 2 — the label must state the true cost.
-      const price = nowState.context?.is_input ? "3 calls" : "2 calls";
+      // remove = 3 calls, not 2 — the label must state the true cost. A
+      // subset never removes anything (a song in a selection has not been
+      // sorted, so it stays in its input), so its price is flat.
+      const price = !subset && nowState.context?.is_input ? "3 calls" : "2 calls";
       const b = document.createElement("button");
       b.className = "picker-row picker-create";
-      b.innerHTML = `<span class="p-name">Create home “${esc(typed)}” and file this track there</span>` +
-        `<span class="p-sub">${price}</span>`;
-      b.onclick = () => { closePicker(); onCreate(typed); };
+      // Nothing typed yet, so there is no name to create under. The row still
+      // draws — it is the only thing that says creating is possible at all —
+      // but it sends you to the box instead of firing a create with no name.
+      if (subset && !typed) {
+        b.innerHTML = '<span class="p-name">Create a new subset…</span>' +
+          '<span class="p-sub">type a name above</span>';
+        b.onclick = () => $("picker-filter").focus();
+      } else {
+        b.innerHTML = `<span class="p-name">${subset
+          ? `Create subset “${esc(typed)}” and add this track to it`
+          : `Create home “${esc(typed)}” and file this track there`}</span>` +
+          `<span class="p-sub">${price}</span>`;
+        b.onclick = () => { closePicker(); onCreate(typed); };
+      }
       list.appendChild(b);
     }
   };
@@ -2534,7 +2804,7 @@ function openPicker(homesMap, onPick, onCreate, onHomeless, verb = "File here") 
   $("picker-filter").value = "";
   $("picker-filter").oninput = (e) => paint(e.target.value.trim().toLowerCase());
   $("picker").hidden = false;
-  $("picker-filter").focus();
+  if (opts.focus !== false) $("picker-filter").focus();
 }
 // ---- hold-to-preview: hold opens a clip-player popup -----------------------
 //
@@ -2568,6 +2838,9 @@ const previewHold = (() => {
     prev: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>',
     next: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>',
     play: '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>',
+    // "not this one" — a struck-through circle. Not a bin: nothing is being
+    // deleted, a wrong match is being sent back.
+    wrong: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg>',
     // the affordance: bars, the shape of a clip waiting to be heard
     wave: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M2 6.5v3M5.5 3v10M9 5v6M12.5 6.5v3M15.5 7.5v1"/></svg>',
   };
@@ -2708,6 +2981,12 @@ const previewHold = (() => {
     const atEnd = idx >= clips.length - 1 && nextOffset == null;
     // How far into this 30s clip we are: `next` is otherwise a blind press.
     const prog = c ? '<div class="pv-prog"><i id="pv-fill"></i></div>' : "";
+    // Only when the clip can actually be named: a page resolved before the
+    // payload carried ids (a medley still in memory across a deploy) has no
+    // recording to reject, and a button that could only fail is worse than
+    // no button. Far left, deliberately — it is a destructive-ish verb and
+    // the two big targets on the right are the ones the thumb goes for.
+    const markable = !!(c && c.uri && c.deezer_id != null);
     // idx counts RESOLVED clips and misses are skipped, so it cannot be
     // "n of total" — the two numbers are not on the same scale.
     const pos = clips.length ? `clip ${idx + 1} · ${total} tracks` : `${total} tracks`;
@@ -2720,6 +2999,7 @@ const previewHold = (() => {
       <div class="pv-live" aria-live="polite">${now}${lines}</div>
       ${prog}
       <div class="pv-ctl">
+        ${markable ? `<button id="pv-wrong" class="icon-btn pv-wrong" title="Not this song — don't play this clip again" aria-label="Not this song — don't play this clip again">${ICON.wrong}</button>` : ""}
         <button id="pv-prev" class="icon-btn" aria-label="Previous clip"${atStart ? " disabled" : ""}>${ICON.prev}</button>
         ${needsTap ? `<button id="pv-play" class="icon-btn" aria-label="Play clip">${ICON.play}</button>` : ""}
         <button id="pv-next" class="icon-btn pv-big" aria-label="Next clip"${atEnd ? " disabled" : ""}>${ICON.next}</button>
@@ -2729,6 +3009,31 @@ const previewHold = (() => {
     // Arrow, not a bare reference: close() takes a `hard` argument, and an
     // onclick handler is called with the click event — which is truthy.
     $("pv-close").onclick = () => close();
+    // Marks the RECORDING wrong for this track, then carries on. The clip
+    // also leaves the medley in hand: the server will not offer it again,
+    // but this page is already resolved, so leaving it in would let Next —
+    // or Prev, one press later — walk straight back onto it.
+    if (markable) $("pv-wrong").onclick = async () => {
+      const bad = clips[idx];
+      if (!bad) return;
+      try {
+        await api("/api/preview_reject", { uri: bad.uri, deezer_id: bad.deezer_id,
+                                           artist: bad.artist, title: bad.name });
+        toast(`marked — that clip won't come back for “${bad.name}”`);
+      } catch (e) { toast(e.message); return; }
+      clips.splice(idx, 1);
+      // Everything resolved so far was wrong and there is no more to fetch:
+      // playAt cannot speak for an empty medley, so say it here instead of
+      // leaving the card frozen on the clip that is no longer in the list.
+      if (!clips.length && nextOffset == null) {
+        stopAudio();
+        render("no clips left — back to your music");
+        resumeSpotify();
+        return;
+      }
+      // The splice already shifted the next clip into this index.
+      playAt(idx);
+    };
     $("pv-prev").onclick = () => playAt(idx - 1);
     $("pv-next").onclick = () => playAt(idx + 1);
     // Autoplay can be refused when play() lands outside the gesture's call

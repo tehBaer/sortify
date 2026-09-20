@@ -22,6 +22,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from . import filing
 from . import rootlist
 from . import suggest as sugg
 from . import tabletshare
@@ -30,6 +31,7 @@ from . import inputsets
 from .folders import (
     creatable_home_name_problem,
     extract_folder_map,
+    folder_paths,
     home_name_excluded,
     select_home_ids,
 )
@@ -87,9 +89,17 @@ class ConfigIn(BaseModel):
 
 class CreatePlaylistIn(BaseModel):
     name: str
-    # Only "home" exists today; explicit rather than implied because the two
-    # deferred roles (inputs, subsets) differ in exactly this field. (Spec §1.)
+    # "home", "subset" or "input". Explicit rather than implied because the
+    # roles differ in what gets marked and in which name rules apply. An
+    # input is defined by its NAME matching a set's pattern (or by the folder
+    # it is created in, for a folder-defined set), so creating one means
+    # honouring that rule rather than writing the role alone.
     role: str = "home"
+    # Where to file it. An existing folder path, or None for the top level.
+    # OMITTING the field is the third case: it means "the default for this
+    # role" (config's `create_folders`), which is what the UI's dropdown
+    # shows pre-selected. `model_fields_set` is what tells the three apart.
+    folder: str | None = None
 
 
 class PlayIn(BaseModel):
@@ -268,7 +278,12 @@ def playlists():
     # Surfaced here because this is the view whose Refresh button produces
     # that listing: the orphans a refresh reveals appear right next to it.
     return {"playlists": out, "fetched_at": entry.get("fetched_at"),
-            "sitting_orphans": _find_sitting_orphans(splits)}
+            "sitting_orphans": _find_sitting_orphans(splits),
+            # The create row's folder dropdown and its pre-selection. Both
+            # ride along here rather than on an endpoint of their own: the
+            # view that creates playlists is the view that loads this.
+            "folder_paths": folder_paths(folders),
+            "create_folders": cfg.get("create_folders") or {}}
 
 
 @app.post("/api/folders")
@@ -434,26 +449,70 @@ def set_config(body: ConfigIn):
 
 @app.post("/api/playlists/create")
 def create_playlist_api(body: CreatePlaylistIn):
-    """Create a home playlist from inside sortify. One Spotify call.
+    """Create a home or subset playlist from inside sortify. One Spotify call.
 
     Everything around the call is local bookkeeping: the listing entry
     (remember_playlist), a seeded empty track cache whose snapshot_id
     matches the listing's (else every profile rebuild refetches a playlist
-    we know is empty — spec §3), the home + sticky role, and a profile
-    cache clear so the new home is usable now, not in PROFILE_TTL.
+    we know is empty — spec §3), the role marking, and a profile cache clear
+    so the new playlist is usable now, not in PROFILE_TTL.
+
+    The two roles differ in exactly two places, and both are about what a
+    subset IS. It is never a filing destination, so it is marked `subset_ids`
+    and never home/sticky — marking it home would put it in the Add to…
+    picker on the next request. And it has no name convention at all
+    (marking is the whole definition), so the home name rules — `{}`, `<>`,
+    `__x__`, emoji prefixes — must not be applied to it; those names are
+    ordinary subset names. The one rule that survives is the input pattern,
+    because `_effective_input_ids` unions pattern matches over the config
+    list: a subset named "[Foo]" comes back as an input regardless of what
+    this endpoint wrote.
     """
-    if body.role != "home":
-        raise HTTPException(400, f"unsupported role {body.role!r} — only homes can be created yet")
+    if body.role not in ("home", "subset", "input"):
+        raise HTTPException(
+            400, f"unsupported role {body.role!r} — only homes, subsets and inputs "
+                 "can be created")
+    subset = body.role == "subset"
+    is_input = body.role == "input"
     cfg = store.config()
-    problem = creatable_home_name_problem(
-        body.name,
-        input_pattern=cfg.get("input_name_pattern"),
-        exclude_patterns=cfg.get("home_name_exclude_patterns") or [],
-        exclude_emoji=bool(cfg.get("home_exclude_emoji_names")),
-    )
-    if problem:
-        raise HTTPException(400, problem)
+
+    # Folder first: for a folder-defined input set ("everything inside THE
+    # BOMB") the destination is what decides whether the name is legal, so
+    # the name checks below need it resolved already.
+    defaults = cfg.get("create_folders") or {}
+    chosen_folder = (body.folder if "folder" in body.model_fields_set
+                     else defaults.get(body.role))
+    if chosen_folder is not None:
+        known = folder_paths(store.folders())
+        if chosen_folder not in known:
+            raise HTTPException(
+                400, f"unknown folder {chosen_folder!r} — sortify only knows the "
+                     "folders that already hold a playlist, from the last folder "
+                     "re-import")
+
     name = body.name.strip()
+    if is_input:
+        # For a pattern set the NAME is the membership. Marking `input_ids`
+        # without it would produce an input that belongs to no set at all,
+        # and the only way to move it into one afterwards is a rename.
+        sets = inputsets.resolve_sets(cfg)
+        if not name:
+            raise HTTPException(400, "the name is empty")
+        if not inputsets.set_of(name, chosen_folder, sets):
+            rules = ", ".join(
+                s.get("pattern") or f"inside {s['path_segment']}" for s in sets) or "none"
+            raise HTTPException(
+                400, f"{name!r} matches no input set rule ({rules}) — it would be "
+                     "marked an input belonging to no set")
+    else:
+        problem = creatable_home_name_problem(
+            body.name,
+            input_pattern=cfg.get("input_name_pattern"),
+            exclude_patterns=[] if subset else (cfg.get("home_name_exclude_patterns") or []),
+            exclude_emoji=False if subset else bool(cfg.get("home_exclude_emoji_names")),
+        )
+        if problem:
+            raise HTTPException(400, problem)
 
     # Cached-only: my_playlists() would silently pay ~21 paginated calls on a
     # cold/absent playlist_list cache. When there is nothing cached, skip the
@@ -479,20 +538,50 @@ def create_playlist_api(body: CreatePlaylistIn):
     sp.remember_playlist(item)
 
     cfg = store.config()
-    store.update_config(
-        home_ids=sorted(set(cfg.get("home_ids") or []) | {new_id}),
-        sticky_home_ids=sorted(set(cfg.get("sticky_home_ids") or []) | {new_id}),
-    )
+    if subset:
+        store.update_config(
+            subset_ids=sorted(set(cfg.get("subset_ids") or []) | {new_id}))
+    elif is_input:
+        store.update_config(
+            input_ids=sorted(set(cfg.get("input_ids") or []) | {new_id}))
+    else:
+        store.update_config(
+            home_ids=sorted(set(cfg.get("home_ids") or []) | {new_id}),
+            sticky_home_ids=sorted(set(cfg.get("sticky_home_ids") or []) | {new_id}),
+        )
+
+    # Last folder used per role becomes that role's default, top level
+    # included — the dropdown is pre-selected from this next time.
+    store.update_config(create_folders={**defaults, body.role: chosen_folder})
 
     # Same move as set_config after a hints save, same reason: usable on the
     # next request, not up to PROFILE_TTL later.
     _profile_state.clear()
     _profile_state["built_at"] = 0.0
 
+    # Filing drives the desktop client for about a minute, so it runs behind
+    # the response: the row is usable immediately, and the folder fills in
+    # when the move lands. A failure leaves the playlist at the top level —
+    # degraded, never lost — and says so through /api/playlists/filing.
+    if chosen_folder is not None:
+        filing.start(
+            new_id, name, chosen_folder,
+            items=list((store.cache().get("playlist_list") or {}).get("items") or []),
+            on_success=lambda path, pid=new_id: store.set_folder_path(pid, path),
+        )
+
     return {
-        "playlist": {**item, "role": "home", "folder": None, "split": None, "hints": ""},
+        "playlist": {**item, "role": body.role, "folder": chosen_folder,
+                     "split": None, "hints": ""},
         "note": note,
+        "filing": chosen_folder is not None,
     }
+
+
+@app.get("/api/playlists/filing/{playlist_id}")
+def filing_status(playlist_id: str):
+    """How the background folder move for this playlist is going. 0 calls."""
+    return filing.status(playlist_id)
 
 
 def _parse_hints(cfg: dict) -> dict[str, list[str]]:
@@ -3490,6 +3579,7 @@ def playlist_preview(playlist_id: str, offset: int = 0) -> dict:
         cached = _preview_cache.get((playlist_id, offset))
         if cached and time.monotonic() - cached[0] < PREVIEW_TTL:
             return cached[1]
+        rejects = store.preview_rejects()
         candidates = sorted(
             (t for t in entry.get("tracks") or []
              if t.get("name") and (t.get("artists") or [{}])[0].get("name")),
@@ -3502,13 +3592,22 @@ def playlist_preview(playlist_id: str, offset: int = 0) -> dict:
                 break
             consumed += 1
             artist = t["artists"][0]["name"]
+            # What the user has already marked as the wrong recording for
+            # this track. Passed INTO the search so it reaches the next
+            # candidate rather than filtering the answer away afterwards.
+            skip = (rejects.get(t.get("uri")) or {}).get("rejected") or []
             try:
-                rec = _deezer_client().fetch_preview(artist, t["name"])
+                rec = _deezer_client().fetch_preview(artist, t["name"], exclude=skip)
             except Exception:
                 log.warning("deezer preview failed for %r — skipping", t["name"])
                 continue
             if not rec.get("miss"):
-                clips.append({"name": t["name"], "artist": artist, "url": rec["url"]})
+                # `uri` and `deezer_id` are what let the player say WHICH
+                # recording was wrong when the user marks it — without them
+                # a reject could only name a title, which is the one thing
+                # already known to be ambiguous.
+                clips.append({"name": t["name"], "artist": artist, "url": rec["url"],
+                              "uri": t.get("uri"), "deezer_id": rec.get("deezer_id")})
         nxt = offset + consumed
         payload = {
             "clips": clips,
@@ -3519,6 +3618,48 @@ def playlist_preview(playlist_id: str, offset: int = 0) -> dict:
         }
         _preview_cache[(playlist_id, offset)] = (time.monotonic(), payload)
         return payload
+
+
+class PreviewRejectIn(BaseModel):
+    uri: str
+    deezer_id: int
+    # Stored, never matched on: the file is meant to be readable by whoever
+    # opens it to correct an entry by hand.
+    artist: str = ""
+    title: str = ""
+
+
+@app.post("/api/preview_reject")
+def preview_reject(body: PreviewRejectIn) -> dict:
+    """"That is not the song" — mark a Deezer recording wrong for this track.
+
+    Costs nothing upstream: it writes a local file and drops some memoised
+    pages. The next resolve for this track searches again with the id
+    excluded, which usually lands on the recording the user wanted, since
+    the free-text fallback that returns a remix normally has the original
+    sitting right behind it.
+    """
+    rejects = store.preview_rejects()
+    entry = rejects.setdefault(
+        body.uri, {"artist": body.artist, "title": body.title, "rejected": []})
+    # Names can improve (an empty one filled in by a later mark); the list is
+    # the part that must only ever grow, and never with duplicates.
+    if body.artist:
+        entry["artist"] = body.artist
+    if body.title:
+        entry["title"] = body.title
+    if body.deezer_id not in entry["rejected"]:
+        entry["rejected"].append(body.deezer_id)
+    store.save_preview_rejects(rejects)
+    # Without this the rejected clip keeps playing for the rest of
+    # PREVIEW_TTL — ten minutes of the app ignoring what it was just told.
+    # Every page is dropped, not just the one holding this track: pages are
+    # keyed by (playlist, offset) and the track can sit in any of them, in
+    # any playlist. They are pure memoisation of a free API, so rebuilding
+    # them costs a Deezer search and nothing else.
+    with _preview_lock:
+        _preview_cache.clear()
+    return {"ok": True, "rejected": entry["rejected"]}
 
 
 # On phones the OS gives the preview audio focus and pauses the Spotify app;
@@ -3559,9 +3700,16 @@ def _idle_inputs_payload() -> list[dict]:
     out = []
     for iid in sorted(_effective_input_ids(store.config(), items)):
         if iid == LIKED_ID:
-            out.append({"id": iid, "name": "Liked Songs", "has_track": False})
+            # No count: the library's size is not in the listing, and reading
+            # it is a call this branch is not allowed to make.
+            out.append({"id": iid, "name": "Liked Songs", "has_track": False,
+                        "total": None})
         elif iid in by_id:
-            out.append({"id": iid, "name": by_id[iid]["name"], "has_track": False})
+            # The listing's own total, NOT a membership set — there is none to
+            # count here, and building one is exactly what this branch must
+            # never do. Same number in practice, staler by a refresh.
+            out.append({"id": iid, "name": by_id[iid]["name"], "has_track": False,
+                        "total": by_id[iid].get("total")})
     return out
 
 
@@ -3618,7 +3766,13 @@ def _suggestion_payload(np: dict) -> dict:
         "homes": _homes_payload(state),
         "inputs": [
             {"id": l["id"], "name": l["name"], "has_track": track["uri"] in l["uris"],
-             "set": l.get("set", inputsets.DEFAULT_KEY)}
+             "set": l.get("set", inputsets.DEFAULT_KEY),
+             # Free, and live: `uris` is the membership set `_sync_membership`
+             # updates on every filing, so the switcher's count falls as the
+             # inbox empties instead of waiting out PROFILE_TTL. Deduped by
+             # construction, which is why it can differ by a track or two from
+             # the listing's `total` on a playlist holding the same song twice.
+             "total": len(l["uris"])}
             for l in state["inputs"]
         ],
         "homeless_id": _homeless_id(state),

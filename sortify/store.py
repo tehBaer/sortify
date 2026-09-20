@@ -144,6 +144,34 @@ class Store:
     def save_folders(self, mapping: dict) -> None:
         self._save("folders.json", mapping)
 
+    def set_folder_path(self, playlist_id: str, path: str | None) -> None:
+        """Record where ONE playlist now lives (None = top level).
+
+        Used after a filing move lands. Deliberately not a folder re-import:
+        that re-marks every home from the tree, which is a far bigger act
+        than "this new playlist is now in this folder".
+        """
+        mapping = self.folders()
+        if path is None:
+            mapping.pop(playlist_id, None)
+        else:
+            caps = any(seg == seg.upper() and any(c.isalpha() for c in seg)
+                       for seg in path.split(" / "))
+            mapping[playlist_id] = {"path": path, "caps": caps}
+        self.save_folders(mapping)
+
+    # preview_rejects.json: {spotify_uri: {artist, title, rejected: [deezer_id]}}
+    # Deezer matches by text, so it sometimes answers with a remix or another
+    # song entirely; this is the user saying which recording was wrong. Keyed
+    # by uri (a rename cannot orphan it) and kept readable — the artist and
+    # title are stored for no other reason than that a human opening the file
+    # to fix an entry needs to know what it is about.
+    def preview_rejects(self) -> dict:
+        return self._load("preview_rejects.json", {})
+
+    def save_preview_rejects(self, mapping: dict) -> None:
+        self._save("preview_rejects.json", mapping)
+
     # usage.json: {day, count} — local daily API-call budget accounting
     def usage(self) -> dict:
         return self._load("usage.json", {"day": "", "count": 0})

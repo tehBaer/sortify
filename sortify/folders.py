@@ -57,6 +57,17 @@ def creatable_home_name_problem(
     return None
 
 
+def folder_paths(mapping: dict) -> list[str]:
+    """Every folder the stored mapping knows about, once each, sorted.
+
+    This is the list of destinations sortify can offer when creating a
+    playlist. It is derived from data/folders.json, so a folder that holds
+    no playlist yet is not in it — there is nothing to derive it from
+    without re-extracting the client's tree.
+    """
+    return sorted({info["path"] for info in mapping.values() if info.get("path")})
+
+
 def _is_caps(name: str) -> bool:
     return name == name.upper() and any(c.isalpha() for c in name)
 

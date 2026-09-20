@@ -1328,16 +1328,23 @@ run("stopNowPolling()");
     const d = { playing: true, is_playing: true,
       context: { id: "in2", name: "[B]", is_input: true },
       inputs: [
-        { id: "in1", name: "[A]", set: "buffer", has_track: false },
-        { id: "in2", name: "[B]", set: "buffer", has_track: false },
-        { id: "o1", name: "<kept>", set: "other", has_track: true },
-        { id: "o2", name: "<folded away>", set: "other", has_track: false },
+        { id: "in1", name: "[A]", set: "buffer", has_track: false, total: 12 },
+        { id: "in2", name: "[B]", set: "buffer", has_track: false, total: 7 },
+        { id: "o1", name: "<kept>", set: "other", has_track: true, total: 3 },
+        { id: "o2", name: "<folded away>", set: "other", has_track: false, total: 0 },
       ] };
     run(`nowSetsExpanded = false; paintNowControls(${JSON.stringify(d)})`);
     check("NB the trigger is shown wearing the playing input's name",
           $$("btn-input-switch").hidden === false
           && /\[B\]/.test($$("input-switch-label").textContent),
           `hidden=${$$("btn-input-switch").hidden} label=` +
+          JSON.stringify($$("input-switch-label").textContent));
+    // How much is left in the list you are working through. It reads off the
+    // PLAYING input's row, not the first one that happens to match — a bar
+    // that counted down someone else's inbox would be worse than no count.
+    check("NB the trigger carries the playing input's own count",
+          /\[B\].*\b7\b/.test($$("input-switch-label").textContent)
+          && !/12/.test($$("input-switch-label").textContent),
           JSON.stringify($$("input-switch-label").textContent));
 
     run(`openInputPop()`);
@@ -1349,6 +1356,9 @@ run("stopNowPolling()");
     check("NB a folded set still peeks the row that contains the track",
           /ip-o1/.test(pop.innerHTML) && !/ip-o2/.test(pop.innerHTML),
           JSON.stringify(pop.innerHTML.slice(0, 200)));
+    check("NB every row carries its own count, so inboxes can be compared",
+          /ip-count">12</.test(pop.innerHTML) && /ip-count">7</.test(pop.innerHTML),
+          JSON.stringify(pop.innerHTML.slice(0, 300)));
     check("NB the fold toggle lives inside the panel, not the top bar",
           /btn-now-sets/.test(pop.innerHTML), JSON.stringify(pop.innerHTML.slice(0, 200)));
 
@@ -1391,6 +1401,29 @@ run("stopNowPolling()");
           $$("btn-input-switch").disabled === false
           && /\[B\]/.test($$("input-switch-label").textContent),
           `disabled=${$$("btn-input-switch").disabled}`);
+
+    // A count the server could not work out (Liked Songs in the idle payload)
+    // arrives as null. Drawing "0" there would be a lie about an empty list.
+    const unknown = { playing: true, is_playing: true,
+      context: { id: "in9", name: "[U]", is_input: true },
+      inputs: [{ id: "in9", name: "[U]", set: "buffer", has_track: false, total: null }] };
+    run(`paintNowControls(${JSON.stringify(unknown)}); openInputPop()`);
+    check("NB an unknown count draws no number at all, on the row or the face",
+          !/ip-count/.test($$("input-pop").innerHTML)
+          && !/·/.test($$("input-switch-label").textContent),
+          `label=${JSON.stringify($$("input-switch-label").textContent)} ` +
+          JSON.stringify($$("input-pop").innerHTML.slice(0, 200)));
+    run(`closeInputPop(); paintNowControls(${JSON.stringify(d)})`);
+
+    // Playing something that is not an input at all: the name says so and
+    // there is nothing to count down.
+    run(`paintNowControls(${JSON.stringify({ ...d,
+      context: { id: "zz", name: "someone else's mix", is_input: false } })})`);
+    check("NB a non-input context gets no count",
+          !/·/.test($$("input-switch-label").textContent)
+          && /not an input/.test($$("input-switch-label").textContent),
+          JSON.stringify($$("input-switch-label").textContent));
+    run(`paintNowControls(${JSON.stringify(d)})`);
   } catch (e) {
     check("NB scenario ran without throwing", false, String(e));
   }
@@ -2791,9 +2824,13 @@ run("stopNowPolling()");
   // suggested it holds that one row, which is exactly the case where the user
   // needs it most.
   card = await paint([]);
-  const empty = card.match(/<div class="sugg-scroll">([\s\S]*?)<\/div>\s*<p class="hint">/);
+  // Greedy, and counting DESTINATIONS rather than "sugg"-ish classes: Add
+  // to… is a wrapped pair now (the row plus its search half), so both the
+  // lazy match and a class-name tally read the nesting as extra rows.
+  // data-to is the thing that actually means "a home you can file into".
+  const empty = card.match(/<div class="sugg-scroll">([\s\S]*)<\/div>\s*<p class="hint">/);
   check("SC nothing suggested, and the box holds Add to… by itself",
-        !!empty && (empty[1].match(/class="sugg/g) || []).length === 1 &&
+        !!empty && (empty[1].match(/data-to="/g) || []).length === 0 &&
         empty[1].includes("sugg-more"), `card=${card}`);
 
   card = await paint(six.slice(0, 2).map((s) => ({ ...s, weak: true })));
@@ -3490,6 +3527,158 @@ run("stopNowPolling()");
 }
 
 // ============================================================================
+// UF — taking a song back out of a home it is already in.
+//
+// The row's own tap keeps its old meaning (file here / clear the inboxes), so
+// the eject is a separate, smaller control and only "already there" rows get
+// one. What it must NOT do is as load-bearing as what it does: no inbox
+// sweep, and no done-card — the song is undecided again, and a card that
+// congratulated itself would hide the suggestions you now need.
+// ============================================================================
+{
+  resetLog();
+  const html = () => $$("now-card").innerHTML;
+  setNow({
+    playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+    track: { uri: "spotify:track:uf1", name: "Song", duration_ms: 200000,
+             artists: [{ name: "Artist" }], sortable: true, image: null },
+    context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
+    suggestions: [
+      { playlist_id: "H1", pct: 100, already: true, weak: false, reasons: ["artist"] },
+      { playlist_id: "H2", pct: 44, already: false, weak: false, reasons: ["tags"] },
+    ],
+    homes: [{ id: "H1", name: "Home One", folder: "" },
+            { id: "H2", name: "Home Two", folder: "" }],
+    subset_targets: [], subsets: [],
+    inputs: [{ id: "IN1", name: "[Hazy]", has_track: true, set: "buffer", total: 9 }],
+    homeless_id: null,
+  });
+  run(`show("now"); filedUris = {}; removedUri = null; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+
+  check("UF the already-there row gets an eject control",
+        /class="sugg-eject" data-out="H1"/.test(html()), JSON.stringify(
+          (html().match(/<button class="sugg-eject"[^>]*>/) || [""])[0]));
+  check("UF ...and an ordinary guess does not — there is nothing to take out",
+        !/data-out="H2"/.test(html()),
+        JSON.stringify(html().match(/data-out="[^"]*"/g)));
+  check("UF the row itself keeps its filing action",
+        /class="sugg already[^"]*" data-to="H1"/.test(html()),
+        JSON.stringify((html().match(/<button class="sugg already[^>]*>/) || [""])[0]));
+
+  routes["POST /api/act"] = { status: 200, body: { ok: true, note: null, can_undo: true, swept: [] } };
+  routes["POST /api/undo"] = { status: 200, body: { ok: true } };
+  resetLog();
+  await run(`nowUnfile("H1")`);
+  await tick();
+  const act = bodies("/api/act")[0];
+  check("UF ejecting removes from that home alone",
+        posts("/api/act") === 1 && act?.action === "remove" && act?.from_id === "H1",
+        JSON.stringify(act));
+  check("UF ...and never sweeps the inboxes — the song is undecided, not rejected",
+        act?.sweep_inputs === false && !act?.to_id, JSON.stringify(act));
+  check("UF the card stays live rather than landing in its done state",
+        !/done-msg/.test(html()) && /data-to="H2"/.test(html()),
+        JSON.stringify(html().slice(0, 120)));
+  check("UF the row stops claiming already-there without waiting for a poll",
+        !/data-out="H1"/.test(html()) && /class="sugg" data-to="H1"/.test(html()),
+        JSON.stringify((html().match(/<button class="sugg[^>]*data-to="H1"[^>]*>/) || [""])[0]));
+
+  await run(`undoLastNowAction()`);
+  await tick();
+  check("UF undo puts the badge back rather than leaving a stale row",
+        /data-out="H1"/.test(html()), JSON.stringify(
+          (html().match(/<button class="sugg[^>]*data-to="H1"[^>]*>/) || [""])[0]));
+  run(`show("lists")`);
+}
+
+// ============================================================================
+// CS — creating a subset from the card, at the moment of need.
+//
+// The price on the row is the promise: a subset add never removes anything (a
+// song in a selection has not been sorted), so it is always create + add, and
+// never the 3 calls the home row quotes when filing out of an input.
+// ============================================================================
+{
+  resetLog();
+  setNow({
+    playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+    track: { uri: "spotify:track:cs1", name: "Song", duration_ms: 200000,
+             artists: [{ name: "Artist" }], sortable: true, image: null },
+    context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
+    suggestions: [], subsets: [],
+    homes: [{ id: "H1", name: "Home One", folder: "" }],
+    subset_targets: [{ id: "S1", name: "best of", total: 4, folder: null }],
+    inputs: [{ id: "IN1", name: "[Hazy]", has_track: true, set: "buffer", total: 9 }],
+    homeless_id: null,
+  });
+  run(`show("now"); filedUris = {}; removedUri = null; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+
+  // The bug this block was written past: with subsets already marked, the
+  // picker renders rows, and a create row gated on "nothing matched" can
+  // never appear. Nine marked subsets meant the create path was unreachable
+  // in the real app while this block's own typed-a-new-name case passed.
+  run(`$("btn-now-subset").onclick()`);
+  const lastRow = () => ($$("picker-list").children.slice(-1)[0] || {}).innerHTML || "";
+  check("CS the create row is offered with the picker merely open",
+        /Create a new subset/.test(lastRow()),
+        JSON.stringify($$("picker-list").children.map((c) => c.innerHTML.slice(0, 60))));
+  check("CS ...and with no name typed it asks for one instead of firing blind",
+        /type a name above/.test(lastRow()), JSON.stringify(lastRow()));
+  resetLog();
+  await $$("picker-list").children.slice(-1)[0].onclick();
+  check("CS ...spending nothing when it does",
+        posts("/api/playlists/create") === 0 && $$("picker").hidden === false,
+        `${posts("/api/playlists/create")} POST(s), hidden=${$$("picker").hidden}`);
+
+  run(`$("picker-filter").value = "best"; $("picker-filter").oninput({ target: { value: "best" } })`);
+  check("CS ...and still offered when the typed name DOES match an existing one",
+        $$("picker-list").children.some((c) => /Create subset/.test(c.innerHTML))
+        && $$("picker-list").children.some((c) => /best of/.test(c.innerHTML)),
+        JSON.stringify($$("picker-list").children.map((c) => c.innerHTML.slice(0, 60))));
+
+  run(`$("picker-filter").value = "krautrock"; $("picker-filter").oninput({ target: { value: "krautrock" } })`);
+  const made = $$("picker-list").children.slice(-1)[0];
+  check("CS a subset picker matching nothing offers to create one",
+        /Create subset/.test(made?.innerHTML || ""), JSON.stringify(made?.innerHTML));
+  check("CS ...named what was typed",
+        /krautrock/.test(made?.innerHTML || ""), JSON.stringify(made?.innerHTML));
+  check("CS ...priced at two calls even though the context is an input",
+        /2 calls/.test(made?.innerHTML || "") && !/3 calls/.test(made?.innerHTML || ""),
+        JSON.stringify(made?.innerHTML));
+
+  routes["POST /api/playlists/create"] = { status: 200, body: {
+    playlist: { id: "S9", name: "krautrock", role: "subset", total: 0, folder: null },
+    note: null } };
+  routes["POST /api/act"] = { status: 200, body: { ok: true, note: null, can_undo: true, swept: [] } };
+  resetLog();
+  await made.onclick();
+  await tick();
+  const created = bodies("/api/playlists/create")[0];
+  check("CS creating sends the subset role, not home",
+        posts("/api/playlists/create") === 1 && created?.role === "subset"
+        && created?.name === "krautrock", JSON.stringify(created));
+  const added = bodies("/api/act")[0];
+  check("CS ...and the track goes straight into it",
+        posts("/api/act") === 1 && added?.to_id === "S9", JSON.stringify(added));
+  check("CS ...without leaving its input — a subset add is not a filing",
+        added?.from_id === null || added?.from_id === undefined, JSON.stringify(added));
+
+  // The home picker's create row must be untouched by the subset wording.
+  run(`openNowPicker()`);
+  run(`$("picker-filter").value = "zzz"; $("picker-filter").oninput({ target: { value: "zzz" } })`);
+  const homeMade = $$("picker-list").children.slice(-1)[0];
+  check("CS the home picker still offers a HOME, priced with its removal",
+        /Create home/.test(homeMade?.innerHTML || "")
+        && /3 calls/.test(homeMade?.innerHTML || ""),
+        JSON.stringify(homeMade?.innerHTML));
+  run(`closePicker(); show("lists")`);
+}
+
+// ============================================================================
 // NC — the verb row is a notched trio: Remove and Next extend toward each
 // other and a combined Remove+Next circle sits in the notch between them,
 // carved free by a moat (the moat IS the mis-tap buffer the old column gap
@@ -3656,6 +3845,363 @@ run("stopNowPolling()");
     run("stopNowPolling()");
     $$("view-now").hidden = false;
   }
+}
+
+// ============================================================================
+// SD — only a SPENT decision takes the Remove slot.
+//
+// The strip swapped Remove for Undo after any action on the playing track.
+// But three of them leave the song exactly where it was in its inbox: adding
+// it to a subset (a selection is not a filing — the song still needs a home),
+// capturing it into another input, and taking it back out of a home. In all
+// three the song is still undecided, so Remove still has something to do and
+// must not be swapped away. The undo for them is the top bar's, one tap away.
+// ============================================================================
+{
+  resetLog();
+  const nowBody = (uri) => ({
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri, name: "Song", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[In]", is_input: true },
+      sitting: null,
+      suggestions: [{ playlist_id: "H1", pct: 100, already: true, weak: false, reasons: ["a"] }],
+      homes: [{ id: "H1", name: "Home", folder: "" }],
+      subset_targets: [{ id: "S1", name: "best of", total: 4, folder: null }],
+      inputs: [{ id: "IN1", name: "[In]", has_track: true, set: "buffer", total: 9 },
+               { id: "IN2", name: "[Other]", has_track: false, set: "buffer", total: 2 }],
+      homeless_id: null,
+    },
+  });
+  const html = () => $$("now-card").innerHTML;
+  const has = (needle) => html().includes(needle);
+  const strip = () => ({ remove: has('id="btn-now-remove"'),
+                         undo: has('id="btn-now-undo-remove"') });
+
+  routes["POST /api/act"] = { status: 200, body: { ok: true, swept: [] } };
+  routes["POST /api/undo"] = { status: 200, body: { ok: true } };
+
+  const fresh = async (uri) => {
+    setNow(nowBody(uri));
+    run(`filedUris = {}; nowActions = 0; removedUri = null; nowActionLog = []; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+  };
+
+  await fresh("spotify:track:sd1");
+  await run(`nowAddToSubset("S1")`);
+  await tick();
+  check("SD a subset add leaves Remove in place — the song is still undecided",
+        strip().remove && !strip().undo, JSON.stringify(strip()));
+  check("SD ...and the undo for it is still offered in the top bar",
+        run(`$("btn-undo-now").hidden`) === false && run("nowActions") === 1,
+        `hidden=${run(`$("btn-undo-now").hidden`)} actions=${run("nowActions")}`);
+
+  await fresh("spotify:track:sd2");
+  await run(`nowCapture("IN2")`);
+  await tick();
+  check("SD capturing into another input leaves Remove in place too",
+        strip().remove && !strip().undo, JSON.stringify(strip()));
+
+  await fresh("spotify:track:sd3");
+  await run(`nowUnfile("H1")`);
+  await tick();
+  check("SD taking it back out of a home leaves Remove in place",
+        strip().remove && !strip().undo, JSON.stringify(strip()));
+
+  // The two that DO spend the decision keep their Undo.
+  await fresh("spotify:track:sd4");
+  await run(`nowFile("H1")`);
+  await tick();
+  check("SD filing to a home still swaps Remove for Undo",
+        strip().undo && !strip().remove, JSON.stringify(strip()));
+
+  await fresh("spotify:track:sd5");
+  await run(`nowRemove()`);
+  await tick();
+  check("SD removing still swaps Remove for Undo",
+        strip().undo && !strip().remove, JSON.stringify(strip()));
+
+  run(`filedUris = {}; nowActions = 0; removedUri = null; nowActionLog = []; show("lists")`);
+}
+
+// ============================================================================
+// TU — the toast carries the undo for actions that do not spend the decision.
+//
+// A subset add, a capture and an un-file all leave Remove in the strip (see
+// SD), and #btn-undo-now is display:none by request — so without this the
+// only way back is the `u` key, which a phone does not have. The undo is
+// deliberately guarded: if anything else has acted since, pressing it must
+// refuse rather than take back somebody else's decision.
+// ============================================================================
+{
+  resetLog();
+  const nowBody = (uri) => ({
+    status: 200,
+    body: {
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri, name: "Song", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[In]", is_input: true },
+      sitting: null,
+      suggestions: [{ playlist_id: "H1", pct: 100, already: true, weak: false, reasons: ["a"] }],
+      homes: [{ id: "H1", name: "Home", folder: "" }],
+      subset_targets: [{ id: "S1", name: "best of", total: 4, folder: null }],
+      inputs: [{ id: "IN1", name: "[In]", has_track: true, set: "buffer", total: 9 },
+               { id: "IN2", name: "[Other]", has_track: false, set: "buffer", total: 2 }],
+      homeless_id: null,
+    },
+  });
+  const toastHtml = () => $$("toast").innerHTML || "";
+  routes["POST /api/act"] = { status: 200, body: { ok: true, swept: [] } };
+  routes["POST /api/undo"] = { status: 200, body: { ok: true } };
+
+  const fresh = async (uri) => {
+    setNow(nowBody(uri));
+    run(`filedUris = {}; nowActions = 0; removedUri = null; nowActionLog = []; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+  };
+
+  await fresh("spotify:track:tu1");
+  await run(`nowAddToSubset("S1")`);
+  await tick();
+  check("TU a subset add's toast offers an Undo",
+        /id="toast-action"/.test(toastHtml()) && /best of/.test(toastHtml()),
+        JSON.stringify(toastHtml().slice(0, 140)));
+
+  resetLog();
+  // Guarded: an unwired button is a failed check, not an exception that ends
+  // the whole run before the later scenarios get to speak.
+  const wired = run(`typeof $("toast-action").onclick === "function"`);
+  check("TU the toast's Undo is wired", wired,
+        `onclick=${run(`typeof $("toast-action").onclick`)}`);
+  if (wired) { await run(`$("toast-action").onclick()`); await tick(); }
+  check("TU pressing it spends exactly one undo",
+        posts("/api/undo") === 1, `${posts("/api/undo")} POST(s)`);
+  check("TU ...and the action log shrinks with it",
+        run("nowActionLog.length") === 0 && run("nowActions") === 0,
+        `log=${run("nowActionLog.length")} actions=${run("nowActions")}`);
+
+  await fresh("spotify:track:tu2");
+  await run(`nowCapture("IN2")`);
+  await tick();
+  check("TU a capture's toast offers one too",
+        /id="toast-action"/.test(toastHtml()), JSON.stringify(toastHtml().slice(0, 140)));
+
+  await fresh("spotify:track:tu3");
+  await run(`nowUnfile("H1")`);
+  await tick();
+  check("TU an un-file's toast offers one too",
+        /id="toast-action"/.test(toastHtml()), JSON.stringify(toastHtml().slice(0, 140)));
+
+  // The guard. The six-second life of this toast is long enough for another
+  // decision to land on the stack, and /api/undo only ever pops the top — so
+  // a press that fired blind would take back the NEWER action. Staged by
+  // pushing onto the log directly, which is exactly what the second action
+  // would have done, without a second toast overwriting the button first.
+  await fresh("spotify:track:tu4");
+  await run(`nowAddToSubset("S1")`);
+  await tick();
+  run(`nowActionLog.push({ uri: "spotify:track:someone-else", kind: "subset" })`);
+  resetLog();
+  const guarded = run(`typeof $("toast-action").onclick === "function"`);
+  if (guarded) { await run(`$("toast-action").onclick()`); await tick(); }
+  check("TU a stale press undoes nothing rather than the newer action",
+        posts("/api/undo") === 0 && run("nowActionLog.length") === 2,
+        `${posts("/api/undo")} POST(s), log=${run("nowActionLog.length")}`);
+  check("TU ...and says why instead of failing silently",
+        /too late/.test($$("toast").textContent || ""),
+        JSON.stringify($$("toast").textContent));
+
+  // A filing keeps its undo in the strip, not in the toast — two undo
+  // affordances for one action is one too many.
+  await fresh("spotify:track:tu5");
+  await run(`nowFile("H1")`);
+  await tick();
+  check("TU a filing's toast carries no undo — the strip has it",
+        !/id="toast-action"/.test(toastHtml()), JSON.stringify(toastHtml().slice(0, 140)));
+
+  run(`filedUris = {}; nowActions = 0; removedUri = null; nowActionLog = []; show("lists")`);
+}
+
+// ============================================================================
+// AA — artist and album get a line each.
+//
+// They shared one line joined by an em dash, which reads as one long string
+// on a phone and truncates the album first. Separate elements also let blind
+// mode blur both (an album name leaks the artist just as well) and let a tap
+// on either one peek the card.
+// ============================================================================
+{
+  resetLog();
+  setNow({
+    playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+    track: { uri: "spotify:track:aa1", name: "Song", duration_ms: 200000,
+             artists: [{ name: "Ar One" }, { name: "Ar Two" }],
+             album: "The Album", sortable: true, image: null },
+    context: { id: "IN1", name: "[In]", is_input: true },
+    sitting: null, suggestions: [], homes: [], subset_targets: [],
+    inputs: [{ id: "IN1", name: "[In]", has_track: true, set: "buffer", total: 3 }],
+    homeless_id: null,
+  });
+  run(`show("now"); filedUris = {}; nowActions = 0; removedUri = null; nowActionLog = []; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  const html = () => $$("now-card").innerHTML;
+
+  check("AA the album has an element of its own",
+        /class="t-album"[^>]*>The Album</.test(html()),
+        JSON.stringify((html().match(/<div class="t-a[^>]*>[^<]*</g) || [])));
+  check("AA ...and the artist line is artists alone, no dash",
+        /class="t-artist">Ar One, Ar Two</.test(html()) && !html().includes(" — The Album"),
+        JSON.stringify((html().match(/class="t-artist">[^<]*/) || [""])[0]));
+
+  // A track with no album must not leave a stray dash or a visible gap.
+  setNow({
+    playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+    track: { uri: "spotify:track:aa2", name: "Song", duration_ms: 200000,
+             artists: [{ name: "Ar One" }], sortable: true, image: null },
+    context: { id: "IN1", name: "[In]", is_input: true },
+    sitting: null, suggestions: [], homes: [], subset_targets: [],
+    inputs: [{ id: "IN1", name: "[In]", has_track: true, set: "buffer", total: 3 }],
+    homeless_id: null,
+  });
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  check("AA a track with no album draws no dash",
+        !/—/.test((html().match(/class="t-artist">[^<]*/) || [""])[0]),
+        JSON.stringify((html().match(/class="t-artist">[^<]*/) || [""])[0]));
+  run(`show("lists")`);
+}
+
+// ============================================================================
+// PW — "that is not the song". Deezer matches by text, so a preview is
+// sometimes a remix or another track entirely. Marking one must name the
+// exact RECORDING (the deezer_id), drop it from the medley in hand, and move
+// on — leaving it in the list would walk Next straight back onto it.
+// ============================================================================
+{
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    routes["GET /api/playlist_preview/pw1"] = {
+      clips: [{ name: "Song A", artist: "Artist A", url: "https://cdn/a.mp3",
+                uri: "spotify:track:a", deezer_id: 11 },
+              { name: "Song B", artist: "Artist B", url: "https://cdn/b.mp3",
+                uri: "spotify:track:b", deezer_id: 22 }],
+      next_offset: null, total: 12, tracks: [],
+    };
+    routes["POST /api/preview_reject"] = { ok: true, rejected: [11] };
+    routes["POST /api/preview_resume"] = { ok: true };
+    setNow({ status: 200, body: { playing: false, poll_after_ms: 999999 } });
+    run(`nowState = { playing: true, is_playing: true, track: { uri: "spotify:track:x" }, homes: new Map() }`);
+
+    const row = new El("pw-row");
+    ctx.__pwrow = row;
+    run(`previewHold.attach(__pwrow, "pw1", "Deep Cuts")`);
+    row.onpointerdown({ clientX: 10, clientY: 10 });
+    await new Promise((r) => setTimeout(r, 700));
+    await tick();
+
+    check("PW the player offers a way to say the clip is wrong",
+          $$("preview-pop").innerHTML.includes('id="pv-wrong"'),
+          JSON.stringify($$("preview-pop").innerHTML.slice(0, 200)));
+    check("PW the first clip is playing before it is marked",
+          AudioStub.made.at(-1)?.src === "https://cdn/a.mp3",
+          `src=${AudioStub.made.at(-1)?.src}`);
+
+    resetLog();
+    const wired = run(`typeof $("pv-wrong").onclick === "function"`);
+    check("PW the control is wired", wired, `onclick=${run(`typeof $("pv-wrong").onclick`)}`);
+    if (wired) { await run(`$("pv-wrong").onclick()`); await tick(); }
+    const sent = bodies("/api/preview_reject")[0];
+    check("PW marking names the recording, not just the title",
+          posts("/api/preview_reject") === 1 && sent?.deezer_id === 11
+          && sent?.uri === "spotify:track:a",
+          JSON.stringify(sent));
+    check("PW ...and carries the names, so the file reads as something human",
+          sent?.artist === "Artist A" && sent?.title === "Song A", JSON.stringify(sent));
+    check("PW marking moves straight on to the next clip",
+          AudioStub.made.at(-1)?.src === "https://cdn/b.mp3",
+          `src=${AudioStub.made.at(-1)?.src}`);
+
+    // The rejected clip must be gone from the medley in hand: Prev from the
+    // clip after it would otherwise play the very thing just rejected.
+    run(`$("pv-prev").onclick()`);
+    await tick();
+    check("PW ...and going back does not land on the rejected clip again",
+          AudioStub.made.at(-1)?.src !== "https://cdn/a.mp3",
+          `src=${AudioStub.made.at(-1)?.src}`);
+
+    run("previewHold.stop()");
+  } catch (e) {
+    check("PW scenario ran without throwing", false, String(e));
+  }
+}
+
+// ============================================================================
+// AB — Add to… is two targets, because this app is used on a phone.
+//
+// The picker focused its filter unconditionally, so every route in threw the
+// on-screen keyboard over the list you were trying to read. The wide button
+// opens it to scroll; the magnifier beside it opens it ready to type. Both
+// reach the same picker — the only difference is the keyboard.
+// ============================================================================
+{
+  resetLog();
+  setNow({
+    playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+    track: { uri: "spotify:track:ab1", name: "Song", duration_ms: 200000,
+             artists: [{ name: "Ar" }], sortable: true, image: null },
+    context: { id: "IN1", name: "[In]", is_input: true },
+    sitting: null, suggestions: [],
+    homes: [{ id: "H1", name: "Home One", folder: "" }],
+    subset_targets: [],
+    inputs: [{ id: "IN1", name: "[In]", has_track: true, set: "buffer", total: 3 }],
+    homeless_id: null,
+  });
+  run(`show("now"); filedUris = {}; nowActions = 0; removedUri = null; nowActionLog = []; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  const html = () => $$("now-card").innerHTML;
+
+  check("AB the row carries both targets",
+        html().includes('id="btn-now-more"') && html().includes('id="btn-now-search"'),
+        JSON.stringify((html().match(/id="btn-now-(more|search)"/g) || [])));
+
+  // The stub records focus() calls, so "did the keyboard come up" is
+  // directly observable rather than inferred.
+  run(`$("picker-filter").focused = 0;
+       $("picker-filter").focus = function () { this.focused++; };`);
+
+  run(`$("btn-now-more").onclick()`);
+  check("AB the wide button opens the picker",
+        run(`$("picker").hidden`) === false, `hidden=${run(`$("picker").hidden`)}`);
+  check("AB ...without raising the keyboard",
+        run(`$("picker-filter").focused`) === 0,
+        `focused=${run(`$("picker-filter").focused`)}`);
+  check("AB ...and still shows the homes to scroll",
+        $$("picker-list").children.some((c) => /Home One/.test(c.innerHTML)),
+        JSON.stringify($$("picker-list").children.map((c) => c.innerHTML.slice(0, 40))));
+
+  run(`closePicker(); $("btn-now-search").onclick()`);
+  check("AB the magnifier opens the same picker",
+        run(`$("picker").hidden`) === false, `hidden=${run(`$("picker").hidden`)}`);
+  check("AB ...and does raise the keyboard",
+        run(`$("picker-filter").focused`) === 1,
+        `focused=${run(`$("picker-filter").focused`)}`);
+
+  // Every other picker is unchanged: they focus as they always have.
+  run(`closePicker(); $("btn-now-subset").onclick()`);
+  check("AB the subset picker still focuses, unchanged",
+        run(`$("picker-filter").focused`) === 2,
+        `focused=${run(`$("picker-filter").focused`)}`);
+
+  run(`closePicker(); show("lists")`);
 }
 
 // ============================================================================
@@ -3843,6 +4389,118 @@ run("stopNowPolling()");
         `html=${html().slice(0, 300)}`);
 
   run(`show("lists")`);
+}
+
+// ============================================================================
+// NF — creating a playlist picks a folder, and the filing job is visible
+// ============================================================================
+// The Web API has no folders, so a created playlist lands at the top level
+// and a desktop-client move (about a minute, zero API calls) files it. Three
+// things have to hold in the UI: the dropdown can only offer folders the
+// server actually knows, the choice per role is remembered, and the wait is
+// never silent — a filing that fails leaves a real playlist at the top
+// level, and saying nothing would look like the playlist was lost.
+{
+  resetLog();
+  routes["GET /api/playlists"] = { status: 200, body: {
+    playlists: [], fetched_at: 0, sitting_orphans: [],
+    folder_paths: ["ROOT / Rock", "THE BOMB"],
+    create_folders: { home: "ROOT / Rock", input: "THE BOMB" } } };
+  await run("loadLists()");
+  await tick();
+
+  const opts = () => $$("new-pl-folder").innerHTML;
+  check("NF the folder dropdown offers every folder the server knows",
+        /ROOT \/ Rock/.test(opts()) && /THE BOMB/.test(opts()), JSON.stringify(opts()));
+  check("NF ...and a top-level choice, which is what no folder means",
+        /value=""/.test(opts()), JSON.stringify(opts()));
+  check("NF the home default is pre-selected",
+        $$("new-pl-folder").value === "ROOT / Rock", `value=${$$("new-pl-folder").value}`);
+
+  $$("new-pl-role").value = "input";
+  await run(`$("new-pl-role").onchange()`);
+  check("NF switching to buffer pre-selects the buffer's own default",
+        $$("new-pl-folder").value === "THE BOMB", `value=${$$("new-pl-folder").value}`);
+
+  // Creating sends the chosen folder, and the wait is announced.
+  routes["POST /api/playlists/create"] = { status: 200, body: {
+    playlist: { id: "N1", name: "[Hazy]", role: "input", folder: "THE BOMB",
+                total: 0, editable: true, owner: "me" },
+    note: null, filing: true } };
+  routes["GET /api/playlists/filing/N1"] = { status: 200, body: {
+    state: "filing", folder: "THE BOMB", error: null } };
+  resetLog();
+  $$("new-home-name").value = "[Hazy]";
+  await run(`$("btn-new-home").onclick()`);
+  await tick();
+  const sent = bodies("/api/playlists/create")[0];
+  check("NF the create request carries the role and the chosen folder",
+        sent && sent.role === "input" && sent.folder === "THE BOMB", JSON.stringify(sent));
+  check("NF the wait is visible while the client is being driven",
+        $$("new-pl-filing").hidden === false && /THE BOMB/.test($$("new-pl-filing").textContent),
+        JSON.stringify($$("new-pl-filing").textContent));
+
+  // A landed move fills the folder in; the row is already in the list.
+  routes["GET /api/playlists/filing/N1"] = { status: 200, body: {
+    state: "filed", folder: "THE BOMB", error: null } };
+  await run(`pollFiling("N1", "[Hazy]")`);
+  await tick();
+  check("NF a landed filing says where it went",
+        /THE BOMB/.test($$("toast").textContent) && $$("new-pl-filing").hidden === true,
+        JSON.stringify($$("toast").textContent));
+  check("NF ...and the row knows its folder without a Refresh",
+        run(`(playlistData.find((p) => p.id === "N1") || {}).folder`) === "THE BOMB",
+        run(`JSON.stringify(playlistData)`));
+
+  // A failed move must name the playlist AND say it still exists.
+  routes["GET /api/playlists/filing/N1"] = { status: 200, body: {
+    state: "failed", folder: null, error: "the client is not installed" } };
+  await run(`pollFiling("N1", "[Hazy]")`);
+  await tick();
+  check("NF a failed filing says the playlist stayed at the top level",
+        /top level/.test($$("toast").textContent), JSON.stringify($$("toast").textContent));
+  check("NF ...and reports why",
+        /not installed/.test($$("toast").textContent), JSON.stringify($$("toast").textContent));
+
+  // Top level is a real choice, not the absence of one: it must be sent as
+  // such, or the server would fall back to the role's stored default and
+  // file the playlist somewhere the user just chose against.
+  $$("new-pl-role").value = "home";
+  await run(`$("new-pl-role").onchange()`);
+  $$("new-pl-folder").value = "";
+  routes["POST /api/playlists/create"] = { status: 200, body: {
+    playlist: { id: "N2", name: "Late Night", role: "home", folder: null,
+                total: 0, editable: true, owner: "me" },
+    note: null, filing: false } };
+  resetLog();
+  $$("new-home-name").value = "Late Night";
+  await run(`$("btn-new-home").onclick()`);
+  await tick();
+  const sent2 = bodies("/api/playlists/create")[0];
+  check("NF choosing the top level sends null, not an omitted field",
+        sent2 && "folder" in sent2 && sent2.folder === null, JSON.stringify(sent2));
+  check("NF nothing is filed when there is no folder to file into",
+        gets("/api/playlists/filing/N2") === 0 && $$("new-pl-filing").hidden === true,
+        `${gets("/api/playlists/filing/N2")} status GET(s)`);
+
+  // A home created from the Now card's picker is the same act as one created
+  // in the Lists view, so it gets the same folder — but it must not RESTATE
+  // the choice: omitting the field is how the client says "the stored
+  // default", and sending null here would file it at the top level instead.
+  routes["POST /api/playlists/create"] = { status: 200, body: {
+    playlist: { id: "N3", name: "From the card", role: "home", folder: "ROOT / Rock",
+                total: 0, editable: true, owner: "me" },
+    note: null, filing: true } };
+  routes["GET /api/playlists/filing/N3"] = { status: 200, body: {
+    state: "filed", folder: "ROOT / Rock", error: null } };
+  resetLog();
+  await run(`nowCreateAndFile("From the card")`);
+  await tick();
+  const sent3 = bodies("/api/playlists/create")[0];
+  check("NF a home created from the Now card lets the server apply the default",
+        sent3 && !("folder" in sent3), JSON.stringify(sent3));
+  check("NF ...and its filing is watched too, not left silent",
+        gets("/api/playlists/filing/N3") >= 1, `${gets("/api/playlists/filing/N3")} status GET(s)`);
 }
 
 // ---- summary ---------------------------------------------------------------

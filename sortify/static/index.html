@@ -98,11 +98,19 @@
       <button id="btn-refresh-lists" title="Re-read the playlist list from Spotify">Refresh</button>
     </div>
     <div id="pl-new-home" class="row">
-      <input id="new-home-name" placeholder="New home playlist…" autocomplete="off">
-      <button id="btn-new-home" title="Created in your Spotify account and marked Home here — no Refresh needed">Create (1 call)</button>
+      <input id="new-home-name" placeholder="New playlist…" autocomplete="off">
+      <select id="new-pl-role" title="A home is a filing destination; a buffer is an inbox you sort out of">
+        <option value="home">Home</option>
+        <option value="input">Buffer</option>
+      </select>
+      <select id="new-pl-folder" title="Which folder to file it into. Folders come from the last folder re-import."></select>
+      <button id="btn-new-home" title="Created in your Spotify account and marked here — no Refresh needed">Create (1 call)</button>
     </div>
-    <p class="hint">Created homes have no folder until the folder tree is re-imported —
-    they work as homes either way.</p>
+    <p id="new-pl-filing" class="hint" hidden></p>
+    <p class="hint">A buffer's name has to match an inbox rule (like <code>[Hazy]</code>) unless
+    the folder you file it into defines the set. Filing runs the Spotify client here for about
+    a minute and costs no API calls; if it fails the playlist is still created, just at the top
+    level. Only folders that already hold a playlist can be offered.</p>
     <div class="row">
       <button id="btn-folders-refresh" title="Runs the box's Spotify client headless for ~1 minute to sync, then re-imports the folder tree. Re-marks homes. 0 API calls.">Re-import folder tree</button>
       <span id="folders-refresh-status" class="hint"></span>

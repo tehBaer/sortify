@@ -81,8 +81,13 @@ class ScriptedPreviews:
         self.results = results  # {title: dict | Exception}
         self.calls = []
 
-    def fetch_preview(self, artist, title):
+    def fetch_preview(self, artist, title, exclude=()):
+        # `exclude` is recorded, not honoured: these tests are about the
+        # endpoint's paging and error handling, and the skipping itself is
+        # pinned in tests/test_preview_rejects.py.
         self.calls.append(title)
+        self.excludes = getattr(self, "excludes", [])
+        self.excludes.append(set(exclude))
         r = self.results.get(title, {"miss": True})
         if isinstance(r, Exception):
             raise r

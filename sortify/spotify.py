@@ -837,7 +837,8 @@ class Spotify:
         self.request("PUT", "/me/library", json={"uris": [uri]})
 
     def create_playlist_full(
-        self, name: str, description: str = "", bulk: bool = False, spend_reserve: bool = False
+        self, name: str, description: str = "", bulk: bool = False,
+        spend_reserve: bool = False, public: bool = False
     ) -> tuple[str, str | None]:
         """Create a playlist; return (id, snapshot_id or None). One call.
 
@@ -845,10 +846,19 @@ class Spotify:
         (spec §3) — callers that get None seed a sentinel instead. The full
         key list is logged so the first real creation settles the question
         without ever probing for it.
+
+        `public` defaults False, which is what every caller in the app wants:
+        a filing destination, a sitting, a split output — none of them are
+        for an audience. Whether the CREATE honours `public=True` is
+        unverified, unlike `PUT /playlists/{id}` with `{"public": true}`,
+        which was read back and confirmed on 2026-08-31. So a caller who
+        needs the playlist to actually be shareable should treat this flag as
+        a request, not a guarantee, and read `public` back (one call) if it
+        matters — or create private and PUT after.
         """
         resp = self.request(
             "POST", "/me/playlists",
-            json={"name": name, "description": description, "public": False},
+            json={"name": name, "description": description, "public": public},
             bulk=bulk, spend_reserve=spend_reserve,
         )
         playlist_id = (resp or {}).get("id")
@@ -862,9 +872,10 @@ class Spotify:
         return playlist_id, resp.get("snapshot_id")
 
     def create_playlist(self, name: str, description: str = "", bulk: bool = False,
-                        spend_reserve: bool = False) -> str:
+                        spend_reserve: bool = False, public: bool = False) -> str:
         """Create a playlist and return its id. One call."""
-        return self.create_playlist_full(name, description, bulk=bulk, spend_reserve=spend_reserve)[0]
+        return self.create_playlist_full(
+            name, description, bulk=bulk, spend_reserve=spend_reserve, public=public)[0]
 
     def unfollow_playlist(self, playlist_id: str) -> None:
         """Discard a whole playlist in one call.

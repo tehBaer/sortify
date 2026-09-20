@@ -114,7 +114,12 @@ escalating penalties. Therefore:
 - The client speaks the Feb-2026 dev-mode API (`items`/`item`, `/me/library`)
   — do not "fix" it back to pre-2026 shapes. Batch ADD exists: up to 100 uris
   per playlist-items POST (probed 2026-08-23; 150 → 400). There is still no
-  batch delete.
+  batch delete. A dev-mode app CAN publish a playlist: `PUT /playlists/{id}`
+  with `{"public": true}` sticks, verified by reading `public` back on
+  2026-08-31 — so "make it shareable" costs one call per playlist, not a trip
+  through the desktop client. Creation still sends `public: false` unless a
+  caller passes `public=True`; whether the CREATE honours it was never probed
+  (the PUT-after-create path is the verified one).
 
 ## Playlist folders (how folder paths work — costs zero API calls)
 
@@ -135,6 +140,19 @@ escalating penalties. Therefore:
   `POST /api/folders` still accepts a tree exported on another machine.
   Both endpoints **re-mark homes** from the tree (`home_folder_prefixes`
   minus excludes, union `sticky_home_ids`), so don't trigger them casually.
+- **Filing on create**: `/api/playlists/create` takes a `folder` and, when
+  given one, starts a background `sortify/filing.py` job that drives the same
+  client-UI mover (zero API calls, ~a minute, shares the client lock with the
+  refresh button). Omitting the field means "this role's default" from
+  config's `create_folders`, which the create row's dropdown pre-selects and
+  every explicit choice rewrites. A landed move patches ONE entry into
+  `data/folders.json` (`Store.set_folder_path`) rather than re-importing the
+  tree, which would re-mark every home. Filing refuses when another playlist
+  shares the name: the client finds the row by filtering on it. A failure is
+  never destructive — the playlist exists, at the top level, and
+  `GET /api/playlists/filing/{id}` says why. Inputs are creatable here too,
+  and their name must match a set rule (or the destination folder must
+  define the set), because for a pattern set the name IS the membership.
 - **Known-good extract**: `~/kode/spotify/spotify-library/folders.json` (Aug 2026) is
   already in the stored mapping shape — copying it straight into
   `data/folders.json` restores paths without touching home marking or Spotify.
