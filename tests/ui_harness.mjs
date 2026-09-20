@@ -2656,10 +2656,12 @@ run("stopNowPolling()");
 // ============================================================================
 // HL — "Homeless": the verdict that no home fits, as a move into the
 // buffer that collects those songs. It files (out of the input, into the
-// buffer) rather than captures, so the checks below are as much about the
-// three cases where the button must NOT appear as about the one where it does
-// — an offered move into the playlist you are already listening to, or one
-// that duplicates a song already there, is worse than no button.
+// buffer) rather than captures.
+//
+// The button used to VANISH in the four cases where the move would be wrong.
+// It is a primary control now (2026-09-20), and one that comes and goes is
+// one your thumb cannot find, so it is always drawn and DISABLED instead —
+// the four cases are still four refusals, just visible ones.
 // ============================================================================
 {
   resetLog();
@@ -2715,22 +2717,32 @@ run("stopNowPolling()");
   check("HL and the strip offers the way back",
         html().includes('id="btn-now-undo-remove"'), `html=${html()}`);
 
+  // The four refusals. Present in every one of them, and inert in every one.
+  const homeless = () => (html().match(/<button id="btn-now-homeless"[^>]*>/) || [""])[0];
+
   await paint({ homeless_id: null });
-  check("HL no configured destination, no button",
-        !html().includes('id="btn-now-homeless"'), `html=${html()}`);
+  check("HL no configured destination: still there, inert",
+        /disabled/.test(homeless()), `btn=${homeless()}`);
 
   await paint({ context: { id: "NH1", name: "[Homeless]", is_input: true } });
-  check("HL playing from the buffer itself offers no move into it",
-        !html().includes('id="btn-now-homeless"'), `html=${html()}`);
+  check("HL playing from the buffer itself: inert rather than gone",
+        /disabled/.test(homeless()), `btn=${homeless()}`);
 
   await paint({ inputs: [{ id: "IN1", name: "[Hazy]", has_track: true, set: "buffer" },
                          { id: "NH1", name: "[Homeless]", has_track: true, set: "buffer" }] });
-  check("HL a song already in the buffer is not offered it twice",
-        !html().includes('id="btn-now-homeless"'), `html=${html()}`);
+  check("HL a song already in the buffer is refused, visibly",
+        /disabled/.test(homeless()), `btn=${homeless()}`);
+  check("HL ...and says why, rather than leaving a dead button",
+        /title="[^"]*already/.test(homeless()), `btn=${homeless()}`);
 
   await paint({ context: null });
-  check("HL nothing to move out of, no button",
-        !html().includes('id="btn-now-homeless"'), `html=${html()}`);
+  check("HL nothing to move out of: inert",
+        /disabled/.test(homeless()), `btn=${homeless()}`);
+
+  await paint({});
+  check("HL and when the move IS available the button is live",
+        /id="btn-now-homeless"/.test(homeless()) && !/disabled/.test(homeless()),
+        `btn=${homeless()}`);
 }
 
 // ============================================================================
@@ -2821,18 +2833,16 @@ run("stopNowPolling()");
   check("SC and the buttons keep their handles, so clicks still wire up",
         !!box && ["H1", "H6"].every((id) => box[1].includes(`data-to="${id}"`)), `card=${card}`);
 
-  // Add to… living in the list means the box is never empty — with nothing
-  // suggested it holds that one row, which is exactly the case where the user
-  // needs it most.
+  // Add to home… moved OUT of the list (2026-09-20), so with nothing
+  // suggested the box is genuinely empty — and the way past the guesses is
+  // below it, where it does not have to be scrolled to.
   card = await paint([]);
-  // Greedy, and counting DESTINATIONS rather than "sugg"-ish classes: Add
-  // to… is a wrapped pair now (the row plus its search half), so both the
-  // lazy match and a class-name tally read the nesting as extra rows.
-  // data-to is the thing that actually means "a home you can file into".
-  const empty = card.match(/<div class="sugg-scroll">([\s\S]*)<\/div>\s*<p class="hint">/);
-  check("SC nothing suggested, and the box holds Add to… by itself",
+  const empty = card.match(/<div class="sugg-scroll">([\s\S]*?)<\/div>/);
+  check("SC nothing suggested leaves the box empty, not holding a control",
         !!empty && (empty[1].match(/data-to="/g) || []).length === 0 &&
-        empty[1].includes("sugg-more"), `card=${card}`);
+        !empty[1].includes("btn-now-more"), `card=${card}`);
+  check("SC ...and Add to home… is still on the card, below the box",
+        card.indexOf("btn-now-more") > card.indexOf("sugg-scroll"), `card=${card}`);
 
   card = await paint(six.slice(0, 2).map((s) => ({ ...s, weak: true })));
   check("SC the guesses lead-in stays outside the box, not scrolled away",
@@ -2852,15 +2862,12 @@ run("stopNowPolling()");
         run("suggScrollHeight(suggRowPitch(46, 10))") === 168, "");
 
   card = await paint(six);
-  const box2 = card.match(/<div class="sugg-scroll">([\s\S]*?)<\/div>\s*<div class="minor-actions">/);
-  check("SC Add to… is the last row of the list, not a button below it",
-        !!box2 && box2[1].includes('id="btn-now-more"') &&
-        box2[1].lastIndexOf('id="btn-now-more"') > box2[1].lastIndexOf('data-to="H6"'),
+  const box2 = card.match(/<div class="sugg-scroll">([\s\S]*?)<\/div>\s*<div class="home-actions">/);
+  check("SC the six guesses fill the box and the controls follow it",
+        !!box2 && box2[1].includes('data-to="H6"') && !box2[1].includes('id="btn-now-more"'),
         `card=${card}`);
-  check("SC it looks like its own thing, not a seventh suggestion",
-        !!box2 && box2[1].includes("sugg-more"), `card=${card}`);
-  check("SC and carries no data-to, so the file wiring cannot pick it up",
-        !!box2 && !/id="btn-now-more"[^>]*data-to=/.test(box2[1]), `card=${card}`);
+  check("SC Add to home… carries no data-to, so the file wiring cannot pick it up",
+        !/id="btn-now-more"[^>]*data-to=/.test(card), `card=${card}`);
   check("SC the minor actions no longer offer it a second time",
         (card.match(/id="btn-now-more"/g) || []).length === 1, `card=${card}`);
 }
@@ -3305,47 +3312,22 @@ run("stopNowPolling()");
   check("CR the chip is inert — a span, not a button",
         /<span class="chip in-chip has" data-in="IN1"/.test(html()),
         JSON.stringify(html().slice(html().indexOf("in-chip") - 30, 120)));
-  check("CR the capture control is there beside it",
-        html().includes('id="btn-now-capture"'), "");
+  // The button that used to sit here is gone (2026-09-20): for a new song
+  // the inboxes are the card's main rows already, so it only covered a filed
+  // song going back into a buffer.
+  check("CR the row reports membership and offers nothing",
+        !html().includes('id="btn-now-capture"'), "");
 
   await paint({ inputs: [{ id: "IN1", name: "[Hazy]", has_track: false, set: "buffer" }] });
   check("CR a song in no input shows no chips at all",
         !html().includes("in-chip"), "");
-  check("CR ...but the capture control stays — it is the row's reason to exist",
-        html().includes('id="btn-now-capture"'), "");
+  check("CR ...and with nothing to report the row is gone too",
+        !html().includes('class="capture"'), "");
 
   await paint({});
-  run(`openCapturePicker()`);
-  check("CR the picker offers the inputs the song is NOT in",
-        rows().some((r) => r.includes("Late night")) &&
-        rows().some((r) => r.includes("Sunday")), `rows=${rows()}`);
-  check("CR ...and never the one it is already in",
-        !rows().some((r) => r.includes("Hazy")), `rows=${rows()}`);
-  // Homeless has its own button, which MOVES the song there. An offer to ADD
-  // it two centimetres away would give one destination two meanings.
-  check("CR ...nor the Homeless buffer, which has a button of its own",
-        !rows().some((r) => r.includes("Homeless")), `rows=${rows()}`);
-  check("CR the set label stands in for the folder path inputs do not carry",
-        rows().some((r) => r.includes("buffer")), `rows=${rows()}`);
-
-  resetLog();
-  routes["POST /api/act"] = { status: 200, body: {} };
-  // The whole gesture, in the order a browser delivers it. The pointerdown
-  // matters: a completed hold-preview leaves a flag that the next click
-  // consumes instead of acting on (previewHold.consumeClick), and pressing a
-  // row is what clears it. Firing the click alone leaves an earlier block's
-  // hold to swallow this one.
-  run(`{
-    const row = $("picker-list").children.find((c) => c.innerHTML.includes("Late night"));
-    row.onpointerdown({ clientX: 0, clientY: 0 });
-    row.onpointerup({ clientX: 0, clientY: 0 });
-    row.onclick();
-  }`);
-  await tick();
-  const cap = bodies("/api/act").slice(-1)[0];
-  check("CR picking one captures the song into it — an add, not a move",
-        cap && cap.to_id === "IN2" && cap.from_id === null && cap.action === "move",
-        JSON.stringify(cap) + " log=" + JSON.stringify(log.map((c) => c.method + " " + c.path)));
+  // The capture picker went with the button (2026-09-20). Nothing opened it
+  // but that control, and for a new song the inboxes are the card's main
+  // rows already — captureRows/nowCapture, which the AN block covers.
 }
 
 // ============================================================================
@@ -4599,6 +4581,75 @@ run("stopNowPolling()");
   run(`nowState.suggPending = true; renderNow()`);
   check("QA the buttons survive the light phase rather than flashing away",
         /id="qa-star"/.test(card()), card().slice(0, 400));
+
+  run(`show("lists")`);
+}
+
+// ============================================================================
+// NC — the card's shape: less height up top, the filing controls out of the
+// scroll box, and the inbox row reduced to what it reports
+// ============================================================================
+// This app is used on a phone, so vertical space is the scarce resource and
+// "where is the button" matters more than "is the button pretty". Three
+// structural facts are pinned here because CSS cannot restore them if the
+// markup loses them: the cover no longer stacks above the title, the two
+// filing controls are OUTSIDE the scrolling list (they were the list's last
+// row, which meant scrolling to reach them), and the inbox row no longer
+// carries a button — only the chips that say where the song already is.
+{
+  resetLog();
+  const paint = async (over) => {
+    setNow({ playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri: "spotify:track:nc", name: "Song", duration_ms: 200000,
+               artists: [{ id: "a1", name: "Artist" }], sortable: true, image: null,
+               album: "Album" },
+      context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
+      suggestions: [{ playlist_id: "H1", pct: 80, reasons: [], already: false }],
+      homes: [{ id: "H1", name: "Home", folder: "" }],
+      subset_targets: [], subsets: [],
+      inputs: [{ id: "IN1", name: "[Hazy]", has_track: true, set: "buffer" },
+               { id: "NH1", name: "[Homeless]", has_track: false, set: "buffer" }],
+      homeless_id: "NH1",
+      quick_adds: [{ key: "star", label: "Star", playlist_id: "P1", name: "topp",
+                     total: 3, has_track: false }],
+      ...over });
+    run(`show("now"); filedUris = {}; nowActions = 0; nowActionLog = [];
+         removedUri = null; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+  };
+  const html = () => $$("now-card").innerHTML;
+  await paint({});
+
+  // The header: text beside the cover, not under it.
+  check("NC the song's details and the cover share one row",
+        /class="t-head"/.test(html()), html().slice(0, 300));
+  check("NC ...with the text first, so the cover can shrink beside it",
+        html().indexOf('class="t-meta"') < html().indexOf('class="art"') &&
+        html().indexOf('class="t-meta"') > -1, html().slice(0, 400));
+
+  // The filing controls: out of the scroll box.
+  const scroll = () => {
+    const at = html().indexOf('class="sugg-scroll');
+    return html().slice(at, html().indexOf("</div>", html().lastIndexOf('class="sugg', at + 200)));
+  };
+  check("NC Add to home… is not inside the scrolling list",
+        html().includes('id="btn-now-more"') && !scroll().includes('id="btn-now-more"'),
+        `in-scroll=${scroll().includes('id="btn-now-more"')}`);
+  check("NC Homeless is not inside it either",
+        !scroll().includes('id="btn-now-homeless"'),
+        `in-scroll=${scroll().includes('id="btn-now-homeless"')}`);
+  check("NC the reach-past-the-guesses button says what it reaches",
+        /Add to home…/.test(html()), html().slice(0, 600));
+  check("NC search sits to the left of it",
+        html().indexOf('id="btn-now-search"') < html().indexOf('id="btn-now-more"'),
+        `search=${html().indexOf('id="btn-now-search"')} more=${html().indexOf('id="btn-now-more"')}`);
+
+  // The inbox row: a report, not a control.
+  check("NC the inbox row keeps the chips that say where the song is",
+        /data-in="IN1"/.test(html()), html().slice(-400));
+  check("NC ...and no longer carries a capture button",
+        !/id="btn-now-capture"/.test(html()), html().slice(-400));
 
   run(`show("lists")`);
 }

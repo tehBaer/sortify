@@ -1779,10 +1779,13 @@ function removeState(d) {
 // The outline that clip-path cannot draw: clipping a bordered button cuts
 // the border away along the cradle, so the notched Remove paints its own
 // edge as a stroked path. Geometry shared with the clip-paths in style.css
-// (keep the two in step): a 56px circle (r 28) plus an 11px moat cuts a
-// 39px-radius cradle out of each 164px pill end; the cut crosses the pill's
-// straight edges 27.1px from the trio's 150px centre (sqrt(39² − 28²)).
-const NP_REMOVE_EDGE = '<svg class="np-edge" viewBox="0 0 164 56" aria-hidden="true"><path d="M28 0 L122.9 0 A39 39 0 0 0 122.9 56 L28 56 A28 28 0 0 1 28 0 Z"/></svg>';
+// (keep the two in step — a stale copy here stretches the drawn edge off
+// the clipped one, which is exactly what a 164-wide path did in a 178-wide
+// button): a 56px circle (r 28) plus an 11px moat cuts a 39px-radius cradle
+// out of each 178px pill end; the cut crosses the pill's straight edges
+// 27.1px from the trio's 164px centre (sqrt(39² − 28²)), so the cradle
+// starts at 178 − 41.1 = 136.9.
+const NP_REMOVE_EDGE = '<svg class="np-edge" viewBox="0 0 178 56" aria-hidden="true"><path d="M28 0 L136.9 0 A39 39 0 0 0 136.9 56 L28 56 A28 28 0 0 1 28 0 Z"/></svg>';
 
 function removeButton(d) {
   const { live, why } = removeState(d);
@@ -1913,13 +1916,21 @@ function renderNow() {
   // Fresh only for a track this card has not drawn yet: a re-render (a poll,
   // a pause toggle, the suggestions arriving) is not an arrival.
   const cardFresh = enterOnce("card", tr.uri) ? " card-fresh" : "";
+  // The header is one row, not a stack: the cover used to take 230px of a
+  // phone's height before the first control, and this app is only ever used
+  // on a phone. Text first in the markup so it takes the width the shrunken
+  // cover leaves, rather than being what gets squeezed.
   $("now-card").innerHTML = `<div class="track-card${cardFresh}${d.is_playing ? "" : " is-paused"}">
-    ${shareBtn}
     ${adriftBanner(d)}
-    <div class="art">${img}${d.is_playing ? "" : '<span class="paused-chip">paused</span>'}</div>
-    <div class="t-name">${esc(tr.name)}</div>
-    <div class="t-artist">${esc(artists)}</div>
-    <div class="t-album">${tr.album ? esc(tr.album) : ""}</div>
+    <div class="t-head">
+      <div class="t-meta">
+        <div class="t-name">${esc(tr.name)}</div>
+        <div class="t-artist">${esc(artists)}</div>
+        <div class="t-album">${tr.album ? esc(tr.album) : ""}</div>
+      </div>
+      ${shareBtn}
+      <div class="art">${img}${d.is_playing ? "" : '<span class="paused-chip">paused</span>'}</div>
+    </div>
     ${playbackStrip(d, tr)}
     ${body}
   </div>`;
@@ -1983,10 +1994,6 @@ function renderNow() {
     const nh = $("btn-now-homeless");
     if (nh) nh.onclick = nowHomeless;
     capSuggScroll();
-    // The chips are inert markers now — the only control in that row is the
-    // one that opens the picker.
-    const cap = $("btn-now-capture");
-    if (cap) cap.onclick = openCapturePicker;
   }
 }
 
@@ -2197,14 +2204,17 @@ function ordinaryCardBody(d, tr, ctx) {
   // to read. The wide button opens it to scroll; the magnifier beside it
   // opens it ready to type. The `m` hint went with the split — it named a key
   // that does not exist on the device this runs on.
-  if (!d.suggPending || nowState.homes.size) rows += `<div class="sugg-wrap">
-    <button class="sugg sugg-more" id="btn-now-more">
-      <span class="s-name">Add to…</span>
-      <span class="s-why">any of your homes — scroll the list</span>
-    </button>
-    <button class="sugg-search" id="btn-now-search" title="Search your homes by name" aria-label="Search your homes by name">${
-      ICON_SEARCH_SM}</button>
-  </div>`;
+  // Add to home… and Homeless sit BELOW the scrolling list, not in it. As the
+  // list's last row, reaching either meant scrolling past the guesses —
+  // which is exactly the case you need them in, when the guesses are wrong.
+  // Search leads, and is a button rather than a sliver: the two ways in
+  // (scroll the list, type a name) are equals, and the typed one was a strip
+  // too narrow to aim at.
+  const homeActions = (!d.suggPending || nowState.homes.size) ? `<div class="home-actions">
+    <button class="home-search" id="btn-now-search" title="Search your homes by name">${
+      ICON_SEARCH_SM}<span>Search</span></button>
+    <button class="home-more" id="btn-now-more">Add to home…</button>
+  </div>` : "";
   // Two columns for inboxes, one for homes. A home suggestion is a ranked
   // guess whose sub-line is the reason to trust it, so it earns the full
   // width; an inbox row is a name and a size, and what you want from that
@@ -2212,6 +2222,8 @@ function ordinaryCardBody(d, tr, ctx) {
   // by the grid — the rows keep their own margin and only a column gap is
   // added — so the box stays exactly as tall and simply holds twice as many.
   body += `<div class="sugg-scroll${showingInboxes ? " cap-grid" : ""}">${rows}</div>`;
+  body += homeActions;
+  body += `<div class="homeless-row">${homelessButton(d)}</div>`;
   // Not on an adrift card: no home was proposed because none was asked for,
   // which is not the same fact as none fitting.
   if (!showingInboxes && !d.suggPending && !d.suggError && !d.suggestions.length) {
@@ -2221,7 +2233,6 @@ function ordinaryCardBody(d, tr, ctx) {
   body += `<div class="minor-actions">
     ${quickAddButtons()}
     <button id="btn-now-subset">Add to subset…</button>
-    ${homelessButton(d) || ""}
   </div>`;
   // Always drawn, even with no chips in it: the button is the row's reason to
   // exist, and a control that comes and goes with the song's membership would
@@ -2229,11 +2240,15 @@ function ordinaryCardBody(d, tr, ctx) {
   // Stood down while the main row is already this offer at full size, and the
   // chips are provably empty anyway — unfiled REQUIRES that no input holds the
   // song, so there is no membership left for them to report.
+  // A report, not a control. "capture to…" lived here to put a song in an
+  // inbox without filing it; for a new song the inboxes are already the
+  // card's main rows, so the button only covered a filed song going back
+  // into a buffer — rare enough not to be worth a row on a phone. The chips
+  // stay: where the song already is, is worth knowing at a glance. With
+  // nothing to report the row is now nothing at all.
   if (!showingInboxes) {
     const chips = captureChips(d.inputs || []);
-    body += `<div class="capture">${chips ? `<span class="hint">in:</span>${chips}` : ""}` +
-      `<button id="btn-now-capture" class="chip cap-more" title="Put this song in one of your inputs — it stays where it is too">${
-        ICON_SEARCH_SM} capture to…</button></div>`;
+    if (chips) body += `<div class="capture"><span class="hint">in:</span>${chips}</div>`;
   }
   return body;
 }
@@ -2256,8 +2271,21 @@ function homelessTarget(d) {
   return d.homeless_id;
 }
 
+// Always drawn, and disabled when the move would be wrong. It used to
+// vanish in those four cases; as a primary control that is worse than a dead
+// button — a button your thumb has to hunt for is one you stop reaching for,
+// and its absence explains nothing. The reason rides the title, which is
+// what a long-press shows.
 function homelessButton(d) {
-  return homelessTarget(d) ? '<button id="btn-now-homeless">Homeless</button>' : "";
+  const id = homelessTarget(d);
+  if (id) return '<button id="btn-now-homeless" class="homeless-btn">Homeless</button>';
+  const why = !d.homeless_id ? "no homeless buffer is configured"
+    : d.context?.id === d.homeless_id ? "you are already playing the homeless buffer"
+    : (d.inputs || []).some((l) => l.id === d.homeless_id && l.has_track)
+      ? "this song is already in the homeless buffer"
+      : "there is nothing to move it out of";
+  return `<button id="btn-now-homeless" class="homeless-btn" disabled title="${
+    esc("Homeless — " + why)}">Homeless</button>`;
 }
 
 async function nowHomeless() {
@@ -2767,19 +2795,6 @@ function openNowPicker(focus = true) {
 // the button, and offering them here would be offering a no-op. `inputs`
 // carries no folder path, so the set label stands in as the grey sub-line,
 // which is what tells two similarly-named inboxes apart.
-function openCapturePicker() {
-  const map = new Map((nowState.inputs || [])
-    // The Homeless buffer stays out, as it always has: its own button MOVES
-    // the song there, and an offer to ADD it two centimetres away would give
-    // one destination two meanings depending on which control you hit. The
-    // membership chips no longer hide it, because a chip is a fact about
-    // where the song is rather than an offer to put it somewhere.
-    .filter((l) => !l.has_track && l.id !== nowState.homeless_id)
-    .map((l) => [l.id, { id: l.id, name: l.name,
-                         folder: setLabel(l.set || NOW_BUFFER_SET) }]));
-  openPicker(map, nowCapture, null, null, "Capture here");
-}
-
 // `opts.focus: false` opens the picker WITHOUT putting the cursor in the
 // filter. On a phone — which is the only place this app is used — focusing
 // throws the on-screen keyboard over the list you meant to scroll, so it has
