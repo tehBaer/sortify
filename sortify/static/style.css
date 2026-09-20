@@ -308,13 +308,13 @@ header .icon-btn::after {
    used to be 230px of height before the first control, on a device whose
    whole point is that the controls are reachable with one thumb. */
 .track-card .t-head {
-  display: flex; align-items: center; gap: .85rem; text-align: left;
+  display: flex; align-items: center; gap: .6rem; text-align: left;
   margin-bottom: .55rem;
 }
 .track-card .t-meta { flex: 1; min-width: 0; }
 .track-card .art { position: relative; display: block; line-height: 0; flex: 0 0 auto; }
 .track-card img, .track-card .noimg {
-  width: min(27vw, 108px); height: min(27vw, 108px);
+  width: min(24vw, 92px); height: min(24vw, 92px);
   border-radius: 14px; object-fit: cover; background: var(--border);
   box-shadow: var(--shadow-art);
   transition: opacity .2s ease;
@@ -328,8 +328,15 @@ header .icon-btn::after {
   padding: .3rem .7rem; border-radius: 999px; line-height: 1.2;
   backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
 }
-.track-card .t-name { font-size: 1.2rem; font-weight: 700; letter-spacing: -.01em; margin: 0 0 .15rem; }
+/* One line each, cut with an ellipsis. Wrapping put the header back into
+   the two rows the one-row layout just bought back, and it did it only for
+   long titles — so the card's height changed from song to song, which is
+   worse than not reading the whole name. */
+.track-card .t-name { font-size: 1.12rem; font-weight: 700; letter-spacing: -.01em; margin: 0 0 .15rem; }
 .track-card .t-artist { color: var(--muted); font-size: .95rem; }
+.track-card .t-name, .track-card .t-artist, .track-card .t-album {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 /* Its own line, a step quieter than the artist, so the header reads as a
    hierarchy — title, who, which record — rather than one long truncating
    string. Always drawn, even empty: the bottom margin is the gap down to the
@@ -348,8 +355,9 @@ header .icon-btn::after {
    of this card belongs to something else. */
 .np-share {
   position: static; flex: 0 0 auto; color: var(--muted);
-  background: none; border: 0; opacity: .75; padding: .2rem;
+  background: none; border: 0; opacity: .75; padding: 0; min-height: 0;
 }
+.np-share svg { width: 20px; height: 20px; display: block; }
 /* Hidden by request, not deleted: renderNow and the undo stack still drive
    btn-undo-now (the strip's own undo covers removals; keyboard u remains),
    and the auto/manual chip keeps its logic for if it ever comes back. */
