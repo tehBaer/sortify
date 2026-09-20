@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import filing
+from . import quickadds
 from . import rootlist
 from . import suggest as sugg
 from . import tabletshare
@@ -834,6 +835,23 @@ def _subset_targets_payload(state: dict) -> list[dict]:
          "folder": (folders.get(p["id"]) or {}).get("path")}
         for p in state.get("playlists", []) if p["id"] in ids
     ]
+
+
+def _quick_adds_payload(state: dict, uri: str | None) -> list[dict]:
+    """The Now card's one-tap buttons (config's `quick_adds`).
+
+    Sits beside the subset picker's list because that is what it skips: a
+    quick add IS a subset add, with the destination decided in advance.
+    Membership comes off the cached track list, so the badge that stops a
+    double-press duplicating a song costs nothing.
+    """
+    cached = store.cache().get("playlists") or {}
+
+    def tracks_of(pid):
+        entry = cached.get(pid)
+        return None if entry is None else (entry.get("tracks") or [])
+
+    return quickadds.payload(store.config(), state.get("playlists", []), tracks_of, uri)
 
 
 @app.post("/api/refresh")
@@ -3620,6 +3638,70 @@ def playlist_preview(playlist_id: str, offset: int = 0) -> dict:
         return payload
 
 
+class ExploreIn(BaseModel):
+    uri: str
+    # Sent by the client from the card it is already showing, the same way
+    # /api/preview_reject takes the names it stores. Nothing is fetched to
+    # confirm them: this is a record of a press, not of Spotify's catalogue.
+    artist: str = ""
+    artist_id: str | None = None
+    title: str = ""
+
+
+@app.post("/api/explore")
+def explore(body: ExploreIn):
+    """Resolve the Explore artist button's playlist, creating it once.
+
+    Two jobs, both of which have to happen before the add: make sure there
+    IS a playlist (the first press creates it — one Spotify call — marks it
+    a subset so it can never become a filing home, and writes its id back
+    into `quick_adds`), and record the artist in data/explore.json, which
+    is what the exploring still to come will read.
+
+    The add itself is not done here: the client sends it through /api/act
+    like every other subset add, so the undo stack and the "a subset add
+    does not spend the song's decision" guard keep working unchanged.
+    """
+    cfg = store.config()
+    entry = quickadds.entry_for(cfg, "explore")
+    if entry is None:
+        raise HTTPException(
+            400, "no explore button is configured — add one to `quick_adds` "
+                 "in data/config.json")
+    pid = entry.get("playlist_id")
+    created = False
+    name = entry.get("create_name") or ""
+    if not pid:
+        if not name:
+            raise HTTPException(
+                400, "the explore button has neither a playlist nor a name to "
+                     "create one with")
+        pid, snapshot = sp.create_playlist_full(name)
+        created = True
+        sp.remember_playlist({
+            "id": pid, "name": name,
+            "owner": (store.cache().get("me") or {}).get("id"),
+            "editable": True, "total": 0,
+            "snapshot_id": snapshot or f"created:{pid}",
+            "image": None, "description": "",
+        })
+        cfg = store.config()
+        store.update_config(
+            subset_ids=sorted(set(cfg.get("subset_ids") or []) | {pid}),
+            quick_adds=quickadds.with_target(cfg, "explore", pid),
+        )
+        _profile_state.clear()
+        _profile_state["built_at"] = 0.0
+    else:
+        listed = next((p for p in (store.cache().get("playlist_list") or {}).get("items") or []
+                       if p["id"] == pid), None)
+        name = (listed or {}).get("name") or name
+
+    store.save_explore(quickadds.note_artist(
+        store.explore(), body.artist_id, body.artist or None, body.uri))
+    return {"playlist_id": pid, "name": name, "created": created}
+
+
 class PreviewRejectIn(BaseModel):
     uri: str
     deezer_id: int
@@ -3763,6 +3845,7 @@ def _suggestion_payload(np: dict) -> dict:
             state.get("playlist_artists"),
         ) if sortable else [],
         "subset_targets": _subset_targets_payload(state),
+        "quick_adds": _quick_adds_payload(state, track["uri"]),
         "homes": _homes_payload(state),
         "inputs": [
             {"id": l["id"], "name": l["name"], "has_track": track["uri"] in l["uris"],

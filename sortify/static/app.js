@@ -897,7 +897,8 @@ function applySuggest(data) {
     suggPending: false, suggError: null,
     homes: new Map((data.homes || []).map((h) => [h.id, h])),
     subsetTargets: new Map((data.subset_targets || [])
-      .map((s) => [s.id, { id: s.id, name: s.name, total: s.total, folder: s.folder }])) };
+      .map((s) => [s.id, { id: s.id, name: s.name, total: s.total, folder: s.folder }])),
+    quickAdds: data.quick_adds || [] };
 }
 
 async function pollNow(force = false) {
@@ -935,6 +936,11 @@ async function pollNow(force = false) {
                  homes: nowState?.homes || new Map(),
                  homeless_id: data.homeless_id ?? nowState?.homeless_id ?? null,
                  subsetTargets: nowState?.subsetTargets || new Map(),
+                 // Carried across the light phase for the same reason the
+                 // inbox list is: which destinations exist is a fact about
+                 // the config, not about this song. Rebuilt empty here, the
+                 // buttons would flash away between the two phases.
+                 quickAdds: nowState?.quickAdds || [],
                  suggestions: [],
                  inputs: data.inputs || nowState?.inputs || [] };
     // A genuinely new track re-arms the played-out refetch (declared below)
@@ -1966,6 +1972,10 @@ function renderNow() {
     if (more) more.onclick = () => openNowPicker(false);
     const search = $("btn-now-search");
     if (search) search.onclick = () => openNowPicker(true);
+    for (const q of nowState?.quickAdds || []) {
+      const b = $(`qa-${q.key}`);
+      if (b) b.onclick = () => nowQuickAdd(q.key);
+    }
     const sub = $("btn-now-subset");
     if (sub) sub.onclick = () => openPicker(
       nowState.subsetTargets, nowAddToSubset, nowCreateSubsetAndAdd, null,
@@ -2044,8 +2054,26 @@ const GONE_MARK = `<svg class="gone-mark" viewBox="0 0 24 24" fill="none"
   <polyline points="6 6 18 18" pathLength="24"></polyline>
   <polyline points="18 6 6 18" pathLength="24"></polyline></svg>`;
 
+// A small check, in the house stroke style: the badge that says this song is
+// already in that destination. Drawn INSIDE the button rather than beside it,
+// because the button stays pressable — it just stops spending a call.
+const QA_ON_MARK = `<svg class="qa-mark" viewBox="0 0 24 24" fill="none"
+  stroke="currentColor" stroke-width="2.5" stroke-linecap="round"
+  stroke-linejoin="round" aria-hidden="true"><polyline points="5 13 10 18 19 6"></polyline></svg>`;
+
+// The one-tap destinations (config's `quick_adds`). Each is an ordinary
+// subset add with the picker skipped, so the row sits next to Add to subset…
+// — the long way round to the same act.
+function quickAddButtons() {
+  return (nowState?.quickAdds || []).map((q) =>
+    `<button id="qa-${esc(q.key)}" class="quick-add${q.has_track ? " qa-on" : ""}"` +
+    `${q.name ? ` title="${esc(q.name)}"` : ""}>` +
+    `${esc(q.label)}${q.has_track ? QA_ON_MARK : ""}</button>`).join("");
+}
+
 function subsetButtonRow() {
   return `<div class="minor-actions">
+    ${quickAddButtons()}
     <button id="btn-now-subset">Add to subset…</button>
   </div>`;
 }
@@ -2191,6 +2219,7 @@ function ordinaryCardBody(d, tr, ctx) {
   }
   // Remove from input lives in the playback strip now (see playbackStrip).
   body += `<div class="minor-actions">
+    ${quickAddButtons()}
     <button id="btn-now-subset">Add to subset…</button>
     ${homelessButton(d) || ""}
   </div>`;
@@ -2326,9 +2355,50 @@ async function nowCapture(inId) {
   } catch (e) { toast(e.message); }
 }
 
-async function nowAddToSubset(id) {
+// One tap, one add. The destination is decided in advance, so this is
+// nowAddToSubset with the picker skipped — deliberately reusing it, because
+// the undo stack, the toast and the "a subset add is not a filing" shape are
+// all things a second code path would have to get right again.
+//
+// Two departures from the plain add. A song already in the target spends
+// NOTHING: Spotify stores duplicates without complaint, and a 344-track
+// best-of quietly growing second copies is the failure this prevents. And a
+// destination that does not exist yet (Explore artist, before its first
+// press) is resolved server-side first — one extra request, no Spotify call
+// beyond the create it does once.
+async function nowQuickAdd(key) {
+  const q = (nowState?.quickAdds || []).find((x) => x.key === key);
+  const tr = nowState?.track;
+  if (!q || !tr) return;
+  if (q.has_track) {
+    toast(`already in ${q.name || q.label}`);
+    return;
+  }
+  let id = q.playlist_id;
+  if (!id) {
+    const artist = (tr.artists || [])[0] || {};
+    try {
+      const res = await api("/api/explore", {
+        uri: tr.uri, artist: artist.name || "", artist_id: artist.id || null,
+        title: tr.name || "",
+      });
+      id = res.playlist_id;
+      // Learned once. The next press is one call, not two — and the name is
+      // what the toast and the already-badge will read.
+      q.playlist_id = id;
+      q.name = res.name || q.name;
+    } catch (e) { toast(e.message); return; }
+  }
+  await nowAddToSubset(id, q.label);
+  // The badge the server will confirm on the next poll, applied now so a
+  // double tap cannot duplicate the song in between.
+  q.has_track = true;
+  renderNow();
+}
+
+async function nowAddToSubset(id, label) {
   const tr = nowState.track;
-  const name = nowState.subsetTargets?.get(id)?.name || "subset";
+  const name = label || nowState.subsetTargets?.get(id)?.name || "subset";
   try {
     // from_id stays null: a song in a best-of has not been sorted, so it
     // must not leave its input. The server refuses the other shape too.

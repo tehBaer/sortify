@@ -248,6 +248,7 @@ function setNow(bodyOrRoute) {
       suggestions: body.suggestions || [], subsets: body.subsets || [],
       subset_targets: body.subset_targets || [], homes: body.homes || [],
       inputs: body.inputs || [],
+      quick_adds: body.quick_adds || [],
       homeless_id: body.homeless_id ?? null,
     },
   } : { status: 200, body: { playing: false } };
@@ -4501,6 +4502,105 @@ run("stopNowPolling()");
         sent3 && !("folder" in sent3), JSON.stringify(sent3));
   check("NF ...and its filing is watched too, not left silent",
         gets("/api/playlists/filing/N3") >= 1, `${gets("/api/playlists/filing/N3")} status GET(s)`);
+}
+
+// ============================================================================
+// QA — the Now card's one-tap destinations (Star, Explore artist, rotation)
+// ============================================================================
+// A quick add is a subset add with the picker skipped, so it must go through
+// the same /api/act shape (from_id null — a selection is not a filing) and
+// leave the undo stack usable. Two things are specific to these buttons: a
+// song already in the target must not be added a second time (Spotify stores
+// duplicates without complaint), and the explore button's playlist does not
+// exist until the first press resolves it.
+{
+  resetLog();
+  const QUICK = [
+    { key: "star", label: "Star", playlist_id: "star1", name: "🐾 topp", total: 344, has_track: false },
+    { key: "explore", label: "Explore artist", playlist_id: null, name: null, total: null, has_track: null },
+    { key: "rotation", label: "Add to rotation", playlist_id: "rot1", name: "{project 17}", total: 12, has_track: true },
+  ];
+  const track = { uri: "spotify:track:qa", name: "Song", sortable: true,
+                  artists: [{ id: "ar9", name: "Nine" }], duration_ms: 200000 };
+  setNow({ playing: true, is_playing: true, track, progress_ms: 1000,
+           poll_after_ms: 999999, suggestions: [], homes: [], inputs: [],
+           quick_adds: QUICK });
+  run(`show("now")`);
+  await run("pollNow(true)");
+  await tick();
+
+  const card = () => $$("now-card").innerHTML;
+  check("QA the card draws one button per configured destination",
+        /id="qa-star"/.test(card()) && /id="qa-explore"/.test(card()) && /id="qa-rotation"/.test(card()),
+        card().slice(0, 400));
+  check("QA each button wears its own label, not the playlist's name",
+        /Explore artist/.test(card()) && /Add to rotation/.test(card()), card().slice(0, 400));
+  check("QA a destination the song is already in says so",
+        /id="qa-rotation"[^>]*class="[^"]*qa-on/.test(card()) ||
+        /class="[^"]*qa-on[^"]*"[^>]*id="qa-rotation"/.test(card()), card().slice(0, 600));
+
+  // The ordinary press: one paid add, shaped exactly like a subset add.
+  routes["POST /api/act"] = { status: 200, body: { ok: true } };
+  resetLog();
+  await run(`$("qa-star").onclick()`);
+  await tick();
+  const act = bodies("/api/act")[0];
+  check("QA pressing Star adds to its playlist and nothing else",
+        posts("/api/act") === 1 && act.to_id === "star1" && act.uri === track.uri,
+        JSON.stringify(act));
+  check("QA ...and sends from_id null, because a selection is not a filing",
+        act.from_id === null, JSON.stringify(act));
+  check("QA ...and offers an undo, like every other add",
+        /Undo/.test($$("toast").innerHTML), JSON.stringify($$("toast").innerHTML));
+
+  // Already in it: pressing again must cost nothing, or the 344-track list
+  // quietly grows a second copy of the song.
+  resetLog();
+  await run(`$("qa-rotation").onclick()`);
+  await tick();
+  check("QA a destination that already holds the song spends no call",
+        posts("/api/act") === 0, `${posts("/api/act")} POST(s)`);
+  check("QA ...and says why nothing happened",
+        /already/.test($$("toast").textContent), JSON.stringify($$("toast").textContent));
+
+  // Explore: resolve (creating the playlist server-side) and then add.
+  routes["POST /api/explore"] = { status: 200, body: {
+    playlist_id: "utf1", name: "Utforsk", created: true } };
+  resetLog();
+  await run(`$("qa-explore").onclick()`);
+  await tick();
+  check("QA Explore artist resolves its playlist before adding",
+        posts("/api/explore") === 1 && posts("/api/act") === 1,
+        `${posts("/api/explore")} explore, ${posts("/api/act")} act`);
+  check("QA ...adds to the playlist the server just named",
+        bodies("/api/act")[0].to_id === "utf1", JSON.stringify(bodies("/api/act")[0]));
+  check("QA ...and tells the server which artist to remember",
+        bodies("/api/explore")[0].artist_id === "ar9", JSON.stringify(bodies("/api/explore")[0]));
+
+  check("QA ...and refuses to add the same song twice once it has landed",
+        run(`nowState.quickAdds.find((q) => q.key === "explore").has_track`) === true,
+        run(`JSON.stringify(nowState.quickAdds)`));
+
+  // The id it learned is kept for the rest of the card's life, so pressing
+  // for the next song is one call and not two.
+  run(`nowState.quickAdds.find((q) => q.key === "explore").has_track = false`);
+  resetLog();
+  await run(`$("qa-explore").onclick()`);
+  await tick();
+  check("QA a later Explore press resolves nothing and just adds",
+        posts("/api/explore") === 0 && posts("/api/act") === 1,
+        `${posts("/api/explore")} explore, ${posts("/api/act")} act`);
+  check("QA ...to the playlist it learned the first time",
+        bodies("/api/act")[0].to_id === "utf1", JSON.stringify(bodies("/api/act")[0]));
+
+  // Phase 1 of the two-phase card carries the buttons, for the same reason it
+  // carries the inbox list: they answer "where can this go", which changes
+  // with the config and not with the song.
+  run(`nowState.suggPending = true; renderNow()`);
+  check("QA the buttons survive the light phase rather than flashing away",
+        /id="qa-star"/.test(card()), card().slice(0, 400));
+
+  run(`show("lists")`);
 }
 
 // ---- summary ---------------------------------------------------------------

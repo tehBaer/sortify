@@ -160,6 +160,17 @@ class Store:
             mapping[playlist_id] = {"path": path, "caps": caps}
         self.save_folders(mapping)
 
+    # explore.json: {version, artists: {id_or_name: {name, count, tracks, …}}}
+    # What "Explore artist" has marked. Written by that button alone and
+    # never fetched — it is a record of the user's own presses, which is
+    # exactly what makes it usable as the seed for exploring those artists
+    # later.
+    def explore(self) -> dict:
+        return self._load("explore.json", {"version": 1, "artists": {}})
+
+    def save_explore(self, log: dict) -> None:
+        self._save("explore.json", log)
+
     # preview_rejects.json: {spotify_uri: {artist, title, rejected: [deezer_id]}}
     # Deezer matches by text, so it sometimes answers with a remix or another
     # song entirely; this is the user saying which recording was wrong. Keyed

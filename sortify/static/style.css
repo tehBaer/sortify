@@ -670,8 +670,21 @@ header .icon-btn::after {
   padding: .1rem .5rem; border-radius: 999px;
 }
 
-.minor-actions { display: flex; gap: .5rem; margin-top: .8rem; }
+.minor-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .8rem; }
 .minor-actions button { flex: 1; white-space: nowrap; }
+/* The one-tap destinations. Smaller than the picker button beside them —
+   they are shortcuts, not the main way in — and narrow enough that three of
+   them plus "Add to subset…" wrap onto two rows on a phone instead of
+   shrinking each other into initials. */
+.quick-add {
+  flex: 1 1 6.5rem; font-size: .85rem; padding: .5rem .6rem;
+  display: inline-flex; align-items: center; justify-content: center; gap: .3rem;
+}
+/* Already in it: the button keeps its place and its size (a control that
+   moved when the song changed would be missed), and states the membership
+   rather than pretending to be gone. */
+.quick-add.qa-on { border-color: var(--accent); color: var(--accent); }
+.qa-mark { width: 14px; height: 14px; flex-shrink: 0; }
 /* "The list ran out and Spotify carried on by itself" — the one state where
    the card is up, everything works, and none of it is doing anything. It sits
    at the top of the card, above the art, because it is a fact about the whole

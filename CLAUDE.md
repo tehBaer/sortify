@@ -111,6 +111,16 @@ escalating penalties. Therefore:
   `/api/act` guard both key on the marked set, so their reach cannot drift
   apart. `suggest.py` is shared with homes and was never modified for
   subsets.
+- **Quick adds** (`quick_adds` in config, `sortify/quickadds.py`) are the Now
+  card's one-tap destinations — Star, Explore artist, Add to rotation. Each is
+  an ordinary subset add with the picker skipped: same `/api/act` shape
+  (`from_id: null`), same undo, same "a selection is not a filing" rule, so
+  the targets must be marked subsets. A button whose target already holds the
+  song spends nothing — membership comes off the cached track list, free.
+  The explore entry starts with `playlist_id: null` + `create_name`;
+  `POST /api/explore` creates it once (1 call), marks it a subset, writes the
+  id back into config, and records the artist in `data/explore.json` — that
+  log is the seed for exploring those artists later, and nothing else writes it.
 - The client speaks the Feb-2026 dev-mode API (`items`/`item`, `/me/library`)
   — do not "fix" it back to pre-2026 shapes. Batch ADD exists: up to 100 uris
   per playlist-items POST (probed 2026-08-23; 150 → 400). There is still no
