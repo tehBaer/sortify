@@ -4182,8 +4182,37 @@ def _cache_move(uri: str, from_ids: list[str] | None, to_id: str | None) -> dict
         else:
             # We no longer have the track dict; force a refetch next triage.
             cache["playlists"][to_id]["snapshot_id"] = None
+    _count_move(cache, from_ids, to_id)
     store.save_cache(cache)
     return track
+
+
+def _count_move(cache: dict, from_ids: list[str] | None, to_id: str | None) -> None:
+    """Keep the listing's per-playlist `total` in step with a move.
+
+    `total` is what every row in the app prints as "N tracks", and it lives
+    in the cached LISTING — a different structure from the track cache this
+    function's caller mirrors into. Nothing updated it, so the count was
+    whatever the last Refresh read: an off-by-one on a 200-track home, and a
+    conspicuous, permanent 0 on a playlist created inside sortify (reported
+    2026-09-21 on a home that had just been filed into).
+
+    Rides inside `_cache_move`'s read-modify-write so the count cannot be
+    saved separately from the tracks it counts.
+
+    One track per call, deliberately. A removal takes every copy of the uri
+    with it (the API deletes by uri, not by position), so a playlist holding
+    the same song twice drifts by one here — the next Refresh reconciles it
+    against the real listing, which is what that button is for.
+    """
+    by_id = {p["id"]: p for p in (cache.get("playlist_list") or {}).get("items") or []}
+    for from_id in from_ids or []:
+        entry = by_id.get(from_id)
+        if entry is not None and isinstance(entry.get("total"), int):
+            entry["total"] = max(0, entry["total"] - 1)
+    entry = by_id.get(to_id) if to_id else None
+    if entry is not None and isinstance(entry.get("total"), int):
+        entry["total"] += 1
 
 
 def _apply_snapshot(pid: str, snapshot_id: str | None) -> None:
