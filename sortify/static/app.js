@@ -1923,12 +1923,12 @@ function renderNow() {
   $("now-card").innerHTML = `<div class="track-card${cardFresh}${d.is_playing ? "" : " is-paused"}">
     ${adriftBanner(d)}
     <div class="t-head">
+      ${shareBtn}
       <div class="t-meta">
         <div class="t-name">${esc(tr.name)}</div>
         <div class="t-artist">${esc(artists)}</div>
         <div class="t-album">${tr.album ? esc(tr.album) : ""}</div>
       </div>
-      ${shareBtn}
       <div class="art">${img}${d.is_playing ? "" : '<span class="paused-chip">paused</span>'}</div>
     </div>
     ${playbackStrip(d, tr)}
@@ -2212,8 +2212,11 @@ function ordinaryCardBody(d, tr, ctx) {
   // too narrow to aim at.
   const homeActions = (!d.suggPending || nowState.homes.size) ? `<div class="home-actions">
     <button class="home-search" id="btn-now-search" title="Search your homes by name">${
-      ICON_SEARCH_SM}<span>Search</span></button>
-    <button class="home-more" id="btn-now-more">Add to home…</button>
+      ICON_SEARCH_SM}</button>
+    <button class="home-more" id="btn-now-more">
+      <span class="s-name">Add to home…</span>
+      <span class="s-why">any of your homes — scroll or search</span>
+    </button>
   </div>` : "";
   // Two columns for inboxes, one for homes. A home suggestion is a ranked
   // guess whose sub-line is the reason to trust it, so it earns the full
@@ -2276,16 +2279,19 @@ function homelessTarget(d) {
 // button — a button your thumb has to hunt for is one you stop reaching for,
 // and its absence explains nothing. The reason rides the title, which is
 // what a long-press shows.
+const HOMELESS_ROW = '<span class="s-name">Homeless</span>' +
+  '<span class="s-why">no home fits — park it in the buffer</span>';
+
 function homelessButton(d) {
   const id = homelessTarget(d);
-  if (id) return '<button id="btn-now-homeless" class="homeless-btn">Homeless</button>';
+  if (id) return `<button id="btn-now-homeless" class="homeless-btn">${HOMELESS_ROW}</button>`;
   const why = !d.homeless_id ? "no homeless buffer is configured"
     : d.context?.id === d.homeless_id ? "you are already playing the homeless buffer"
     : (d.inputs || []).some((l) => l.id === d.homeless_id && l.has_track)
       ? "this song is already in the homeless buffer"
       : "there is nothing to move it out of";
   return `<button id="btn-now-homeless" class="homeless-btn" disabled title="${
-    esc("Homeless — " + why)}">Homeless</button>`;
+    esc("Homeless — " + why)}">${HOMELESS_ROW}</button>`;
 }
 
 async function nowHomeless() {

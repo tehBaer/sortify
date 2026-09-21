@@ -304,17 +304,22 @@ header .icon-btn::after {
   .sugg-loading { animation: none; }
   button:active { transform: none; }
 }
-/* One row: the details on the left, a small cover on the right. The cover
-   used to be 230px of height before the first control, on a device whose
-   whole point is that the controls are reachable with one thumb. */
+/* One row: share at the far left, the details ranged right against the
+   cover, and the cover itself pulled in off the card's edge so it reads as
+   the middle of the row rather than as a corner. The stacked header cost
+   230px of height before the first control, on a device whose whole point
+   is that the controls are reachable with one thumb. */
 .track-card .t-head {
-  display: flex; align-items: center; gap: .6rem; text-align: left;
+  display: flex; align-items: center; gap: .6rem; text-align: right;
   margin-bottom: .55rem;
 }
-.track-card .t-meta { flex: 1; min-width: 0; }
-.track-card .art { position: relative; display: block; line-height: 0; flex: 0 0 auto; }
+.track-card .t-meta { flex: 1; min-width: 0; text-align: right; }
+.track-card .art {
+  position: relative; display: block; line-height: 0; flex: 0 0 auto;
+  margin-right: clamp(.25rem, 4vw, 1.5rem);
+}
 .track-card img, .track-card .noimg {
-  width: min(24vw, 92px); height: min(24vw, 92px);
+  width: min(30vw, 116px); height: min(30vw, 116px);
   border-radius: 14px; object-fit: cover; background: var(--border);
   box-shadow: var(--shadow-art);
   transition: opacity .2s ease;
@@ -706,17 +711,38 @@ body.on-now header h1 { visibility: hidden; }
 
 /* Below the scrolling guesses, not in them: reaching past the list is the
    case these two exist for, and as the list's last row it had to be
-   scrolled to. Search leads and is a real button — the sliver beside the
-   old row was hard to aim at on a phone. */
-.home-actions { display: flex; gap: .5rem; margin-top: .6rem; }
+   scrolled to. They wear the rows' own shape — same fill, same radius, name
+   over sub-line — because they are the same kind of thing: a destination
+   for this song. Being outside the box is what changed, not what they are.
+   Search is welded to Add to home…: one seam, no gap, so the pair reads as
+   one control with two ways in rather than as two unrelated buttons. */
+.home-actions { display: flex; gap: 0; margin-top: .6rem; }
 .home-search {
-  flex: 0 0 38%; display: inline-flex; align-items: center; justify-content: center;
-  gap: .35rem; min-height: 48px; font-size: .9rem;
+  flex: 0 0 4rem; display: inline-flex; align-items: center; justify-content: center;
+  background: var(--card2); border: 0; color: var(--muted);
+  border-radius: 12px 0 0 12px;
+  box-shadow: inset -1px 0 0 color-mix(in srgb, var(--fg) 12%, transparent);
 }
-.home-search svg { flex-shrink: 0; }
-.home-more { flex: 1; min-height: 48px; font-weight: 600; }
-.homeless-row { display: flex; margin-top: .5rem; }
-.homeless-btn { flex: 1; min-height: 48px; }
+.home-search:hover { color: var(--fg); border: 0; }
+.home-search svg { width: 20px; height: 20px; flex-shrink: 0; }
+.home-more, .homeless-btn {
+  display: block; width: 100%; text-align: left;
+  padding: 1rem 1rem 1.05rem; border-radius: 12px;
+  background: var(--card2); border-color: transparent;
+}
+/* The same name-over-reason shape the rows have. Their rules are scoped to
+   .sugg, and these are not suggestions — nothing scores them — so the shape
+   is restated here rather than by borrowing the class. */
+.home-more .s-name, .homeless-btn .s-name {
+  display: block; font-weight: 650; font-size: 1.05rem;
+}
+.home-more .s-why, .homeless-btn .s-why {
+  display: block; color: var(--muted); font-size: .8rem; margin-top: .35rem;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.home-more { flex: 1; min-width: 0; border-radius: 0 12px 12px 0; }
+.homeless-row { display: flex; margin-top: .6rem; }
+.homeless-btn { flex: 1; }
 /* Drawn but refused: the four cases where the move would be wrong keep the
    button in place rather than removing it — its title says which one. */
 .homeless-btn:disabled { opacity: .45; }
