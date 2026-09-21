@@ -936,11 +936,12 @@ async function pollNow(force = false) {
                  homes: nowState?.homes || new Map(),
                  homeless_id: data.homeless_id ?? nowState?.homeless_id ?? null,
                  subsetTargets: nowState?.subsetTargets || new Map(),
-                 // Carried across the light phase for the same reason the
-                 // inbox list is: which destinations exist is a fact about
-                 // the config, not about this song. Rebuilt empty here, the
-                 // buttons would flash away between the two phases.
-                 quickAdds: nowState?.quickAdds || [],
+                 // The light payload carries these now (they cost a cached
+                 // listing read, never a profile build), so the first card of
+                 // a session has them too. The carry stays as the fallback
+                 // for an older server or a payload that omits them —
+                 // rebuilt empty, the buttons would flash away mid-card.
+                 quickAdds: data.quick_adds || nowState?.quickAdds || [],
                  suggestions: [],
                  inputs: data.inputs || nowState?.inputs || [] };
     // A genuinely new track re-arms the played-out refetch (declared below)
@@ -2229,14 +2230,21 @@ function ordinaryCardBody(d, tr, ctx) {
   // Search leads, and is a button rather than a sliver: the two ways in
   // (scroll the list, type a name) are equals, and the typed one was a strip
   // too narrow to aim at.
-  const homeActions = (!d.suggPending || nowState.homes.size) ? `<div class="home-actions">
-    <button class="home-search" id="btn-now-search" title="Search your homes by name">${
-      ICON_SEARCH_SM}</button>
-    <button class="home-more" id="btn-now-more">
+  // Drawn always, live only once there are homes to offer. On the first card
+  // of a session the list has not landed yet, and a picker that opens on
+  // nothing helps nobody — but neither does a card whose controls appear one
+  // at a time while you are looking at it. So the row holds its place and
+  // says what it is waiting for.
+  const homesReady = nowState.homes.size > 0;
+  const homeActions = `<div class="home-actions">
+    <button class="home-search" id="btn-now-search" title="Search your homes by name"${
+      homesReady ? "" : " disabled"}>${ICON_SEARCH_SM}</button>
+    <button class="home-more" id="btn-now-more"${homesReady ? "" : " disabled"}>
       <span class="s-name">Add to home…</span>
-      <span class="s-why">any of your homes — scroll or search</span>
+      <span class="s-why">${homesReady ? "any of your homes — scroll or search"
+                                       : "loading your homes…"}</span>
     </button>
-  </div>` : "";
+  </div>`;
   // Two columns for inboxes, one for homes. A home suggestion is a ranked
   // guess whose sub-line is the reason to trust it, so it earns the full
   // width; an inbox row is a name and a size, and what you want from that

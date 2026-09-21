@@ -3931,7 +3931,18 @@ def now_playing(force: bool = False, light: bool = False):
     if light:
         # Even `force=1` spends nothing extra here: force is forwarded to the
         # suggest phase by the client, where the Last.fm gate has moved.
-        return {**base, "light": True, "context": _light_context(ctx_id)}
+        #
+        # The quick adds ride along because they are furniture: which
+        # playlists they point at comes from the config and the cached
+        # listing, never from a profile build. Sending them only with the
+        # suggestion half meant the first card of a session drew its buttons
+        # in pieces — the tiles said "rows are coming", and the row of
+        # destinations underneath appeared a second later as if it were an
+        # answer too. Same discipline as _light_context: cached listing only.
+        cached_items = (store.cache().get("playlist_list") or {}).get("items") or []
+        return {**base, "light": True, "context": _light_context(ctx_id),
+                "quick_adds": _quick_adds_payload({"playlists": cached_items},
+                                                  track.get("uri"))}
     # A targeted artist fetch used to sit here to sharpen the card's genre
     # reasons; it cost a call per unseen artist to learn nothing, since the
     # dev-mode API stopped returning Spotify genres at all. `_fetch_missing_now_tags`

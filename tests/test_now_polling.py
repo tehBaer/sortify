@@ -432,6 +432,17 @@ def test_light_poll_returns_the_track_without_the_suggestion_payload(route_clien
     assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]
 
 
+def test_light_poll_carries_the_quick_add_buttons(route_client):
+    """The card's one-tap destinations are furniture, not a verdict: which
+    playlists they point at is a fact about the config, not about this song.
+    Withholding them until the suggestion half lands meant the first card of
+    a session drew its buttons in pieces. Built from the cached listing —
+    the light branch must never be able to trigger a profile build."""
+    body = route_client.get("/api/now?light=1").json()
+    assert "quick_adds" in body
+    assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]
+
+
 def test_light_poll_resolves_context_from_the_cached_listing(route_client):
     """The card needs `context` up front (the Remove button and the context
     line hang off it), but from the cached listing only — the light branch

@@ -2633,8 +2633,10 @@ run("stopNowPolling()");
         JSON.stringify(html().slice(0, 160)));
 
   // Cold start — no suggest answer has ever landed, so `homes` is genuinely
-  // empty and Add to… would open a picker with nothing in it. That one row is
-  // all phase 1 still withholds.
+  // empty and the picker would open on nothing. The row is DRAWN anyway and
+  // disabled (2026-09-21): a card whose furniture arrives in pieces is a card
+  // you cannot aim at, and "loading" is a truthful thing for a control to
+  // say. Pressing it is what must not happen, not seeing it.
   run("nowState = null; nowSuggestCache = null");
   let release2;
   const gate2 = new Promise((r) => { release2 = r; });
@@ -2643,14 +2645,16 @@ run("stopNowPolling()");
   routes["GET /api/now/suggest?force=1"] = () => gate2.then(() => suggRoute3);
   run(`pollNow(true)`);
   await tick();
-  check("TP a cold phase 1 withholds Add to… — an empty picker helps nobody",
-        !html().includes('id="btn-now-more"') && html().includes('id="btn-now-subset"'),
-        `more=${html().includes('id="btn-now-more"')}`);
+  const more = () => (html().match(/<button[^>]*id="btn-now-more"[^>]*>/) || [""])[0];
+  check("TP a cold phase 1 draws Add to home… but will not open an empty picker",
+        /disabled/.test(more()) && html().includes('id="btn-now-subset"'), `more=${more()}`);
+  check("TP ...and says it is still loading rather than sitting there dead",
+        /loading your homes/.test(html()), html().slice(0, 400));
   release2();
   await tick();
   run("stopNowPolling()");
-  check("TP ...and it is there the moment the homes land",
-        html().includes('id="btn-now-more"'), "");
+  check("TP ...and it goes live the moment the homes land",
+        html().includes('id="btn-now-more"') && !/disabled/.test(more()), `more=${more()}`);
 }
 
 // ============================================================================
