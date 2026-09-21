@@ -2167,11 +2167,11 @@ function ordinaryCardBody(d, tr, ctx) {
     // and everything under it would jump up under the thumb that just
     // pressed. The region's own measured height is held instead, and the
     // check sits in the middle of it.
-    return `<div class="filing-region filed-region" style="min-height:${lastRegionHeight}px">` +
+    return subsetButtonRow() +
+           `<div class="filing-region filed-region" style="min-height:${lastRegionHeight}px">` +
            `<div class="done-msg${removed ? " gone-msg" : ""}${fresh}">` +
            `${removed ? GONE_MARK : DONE_MARK}` +
-           `<p>${removed ? "removed from" : "filed to"} <b>${esc(filedTo)}</b></p></div></div>` +
-           subsetButtonRow();
+           `<p>${removed ? "removed from" : "filed to"} <b>${esc(filedTo)}</b></p></div></div>`;
   }
   // Nothing resolved on screen — arm the draw for whatever this card resolves
   // to next, including a re-filing of this same track after an undo.
@@ -2311,6 +2311,11 @@ function ordinaryCardBody(d, tr, ctx) {
   // added — so the box stays exactly as tall and simply holds twice as many.
   // The slot itself: always drawn, so its height is the card's height in
   // every state. Empty is a legitimate thing for it to say.
+  // The four one-tap destinations sit ABOVE the guesses: they are answers
+  // you already know, reachable without reading a list, and they hold the
+  // same position on a filed card — so the row your thumb goes to does not
+  // move when a song resolves.
+  body += subsetButtonRow();
   body += '<div class="filing-region">';
   if (!showingInboxes && !d.suggError) {
     body += `<p class="hint sugg-lead">${esc(lead)}</p>`;
@@ -2320,10 +2325,6 @@ function ordinaryCardBody(d, tr, ctx) {
   body += `<div class="homeless-row">${homelessButton(d)}</div>`;
   body += "</div>";
   // Remove from input lives in the playback strip now (see playbackStrip).
-  body += `<div class="minor-actions">
-    ${quickAddButtons()}
-    <button id="btn-now-subset">Add to subset…</button>
-  </div>`;
   // Always drawn, even with no chips in it: the button is the row's reason to
   // exist, and a control that comes and goes with the song's membership would
   // be missing exactly when you reach for it.
