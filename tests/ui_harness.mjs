@@ -2581,7 +2581,7 @@ run("stopNowPolling()");
   check("TP no suggestion buttons render while pending",
         !html().includes('class="sugg"'), "");
   check("TP the wait sits inside the row box, where the rows themselves land",
-        /<div class="sugg-scroll">\s*<p class="hint sugg-loading">/.test(html()),
+        /<div class="sugg-scroll">\s*<p class="sr-only"[^>]*>finding a home…<\/p><div class="sugg-skel"/.test(html()),
         JSON.stringify(html().slice(html().indexOf("sugg-scroll") - 20, 200)));
   // The point of the phase: everything that does NOT depend on the suggest
   // answer is on the card already, so the lower half does not drop in later.
@@ -4650,6 +4650,58 @@ run("stopNowPolling()");
         /data-in="IN1"/.test(html()), html().slice(-400));
   check("NC ...and no longer carries a capture button",
         !/id="btn-now-capture"/.test(html()), html().slice(-400));
+
+  run(`show("lists")`);
+}
+
+// ============================================================================
+// SK — the wait for suggestions is drawn, not written
+// ============================================================================
+// Phase 2 takes as long as a profile build and a Last.fm lookup take, and a
+// single pulsing line left the card's lower half visibly empty meanwhile —
+// which reads as "nothing is coming" rather than "not yet". Placeholder
+// tiles in the rows' own shape say how much is coming and where it will
+// land, and the box stops changing height when it arrives.
+//
+// The sentence stays in the markup for a screen reader: tiles announce
+// nothing, and "finding a home…" is the only thing here that says what the
+// wait is for.
+{
+  resetLog();
+  const html = () => $$("now-card").innerHTML;
+  setNow({ playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+    track: { uri: "spotify:track:sk", name: "Song", duration_ms: 200000,
+             artists: [{ name: "Artist" }], sortable: true, image: null },
+    context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
+    suggestions: [], homes: [], inputs: [], subset_targets: [], homeless_id: null });
+  run(`show("now"); pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  // The card as it stands between the two phases: a track, no verdict yet.
+  run(`nowState.suggPending = true; nowState.suggestions = []; renderNow()`);
+
+  check("SK the wait draws placeholder tiles, not one line of text",
+        (html().match(/class="sugg-skel"/g) || []).length >= 3,
+        `tiles=${(html().match(/class="sugg-skel"/g) || []).length}`);
+  check("SK a tile carries the rows' two bars, so the shape is the rows' shape",
+        /class="skel-bar skel-name"/.test(html()) && /class="skel-bar skel-why"/.test(html()),
+        html().slice(html().indexOf("sugg-skel") - 40, html().indexOf("sugg-skel") + 260));
+  check("SK the tiles sit in the list's own box, where the rows will appear",
+        html().indexOf('class="sugg-scroll') < html().indexOf("sugg-skel"),
+        `box=${html().indexOf('class="sugg-scroll')} skel=${html().indexOf("sugg-skel")}`);
+  check("SK the wait is still announced for a screen reader",
+        /finding a home…/.test(html()) && /class="[^"]*sr-only/.test(html()),
+        html().slice(html().indexOf("finding a home") - 120, html().indexOf("finding a home") + 40));
+  check("SK a tile is not pressable — there is nothing behind it yet",
+        !/<button[^>]*class="sugg-skel"/.test(html()), "");
+
+  // And when the answer lands the tiles go, rather than sitting under it.
+  run(`nowState.suggPending = false;
+       nowState.suggestions = [{ playlist_id: "H1", pct: 70, reasons: ["x"], already: false }];
+       nowState.homes = new Map([["H1", { id: "H1", name: "Home", folder: "" }]]);
+       renderNow()`);
+  check("SK the tiles are gone once the guesses land",
+        !/sugg-skel/.test(html()) && /data-to="H1"/.test(html()), html().slice(0, 300));
 
   run(`show("lists")`);
 }

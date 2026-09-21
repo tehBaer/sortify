@@ -2078,6 +2078,25 @@ function quickAddButtons() {
     `${esc(q.label)}${q.has_track ? QA_ON_MARK : ""}</button>`).join("");
 }
 
+// The wait for phase 2, drawn in the shape of what is coming: three tiles
+// where three rows will be. A single pulsing line left the card's lower half
+// empty, which reads as "nothing is coming" rather than "not yet" — and the
+// box then jumped in height when the rows landed.
+//
+// The sentence survives inside it, for a screen reader: a shimmering tile
+// announces nothing, and "finding a home…" is the only part of this that
+// says what is being waited for. Divs, not buttons — there is nothing behind
+// a placeholder to press.
+const SUGG_SKELETON_TILES = 3;
+
+function suggSkeleton() {
+  return '<p class="sr-only" role="status">finding a home…</p>' +
+    Array.from({ length: SUGG_SKELETON_TILES }, (_, i) =>
+      `<div class="sugg-skel" style="--skel-i:${i}" aria-hidden="true">` +
+      '<span class="skel-bar skel-name"></span>' +
+      '<span class="skel-bar skel-why"></span></div>').join("");
+}
+
 function subsetButtonRow() {
   return `<div class="minor-actions">
     ${quickAddButtons()}
@@ -2145,7 +2164,7 @@ function ordinaryCardBody(d, tr, ctx) {
   } else if (d.suggPending) {
     // Inside the scrolling box, where the rows themselves will appear: the
     // wait is shown where the thing being waited for goes.
-    rows += '<p class="hint sugg-loading">finding a home…</p>';
+    rows += suggSkeleton();
   } else if (isUnfiled) {
     // Deliberately instead of the suggestions, not above them. The app has
     // established this song is in no inbox and no home, so the home list is
@@ -4320,7 +4339,7 @@ function sittingCardBody(tr, srvSitting) {
   if (!tr.sortable) {
     html += '<p class="hint">Can\'t be kept via the API (local file or episode) — reject it instead.</p>';
   } else if (nowState.suggPending) {
-    html += '<p class="hint sugg-loading">finding a home…</p>';
+    html += suggSkeleton();
   } else {
     const sugg = nowState.suggestions || [];
     if (sugg.length && sugg[0].weak) {
