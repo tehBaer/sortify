@@ -2014,15 +2014,33 @@ function suggScrollHeight(pitch, visible = SUGG_VISIBLE) {
   return pitch * visible;
 }
 
+// The height of the last real suggestion row this browser drew. The
+// placeholder tiles are sized from it, so a tile is exactly as tall as the
+// row that replaces it — on this device, in this font, at this text size —
+// rather than as tall as a constant that was right on the machine it was
+// written on. SKEL_ROW_FALLBACK is only for the very first card of a fresh
+// install, before any row has ever been measured (measured 75px).
+const SKEL_ROW_FALLBACK = 75;
+let lastRowHeight = SKEL_ROW_FALLBACK;
+
 function capSuggScroll() {
   const box = $("now-card").querySelector(".sugg-scroll");
   const rows = box && box.querySelectorAll ? [...box.querySelectorAll(".sugg")] : [];
+  // The placeholder tiles are measured too, and the box is given its height
+  // while they are up — so the frame is one explicit number in both states
+  // rather than an explicit one after loading and an implicit one before.
+  // A tile is built to the last measured row's height, so the two agree.
+  const skels = box && box.querySelectorAll ? [...box.querySelectorAll(".sugg-skel")] : [];
+  const measurable = rows.length ? rows : skels;
   // No layout under the test harness's stub DOM — the arithmetic above is
   // pinned there instead. Measure an ordinary suggestion in preference to the
   // Add to… row, whose dashed border makes it a couple of pixels taller.
-  if (!rows.length || rows[0].offsetHeight === undefined) return;
+  if (!measurable.length || measurable[0].offsetHeight === undefined) return;
   if (typeof getComputedStyle !== "function") return;
-  const row = rows.find((r) => !r.className.includes("sugg-more")) || rows[0];
+  const row = measurable.find((r) => !r.className.includes("sugg-more")) || measurable[0];
+  // Only a REAL row updates the remembered height; measuring a tile would
+  // just feed the tile's own min-height back to itself.
+  if (rows.length) lastRowHeight = row.offsetHeight;
   const pitch = suggRowPitch(row.offsetHeight,
                              parseFloat(getComputedStyle(row).marginBottom) || 0);
   box.style.height = `${suggScrollHeight(pitch)}px`;
@@ -2091,11 +2109,15 @@ function quickAddButtons() {
 const SUGG_SKELETON_TILES = 3;
 
 function suggSkeleton() {
+  // The bars carry a non-breaking space and the row's own font metrics, so a
+  // tile is exactly as tall as the row it stands in for — measured 75px
+  // either way. Sizing the bars by hand made each tile 12px short, and three
+  // of them moved the whole lower half of the card when the rows arrived.
   return '<p class="sr-only" role="status">finding a home…</p>' +
     Array.from({ length: SUGG_SKELETON_TILES }, (_, i) =>
-      `<div class="sugg-skel" style="--skel-i:${i}" aria-hidden="true">` +
-      '<span class="skel-bar skel-name"></span>' +
-      '<span class="skel-bar skel-why"></span></div>').join("");
+      `<div class="sugg-skel" style="--skel-i:${i};min-height:${lastRowHeight}px" aria-hidden="true">` +
+      '<span class="skel-bar skel-name">&nbsp;</span>' +
+      '<span class="skel-bar skel-why">&nbsp;</span></div>').join("");
 }
 
 function subsetButtonRow() {
@@ -2158,6 +2180,11 @@ function ordinaryCardBody(d, tr, ctx) {
   const provisional = !!(d.suggPending && !d.suggError && d.playing &&
                          !d.context?.is_input);
   const showingInboxes = isUnfiled || provisional;
+  // One line's worth of room above the box, reserved whether or not there is
+  // anything to say in it. It used to appear only when the guesses came back
+  // weak — which meant the box, and everything under it, dropped 47px at the
+  // moment the answer landed, on a card the user was already aiming at.
+  let lead = "";
   if (d.suggError) {
     body += `<p class="hint">suggestions failed: ${esc(d.suggError)} — refresh to retry.</p>`;
   } else if (provisional) {
@@ -2175,8 +2202,10 @@ function ordinaryCardBody(d, tr, ctx) {
     // reachable through the Add to… row that follows, for when you do know.
     rows += captureRows(d);
   } else {
-    if (d.suggestions.length && d.suggestions[0].weak) {
-      body += '<p class="hint">No confident match — closest guesses:</p>';
+    if (!d.suggestions.length) {
+      lead = "No confident match — Add to home… below.";
+    } else if (d.suggestions[0].weak) {
+      lead = "No confident match — closest guesses:";
     }
     // The rows go in a scrolling box of their own: the list is six long now
     // and six full-height rows are more card than a phone screen wants at
@@ -2251,14 +2280,14 @@ function ordinaryCardBody(d, tr, ctx) {
   // list is to see all of it at once. capSuggScroll's arithmetic is untouched
   // by the grid — the rows keep their own margin and only a column gap is
   // added — so the box stays exactly as tall and simply holds twice as many.
+  // The slot itself: always drawn, so its height is the card's height in
+  // every state. Empty is a legitimate thing for it to say.
+  if (!showingInboxes && !d.suggError) {
+    body += `<p class="hint sugg-lead">${esc(lead)}</p>`;
+  }
   body += `<div class="sugg-scroll${showingInboxes ? " cap-grid" : ""}">${rows}</div>`;
   body += homeActions;
   body += `<div class="homeless-row">${homelessButton(d)}</div>`;
-  // Not on an adrift card: no home was proposed because none was asked for,
-  // which is not the same fact as none fitting.
-  if (!showingInboxes && !d.suggPending && !d.suggError && !d.suggestions.length) {
-    body += '<p class="hint">No confident match — Add to… above.</p>';
-  }
   // Remove from input lives in the playback strip now (see playbackStrip).
   body += `<div class="minor-actions">
     ${quickAddButtons()}

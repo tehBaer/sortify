@@ -297,19 +297,28 @@ header .icon-btn::after {
 .track-card.card-fresh { animation: card-in .18s ease-out; }
 @keyframes card-in { from { opacity: .4; transform: translateY(5px); } }
 /* Phase 1 of the two-phase card: the track is up, suggestions still computing. */
+/* Reserved, always: this line says "no confident match" when there is one
+   to report and nothing the rest of the time, but it occupies the same
+   height either way — it is the card's one variable-content line above the
+   box, and the box must not move under a thumb already reaching for it. */
+.sugg-lead { min-height: 1.25rem; margin: .85rem 0; }
 .sugg-loading { animation: sugg-pulse 1.2s ease-in-out infinite; }
 @keyframes sugg-pulse { 50% { opacity: .35; } }
 
-/* Placeholder tiles for the phase-2 wait: the rows' own box, fill and
-   radius, with two bars where a name and a reason will be. Sized to the
-   real row rather than to the text they hide, so nothing moves when the
-   answer lands. */
+/* Placeholder tiles for the phase-2 wait: the rows' own box, fill, radius
+   and padding, with two bars where a name and a reason will be. */
 .sugg-skel {
   margin-bottom: .6rem; padding: 1rem 1rem 1.05rem; border-radius: 12px;
   background: var(--card2);
+  /* min-height comes from the last row this browser measured (app.js); this
+     is the floor for the first card of a fresh install. */
+  min-height: 75px; box-sizing: border-box;
 }
+/* Sized by the type they stand in for, not by hand: each bar holds a
+   non-breaking space at the row's own font-size, so the tile's height is
+   the row's height and stays that way if the type changes. */
 .skel-bar {
-  display: block; height: .75rem; border-radius: 999px;
+  display: block; border-radius: 999px; color: transparent; overflow: hidden;
   background: linear-gradient(90deg,
     color-mix(in srgb, var(--fg) 9%, transparent) 25%,
     color-mix(in srgb, var(--fg) 16%, transparent) 37%,
@@ -320,8 +329,12 @@ header .icon-btn::after {
   animation: skel-sweep 1.4s ease-in-out infinite;
   animation-delay: calc(var(--skel-i, 0) * .12s);
 }
-.skel-name { width: 58%; }
-.skel-why { width: 34%; height: .6rem; margin-top: .55rem; }
+/* Each bar is as tall as the line of text it hides: the real name and
+   reason are inline spans, so their height is the font's content box (19px
+   and 15px measured), not the line box a block would take. Expressed in em
+   of the matching font-size so the two move together. */
+.skel-name { width: 58%; font-size: 1.05rem; height: 1.13em; }
+.skel-why { width: 34%; font-size: .8rem; height: 1.17em; margin-top: .35rem; }
 @keyframes skel-sweep { from { background-position: 120% 0; } to { background-position: -40% 0; } }
 
 /* Announced, never drawn: the tiles carry no words, so the sentence they

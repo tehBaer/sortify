@@ -4698,6 +4698,17 @@ run("stopNowPolling()");
         html().slice(html().indexOf("finding a home") - 120, html().indexOf("finding a home") + 40));
   check("SK a tile is not pressable — there is nothing behind it yet",
         !/<button[^>]*class="sugg-skel"/.test(html()), "");
+  // Nothing may move when the answer lands, so a tile is exactly as tall as
+  // the row that replaces it — measured from the last real row this browser
+  // drew (capSuggScroll), not from a constant. Under the stub DOM nothing
+  // has layout, so the fallback is what appears here.
+  check("SK a tile is sized from a measured row, not from the text it hides",
+        /min-height:75px/.test(html()), html().slice(html().indexOf("sugg-skel") - 40, 200));
+  // The one variable-content line above the box. It says something only when
+  // the guesses come back weak or empty — and takes the same height either
+  // way, or the box drops the moment the answer lands.
+  check("SK the line above the box is reserved while the guesses are still out",
+        /class="hint sugg-lead"/.test(html()), html().slice(0, 400));
 
   // And when the answer lands the tiles go, rather than sitting under it.
   run(`nowState.suggPending = false;
@@ -4706,6 +4717,8 @@ run("stopNowPolling()");
        renderNow()`);
   check("SK the tiles are gone once the guesses land",
         !/sugg-skel/.test(html()) && /data-to="H1"/.test(html()), html().slice(0, 300));
+  check("SK ...and the reserved line is still there, holding the same room",
+        /class="hint sugg-lead"/.test(html()), html().slice(0, 300));
 
   run(`show("lists")`);
 }
