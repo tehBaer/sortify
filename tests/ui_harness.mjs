@@ -2712,6 +2712,12 @@ run("stopNowPolling()");
         run(`filedUris["spotify:track:nh1"] === "Homeless"`) &&
         /filed to/.test(html()),
         run(`JSON.stringify(filedUris)`));
+  // Filing replaces the list, Add to home…, Homeless and the chips row all
+  // at once — ~517px on the device this was measured on. Held open, or the
+  // card shortens under the thumb that just pressed it.
+  check("HL the filed card holds open the room the filing controls had",
+        /class="filing-region filed-region" style="min-height:\d+px"/.test(html()),
+        (html().match(/class="filing-region[^"]*" style="[^"]*"/) || ["none"])[0]);
   check("HL the filed card celebrates with the big drawn check",
         html().includes('class="done-mark"') && html().includes("<svg"),
         `mark=${html().includes('class="done-mark"')}`);

@@ -356,13 +356,16 @@ header .icon-btn::after {
    230px of height before the first control, on a device whose whole point
    is that the controls are reachable with one thumb. */
 .track-card .t-head {
-  display: flex; align-items: center; gap: .6rem; text-align: right;
-  margin-bottom: .55rem;
+  display: flex; align-items: center; justify-content: center;
+  gap: .6rem; text-align: right; margin-bottom: .55rem;
 }
-.track-card .t-meta { flex: 1; min-width: 0; text-align: right; }
+/* Shrink-to-fit, not flex-1: the details and the cover are one centred
+   group, and a text block that claimed the leftover width would push the
+   cover off the middle. It still gives way first when the name is long —
+   min-width:0 is what lets the ellipsis fire instead of the row widening. */
+.track-card .t-meta { flex: 0 1 auto; min-width: 0; text-align: right; }
 .track-card .art {
   position: relative; display: block; line-height: 0; flex: 0 0 auto;
-  margin-right: clamp(.25rem, 4vw, 1.5rem);
 }
 .track-card img, .track-card .noimg {
   width: min(30vw, 116px); height: min(30vw, 116px);
@@ -790,6 +793,15 @@ body.on-now header h1 { visibility: hidden; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .home-more { flex: 1; min-width: 0; border-radius: 0 12px 12px 0; }
+/* The filed card holds this region's height open (app.js keeps the last
+   measured one), so filing a song never shortens the card under the thumb
+   that just filed it. The check centres in the room that is left. */
+.filed-region { display: flex; align-items: center; justify-content: center; }
+/* The check's own 3rem of padding is what made the message stand alone on a
+   card that ended right under it. Inside the reserved block there IS room
+   around it — that is the point of the block — and keeping the padding
+   pushed the card past the height it is meant to be holding. */
+.filed-region > .done-msg { padding: 0; }
 .homeless-row { display: flex; margin-top: .6rem; }
 .homeless-btn { flex: 1; }
 /* Drawn but refused: the four cases where the move would be wrong keep the

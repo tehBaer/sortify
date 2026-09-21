@@ -1924,13 +1924,13 @@ function renderNow() {
   $("now-card").innerHTML = `<div class="track-card${cardFresh}${d.is_playing ? "" : " is-paused"}">
     ${adriftBanner(d)}
     <div class="t-head">
-      ${shareBtn}
       <div class="t-meta">
         <div class="t-name">${esc(tr.name)}</div>
         <div class="t-artist">${esc(artists)}</div>
         <div class="t-album">${tr.album ? esc(tr.album) : ""}</div>
       </div>
       <div class="art">${img}${d.is_playing ? "" : '<span class="paused-chip">paused</span>'}</div>
+      ${shareBtn}
     </div>
     ${playbackStrip(d, tr)}
     ${body}
@@ -2023,6 +2023,13 @@ function suggScrollHeight(pitch, visible = SUGG_VISIBLE) {
 const SKEL_ROW_FALLBACK = 75;
 let lastRowHeight = SKEL_ROW_FALLBACK;
 
+// The same trick one level up: how tall the filing region (the lead line,
+// the list, Add to home…, Homeless) stood on this device, so the filed card
+// can hold exactly that much room open. Measured, never assumed — it
+// depends on the row height, which depends on the reader's text size.
+const FILING_REGION_FALLBACK = 517;
+let lastRegionHeight = FILING_REGION_FALLBACK;
+
 function capSuggScroll() {
   const box = $("now-card").querySelector(".sugg-scroll");
   const rows = box && box.querySelectorAll ? [...box.querySelectorAll(".sugg")] : [];
@@ -2041,6 +2048,22 @@ function capSuggScroll() {
   // Only a REAL row updates the remembered height; measuring a tile would
   // just feed the tile's own min-height back to itself.
   if (rows.length) lastRowHeight = row.offsetHeight;
+  // Likewise the region: an unfiled card is the only state that has one to
+  // measure, and a filed card's reserved space would otherwise measure
+  // itself.
+  const region = $("now-card").querySelector(".filing-region:not(.filed-region)");
+  if (region && region.offsetHeight) {
+    // The chips row goes with the region when a song is filed — the filed
+    // card has no inbox membership to report — so its height is part of what
+    // has to be held open, or the card still loses ~58px at the bottom.
+    const cap = $("now-card").querySelector(".capture");
+    const capStyle = cap && cap.offsetHeight ? getComputedStyle(cap) : null;
+    const capHeight = capStyle
+      ? cap.offsetHeight + (parseFloat(capStyle.marginTop) || 0)
+                         + (parseFloat(capStyle.marginBottom) || 0)
+      : 0;
+    lastRegionHeight = region.offsetHeight + capHeight;
+  }
   const pitch = suggRowPitch(row.offsetHeight,
                              parseFloat(getComputedStyle(row).marginBottom) || 0);
   box.style.height = `${suggScrollHeight(pitch)}px`;
@@ -2139,9 +2162,15 @@ function ordinaryCardBody(d, tr, ctx) {
     const removed = removedUri === tr.uri;
     // Drawn on by the render that first puts it up, and only that one.
     const fresh = enterOnce("mark", `${tr.uri}:${removed ? "gone" : "done"}`) ? " mark-in" : "";
-    return `<div class="done-msg${removed ? " gone-msg" : ""}${fresh}">` +
+    // The check replaces the whole filing region — the list, Add to home…
+    // and Homeless — so the card would lose ~470px at the moment of filing
+    // and everything under it would jump up under the thumb that just
+    // pressed. The region's own measured height is held instead, and the
+    // check sits in the middle of it.
+    return `<div class="filing-region filed-region" style="min-height:${lastRegionHeight}px">` +
+           `<div class="done-msg${removed ? " gone-msg" : ""}${fresh}">` +
            `${removed ? GONE_MARK : DONE_MARK}` +
-           `<p>${removed ? "removed from" : "filed to"} <b>${esc(filedTo)}</b></p></div>` +
+           `<p>${removed ? "removed from" : "filed to"} <b>${esc(filedTo)}</b></p></div></div>` +
            subsetButtonRow();
   }
   // Nothing resolved on screen — arm the draw for whatever this card resolves
@@ -2282,12 +2311,14 @@ function ordinaryCardBody(d, tr, ctx) {
   // added — so the box stays exactly as tall and simply holds twice as many.
   // The slot itself: always drawn, so its height is the card's height in
   // every state. Empty is a legitimate thing for it to say.
+  body += '<div class="filing-region">';
   if (!showingInboxes && !d.suggError) {
     body += `<p class="hint sugg-lead">${esc(lead)}</p>`;
   }
   body += `<div class="sugg-scroll${showingInboxes ? " cap-grid" : ""}">${rows}</div>`;
   body += homeActions;
   body += `<div class="homeless-row">${homelessButton(d)}</div>`;
+  body += "</div>";
   // Remove from input lives in the playback strip now (see playbackStrip).
   body += `<div class="minor-actions">
     ${quickAddButtons()}
