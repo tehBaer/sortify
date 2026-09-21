@@ -764,7 +764,10 @@ body.on-now header h1 { visibility: hidden; }
    one control with two ways in rather than as two unrelated buttons. */
 .home-actions { display: flex; gap: 0; margin-top: .6rem; }
 .home-search {
-  flex: 0 0 4rem; display: inline-flex; align-items: center; justify-content: center;
+  /* Wider than the glyph needs: it is one of two ways into the same list,
+     and the thumb aims at the panel rather than at the lens. The icon keeps
+     its own size — the target grew, not the drawing. */
+  flex: 0 0 5.75rem; display: inline-flex; align-items: center; justify-content: center;
   background: var(--card2); border: 0; color: var(--muted);
   border-radius: 12px 0 0 12px;
   box-shadow: inset -1px 0 0 color-mix(in srgb, var(--fg) 12%, transparent);
