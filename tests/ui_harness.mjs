@@ -1629,12 +1629,11 @@ run("stopNowPolling()");
 }
 
 // ============================================================================
-// BR — a remove made in blind mode must name what it removed. The whole point
-// of blind mode is that the ear decides, so the card is blurred while the
-// decision is open; once the track is gone from the input the decision is
-// spent and hiding it only means the input lost a track you never got to see.
-// Reuses the peek the tap gesture already sets, so the reveal expires with
-// the track instead of quietly turning blind mode off.
+// BR — blind by default. The card never names what is playing until the eye
+// in the bar opens the panel, and that reveal lasts one track. A remove must
+// still name what it removed — once the track is out of the input the
+// decision is spent, and hiding it would mean the input lost a track you
+// never got to see — so the toast names it, without opening the panel.
 // ============================================================================
 {
   setNow({
@@ -1650,30 +1649,40 @@ run("stopNowPolling()");
       inputs: [{ id: "IN1", name: "[In]", has_track: true }],
     },
   });
-  run(`show("now"); blindMode = true; applyBlind()`);
+  run(`show("now"); setReveal(false)`);
   run(`filedUris = {}; nowActions = 0; pollNow(true)`);
   await tick();
   run("stopNowPolling()");
-  check("BR the card is blurred while the decision is still open",
-        document.body.classList.contains("blind") &&
+  check("BR the card opens blind — nothing revealed until asked",
         !document.body.classList.contains("peeked"),
-        `blind=${document.body.classList.contains("blind")} ` +
         `peeked=${document.body.classList.contains("peeked")}`);
+  check("BR ...and the details are in the hidden panel, not the card's flow",
+        /class="t-reveal"[\s\S]*Removed Song/.test($$("now-card").innerHTML),
+        $$("now-card").innerHTML.slice(0, 300));
+
+  run(`$("btn-reveal").onclick()`);
+  check("BR the eye reveals this track",
+        document.body.classList.contains("peeked") && run("peekedUri") === "spotify:track:br1" &&
+        $$("btn-reveal").classList.contains("on"),
+        `peeked=${document.body.classList.contains("peeked")} peekedUri=${run("peekedUri")}`);
+  run(`$("btn-reveal").onclick()`);
+  check("BR ...and a second press hides it again",
+        !document.body.classList.contains("peeked") && run("peekedUri") === null, "");
 
   routes["POST /api/act"] = { status: 200, body: {} };
   await run(`nowRemove()`);
   await tick();
-  check("BR removing in blind mode reveals what was removed",
-        document.body.classList.contains("peeked"),
-        `peeked=${document.body.classList.contains("peeked")} ` +
-        `toast=${JSON.stringify($$("toast").textContent)} ` +
-        `blindMode=${run("blindMode")} ` +
-        `nowTrack=${run("nowState && nowState.track && nowState.track.uri")}`);
-  check("BR the reveal is pinned to the removed track, not whatever plays next",
-        run("peekedUri") === "spotify:track:br1", String(run("peekedUri")));
+  check("BR removing names what was removed, song and artist",
+        /Removed Song/.test($$("toast").textContent) &&
+        /Removed Artist/.test($$("toast").textContent) &&
+        /\[In\]/.test($$("toast").textContent),
+        `toast=${JSON.stringify($$("toast").textContent)}`);
+  check("BR ...without dropping the big panel into the card",
+        !document.body.classList.contains("peeked"), "");
 
   // The reveal has to expire with the track. Otherwise the next track arrives
-  // already named and blind mode is off without anyone having asked for it.
+  // already named without anyone having asked for it.
+  run(`$("btn-reveal").onclick()`);
   routes["GET /api/now?light=1"].body.track =
     { uri: "spotify:track:br2", name: "Next Song",
       artists: [{ name: "Next Artist" }], sortable: true, image: null };
@@ -1682,11 +1691,10 @@ run("stopNowPolling()");
   await tick();
   run("stopNowPolling()");
   check("BR the reveal falls away when the next track starts",
-        !document.body.classList.contains("peeked") && run("peekedUri") === null,
+        !document.body.classList.contains("peeked") && run("peekedUri") === null &&
+        !$$("btn-reveal").classList.contains("on"),
         `peeked=${document.body.classList.contains("peeked")} ` +
         `peekedUri=${run("peekedUri")}`);
-
-  run(`blindMode = false; applyBlind()`);   // stable end state for the summary
 }
 
 // ============================================================================
@@ -2136,7 +2144,7 @@ run("stopNowPolling()");
         `toggle@${at('id="btn-now-toggle"')} buttons@${at('np-buttons')}`);
   // Share lives on the card itself, in the corner beside the cover — not in
   // the top bar. It renders only for a real spotify:track uri.
-  check("RB the share button rides the card, beside the cover",
+  check("RB the share button rides the card, in the reveal panel",
         at('id="btn-share"') !== -1 && at('id="btn-share"') < at('np-progress'),
         `share@${at('id="btn-share"')} progress@${at('np-progress')}`);
 
@@ -4636,12 +4644,13 @@ run("stopNowPolling()");
   const html = () => $$("now-card").innerHTML;
   await paint({});
 
-  // The header: text beside the cover, not under it.
-  check("NC the song's details and the cover share one row",
-        /class="t-head"/.test(html()), html().slice(0, 300));
-  check("NC ...with the text first, so the cover can shrink beside it",
-        html().indexOf('class="t-meta"') < html().indexOf('class="art"') &&
-        html().indexOf('class="t-meta"') > -1, html().slice(0, 400));
+  // What is playing lives in one panel, shown only on request: the big
+  // cover with the details under it.
+  check("NC the song's details and the cover share one reveal panel",
+        /class="t-reveal"/.test(html()), html().slice(0, 300));
+  check("NC ...cover first, the details under it",
+        html().indexOf('class="art"') < html().indexOf('class="t-meta"') &&
+        html().indexOf('class="art"') > -1, html().slice(0, 400));
 
   // The filing controls: out of the scroll box.
   const scroll = () => {

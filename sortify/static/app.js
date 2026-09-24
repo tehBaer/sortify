@@ -1849,12 +1849,9 @@ function renderNow() {
   // on the other. The bar is the part that must still update here: the
   // sitting it described is exactly what just went away.
   if (!d) { paintSittingBar(); return; }
-  // A blind-mode peek lasts exactly one track: the reveal falls away the
-  // moment the playing uri is no longer the one that was peeked.
-  if (document.body.classList.contains("peeked") && d.track?.uri !== peekedUri) {
-    document.body.classList.remove("peeked");
-    peekedUri = null;
-  }
+  // A reveal lasts exactly one track: it falls away the moment the playing
+  // uri is no longer the one it was opened for.
+  if (document.body.classList.contains("peeked") && d.track?.uri !== peekedUri) setReveal(false);
   // Same expiry, same reason: the strip's undo offer belongs to one track.
   if (removedUri && d.track?.uri !== removedUri) removedUri = null;
   // Next's completion signal. What the press was FOR is a different track, so
@@ -1935,13 +1932,13 @@ function renderNow() {
   // on a phone. Text first in the markup so it takes the width the shrunken
   // cover leaves, rather than being what gets squeezed.
   $("now-card").innerHTML = `<div class="track-card${cardFresh}${d.is_playing ? "" : " is-paused"}">
-    <div class="t-head">
+    <div class="t-reveal">
+      <div class="art">${img}${d.is_playing ? "" : '<span class="paused-chip">paused</span>'}</div>
       <div class="t-meta">
         <div class="t-name">${esc(tr.name)}</div>
         <div class="t-artist">${esc(artists)}</div>
         <div class="t-album">${tr.album ? esc(tr.album) : ""}</div>
       </div>
-      <div class="art">${img}${d.is_playing ? "" : '<span class="paused-chip">paused</span>'}</div>
       ${shareBtn}
     </div>
     ${playbackStrip(d, tr)}
@@ -2654,20 +2651,21 @@ async function removeFromInput(d, tr) {
   // label is the place it left rather than a sentence about nowhere.
   filedUris[tr.uri] = d.context.name || "the input";
   nowActionLog.push({ uri: tr.uri, kind: "home" });
-  // Blind mode blurred this track so the ear would decide, not the name.
-  // That decision is spent the moment it leaves the input, so say what left
-  // — otherwise the input quietly loses a track you never got to see. It is
-  // the same peek a tap sets, so renderNow expires it when the next track
-  // starts and the following one is blind again.
-  if (blindMode) {
-    peekedUri = tr.uri;
-    document.body.classList.add("peeked");
-  }
   removedUri = tr.uri;
   // Names the list. "removed from input" said only that something happened;
   // the card beside it already names the place, and the toast disagreeing
   // with it by being vaguer is a wasted line.
-  toast(`removed from ${d.context.name || "input"}` + sweptSuffix(res.swept));
+  // Names the song as well as the list. The card never shows what is
+  // playing, so the ear decided — but once the song is out of the input the
+  // decision is spent, and saying nothing would let the input lose a track
+  // you never got to see. Named in the toast, not by opening the panel: a
+  // big cover dropping into the card is not something a removal should do.
+  toast(`removed from ${d.context.name || "input"}${sweptSuffix(res.swept)}: ${trackLabel(tr)}`);
+}
+
+function trackLabel(tr) {
+  const who = (tr.artists || []).map((a) => a.name).join(", ");
+  return `“${tr.name || "this song"}”${who ? ` — ${who}` : ""}`;
 }
 
 async function nowRemove() {
@@ -2782,38 +2780,29 @@ async function undoStripAction() {
   return undoLastNowAction();
 }
 
-// ---- blind mode ------------------------------------------------------------
+// ---- blind by default -------------------------------------------------------
 //
-// Hide what's playing so the ear decides, not the name: blurs title, artist,
-// art, and the suggestion REASONS (they leak artist names) on the listening
-// surfaces (#now-card — the now view and the sitting decide card both render
-// there; triage keeps its labels). Pure client state, persisted locally.
-// Tapping the blurred title, artist or art peeks the card without filing
-// anything; the suggestion buttons stay live, so picking a home files it.
+// The card never names what is playing: the ear decides, not the name. The
+// title, artist, album and cover are not blurred but left out of the layout
+// altogether, which is what gives the transport and the filing rows the
+// room. The eye in the bar opens them as one panel — big cover, the details,
+// share — and the suggestion REASONS unblur with it (they leak artist
+// names). The reveal lasts one track: renderNow drops it as soon as the
+// playing uri is no longer the one it was opened for.
 
-let blindMode = localStorage.getItem("blindMode") === "1";
-// One tap on any blurred field reveals EVERYTHING for the remainder of that
-// track — renderNow drops the reveal as soon as the playing uri changes.
 let peekedUri = null;
 // The track whose removal the strip is currently offering to undo. Expires
 // with the track (renderNow), because an undo inherited by the next song
 // would undo a decision made about a different one.
 let removedUri = null;
 
-function applyBlind() {
-  // No emoji in the UI: the button is an inline SVG eye whose slash line is
-  // shown by CSS when body.blind is set (same class the blurs key off).
-  document.body.classList.toggle("blind", blindMode);
-  $("btn-blind").classList.toggle("on", blindMode);
-  if (!blindMode) { document.body.classList.remove("peeked"); peekedUri = null; }
+function setReveal(on) {
+  peekedUri = on ? (nowState?.track?.uri || null) : null;
+  document.body.classList.toggle("peeked", !!peekedUri);
+  $("btn-reveal").classList.toggle("on", !!peekedUri);
+  $("btn-reveal").setAttribute("aria-pressed", peekedUri ? "true" : "false");
 }
-$("btn-blind").onclick = () => {
-  blindMode = !blindMode;
-  localStorage.setItem("blindMode", blindMode ? "1" : "0");
-  applyBlind();
-  toast(blindMode ? "blind mode — tap a blurred field to peek" : "blind mode off");
-};
-applyBlind();
+$("btn-reveal").onclick = () => setReveal(!document.body.classList.contains("peeked"));
 
 // ---- tablet share (Spotify Messages via the tablet — see /api/share) -------
 
@@ -2866,22 +2855,6 @@ async function doShare(track, friend) {
 
 // btn-share is card-internal now (rendered and wired by renderNow, like the
 // other strip controls) — there is no static element left to wire here.
-
-// Capture phase, so the peek happens before anything underneath reacts — but
-// a blurred field inside a control is that control's, not the peek's: picking
-// a playlist in blind mode files straight away rather than spending the click
-// on a reveal. The suggestion reason (.s-why) lives inside the .sugg button,
-// so it is only ever peeked as a side effect of tapping the title, artist or
-// art — which lift every blur on the card at once.
-$("now-card").addEventListener("click", (e) => {
-  if (!blindMode || document.body.classList.contains("peeked")) return;
-  const el = e.target.closest(".t-name, .t-artist, .t-album, .art, .s-why");
-  if (!el || el.closest("button")) return;
-  e.stopPropagation();
-  e.preventDefault();
-  peekedUri = nowState?.track?.uri || null;
-  document.body.classList.add("peeked");
-}, true);
 
 // ---- picker ----------------------------------------------------------------
 

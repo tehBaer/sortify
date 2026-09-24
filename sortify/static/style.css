@@ -359,26 +359,23 @@ header .icon-btn::after {
   .skel-bar { animation: none; }
   button:active { transform: none; }
 }
-/* One row: share at the far left, the details ranged right against the
-   cover, and the cover itself pulled in off the card's edge so it reads as
-   the middle of the row rather than as a corner. The stacked header cost
-   230px of height before the first control, on a device whose whole point
-   is that the controls are reachable with one thumb. */
-.track-card .t-head {
-  display: flex; align-items: center; justify-content: center;
-  gap: .6rem; text-align: right; margin-bottom: .55rem;
+/* What is playing, shown only on request (the eye in the bar). Absent from
+   the layout until then, not blurred in place: the room it would take is
+   what the transport and the filing rows get instead. Opened, it is the
+   big cover with the details under it — the one moment you asked to look. */
+.track-card .t-reveal { display: none; }
+body.peeked .track-card .t-reveal {
+  display: flex; flex-direction: column; align-items: center;
+  gap: .6rem; text-align: center; margin-bottom: .9rem;
+  animation: card-in .18s ease-out;
 }
-/* Shrink-to-fit, not flex-1: the details and the cover are one centred
-   group, and a text block that claimed the leftover width would push the
-   cover off the middle. It still gives way first when the name is long —
-   min-width:0 is what lets the ellipsis fire instead of the row widening. */
-.track-card .t-meta { flex: 0 1 auto; min-width: 0; text-align: right; }
+.track-card .t-meta { min-width: 0; max-width: 100%; }
 .track-card .art {
   position: relative; display: block; line-height: 0; flex: 0 0 auto;
 }
 .track-card img, .track-card .noimg {
-  width: min(30vw, 116px); height: min(30vw, 116px);
-  border-radius: 14px; object-fit: cover; background: var(--border);
+  width: min(72vw, 300px); height: min(72vw, 300px);
+  border-radius: 16px; object-fit: cover; background: var(--border);
   box-shadow: var(--shadow-art);
   transition: opacity .2s ease;
 }
@@ -409,16 +406,11 @@ header .icon-btn::after {
   color: var(--muted); font-size: .85rem; opacity: .8;
   margin-top: .1rem;
 }
-/* Share rides the card's corner — a once-in-a-while control living in the
-   strip of whitespace beside the art. Bare glyph, same as the hamburger:
-   an outlined circle up there competed with the real controls. */
-/* The cover took the card's top-right corner when the header became one row
-   (2026-09-20), where share used to sit. It rides IN that row now, between
-   the details and the art — no longer absolute, because every free corner
-   of this card belongs to something else. */
+/* Share lives in the panel: sending a song is something you do having
+   looked at it. */
 .np-share {
   position: static; flex: 0 0 auto; color: var(--muted);
-  background: none; border: 0; opacity: .75; padding: 0; min-height: 0;
+  background: none; border: 0; opacity: .75; min-height: 40px;
 }
 .np-share svg { width: 20px; height: 20px; display: block; }
 /* Hidden by request, not deleted: renderNow and the undo stack still drive
@@ -434,15 +426,23 @@ header .icon-btn::after {
 body.on-now header h1 { visibility: hidden; }
 
 /* playback strip: elapsed / bar / total, then the two round buttons */
+/* The bar takes a line of its own, the card's full width, with the quiet
+   controls and the times on the line under it. The source order is still
+   prev · elapsed · bar · total · pause — `order` lifts the bar above. */
 .np-progress {
-  display: flex; align-items: center; gap: .6rem; margin: 0 .3rem .5rem;
+  display: flex; flex-wrap: wrap; align-items: center; gap: .6rem;
+  margin: .4rem 0 .6rem;
 }
+.np-progress .np-bar { order: -1; flex: 1 0 100%; margin-bottom: .35rem; }
+/* Elapsed and total sit apart, at the two ends of the line under the bar
+   (after previous, before pause): the auto margin takes the middle. */
+#np-elapsed { margin-right: auto; }
 .np-time {
   color: var(--muted); font-size: .75rem; font-variant-numeric: tabular-nums;
   min-width: 2.4em;
 }
 .np-bar {
-  flex: 1; display: block; height: 4px; border-radius: 999px;
+  flex: 1; display: block; height: 10px; border-radius: 999px;
   background: color-mix(in srgb, var(--fg) 12%, transparent);
   /* No overflow:hidden — the fill rounds itself, and the last-update marker
      deliberately pokes past the track's 4px so it reads as a tick. */
@@ -452,11 +452,11 @@ body.on-now header h1 { visibility: hidden; }
      strip is exactly what it would otherwise take for one. */
   touch-action: none;
 }
-/* 4px is a line to look at, not a target to hit. The bar keeps its height and
-   grows an invisible 22px-tall grab area around it, which is what the finger
-   actually lands on. */
+/* 10px is a line to look at, not a target to hit. The bar keeps its height
+   and grows an invisible 34px-tall grab area around it, which is what the
+   finger actually lands on. */
 .np-bar::before {
-  content: ""; position: absolute; left: 0; right: 0; top: -11px; bottom: -11px;
+  content: ""; position: absolute; left: 0; right: 0; top: -12px; bottom: -12px;
 }
 #np-fill { display: block; height: 100%; background: var(--accent); border-radius: 999px;
            transition: width 1s linear; }
@@ -468,11 +468,11 @@ body.on-now header h1 { visibility: hidden; }
 /* The freshness signal: a thin yellow line inside the green at the position
    Spotify last confirmed. The green running ahead of it is the local ticker
    extrapolating, so marker-to-tip distance is how old the answer is — and a
-   fresh poll snaps the marker forward to the tip. In blind mode the card is
-   blurred but the bar is not: this stays the proof the app actually knows
-   what's playing. */
+   fresh poll snaps the marker forward to the tip. The card does not name
+   the song, but the bar is always drawn: this stays the proof the app
+   actually knows what's playing. */
 #np-fill-mark {
-  position: absolute; top: -2px; bottom: -2px; width: 3px; margin-left: -1.5px;
+  position: absolute; top: -3px; bottom: -3px; width: 3px; margin-left: -1.5px;
   background: #f2c027; border-radius: 2px;
 }
 /* The quiet controls (previous, play/pause) ride the progress line as small
@@ -1050,30 +1050,18 @@ kbd {
 /* while the card is up it must not sit on top of the picker's last rows or
    its Cancel button — the row just held is usually the one underneath it */
 body.previewing .picker-inner { max-height: min(80vh, calc(100dvh - 19rem)); }
-#btn-blind .eye-slash { display: none; }
-body.blind #btn-blind .eye-slash { display: block; }
 .picker-row .p-name { display: block; font-weight: 600; }
 .picker-row .p-sub { display: block; color: var(--muted); font-size: .78rem; margin-top: .1rem; }
 .picker-create .p-name { color: var(--accent); }
 
-/* blind mode: the ear decides. Blur rather than remove, so layout is stable.
-   One tap on any blurred field lifts every blur (body.peeked) until the
-   track changes — see the capture-phase handler in app.js. The art is also
-   desaturated and dimmed: a blurred cover's color alone can identify it. */
-body.blind:not(.peeked) #now-card .t-name,
-body.blind:not(.peeked) #now-card .t-artist,
-body.blind:not(.peeked) #now-card .t-album { filter: blur(8px); }
-body.blind:not(.peeked) #now-card .art img,
-body.blind:not(.peeked) #now-card .art .noimg { filter: blur(18px) grayscale(1) brightness(.7); }
-/* Reasons leak artist names, so they blur — but Add to…'s line is a
-   description of the control, not evidence about the track, and blurring it
-   only made the way out of blind mode unreadable. An inbox row's line is the
-   same kind of thing (its set and its size), and it is the whole card on an
-   adrift song, so it is excluded for the same reason rather than a new one. */
-body.blind:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
+/* Blind by default: the card does not name what is playing. Reasons leak
+   artist names, so they blur until the eye opens the panel — but Add to…'s
+   line describes the control, not the track, and an inbox row's line is its
+   set and size, so neither is evidence and neither blurs. */
+body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
   filter: blur(5px);
 }
-#btn-blind.on { color: var(--accent); }
+#btn-reveal.on { color: var(--accent); }
 
 #toast {
   position: fixed; left: 50%; bottom: 1.2rem; transform: translateX(-50%);
