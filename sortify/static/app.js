@@ -2001,6 +2001,8 @@ function renderNow() {
       "Add here", "subset");
     const nh = $("btn-now-homeless");
     if (nh) nh.onclick = nowHomeless;
+    const nb = $("btn-now-buffer");
+    if (nb) nb.onclick = openBufferPicker;
     capSuggScroll();
   }
 }
@@ -2329,7 +2331,11 @@ function ordinaryCardBody(d, tr, ctx) {
   }
   body += `<div class="sugg-scroll${showingInboxes ? " cap-grid" : ""}">${rows}</div>`;
   body += homeActions;
-  body += `<div class="homeless-row">${homelessButton(d)}</div>`;
+  // Move to buffer… shares Homeless's row: both park the song in an inbox
+  // rather than filing it home, so they sit together, and the row costs the
+  // card no height it did not already spend.
+  body += `<div class="homeless-row">${homelessButton(d)}<button id="btn-now-buffer" class="homeless-btn buffer-btn">
+    <span class="s-name">Move to buffer…</span><span class="s-why">any inbox, or a new one</span></button></div>`;
   body += "</div>";
   // Remove from input lives in the playback strip now (see playbackStrip).
   // Always drawn, even with no chips in it: the button is the row's reason to
@@ -2375,7 +2381,7 @@ function homelessTarget(d) {
 // and its absence explains nothing. The reason rides the title, which is
 // what a long-press shows.
 const HOMELESS_ROW = '<span class="s-name">Homeless</span>' +
-  '<span class="s-why">no home fits — park it in the buffer</span>';
+  '<span class="s-why">no home fits</span>';
 
 function homelessButton(d) {
   const id = homelessTarget(d);
@@ -2867,6 +2873,59 @@ function openNowPicker(focus = true) {
              "File here", "home", { focus });
 }
 
+// Move to buffer…: the song belongs in a different inbox than the one it
+// is in — or, playing from outside your inboxes, in one at all. Every input
+// is offered except three: the one you are playing (moving there is a
+// no-op), Liked Songs (not an inbox you park in), and Homeless, which has
+// its own button and is a verdict rather than a place to park. `inputs`
+// carries no folder path, so the set label is the grey sub-line.
+function bufferTargets(d) {
+  const skip = new Set(["liked", d.homeless_id, d.context?.is_input ? d.context.id : null]);
+  return new Map((d.inputs || []).filter((l) => !skip.has(l.id)).map((l) => [l.id,
+    { id: l.id, name: l.name, total: l.total, folder: setLabel(l.set) }]));
+}
+
+function openBufferPicker() {
+  // No hold-to-preview, for the reason the card's inbox rows have none:
+  // hearing what already sits in an inbox says nothing about whether a song
+  // you have not judged belongs there.
+  openPicker(bufferTargets(nowState), nowMoveToBuffer, nowCreateBufferAndMove, null,
+             "Move here", "input", { focus: false, preview: false });
+}
+
+// Playing from an inbox, this is a filing like Homeless is: out of the
+// inbox you are in (and swept from any other), into the chosen one, and the
+// card lands in its done state with the strip's Undo. Playing from anywhere
+// else there is nothing to move out of, so it is the adrift card's inbox row
+// — an add, and the card stays live for its home.
+async function nowMoveToBuffer(id) {
+  const d = nowState;
+  const name = (d.inputs || []).find((l) => l.id === id)?.name || "buffer";
+  if (d.context?.is_input) await nowFile(id, name);
+  else await nowCapture(id);
+}
+
+// The buffer set is the one whose NAME is the membership (`[like this]`),
+// so a typed name is bracketed on the way in unless it already is — an
+// unbracketed name would be refused as belonging to no set at all.
+function bufferName(typed) {
+  const t = typed.trim();
+  return /^\[.+\]$/.test(t) ? t : `[${t}]`;
+}
+
+async function nowCreateBufferAndMove(typed) {
+  try {
+    const { p, note, filing } = await createPlaylist(bufferName(typed), "input");
+    if (filing) pollFiling(p.id, p.name);
+    // Seeded locally so the move below can name it and the next picker lists
+    // it; the next poll replaces the entry with the server's own.
+    nowState.inputs = [...(nowState.inputs || []),
+      { id: p.id, name: p.name, total: 0, set: NOW_BUFFER_SET, has_track: false }];
+    await nowMoveToBuffer(p.id);
+    if (note) toast(note, 5000);
+  } catch (e) { toast(e.message); }
+}
+
 // Capture: put the song in an input as well as wherever it already is. Every
 // input the song is NOT already in — the ones it is in are the chips beside
 // the button, and offering them here would be offering a no-op. `inputs`
@@ -2915,10 +2974,10 @@ function openPicker(homesMap, onPick, onCreate, onHomeless, verb = "File here",
       b.onclick = () => {
         // A completed hold-preview must not also file the track: the click
         // that follows pointerup is the same gesture, so it is consumed.
-        if (previewHold.consumeClick()) return;
+        if (opts.preview !== false && previewHold.consumeClick()) return;
         closePicker(); onPick(h.id);
       };
-      previewHold.attach(b, h.id, h.name,
+      if (opts.preview !== false) previewHold.attach(b, h.id, h.name,
         { label: verb, run: () => { closePicker(); onPick(h.id); } });
       list.appendChild(b);
     }
@@ -2936,7 +2995,10 @@ function openPicker(homesMap, onPick, onCreate, onHomeless, verb = "File here",
     // including when the typed name matches an existing one (wanting a
     // second "best of" is a legitimate answer, and Spotify allows it).
     const subset = role === "subset";
-    if (onCreate && (subset || (!shown && filter))) {
+    // A buffer is made the way a subset is — the moment you want a new
+    // inbox — so its create row is always there too, not a last resort.
+    const buffer = role === "input";
+    if (onCreate && (subset || buffer || (!shown && filter))) {
       const typed = $("picker-filter").value.trim();
       // nowFile sends a remove too when filing from an input: create + add +
       // remove = 3 calls, not 2 — the label must state the true cost. A
@@ -2948,13 +3010,15 @@ function openPicker(homesMap, onPick, onCreate, onHomeless, verb = "File here",
       // Nothing typed yet, so there is no name to create under. The row still
       // draws — it is the only thing that says creating is possible at all —
       // but it sends you to the box instead of firing a create with no name.
-      if (subset && !typed) {
-        b.innerHTML = '<span class="p-name">Create a new subset…</span>' +
+      if ((subset || buffer) && !typed) {
+        b.innerHTML = `<span class="p-name">Create a new ${subset ? "subset" : "buffer"}…</span>` +
           '<span class="p-sub">type a name above</span>';
         b.onclick = () => $("picker-filter").focus();
       } else {
         b.innerHTML = `<span class="p-name">${subset
           ? `Create subset “${esc(typed)}” and add this track to it`
+          : buffer
+          ? `Create buffer “${esc(bufferName(typed))}” and move this track there`
           : `Create home “${esc(typed)}” and file this track there`}</span>` +
           `<span class="p-sub">${price}</span>`;
         b.onclick = () => { closePicker(); onCreate(typed); };

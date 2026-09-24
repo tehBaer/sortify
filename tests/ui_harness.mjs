@@ -4743,6 +4743,104 @@ run("stopNowPolling()");
   run(`show("lists")`);
 }
 
+// ============================================================================
+// MB — Move to buffer…: the song belongs in a different inbox. Reachable from
+// any song, beside Homeless; out of the inbox you are playing when there is
+// one (a filing, swept like Homeless), a plain add when there is not; and
+// the picker makes a new buffer, bracketed so it lands in the buffer set.
+// ============================================================================
+{
+  const html = () => $$("now-card").innerHTML;
+  const paint = async (over) => {
+    setNow({
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri: "spotify:track:mb1", name: "Song", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[One]", is_input: true }, sitting: null,
+      suggestions: [{ playlist_id: "H1", pct: 80, reasons: [], already: false }],
+      subsets: [], subset_targets: [],
+      homes: [{ id: "H1", name: "Home One", folder: "" }],
+      inputs: [{ id: "IN1", name: "[One]", has_track: true, set: "buffer", total: 9 },
+               { id: "IN2", name: "[Two]", has_track: false, set: "buffer", total: 3 },
+               { id: "IN3", name: "<Old>", has_track: false, set: "other", total: 5 },
+               { id: "NH1", name: "[Homeless]", has_track: false, set: "buffer" },
+               { id: "liked", name: "Liked Songs", has_track: false }],
+      homeless_id: "NH1",
+      ...over,
+    });
+    run(`show("now"); filedUris = {}; removedUri = null; nowActions = 0;
+         nowActionLog = []; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+  };
+  await paint({});
+  check("MB the card offers Move to buffer… beside Homeless",
+        /class="homeless-row">[\s\S]*btn-now-homeless[\s\S]*id="btn-now-buffer"/.test(html()),
+        html().slice(html().indexOf("homeless-row") - 20, 400));
+
+  run(`$("btn-now-buffer").onclick()`);
+  const names = () => $$("picker-list").children.map((c) => c.innerHTML);
+  check("MB the picker lists the other inboxes, any set",
+        names().some((h) => /\[Two\]/.test(h)) && names().some((h) => /&lt;Old&gt;/.test(h)),
+        JSON.stringify(names().map((h) => h.slice(0, 50))));
+  check("MB ...but not the one playing, Homeless, or Liked Songs",
+        !names().some((h) => /\[One\]|\[Homeless\]|Liked Songs/.test(h)),
+        JSON.stringify(names().map((h) => h.slice(0, 50))));
+  check("MB ...and always offers to make a new buffer",
+        /Create a new buffer/.test(names().slice(-1)[0] || ""), JSON.stringify(names().slice(-1)));
+
+  resetLog();
+  routes["POST /api/act"] = { status: 200, body: {} };
+  await $$("picker-list").children.find((c) => /\[Two\]/.test(c.innerHTML)).onclick();
+  await tick(); await tick();   // the row's onclick does not return its promise
+  const mv = bodies("/api/act").slice(-1)[0];
+  check("MB playing from an inbox, it MOVES: out of it, into the other, swept",
+        mv && mv.from_id === "IN1" && mv.to_id === "IN2" && mv.sweep_inputs === true,
+        JSON.stringify(mv));
+  check("MB ...and the card lands filed to it",
+        /filed to <b>\[Two\]<\/b>/.test(html()), html().slice(0, 300));
+
+  // Outside the inboxes there is nothing to move out of: an add, and the
+  // card stays live for its home.
+  await paint({ context: { id: "PL9", name: "Discover Weekly", is_input: false } });
+  run(`$("btn-now-buffer").onclick()`);
+  resetLog();
+  await $$("picker-list").children.find((c) => /\[Two\]/.test(c.innerHTML)).onclick();
+  await tick();
+  const add = bodies("/api/act").slice(-1)[0];
+  check("MB playing from elsewhere, it adds: no from_id, no sweep",
+        add && add.from_id === null && add.to_id === "IN2" && !add.sweep_inputs,
+        JSON.stringify(add));
+  check("MB ...and the card is not marked filed", !/filed to/.test(html()), html().slice(0, 300));
+
+  // A new buffer, bracketed on the way in.
+  await paint({});
+  run(`$("btn-now-buffer").onclick()`);
+  run(`$("picker-filter").value = "late night"; $("picker-filter").oninput({ target: { value: "late night" } })`);
+  const mk = $$("picker-list").children.slice(-1)[0];
+  check("MB typing a name offers that buffer, bracketed",
+        /Create buffer “\[late night\]”/.test(mk?.innerHTML || ""), JSON.stringify(mk?.innerHTML));
+  check("MB ...priced create + add + remove from the inbox playing",
+        /3 calls/.test(mk?.innerHTML || ""), JSON.stringify(mk?.innerHTML));
+  routes["POST /api/playlists/create"] = { status: 200, body: {
+    playlist: { id: "IN9", name: "[late night]", role: "input", total: 0, folder: null } } };
+  resetLog();
+  run(`$("picker-filter").value = "late night"`);
+  await mk.onclick();
+  await tick(); await tick(); await tick();
+  const cr = bodies("/api/playlists/create").slice(-1)[0];
+  check("MB creating sends the bracketed name as an input, in the role's default folder",
+        cr && cr.name === "[late night]" && cr.role === "input" && cr.folder === undefined,
+        JSON.stringify(cr));
+  const mv2 = bodies("/api/act").slice(-1)[0];
+  check("MB ...and then moves the song into it",
+        mv2 && mv2.from_id === "IN1" && mv2.to_id === "IN9", JSON.stringify(mv2));
+  check("MB an already-bracketed name is left as typed",
+        run(`bufferName("[x]")`) === "[x]" && run(`bufferName(" y ")`) === "[y]", "");
+
+  run(`show("lists")`);
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
