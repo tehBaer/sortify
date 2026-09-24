@@ -39,7 +39,7 @@ header {
      only shows when there is content to scroll under it — a divider that
      appears exactly when it is needed. The controls keep their 48px touch
      targets, so the glyphs still centre inside them. */
-  display: flex; align-items: center; gap: .6rem;
+  display: flex; flex-wrap: wrap; align-items: center; gap: .6rem;
   padding: 0 .7rem .3rem;
   /* Stays put so the nav is always reachable mid-scroll on a phone. */
   position: sticky; top: 0; z-index: 5;
@@ -186,7 +186,9 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
      whenever the two ends differ in width. Absolute centring is exact, and
      it is why the width came down to 10.5rem — at 390px the title ends
      around 120px and the centred face starts around 125px. */
-  position: absolute; left: 50%; transform: translateX(-50%);
+  /* top pinned: the bar can grow a second line (the autoplay strip), and
+     an absolute box with no top would centre itself across both. */
+  position: absolute; left: 50%; top: 0; transform: translateX(-50%);
   flex: 0 1 auto; width: min(36vw, 10.5rem); min-width: 0; min-height: 40px;
   display: inline-flex; align-items: center; gap: .35rem;
   padding: .3rem .55rem .3rem .8rem; border-radius: 12px;
@@ -196,6 +198,13 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .input-switch.placeholder #input-switch-label { color: var(--muted); }
+/* The list ran out and Spotify carried on: the switcher says so in the
+   accent — nothing has gone wrong, you have simply finished. */
+.input-switch.adrift {
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.input-switch.adrift .ip-chev { color: inherit; }
 /* Parked (cooldown, reauth, no inputs, first paint): present but inert, so
    the top row never reflows when the state changes. */
 .input-switch:disabled { opacity: .7; cursor: default; }
@@ -822,25 +831,30 @@ body.on-now header h1 { visibility: hidden; }
    rather than pretending to be gone. */
 .quick-add.qa-on { border-color: var(--accent); color: var(--accent); }
 .qa-mark { width: 14px; height: 14px; flex-shrink: 0; }
-/* "The list ran out and Spotify carried on by itself" — the one state where
-   the card is up, everything works, and none of it is doing anything. It sits
-   at the top of the card, above the art, because it is a fact about the whole
-   session rather than about this song; and it is bordered in the accent
-   rather than filled in red, because nothing has gone wrong — you have simply
-   finished, which is good news wearing an unfamiliar hat. */
-.np-adrift {
-  display: flex; flex-direction: column; align-items: center; gap: .25rem;
-  margin: -.35rem 0 .9rem; padding: .7rem .6rem;
-  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
+/* The autoplay tail's offer, as the bar's second line: one row, the way
+   back to the list that ran out, and a dismiss. It used to be a bordered
+   banner at the top of the card, which cost the card a hundred pixels for
+   a fact about the session rather than about the song. */
+#adrift-strip {
+  flex: 1 0 100%; order: 10;
+  display: flex; align-items: center; gap: .5rem;
+  padding: .15rem 0 0;
 }
-.np-adrift .ad-head {
-  display: flex; align-items: center; gap: .4rem;
-  color: var(--accent); font-size: .95rem;
+body:not(.on-now) #adrift-strip { display: none; }
+#adrift-strip .ad-head {
+  display: flex; align-items: center; gap: .35rem; flex: 1; min-width: 0;
+  color: var(--accent); font-size: .85rem;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.np-adrift .ad-sub { color: var(--muted); font-size: .8rem; }
-.np-adrift .ad-back { margin-top: .35rem; }
+#adrift-strip .ad-head svg { flex-shrink: 0; }
+#adrift-strip .ad-back {
+  flex: 0 1 auto; min-width: 0; min-height: 40px; padding: .3rem .8rem;
+  font-size: .85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#adrift-strip .ad-close {
+  flex: none; min-height: 40px; min-width: 40px; padding: 0;
+  background: none; border: 0; color: var(--muted);
+}
 
 .capture {
   display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; justify-content: center;

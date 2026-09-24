@@ -3376,17 +3376,23 @@ run("stopNowPolling()");
   // Playing from the input is the normal case, and it also teaches the client
   // which list to name when that list later runs out.
   await paint({});
-  check("AD playing from an input says nothing", !html().includes("np-adrift"), "");
+  const up = () => !$$("adrift-strip").hidden && $$("adrift-strip").innerHTML.includes("btn-now-back");
+  const strip = () => $$("adrift-strip").innerHTML;
+  check("AD playing from an input says nothing", !up() && !html().includes("np-adrift"), "");
   check("AD ...and the input is remembered for when it runs dry",
         run(`lastInput && lastInput.id`) === "IN1", `lastInput=${run("JSON.stringify(lastInput)")}`);
 
   await paint(adrift);
-  check("AD out of the input with the song in nothing: the banner is up",
-        html().includes("np-adrift"), `html=${html().slice(0, 200)}`);
-  check("AD ...it names the list that ran out",
-        /\[Hazy\] ran out/.test(html()), `html=${html().slice(0, 300)}`);
-  check("AD ...and offers it back",
-        html().includes('id="btn-now-back"'), "");
+  check("AD out of the input with the song in nothing: the strip is up in the bar",
+        up(), `strip=${strip()}`);
+  check("AD ...not as a banner on the card",
+        !html().includes("np-adrift") && !html().includes("btn-now-back"), html().slice(0, 200));
+  check("AD ...the switcher names the list that ran out",
+        /\[Hazy\] ran out/.test($$("input-switch-label").textContent) &&
+        $$("btn-input-switch").classList.contains("adrift"),
+        `label=${$$("input-switch-label").textContent}`);
+  check("AD ...and the strip offers it back",
+        /Play \[Hazy\] again/.test(strip()), strip());
 
   resetLog();
   run(`$("btn-now-back").onclick()`);
@@ -3395,42 +3401,41 @@ run("stopNowPolling()");
   check("AD pressing it starts that input again — one call, the existing one",
         play && play.input_id === "IN1", JSON.stringify(play));
 
+  // Dismissed: the offer goes, the amber switcher stays, and it stays gone
+  // across polls until you are back in an input.
+  await paint(adrift);
+  run(`$("btn-adrift-close").onclick()`);
+  check("AD ✕ dismisses the strip", $$("adrift-strip").hidden, strip());
+  await paint(adrift);
+  check("AD ...it stays dismissed on the next poll, the switcher still amber",
+        $$("adrift-strip").hidden && $$("btn-input-switch").classList.contains("adrift"), strip());
+  await paint({});
+  await paint(adrift);
+  check("AD ...and comes back once an input has played and run out again", up(), strip());
+
   // The three silences.
   await paint({ context: null,
                 inputs: [{ id: "IN1", name: "[Hazy]", has_track: true, set: "buffer" }] });
-  check("AD a song still sitting in an input is not adrift",
-        !html().includes("np-adrift"), "");
+  check("AD a song still sitting in an input is not adrift", !up(), "");
 
   await paint({ ...adrift,
                 suggestions: [{ playlist_id: "H1", pct: 100, reasons: [], already: true }] });
-  check("AD a song already in one of your homes is not adrift either",
-        !html().includes("np-adrift"), "");
+  check("AD a song already in one of your homes is not adrift either", !up(), "");
 
-  // Deliberately putting a playlist on is not drift, and the banner stays out
-  // of it. This used to draw a third head line — "Playing <X> — not one of
-  // your inputs" — which was a complaint about a choice the user had just
-  // made, and one it could seldom even name: a Spotify-owned playlist like
-  // Discover Weekly is in neither the cached listing `_light_context` reads
-  // nor the suggest payload's, so `name` came back null and it rendered
-  // "Playing something else". The song still gets its inbox rows (see AN);
-  // it is only the banner that stands down.
+  // Deliberately putting a playlist on is not drift, and the strip stays out
+  // of it: that is a choice the user just made, not playback drifting.
   await paint({ ...adrift, context: { id: "PL9", name: "Discover Weekly", is_input: false } });
-  check("AD a playlist you deliberately put on draws no banner at all",
-        !html().includes("np-adrift"), JSON.stringify(html().slice(0, 400)));
+  check("AD a playlist you deliberately put on draws no strip at all",
+        !up() && !$$("btn-input-switch").classList.contains("adrift"), strip());
   check("AD ...and the unnameable case it used to botch is gone with it",
         !/something else/.test(html()), JSON.stringify(html().slice(0, 400)));
 
-  // The autoplay tail still says the useful half out loud.
-  await paint(adrift);
-  check("AD ...while the real drift still explains itself",
-        /not in any of your inboxes/.test(html()), "");
-
   // Phase 1 has no membership yet — suggestions are empty because they have
   // not been computed, not because the song is homeless. Reading the one as
-  // the other would flash the banner onto every fresh card.
+  // the other would flash the strip onto every fresh card.
+  await paint(adrift);
   run(`nowState.suggPending = true; renderNow()`);
-  check("AD the banner never fires while the suggestion side is still pending",
-        !html().includes("np-adrift"), "");
+  check("AD the strip never fires while the suggestion side is still pending", !up(), "");
 }
 
 // ============================================================================
@@ -4289,8 +4294,8 @@ run("stopNowPolling()");
 
   // The banner stops claiming nothing is being filed — that was true when the
   // card was a dead end and is a lie the moment it offers a destination.
-  check("AN the banner is still up, and stops saying nothing can be done",
-        html().includes("np-adrift") && !/nothing you play here is being filed/.test(html()),
+  check("AN the strip is up in the bar, and the card says nothing can't be done",
+        !$$("adrift-strip").hidden && !/nothing you play here is being filed/.test(html()),
         `html=${html().slice(0, 500)}`);
 
   // The case the whole feature is for, and the one that forced the rows and
@@ -4303,7 +4308,7 @@ run("stopNowPolling()");
         html().includes('data-cap="IN1"') && html().includes('data-cap="IN2"'),
         `html=${html().slice(0, 500)}`);
   check("AN ...and is not scolded for being there",
-        !html().includes("np-adrift"), `html=${html().slice(0, 500)}`);
+        $$("adrift-strip").hidden, `strip=${$$("adrift-strip").innerHTML}`);
   check("AN ...and the home suggestion is still withheld",
         !html().includes('data-to="H1"'), `html=${html().slice(0, 500)}`);
 
@@ -4312,7 +4317,7 @@ run("stopNowPolling()");
   // names contexts from. It must not fall back to the banner.
   await paint({ ...adrift, context: { id: "PL9", name: null, is_input: false } });
   check("AN an unnameable playlist behaves the same, not like autoplay",
-        html().includes('data-cap="IN1"') && !html().includes("np-adrift"),
+        html().includes('data-cap="IN1"') && $$("adrift-strip").hidden,
         `html=${html().slice(0, 500)}`);
 
   // The act itself: an ADD, never a move. A song playing out in the wild has

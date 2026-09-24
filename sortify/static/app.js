@@ -1108,7 +1108,9 @@ function parkInputSwitch(label) {
   const b = $("btn-input-switch");
   b.disabled = true;
   b.classList.add("placeholder");
+  b.classList.remove("adrift");
   $("input-switch-label").textContent = label;
+  paintAdrift(null);
   closeInputPop();
 }
 
@@ -1131,13 +1133,46 @@ function paintNowControls(d) {
   const playingRow = d.playing && ctx?.is_input
     ? playable.find((l) => l.id === ctx.id) : null;
   const left = playingRow && playingRow.total != null ? ` · ${playingRow.total}` : "";
+  // The autoplay tail wears the switcher's own face: the list that ran out,
+  // in the accent, where the name of the list you are filing out of sits.
+  const drift = adrift(d);
   $("input-switch-label").textContent = d.playing
-    ? (ctx?.name
+    ? (drift
+        ? (lastInput?.name ? `${lastInput.name} ran out` : "autoplay")
+        : ctx?.name
         ? (ctx.is_input ? `${ctx.name}${left}` : `${ctx.name} (not an input)`)
         : "not playing from a playlist")
     : "start an input…";
-  $("btn-input-switch").classList.toggle("placeholder", !(d.playing && ctx?.is_input));
+  $("btn-input-switch").classList.toggle("placeholder", !(d.playing && ctx?.is_input) && !drift);
+  $("btn-input-switch").classList.toggle("adrift", drift);
+  paintAdrift(d);
   if (!$("input-pop").hidden) renderInputPop();
+}
+
+// The list the strip was dismissed for. A dismissal answers "I know it ran
+// out" about ONE list, so it lasts until you are back in an input (see
+// rememberInput) — the next list that runs dry is news again.
+let adriftDismissed = null;
+
+// The banner's one useful act, as a line under the bar: put the list that
+// ran out back on. Drawn only when there is a list to name — without one
+// the strip would be a complaint with no button, and the amber switcher
+// already says it. The switcher stays amber after a dismissal; only the
+// offer goes.
+function paintAdrift(d) {
+  const strip = $("adrift-strip");
+  const name = lastInput?.name;
+  const show = !!(d && adrift(d) && name && adriftDismissed !== lastInput.id);
+  strip.hidden = !show;
+  if (!show) { strip.innerHTML = ""; return; }
+  strip.innerHTML = `<span class="ad-head">${ICON_ADRIFT}<span>autoplay took over</span></span>
+    <button id="btn-now-back" class="ad-back">Play ${esc(name)} again</button>
+    <button id="btn-adrift-close" class="ad-close" title="Dismiss" aria-label="Dismiss">✕</button>`;
+  $("btn-now-back").onclick = () => pickInput(lastInput.id, lastInput.name);
+  $("btn-adrift-close").onclick = () => {
+    adriftDismissed = lastInput.id;
+    paintAdrift(d);
+  };
 }
 
 // Which buffer list to put on when you don't care which — the drawn pick
@@ -1547,6 +1582,7 @@ try { lastInput = JSON.parse(localStorage.getItem("sortify-lastinput") || "null"
 
 function rememberInput(ctx) {
   if (!ctx?.is_input || !ctx.id) return;
+  adriftDismissed = null;
   if (lastInput?.id === ctx.id && lastInput?.name === ctx.name) return;
   lastInput = { id: ctx.id, name: ctx.name || "" };
   try { localStorage.setItem("sortify-lastinput", JSON.stringify(lastInput)); } catch (_) {}
@@ -1587,29 +1623,6 @@ function adrift(d) { return unfiled(d) && !d.context; }
 // A list running dry, drawn as one: the rows stop and the arrow carries on
 // past where they ended.
 const ICON_ADRIFT = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h10M4 11h7M4 16h4"/><path d="M14 19h6m-3-3 3 3-3 3"/></svg>';
-
-function adriftBanner(d) {
-  if (!adrift(d)) return "";
-  const name = lastInput?.name;
-  // Only the autoplay tail reaches here now (see adrift), so the banner names
-  // the list that ran out when it knows it and stays vague when it does not.
-  // The old third branch — "Playing <X> — not one of your inputs" — is gone
-  // with the condition that produced it: it fired on any playlist that was
-  // not an input, which meant deliberately putting on Discover Weekly got a
-  // banner scolding you for it. Worse, it could rarely name the playlist,
-  // because a Spotify-owned one is absent from the cached listing both
-  // `_light_context` and the suggest payload read, so it usually read
-  // "Playing something else" — a complaint that could not even say about
-  // what. Naming those costs an API call per unknown playlist; not
-  // complaining costs nothing.
-  const head = name ? `${esc(name)} ran out — autoplay took over`
-                    : "Not playing from an input — autoplay took over";
-  return `<div class="np-adrift">
-    <span class="ad-head">${ICON_ADRIFT}<b>${head}</b></span>
-    <span class="ad-sub">not in any of your inboxes — pick one below</span>
-    ${name ? `<button id="btn-now-back" class="ad-back">Play ${esc(name)} again</button>` : ""}
-  </div>`;
-}
 
 // The strip under the title: the progress line (elapsed / bar / total) with
 // the two quiet controls tucked at its right end, then the verb row.
@@ -1922,7 +1935,6 @@ function renderNow() {
   // on a phone. Text first in the markup so it takes the width the shrunken
   // cover leaves, rather than being what gets squeezed.
   $("now-card").innerHTML = `<div class="track-card${cardFresh}${d.is_playing ? "" : " is-paused"}">
-    ${adriftBanner(d)}
     <div class="t-head">
       <div class="t-meta">
         <div class="t-name">${esc(tr.name)}</div>
@@ -1955,8 +1967,6 @@ function renderNow() {
   if (undoRem) undoRem.onclick = undoStripAction;
   const sh = $("btn-share");
   if (sh) sh.onclick = openSharePop;
-  const back = $("btn-now-back");
-  if (back) back.onclick = () => pickInput(lastInput.id, lastInput.name);
   startNowTicker(d, tr);
   wireSeekBar(tr);
 
