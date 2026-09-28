@@ -1138,7 +1138,7 @@ function paintNowControls(d) {
   const drift = adrift(d);
   $("input-switch-label").textContent = d.playing
     ? (drift
-        ? (lastInput?.name ? `${lastInput.name} ran out` : "autoplay")
+        ? (ranOutOf(d)?.name ? `${ranOutOf(d).name} ran out` : "autoplay")
         : ctx?.name
         ? (ctx.is_input ? `${ctx.name}${left}` : `${ctx.name} (not an input)`)
         : "not playing from a playlist")
@@ -1161,16 +1161,17 @@ let adriftDismissed = null;
 // offer goes.
 function paintAdrift(d) {
   const strip = $("adrift-strip");
-  const name = lastInput?.name;
-  const show = !!(d && adrift(d) && name && adriftDismissed !== lastInput.id);
+  const list = ranOutOf(d);
+  const name = list?.name;
+  const show = !!(d && adrift(d) && name && adriftDismissed !== list.id);
   strip.hidden = !show;
   if (!show) { strip.innerHTML = ""; return; }
   strip.innerHTML = `<span class="ad-head">${ICON_ADRIFT}<span>autoplay took over</span></span>
     <button id="btn-now-back" class="ad-back">Play ${esc(name)} again</button>
     <button id="btn-adrift-close" class="ad-close" title="Dismiss" aria-label="Dismiss">✕</button>`;
-  $("btn-now-back").onclick = () => pickInput(lastInput.id, lastInput.name);
+  $("btn-now-back").onclick = () => pickInput(list.id, list.name);
   $("btn-adrift-close").onclick = () => {
-    adriftDismissed = lastInput.id;
+    adriftDismissed = list.id;
     paintAdrift(d);
   };
 }
@@ -1580,9 +1581,14 @@ const ICON_UNDO = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" s
 let lastInput = null;
 try { lastInput = JSON.parse(localStorage.getItem("sortify-lastinput") || "null"); } catch (_) {}
 
-function rememberInput(ctx) {
+// A dismissal ends when the input is really playing again — its context AND
+// a song that is in it. The context alone no longer says so: Spotify keeps
+// reporting the input all through the autoplay tail, and clearing on that
+// would bring the strip back on every poll.
+function rememberInput(d) {
+  const ctx = d.context;
   if (!ctx?.is_input || !ctx.id) return;
-  adriftDismissed = null;
+  if ((d.inputs || []).some((l) => l.has_track)) adriftDismissed = null;
   if (lastInput?.id === ctx.id && lastInput?.name === ctx.name) return;
   lastInput = { id: ctx.id, name: ctx.name || "" };
   try { localStorage.setItem("sortify-lastinput", JSON.stringify(lastInput)); } catch (_) {}
@@ -1601,8 +1607,14 @@ function rememberInput(ctx) {
 // answers: during phase 1 `suggestions` is empty, and reading that as "in no
 // home" would flash the banner onto every fresh card.
 function unfiled(d) {
-  if (!d.playing || d.suggPending || d.suggError) return false;
   if (d.context?.is_input) return false;
+  return inNothing(d);
+}
+
+// The song half of `unfiled`, without the playback half: in no inbox and no
+// home, as far as a settled suggest phase can say.
+function inNothing(d) {
+  if (!d.playing || d.suggPending || d.suggError) return false;
   if ((d.inputs || []).some((l) => l.has_track)) return false;
   if ((d.suggestions || []).some((s) => s.already)) return false;
   return true;
@@ -1616,9 +1628,22 @@ function unfiled(d) {
 // on. Choosing to play Discover Weekly is not drift, and telling you it is
 // "not one of your inputs" is a complaint about a decision you just made.
 //
-// No playlist context at all is the signature. (It also covers an album or a
-// single track played from search, which is why the head line hedges.)
-function adrift(d) { return unfiled(d) && !d.context; }
+// Two signatures. No playlist context at all (which also covers an album or
+// a single track played from search). Or — what Spotify does now, seen
+// 2026-09-28 on [Discopop] — the input stays the reported context while
+// autoplay plays songs that are not in it. A song you just filed or removed
+// out of that input is out of it by your hand, not by drift, so it stays
+// silent.
+function adrift(d) {
+  if (!d.context) return unfiled(d);
+  return !!d.context.is_input && !filedUris[d.track?.uri] && inNothing(d);
+}
+
+// The list that ran out: the context itself when Spotify still reports it,
+// else the last input remembered from before the context went away.
+function ranOutOf(d) {
+  return d?.context?.is_input ? { id: d.context.id, name: d.context.name || "" } : lastInput;
+}
 
 // A list running dry, drawn as one: the rows stop and the arrow carries on
 // past where they ended.
@@ -1922,7 +1947,7 @@ function renderNow() {
       </button>`
     : "";
 
-  rememberInput(d.context);
+  rememberInput(d);
   nowProblem = false;  // a real card for a real track is about to go up
   // Fresh only for a track this card has not drawn yet: a re-render (a poll,
   // a pause toggle, the suggestions arriving) is not an arrival.

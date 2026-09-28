@@ -3444,6 +3444,28 @@ run("stopNowPolling()");
   await paint(adrift);
   run(`nowState.suggPending = true; renderNow()`);
   check("AD the strip never fires while the suggestion side is still pending", !up(), "");
+
+  // The tail as Spotify reports it now (seen 2026-09-28): the input stays
+  // the context while autoplay plays songs that are not in it.
+  const tail = { inputs: [{ id: "IN2", name: "[Disco]", has_track: false, set: "buffer" }],
+                 context: { id: "IN2", name: "[Disco]", is_input: true } };
+  await paint(tail);
+  check("AD the input still reported as context, the song in nothing: the strip is up",
+        up() && /Play \[Disco\] again/.test(strip()), strip());
+  check("AD ...the switcher names that input as the one that ran out",
+        /\[Disco\] ran out/.test($$("input-switch-label").textContent),
+        `label=${$$("input-switch-label").textContent}`);
+  run(`$("btn-adrift-close").onclick()`);
+  await paint(tail);
+  check("AD ...a dismissal holds although the context is an input on every poll",
+        $$("adrift-strip").hidden, strip());
+  await paint({ ...tail, inputs: [{ id: "IN2", name: "[Disco]", has_track: true, set: "buffer" }] });
+  await paint(tail);
+  check("AD ...and ends once a song in the input has played", up(), strip());
+
+  await paint(tail);
+  run(`filedUris["spotify:track:ad1"] = "Home"; renderNow()`);
+  check("AD a song you just filed or removed out of the input is not drift", !up(), strip());
 }
 
 // ============================================================================
