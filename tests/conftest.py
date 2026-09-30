@@ -17,6 +17,10 @@ os.environ["SORTIFY_DATA_DIR"] = tempfile.mkdtemp(prefix="sortify-tests-")
 os.environ["SPOTIFY_ACCOUNT_LEDGER"] = os.path.join(
     tempfile.mkdtemp(prefix="sortify-ledger-"), "account-ledger.json"
 )
+# The skip counter shared with spotify-autoqueuer: no test may count into it.
+os.environ["SPOTIFY_SKIP_LEDGER"] = os.path.join(
+    tempfile.mkdtemp(prefix="sortify-skips-"), "skips.json"
+)
 # clientui's find_text saves the screen it failed on — real forensics for a
 # live UI run. Unit tests exercise that failure path with toy images, which
 # must not clobber a real run's saved evidence.
@@ -37,6 +41,7 @@ def isolated_account_ledger(tmp_path, monkeypatch):
     the cap tests begin failing in whatever order pytest happens to run them.
     """
     monkeypatch.setenv("SPOTIFY_ACCOUNT_LEDGER", str(tmp_path / "account-ledger.json"))
+    monkeypatch.setenv("SPOTIFY_SKIP_LEDGER", str(tmp_path / "skips.json"))
 
 
 @pytest.fixture(autouse=True)

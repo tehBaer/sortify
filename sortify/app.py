@@ -29,6 +29,7 @@ from . import suggest as sugg
 from . import tabletshare
 from .deezer import Deezer
 from . import inputsets
+from .skip_ledger import Observation, SkipDetector, SkipLedger
 from .folders import (
     creatable_home_name_problem,
     extract_folder_map,
@@ -3241,8 +3242,51 @@ def _currently_playing_shared(force: bool = False) -> tuple[dict | None, float]:
                 ttl = min(ttl, NOW_SKIP_SETTLE_TTL)
             else:
                 _skip_settle.update(uri=None, until=0.0)  # settled: back to normal
-        _now_cache.update(at=time.time(), value=value, ttl=ttl)
-        return value, ttl
+        fetched_at = time.time()
+        _now_cache.update(at=fetched_at, value=value, ttl=ttl)
+    _skip_observe(value, fetched_at)
+    return value, ttl
+
+
+# ---- skip counting ---------------------------------------------------------
+#
+# Every fresh now-playing answer feeds the skip counter shared with
+# spotify-autoqueuer (~/state/spotify/skips.json, see skip_ledger.py): a song
+# that changed before min(60 s, 90% of it) had played counts as skipped, once,
+# whichever app saw it. Zero extra Spotify calls — it only reads answers we
+# already fetched. This app polls about once per track, so on its own it would
+# rarely see a skip early enough to be sure; player_next closes that gap by
+# telling the detector exactly where the song was when Next was pressed.
+
+_skip_detector = SkipDetector()
+_skip_detector_lock = threading.Lock()
+
+
+def _skip_observe(value: dict | None, at: float, progress_ms: float | None = None,
+                  left: bool = False) -> None:
+    """Feed one playback snapshot to the skip counter. Never raises.
+
+    `left` marks a reading taken as the song was skipped away from: it stops
+    advancing there, so the detector must not credit it the time until the
+    next answer arrives."""
+    try:
+        track = (value or {}).get("track") or {}
+        is_track = track.get("type", "track") == "track" and not track.get("is_local")
+        obs = Observation(
+            track_id=track.get("id") if is_track else None,
+            progress_ms=progress_ms if progress_ms is not None else (value or {}).get("progress_ms"),
+            duration_ms=track.get("duration_ms"),
+            is_playing=bool((value or {}).get("is_playing")) and not left,
+            at=at,
+            name=track.get("name"),
+            artists=[a.get("name") for a in track.get("artists") or [] if a.get("name")],
+        )
+        with _skip_detector_lock:
+            ev = _skip_detector.observe(obs)
+        if ev:
+            SkipLedger("sortify", now=lambda: time.time()).record(ev)
+    except Exception:  # a counter must never break now-playing
+        log.warning("skip counter failed", exc_info=True)
 
 
 def _now_fetched_ago_ms() -> int:
@@ -4011,7 +4055,18 @@ def player_next():
     # track's remaining runtime (see NOW_SKIP_SETTLE_TTL).
     with _now_lock:
         prev_uri = ((_now_cache["value"] or {}).get("track") or {}).get("uri")
+        cached, cached_at, cached_ttl = _now_cache["value"], _now_cache["at"], _now_cache["ttl"]
     out = _playback_call(sp.skip_next)
+    # The skip counter's exact reading: where the song is now, extrapolated
+    # from the cached answer (only ever too far along, so it can only
+    # undercount). An expired answer says nothing — the song may have played
+    # out and been replaced since.
+    now = time.time()
+    if cached and cached_at and now - cached_at <= cached_ttl:
+        progress = cached.get("progress_ms")
+        if progress is not None and cached.get("is_playing"):
+            progress += (now - cached_at) * 1000
+        _skip_observe(cached, now, progress, left=True)
     if prev_uri:
         with _now_lock:
             _skip_settle.update(uri=prev_uri, until=time.time() + NOW_SKIP_SETTLE_WINDOW)
