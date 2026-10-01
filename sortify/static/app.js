@@ -2615,9 +2615,10 @@ async function nowFile(toId, label) {
 
 // Picker's no-match create row, hoisted so both the "Add to…" button and the
 // `m` keyboard shortcut get the create row (previously only the button did).
-async function nowCreateAndFile(name) {
+async function nowCreateAndFile(name, folder) {
   try {
-    const { p, note, filing } = await createPlaylist(name);
+    // `folder` undefined -> omitted -> the server's default for homes.
+    const { p, note, filing } = await createPlaylist(name, "home", folder);
     if (filing) pollFiling(p.id, p.name);
     // Stamped now: it just received this track, so the recency sort keeps it
     // on top until the next profile rebuild reports the real value.
@@ -3044,6 +3045,7 @@ function openPicker(homesMap, onPick, onCreate, onHomeless, verb = "File here",
       const price = !subset && nowState.context?.is_input ? "3 calls" : "2 calls";
       const b = document.createElement("button");
       b.className = "picker-row picker-create";
+      let folders = null;
       // Nothing typed yet, so there is no name to create under. The row still
       // draws — it is the only thing that says creating is possible at all —
       // but it sends you to the box instead of firing a create with no name.
@@ -3058,9 +3060,33 @@ function openPicker(homesMap, onPick, onCreate, onHomeless, verb = "File here",
           ? `Create buffer “${esc(bufferName(typed))}” and move this track there`
           : `Create home “${esc(typed)}” and file this track there`}</span>` +
           `<span class="p-sub">${price}</span>`;
-        b.onclick = () => { closePicker(); onCreate(typed); };
+        // A new home is filed into a folder you pick (2026-10-01): the
+        // folders today's homes live in, the top guess's pre-selected. A
+        // folder the client's search cannot single out is shown disabled
+        // with why, never offered and then failed after the create.
+        if (!subset && !buffer && onCreate === nowCreateAndFile && nowState?.home_folders?.length) {
+          folders = document.createElement("div");
+          folders.className = "picker-folders";
+          folders.dataset.chosen = nowState.home_folder_default || "";
+          const paintChips = () => {
+            folders.innerHTML = nowState.home_folders.map((f) => f.blocked
+              ? `<button class="chip" disabled title="${esc(f.blocked)}">${esc(f.path)}</button>`
+              : `<button class="chip${f.path === folders.dataset.chosen ? " on" : ""}" data-path="${esc(f.path)}">${esc(f.path)}</button>`
+            ).join("");
+            for (const c of folders.querySelectorAll("button[data-path]")) {
+              c.onclick = (ev) => { ev.stopPropagation(); folders.dataset.chosen = c.dataset.path; paintChips(); };
+            }
+          };
+          paintChips();
+        }
+        b.onclick = () => {
+          closePicker();
+          if (folders) onCreate(typed, folders.dataset.chosen || undefined);
+          else onCreate(typed);
+        };
       }
       list.appendChild(b);
+      if (folders) list.appendChild(folders);
     }
   };
   paint("");

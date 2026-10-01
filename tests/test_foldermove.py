@@ -343,3 +343,16 @@ def test_cli_tree_rejects_unknown_flag(monkeypatch, capsys):
         main()
     assert exc.value.code == 2
     assert "unknown flag" in capsys.readouterr().out
+
+
+from sortify.foldermove import leaf_collisions
+
+PATHS = ["[Filter]", "ROOT", "ROOT / Hazy", "ROOT / Hominin", "ROOT / Hominin / OLD", "input",
+         "input / inputlister"]
+
+
+def test_leaf_collisions_finds_subfolders_and_name_overlaps():
+    assert leaf_collisions(PATHS, "ROOT / Hazy") == []
+    assert leaf_collisions(PATHS, "[Filter]") == []
+    assert leaf_collisions(PATHS, "ROOT / Hominin") == ["ROOT / Hominin / OLD"]
+    assert "input / inputlister" in leaf_collisions(PATHS, "input")

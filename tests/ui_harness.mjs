@@ -103,9 +103,15 @@ class El {
   // element that makeListRow wired its onclick onto, and `.name` to stay
   // readable after the click wrote to it.
   querySelectorAll(sel) {
-    if (sel !== "button") return [];
-    this._btns ||= [...this._html.matchAll(/<button[^>]*>/g)].map(() => new El("_btn"));
-    return this._btns;
+    if (sel !== "button" && sel !== "button[data-path]") return [];
+    this._btns ||= [...this._html.matchAll(/<button[^>]*>/g)].map((m) => {
+      const b = new El("_btn");
+      const d = m[0].match(/data-path="([^"]*)"/);   // attribute selector support: data-path only
+      b._path = d ? d[1].replace(/&amp;/g, "&") : null;
+      if (d) b.dataset.path = b._path;
+      return b;
+    });
+    return sel === "button" ? this._btns : this._btns.filter((b) => b._path !== null);
   }
   querySelector(sel) {
     this._qs ||= {};
@@ -4900,6 +4906,66 @@ run("stopNowPolling()");
     check("SR ...and the chip is on", run(`roles["PS1"]`) === "subset", String(run(`roles["PS1"]`)));
   } finally {
     run(`roles = {}`);
+  }
+}
+
+// ============================================================================
+// FH — a home created from the Now card is filed into the folder you pick.
+// ============================================================================
+{
+  const paint = async (over) => {
+    setNow({
+      playing: true, is_playing: true, progress_ms: 1000, poll_after_ms: 999999,
+      track: { uri: "spotify:track:fh1", name: "Song", duration_ms: 200000,
+               artists: [{ name: "Artist" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[One]", is_input: true }, sitting: null,
+      suggestions: [{ playlist_id: "H1", pct: 80, reasons: [], already: false }],
+      subsets: [], subset_targets: [],
+      homes: [{ id: "H1", name: "Home One", folder: "ROOT / Hazy" }],
+      inputs: [{ id: "IN1", name: "[One]", has_track: true, set: "buffer", total: 9 }],
+      home_folders: [{ path: "ROOT / Hazy", blocked: null },
+                     { path: "ROOT / Dusk", blocked: null },
+                     { path: "ROOT / Hominin", blocked: "the client's folder search would also offer ROOT / Hominin / OLD — file this one by hand" }],
+      home_folder_default: "ROOT / Hazy",
+      ...over,
+    });
+    run(`show("now"); filedUris = {}; removedUri = null; nowActions = 0;
+         nowActionLog = []; pollNow(true)`);
+    await tick();
+    run("stopNowPolling()");
+  };
+  await paint({});
+  try {
+    run(`openPicker(nowState.homes, nowFile, nowCreateAndFile, null)`);
+    run(`$("picker-filter").value = "Night drive"; $("picker-filter").oninput({ target: { value: "night drive" } })`);
+    const kids = () => $$("picker-list").children;
+    const chips = kids().find((c) => c.className === "picker-folders");
+    check("FH the create-home row offers the home folders", !!chips && /ROOT \/ Hazy/.test(chips.innerHTML),
+          JSON.stringify(kids().map((c) => c.className)));
+    check("FH ...the top guess's folder pre-selected",
+          /class="chip on"[^>]*>ROOT \/ Hazy</.test(chips?.innerHTML || "") &&
+          chips?.dataset.chosen === "ROOT / Hazy",
+          chips?.innerHTML);
+    check("FH ...and a folder the mover can't reach disabled, with why",
+          /disabled title="the client(&#39;|')s folder search/.test(chips?.innerHTML || ""), chips?.innerHTML);
+    routes["POST /api/playlists/create"] = { status: 200, body: {
+      playlist: { id: "H9", name: "Night drive", role: "home", total: 0, folder: "ROOT / Hazy" }, filing: true } };
+    routes["POST /api/act"] = { status: 200, body: {} };
+    // Tapping another chip moves the selection, and the create sends it.
+    const dusk = chips.querySelectorAll("button[data-path]").find((c) => c.dataset.path === "ROOT / Dusk");
+    dusk.onclick({ stopPropagation() {} });
+    check("FH tapping a chip moves the selection",
+          chips.dataset.chosen === "ROOT / Dusk" && /class="chip on" data-path="ROOT \/ Dusk"/.test(chips.innerHTML),
+          chips.innerHTML);
+    resetLog();
+    const create = kids().find((c) => /Create home/.test(c.innerHTML));
+    await create.onclick();
+    await tick(); await tick();
+    const cr = bodies("/api/playlists/create").slice(-1)[0];
+    check("FH creating sends the chosen folder", cr && cr.folder === "ROOT / Dusk" && cr.role === "home",
+          JSON.stringify(cr));
+  } finally {
+    run(`closePicker()`);
   }
 }
 

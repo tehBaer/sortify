@@ -295,3 +295,26 @@ def test_the_listing_offers_the_folders_and_the_defaults(client):
     body = client.get("/api/playlists").json()
     assert body["folder_paths"] == ["ROOT / Rock", "THE BOMB"]
     assert body["create_folders"] == {"home": "ROOT / Rock"}
+
+
+def test_a_failed_filing_is_logged(caplog):
+    def boom():
+        raise filing.FilingError("the client is busy")
+    with caplog.at_level("WARNING"):
+        filing.start("P9", "x", "ROOT / Hazy", runner=boom, threaded=False)
+    assert filing.status("P9")["state"] == "failed"
+    assert any("P9" in r.getMessage() and "client is busy" in r.getMessage() for r in caplog.records)
+
+
+def test_home_folder_choices(monkeypatch):
+    monkeypatch.setattr(appmod.store, "folders", lambda: {
+        "H1": {"path": "ROOT / Hazy"}, "H2": {"path": "ROOT / Hominin"},
+        "X1": {"path": "ROOT / Hominin / OLD"}, "B1": {"path": "[Filter]"}})
+    cfg = {"home_ids": ["H1", "H2"], "create_folders": {"home": None}}
+    choices, default = appmod._home_folder_choices(cfg, "H1")
+    assert [c["path"] for c in choices] == ["ROOT / Hazy", "ROOT / Hominin"]
+    assert choices[0]["blocked"] is None and "ROOT / Hominin / OLD" in choices[1]["blocked"]
+    assert default == "ROOT / Hazy"
+    assert appmod._home_folder_choices(cfg, "H2")[1] is None      # top guess's folder is blocked
+    cfg["create_folders"]["home"] = "ROOT / Hazy"
+    assert appmod._home_folder_choices(cfg, None)[1] == "ROOT / Hazy"

@@ -86,6 +86,19 @@ def resolve_folder(tree: dict, path_query: str) -> str:
     )
 
 
+def leaf_collisions(paths: list[str], dest_path: str) -> list[str]:
+    """The other folders the client's "Move to folder" search would offer
+    alongside `dest_path` (see _check_leaf_unique for why that matters)."""
+    low = dest_path.split(" / ")[-1].lower()
+    # Rows the search would return: any folder whose name contains the
+    # query (substring, because the client highlights partial matches), and
+    # any folder below one of those — its parent line carries the text.
+    return [p for p in paths
+            if p != dest_path
+            and (low in p.split(" / ")[-1].lower()
+                 or any(low in seg.lower() for seg in p.split(" / ")[:-1]))]
+
+
 def _check_leaf_unique(tree: dict, dest_path: str) -> None:
     """Refuse a destination the client's folder search cannot single out.
 
@@ -107,15 +120,7 @@ def _check_leaf_unique(tree: dict, dest_path: str) -> None:
     a silent misfile the user has to notice and undo by hand.
     """
     leaf = dest_path.split(" / ")[-1]
-    low = leaf.lower()
-    paths = _folder_paths(tree)
-    # Rows the search would return: any folder whose name contains the
-    # query (substring, because the client highlights partial matches), and
-    # any folder below one of those — its parent line carries the text.
-    hits = [p for p in paths
-            if p != dest_path
-            and (low in p.split(" / ")[-1].lower()
-                 or any(low in seg.lower() for seg in p.split(" / ")[:-1]))]
+    hits = leaf_collisions(_folder_paths(tree), dest_path)
     if hits:
         listing = "\n  ".join(hits)
         raise ResolveError(

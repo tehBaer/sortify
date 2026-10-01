@@ -18,9 +18,12 @@ moves, so filing refuses rather than guess.
 
 from __future__ import annotations
 
+import logging
 import threading
 
 from .foldermove import MovePlan, ResolveError, resolve_folder, _check_leaf_unique
+
+log = logging.getLogger("uvicorn.error")
 
 
 class FilingError(Exception):
@@ -114,9 +117,11 @@ def start(
         try:
             landed = runner() or dest_path
         except FilingError as e:
+            log.warning("filing %s into %r failed: %s", playlist_id, dest_path, e)
             _set(playlist_id, state="failed", folder=None, error=str(e))
             return
         except Exception as e:  # a broken seam must not kill the thread silently
+            log.warning("filing %s into %r failed: %r", playlist_id, dest_path, e)
             _set(playlist_id, state="failed", folder=None, error=repr(e))
             return
         _set(playlist_id, state="filed", folder=landed, error=None)

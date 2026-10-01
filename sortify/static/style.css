@@ -1186,3 +1186,9 @@ body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
 .pl-set > summary:hover { color: var(--fg); }
 .pl-set[open] > summary { margin-bottom: .3rem; color: var(--fg); }
 
+
+/* The folder a new home is filed into, under the create-home row. */
+.picker-folders { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 12px 10px; }
+.picker-folders .chip { font-size: 13px; }
+.picker-folders .chip.on { outline: 2px solid currentColor; }
+.picker-folders .chip:disabled { opacity: .45; }

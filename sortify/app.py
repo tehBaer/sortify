@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import filing
+from . import foldermove
 from . import quickadds
 from . import rootlist
 from . import suggest as sugg
@@ -3883,6 +3884,33 @@ def _light_context(ctx_id: str | None) -> dict | None:
             "is_input": ctx_id in _effective_input_ids(store.config(), items)}
 
 
+def _home_folder_choices(cfg: dict, top_home_id: str | None) -> tuple[list[dict], str | None]:
+    """The folders a new home can be filed into from the Now card, and which
+    one to pre-select. 0 calls: folders.json only.
+
+    The choices are the folders today's homes live in. One the desktop
+    client's folder search cannot single out (subfolders, or a name inside
+    another folder's) is listed with the reason instead of offered — the
+    mover would refuse it after the create (foldermove._check_leaf_unique).
+    Pre-selected: the top guess's folder, else the last folder used for homes.
+    """
+    folders = store.folders()
+    every = folder_paths(folders)
+    homes = sorted({(folders.get(h) or {}).get("path") for h in cfg.get("home_ids") or []} - {None, ""})
+    choices = []
+    for path in homes:
+        hits = foldermove.leaf_collisions(every, path)
+        choices.append({"path": path, "blocked": (
+            f"the client's folder search would also offer {', '.join(hits[:3])} — "
+            "file this one by hand") if hits else None})
+    ok = {c["path"] for c in choices if not c["blocked"]}
+    for cand in ((folders.get(top_home_id) or {}).get("path") if top_home_id else None,
+                 (cfg.get("create_folders") or {}).get("home")):
+        if cand in ok:
+            return choices, cand
+    return choices, None
+
+
 def _suggestion_payload(np: dict) -> dict:
     """The suggestion side of the now card — everything that needs profiles,
     tag maps, or CPU beyond naming the track. Shared verbatim by the one-shot
@@ -3905,16 +3933,21 @@ def _suggestion_payload(np: dict) -> dict:
     artist_map = store.lastfm_artist_map()
     ctx_id = np["context_playlist_id"]
     ctx = next((p for p in state["playlists"] if p["id"] == ctx_id), None)
+    suggestions = sugg.suggest(
+        track, state["profiles"], tag_artists, track_map, artist_map,
+        state.get("playlist_artists"),
+    ) if sortable else []
+    home_folders, home_folder_default = _home_folder_choices(
+        store.config(), suggestions[0]["playlist_id"] if suggestions else None)
     return {
         "context": (
             {"id": ctx_id, "name": ctx["name"] if ctx else None,
              "is_input": ctx_id in state["input_ids"]}
             if ctx_id else None
         ),
-        "suggestions": sugg.suggest(
-            track, state["profiles"], tag_artists, track_map, artist_map,
-            state.get("playlist_artists"),
-        ) if sortable else [],
+        "suggestions": suggestions,
+        "home_folders": home_folders,
+        "home_folder_default": home_folder_default,
         "subset_targets": _subset_targets_payload(state),
         "quick_adds": _quick_adds_payload(state, track["uri"]),
         "homes": _homes_payload(state),
