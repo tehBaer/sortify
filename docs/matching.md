@@ -55,25 +55,35 @@ next suggestion after saving.
 A **subset** is a non-exclusive selection any song can join, including songs
 that already have a home. Best-ofs, moods, project lists.
 
-Any playlist you own can be one — you say so with the **Subset** chip on the
-Playlists view, and that marking is the whole definition. (Subsets used to
-have to be named `{like this}`. That requirement is gone: the chip only
-appears on rows the list actually draws, 200 of your ~990 playlists, so a
-name rule meant most of your library could never be marked at all.)
+A subset is its **name**: a playlist you own whose name starts with an
+emoji — 🐾 tabletop, 🧸 lungt. The one exception is 🗄️, which means
+**archived**: an archived playlist has no role at all, not even input, so
+an old inbox leaves the Now view without leaving its folder. Inputs and
+homes win over the name, so an emoji-led buffer or home stays what it is.
+The rule is shared with spotify-autoqueuer, which groups your library the
+same way (`~/kode/spotify/spotify-ledger/playlist_roles.py`).
 
-**Nothing on this page applies to subsets.** They are not scored, not
+The **Subset** chip on the Playlists view marks one by renaming it: it
+puts 🐾 in front, and tapping it again takes the leading emoji off. On an
+archived row it is the only chip, and marking takes the 🗄️ off — that is
+the way back from the archive. Subsets created from the Now card get the 🐾
+when they are made.
+
+**Nothing else on this page applies to subsets.** They are not scored, not
 ranked, and never suggested — sortify has no opinion about which of them a
 song belongs in. They were scored briefly, in August 2026, and it wasn't
 wanted: a suggestion is a question you have to answer, and a best-of is not
 a question.
 
 So a subset is simply a destination you can reach quickly. **Add to
-subset…** on the Now card opens the ones you've marked, and putting a song
-in one changes nothing else — it does not count as filing, it does not take
-the song out of its input, and the song still needs its home.
+subset…** on the Now card opens them, and putting a song in one changes
+nothing else — it does not count as filing, it does not take the song out
+of its input, and the song still needs its home.
 
-Marking one is **free**: because nothing scores them, nothing reads them,
-and no Spotify calls are spent. Mark as many as you find useful.
+Marking one costs **one Spotify call** — the rename — and none when the
+name already says so (marking "🧸 lungt" changes nothing). Unmarking is one
+call too. Nothing reads a subset to score it, so once marked it costs
+nothing per poll.
 
 ## Where the data comes from
 

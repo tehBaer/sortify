@@ -93,8 +93,8 @@ escalating penalties. Therefore:
   so renaming is how a playlist moves between sets — and a misnamed one
   cannot be attributed to its intended set at all.
 - Homes: playlists under the `ROOT` folder tree minus ARCHIVED/OLD/NEUE
-  segments, emoji-prefixed names (🐾/🧸 derived super/subsets), and
-  `__x__`/`{x}`/`<x>` marker names. NEUE was excluded 2026-08-24: they are
+  segments, emoji-led names (those are subsets, or archived under 🗄️ — see
+  **Subsets** below), and `__x__`/`{x}`/`<x>` marker names. NEUE was excluded 2026-08-24: they are
   staging buckets for new finds, not filing destinations.
 - **Subsets** are non-exclusive selections: never a filing home, never an
   input, and a song in one still needs its home. **A subset is its NAME**
