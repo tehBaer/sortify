@@ -29,6 +29,7 @@ from . import suggest as sugg
 from . import tabletshare
 from .deezer import Deezer
 from . import inputsets
+from . import playlist_roles as roles
 from .skip_ledger import Observation, SkipDetector, SkipLedger
 from .folders import (
     creatable_home_name_problem,
@@ -246,7 +247,6 @@ def playlists():
              "total": None, "image": None}
     out = [liked] + items
     inputs = _effective_input_ids(cfg, items)
-    subsets = _effective_subset_ids(cfg, items)
     _sets = inputsets.resolve_sets(cfg)
     # One disk read + JSON parse for the whole listing, not one per playlist.
     # Against a real ~1000-playlist account with a splits.json that has grown
@@ -259,17 +259,17 @@ def playlists():
     hints = cfg.get("home_hints") or {}
     for p in out:
         p["folder"] = (folders.get(p["id"]) or {}).get("path")
-        p["role"] = (
-            "input" if p["id"] in inputs
-            else "home" if p["id"] in cfg.get("home_ids", [])
-            else "subset" if p["id"] in subsets
-            else None
-        )
-        # Any playlist you own can be marked a subset. This used to also
-        # require a `{}` name; that made most of a 990-playlist library
-        # unmarkable in a view that renders 200 rows, since the chip only
-        # appears on rows you can actually see.
-        p["subset_eligible"] = bool(p.get("editable"))
+        role = roles.role_of(
+            p["name"], is_input=p["id"] in inputs,
+            is_home=p["id"] in cfg.get("home_ids", []),
+            editable=bool(p.get("editable")) and p["id"] != LIKED_ID)
+        p["archived"] = role == "archived"
+        p["role"] = None if role == "archived" else role
+        # The Subset chip renames: the paw on, the leading emoji off. Only on
+        # our own playlists, and never on a home or input — those roles win
+        # anyway.
+        p["subset_eligible"] = (bool(p.get("editable")) and p["id"] != LIKED_ID
+                                and role in (None, "subset"))
         p["input_set"] = (
             inputsets.set_of(p["name"], p.get("folder"), _sets) or inputsets.DEFAULT_KEY
         ) if p["role"] == "input" else None
@@ -597,41 +597,35 @@ def _parse_hints(cfg: dict) -> dict[str, list[str]]:
 
 
 def _effective_input_ids(cfg: dict, playlists: list[dict]) -> set[str]:
-    """Explicitly marked inputs plus everything matching any input SET.
+    """Explicitly marked inputs plus everything matching any input SET, minus
+    anything archived (the archive marker first: no role at all, see
+    playlist_roles.py).
 
     Set rules (name patterns like ^\\[.+\\]$, or a folder segment such as
     THE BOMB) live in config so a stale browser tab saving roles can never
     un-mark the real inputs. See sortify/inputsets.py.
     """
-    ids = set(cfg.get("input_ids", []))
-    return ids | inputsets.matched_ids(playlists, store.folders(), cfg)
+    ids = set(cfg.get("input_ids", [])) | inputsets.matched_ids(playlists, store.folders(), cfg)
+    archived = {p["id"] for p in playlists if roles.is_archived(p.get("name", ""))}
+    return ids - archived
 
 
 def _effective_subset_ids(cfg: dict, playlists: list[dict]) -> set[str]:
-    """The subsets: the playlists the user marked as one.
+    """The subsets: playlists of ours whose name starts with an emoji other
+    than the archive marker (playlist_roles.py, shared with spotify-autoqueuer).
 
-    Opt-in, unlike inputs, and marking is the WHOLE definition — there is no
-    name convention any more. `{}` originally gated which playlists could be
-    marked, but that made most of a 990-playlist library unmarkable in a view
-    that renders 200 rows, so the requirement was dropped: any playlist you
-    own can be a subset if you say it is.
-
-    A mark is dropped when the playlist is gone, not ours to edit, or has
-    since become an input or a home. That last rule is now the only thing
-    keeping the roles exclusive — the name rule used to help, since `{}` is
-    also in `home_name_exclude_patterns` — so it carries more weight than it
-    did: a stale `subset_ids` entry must never quietly turn a home into
-    something else.
+    Since 2026-10-01 the NAME is the whole definition. It used to be an
+    opt-in id list (`subset_ids`) because the Lists chip could only mark the
+    ~200 rows it draws; marking is now a rename the chip does itself, so the
+    name reaches every playlist and other tools can see it without reading
+    sortify's config. Inputs and homes still win, and archived is no role.
     """
-    marked = set(cfg.get("subset_ids") or [])
-    if not marked:
-        return set()
-    taken = _effective_input_ids(cfg, playlists) | set(cfg.get("home_ids") or [])
+    inputs = _effective_input_ids(cfg, playlists)
+    homes = set(cfg.get("home_ids") or [])
     return {
         p["id"] for p in playlists
-        if p["id"] in marked
-        and p["id"] not in taken
-        and p.get("editable")
+        if roles.role_of(p.get("name", ""), is_input=p["id"] in inputs,
+                         is_home=p["id"] in homes, editable=bool(p.get("editable"))) == "subset"
     }
 
 
@@ -820,14 +814,9 @@ def _homes_payload(state: dict, exclude: str = "") -> list[dict]:
 
 
 def _subset_targets_payload(state: dict) -> list[dict]:
-    """The marked subsets — the Add-to-subset picker's list.
-
-    This used to be every `{}`-named playlist, opted in or not, because the
-    name convention gave "a subset" a meaning independent of the opt-in list.
-    With the name requirement gone, marking IS the definition, so the picker
-    reaches exactly what the user marked. The alternative — offering all ~990
-    owned playlists — would ship the whole library in every /api/now poll to
-    save a marking step.
+    """The subsets — the Add-to-subset picker's list: every playlist of ours
+    named with an emoji (the archive marker excepted). See
+    `_effective_subset_ids`.
     """
     ids = _effective_subset_ids(store.config(), state.get("playlists", []))
     folders = store.folders()

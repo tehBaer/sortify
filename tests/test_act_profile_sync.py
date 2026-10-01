@@ -66,7 +66,7 @@ def filing(monkeypatch):
     }
     store.save_cache(cache)
     store.save_config({**original_config, "home_ids": ["h1"], "input_ids": ["inp"],
-                       "subset_ids": [], "input_name_pattern": r"^\[.+\]$"})
+                       "input_name_pattern": r"^\[.+\]$"})
 
     monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: LISTING)
     monkeypatch.setattr(appmod.sp, "add_to_playlist", lambda pid, uri: "s-h1-new")

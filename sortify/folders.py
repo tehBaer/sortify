@@ -9,26 +9,11 @@ normal-case folder (trips etc.) is not a filing destination.
 from __future__ import annotations
 
 import re
-import unicodedata
 
 
-def starts_with_emoji(name: str) -> bool:
-    """True for names opening with an emoji/symbol (the user's marker for
-    derived superset/subset playlists, which are never filing destinations)."""
-    s = name.strip()
-    if not s:
-        return False
-    return ord(s[0]) >= 0x1F000 or unicodedata.category(s[0]) == "So"
-
-
-def home_name_excluded(name: str, patterns: list[str], emoji: bool) -> bool:
-    """Name-shape rules for playlists that are never filing destinations:
-    emoji prefix (derived super/subsets), plus configurable regexes for
-    markers like __start__/__stop__, {…} and <…>."""
-    s = name.strip()
-    if emoji and starts_with_emoji(s):
-        return True
-    return any(re.fullmatch(p, s) for p in patterns)
+# The name rules are shared with spotify-autoqueuer (playlist_roles.py, symlinked
+# from ~/kode/spotify/spotify-ledger). Re-exported so existing imports keep working.
+from .playlist_roles import home_name_excluded, starts_with_emoji  # noqa: F401
 
 
 def creatable_home_name_problem(

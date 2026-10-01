@@ -46,7 +46,7 @@ PLAYING = {"uri": "spotify:track:z", "id": "z", "name": "Z", "type": "track",
 
 
 def _cfg(**over):
-    base = {"input_ids": [], "home_ids": ["h1"], "subset_ids": [],
+    base = {"input_ids": [], "home_ids": ["h1"],
             "input_name_pattern": r"^\[.+\]$"}
     base.update(over)
     return base

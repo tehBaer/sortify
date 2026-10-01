@@ -57,7 +57,7 @@ def misfiled(monkeypatch):
     store.save_cache(cache)
     store.save_config({**original_config,
                        "home_ids": ["h1", "h2"], "input_ids": ["inA", "inB"],
-                       "subset_ids": [], "input_name_pattern": r"^\[.+\]$"})
+                       "input_name_pattern": r"^\[.+\]$"})
 
     removed, added = [], []
     monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: LISTING)

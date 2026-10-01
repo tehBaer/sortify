@@ -54,7 +54,7 @@ def counted(monkeypatch):
     }
     store.save_cache(cache)
     store.save_config({**original_config, "home_ids": ["h1"],
-                       "input_ids": ["inA", "inB"], "subset_ids": [],
+                       "input_ids": ["inA", "inB"],
                        "input_name_pattern": r"^\[.+\]$"})
 
     monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: LISTING)

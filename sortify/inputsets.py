@@ -18,7 +18,7 @@ inventing a wrapper for names that were never meant to carry one.
 
 from __future__ import annotations
 
-import re
+from .playlist_roles import input_set_of
 
 # Explicitly marked inputs that match no set's rule land here, so a
 # hand-marked playlist is never left without a group.
@@ -41,18 +41,8 @@ def resolve_sets(cfg: dict) -> list[dict]:
 
 
 def set_of(name: str, path: str | None, sets: list[dict]) -> str | None:
-    """The key of the first set matching this playlist, or None."""
-    stripped = (name or "").strip()
-    segments = (path or "").split(" / ")
-    for s in sets:
-        pattern = s.get("pattern")
-        if pattern and re.fullmatch(pattern, stripped):
-            return s["key"]
-        segment = s.get("path_segment")
-        # Whole-segment match: "THE BOMB" must not match "THE BOMB SQUAD".
-        if segment and segment in segments:
-            return s["key"]
-    return None
+    """The key of the first set matching this playlist, or None (shared rule)."""
+    return input_set_of(name, path, sets)
 
 
 def matched_ids(playlists: list[dict], folders: dict, cfg: dict) -> set[str]:

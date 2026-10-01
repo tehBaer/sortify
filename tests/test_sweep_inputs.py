@@ -41,7 +41,7 @@ LISTING = [
      "total": 3, "snapshot_id": "s-inB", "image": None, "description": ""},
     {"id": "homeless", "name": "[Homeless]", "owner": "me", "editable": True,
      "total": 1, "snapshot_id": "s-hl", "image": None, "description": ""},
-    {"id": "sub1", "name": "best of", "owner": "me", "editable": True,
+    {"id": "sub1", "name": "🐾 best of", "owner": "me", "editable": True,
      "total": 2, "snapshot_id": "s-sub", "image": None, "description": ""},
 ]
 
@@ -72,7 +72,7 @@ def swept(monkeypatch):
     store.save_cache(cache)
     store.save_config({**original_config,
                        "home_ids": ["h1"], "input_ids": ["inA", "inB", "homeless"],
-                       "subset_ids": ["sub1"], "homeless_id": "homeless",
+                       "homeless_id": "homeless",
                        "input_name_pattern": r"^\[.+\]$"})
 
     removed, added = [], []

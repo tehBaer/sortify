@@ -24,7 +24,7 @@ assert_not_live_data(appmod.store.dir)
 LISTING = [
     {"id": "star1", "name": "🐾 sjangersprengt topp", "owner": "me", "editable": True,
      "total": 344, "snapshot_id": "s-star", "image": None, "description": ""},
-    {"id": "rot1", "name": "{project 17}", "owner": "me", "editable": True,
+    {"id": "rot1", "name": "🐾 project 17", "owner": "me", "editable": True,
      "total": 12, "snapshot_id": "s-rot", "image": None, "description": ""},
 ]
 
@@ -96,7 +96,6 @@ def test_no_quick_adds_configured_is_simply_no_buttons():
 def client(monkeypatch):
     appmod.store.save_config({
         "client_id": "x", "input_ids": [], "home_ids": [],
-        "subset_ids": ["star1", "rot1"],
         "input_name_pattern": r"^\[.+\]$",
         "quick_adds": [dict(e) for e in QUICK],
     })

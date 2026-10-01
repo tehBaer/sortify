@@ -49,7 +49,7 @@ def client(monkeypatch):
     }
     store.save_cache(cache)
     store.save_config({**original_config, "home_ids": ["new1"], "input_ids": ["inp"],
-                       "subset_ids": [], "input_name_pattern": r"^\[.+\]$"})
+                       "input_name_pattern": r"^\[.+\]$"})
 
     # NOT stubbed to a constant: the real my_playlists serves the cached
     # listing, which is the structure under test — a stub returning a fixed
