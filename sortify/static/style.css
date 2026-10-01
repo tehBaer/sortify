@@ -1192,3 +1192,4 @@ body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
 .picker-folders .chip { font-size: 13px; }
 .picker-folders .chip.on { outline: 2px solid currentColor; }
 .picker-folders .chip:disabled { opacity: .45; }
+.picker-folders .picker-folders-why { flex-basis: 100%; color: var(--muted); font-size: .78rem; line-height: 1.35; }

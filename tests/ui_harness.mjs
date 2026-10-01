@@ -4909,6 +4909,69 @@ run("stopNowPolling()");
   }
 }
 
+// SF — a refused rename leaves the row exactly as it was, chip usable again.
+{
+  routes["GET /api/playlists"] = { status: 200, body: {
+    playlists: [{ id: "PS2", name: "plainlist", role: null, editable: true, total: 3,
+                  subset_eligible: true, folder: null, split: null, hints: "" }],
+    fetched_at: 1, sitting_orphans: [] } };
+  routes["POST /api/playlists/PS2/subset"] = { status: 409, body: { detail: "refused" } };
+  try {
+    run(`show("lists")`);
+    await run(`loadLists()`);
+    await tick();
+    const row = $$("playlists").children.find((c) => /plainlist/.test(c.innerHTML));
+    const chip = row?.querySelectorAll("button")[2];
+    resetLog();
+    await chip.onclick();
+    await tick();
+    check("SF a refused mark still posted once", bodies("/api/playlists/PS2/subset").length === 1,
+          String(bodies("/api/playlists/PS2/subset").length));
+    check("SF ...the chip is enabled again", chip.disabled === false, String(chip.disabled));
+    check("SF ...the role is unchanged", run(`roles["PS2"]`) === null, String(run(`roles["PS2"]`)));
+    check("SF ...and so is the row's name",
+          row.querySelector(".name").textContent !== "\u{1F43E} plainlist" &&
+          run(`playlistData.find((p) => p.id === "PS2").name`) === "plainlist",
+          run(`playlistData.find((p) => p.id === "PS2").name`));
+  } finally {
+    delete routes["POST /api/playlists/PS2/subset"];
+    run(`roles = {}`);
+  }
+}
+
+// AR — an archived row offers only the Subset chip: the way back from 🗄️.
+{
+  routes["GET /api/playlists"] = { status: 200, body: {
+    playlists: [{ id: "PA1", name: "\u{1F5C4}\uFE0F old best", role: null, archived: true,
+                  editable: true, total: 3, subset_eligible: true, folder: null, split: null,
+                  hints: "" }],
+    fetched_at: 1, sitting_orphans: [] } };
+  routes["POST /api/playlists/PA1/subset"] = { status: 200, body:
+    { playlist_id: "PA1", name: "\u{1F43E} old best", role: "subset" } };
+  try {
+    run(`show("lists")`);
+    await run(`loadLists()`);
+    await tick();
+    const row = $$("playlists").children.find((c) => /old best/.test(c.innerHTML));
+    const [bIn, bHome, bSubset] = row?.querySelectorAll("button") || [];
+    check("AR an archived row hides Buffer and Home", bIn?.hidden === true && bHome?.hidden === true,
+          `buffer hidden=${bIn?.hidden} home hidden=${bHome?.hidden}`);
+    check("AR ...and shows Subset", bSubset?.hidden === false, String(bSubset?.hidden));
+    resetLog();
+    await bSubset.onclick();
+    await tick();
+    const b = bodies("/api/playlists/PA1/subset").slice(-1)[0];
+    check("AR tapping Subset marks it (un-archives)", b && b.on === true, JSON.stringify(b));
+    check("AR ...after which the row is an ordinary subset row",
+          run(`roles["PA1"]`) === "subset" && bIn.hidden === false && bHome.hidden === false &&
+          row.querySelector(".name").textContent === "\u{1F43E} old best",
+          `role=${run(`roles["PA1"]`)} buffer hidden=${bIn.hidden}`);
+  } finally {
+    delete routes["POST /api/playlists/PA1/subset"];
+    run(`roles = {}`);
+  }
+}
+
 // ============================================================================
 // FH — a home created from the Now card is filed into the folder you pick.
 // ============================================================================
@@ -4946,8 +5009,14 @@ run("stopNowPolling()");
           /class="chip on"[^>]*>ROOT \/ Hazy</.test(chips?.innerHTML || "") &&
           chips?.dataset.chosen === "ROOT / Hazy",
           chips?.innerHTML);
-    check("FH ...and a folder the mover can't reach disabled, with why",
-          /disabled title="the client(&#39;|')s folder search/.test(chips?.innerHTML || ""), chips?.innerHTML);
+    check("FH ...and a folder the mover can't reach disabled",
+          /<button class="chip" disabled[^>]*>ROOT \/ Hominin</.test(chips?.innerHTML || ""), chips?.innerHTML);
+    // Phones never show a `title` tooltip: the reason has to be on screen.
+    const visible = (chips?.innerHTML || "").replace(/<[^>]*>/g, " ").replace(/&#39;/g, "'");
+    check("FH ...with why, as visible text naming the folder",
+          /ROOT \/ Hominin[^]*client's folder search would also offer/.test(visible), visible);
+    check("FH a Top level chip is offered, and is not selected while a folder is",
+          /<button class="chip" data-path="">Top level</.test(chips?.innerHTML || ""), chips?.innerHTML);
     routes["POST /api/playlists/create"] = { status: 200, body: {
       playlist: { id: "H9", name: "Night drive", role: "home", total: 0, folder: "ROOT / Hazy" }, filing: true } };
     routes["POST /api/act"] = { status: 200, body: {} };
@@ -4957,6 +5026,13 @@ run("stopNowPolling()");
     check("FH tapping a chip moves the selection",
           chips.dataset.chosen === "ROOT / Dusk" && /class="chip on" data-path="ROOT \/ Dusk"/.test(chips.innerHTML),
           chips.innerHTML);
+    // The filter repaints the list; the choice must survive it.
+    run(`$("picker-filter").value = "Night drives"; $("picker-filter").oninput({ target: { value: "night drives" } })`);
+    const chips2 = kids().find((c) => c.className === "picker-folders");
+    check("FH typing in the filter keeps the chosen folder",
+          chips2?.dataset.chosen === "ROOT / Dusk" && /class="chip on" data-path="ROOT \/ Dusk"/.test(chips2?.innerHTML || ""),
+          chips2?.innerHTML);
+    run(`$("picker-filter").value = "Night drive"; $("picker-filter").oninput({ target: { value: "night drive" } })`);
     resetLog();
     const create = kids().find((c) => /Create home/.test(c.innerHTML));
     await create.onclick();
@@ -4964,6 +5040,44 @@ run("stopNowPolling()");
     const cr = bodies("/api/playlists/create").slice(-1)[0];
     check("FH creating sends the chosen folder", cr && cr.folder === "ROOT / Dusk" && cr.role === "home",
           JSON.stringify(cr));
+
+    // Tapping the selected chip again is the opt-out: top level, sent as null.
+    // A new name: "Night drive" is a home now (the create above added it),
+    // and a filter that matches a home draws no create row.
+    run(`openPicker(nowState.homes, nowFile, nowCreateAndFile, null)`);
+    run(`$("picker-filter").value = "Moon walk"; $("picker-filter").oninput({ target: { value: "moon walk" } })`);
+    const c3 = kids().find((c) => c.className === "picker-folders");
+    const hazy = c3?.querySelectorAll("button[data-path]").find((c) => c.dataset.path === "ROOT / Hazy");
+    hazy?.onclick({ stopPropagation() {} });
+    const c3b = kids().find((c) => c.className === "picker-folders");
+    check("FH tapping the selected chip selects Top level",
+          /<button class="chip on" data-path="">Top level</.test(c3b?.innerHTML || ""), c3b?.innerHTML);
+    resetLog();
+    await kids().find((c) => /Create home/.test(c.innerHTML))?.onclick();
+    await tick(); await tick();
+    const cr3 = bodies("/api/playlists/create").slice(-1)[0];
+    check("FH ...and creating then sends folder: null (the top level, not the stored default)",
+          cr3 && "folder" in cr3 && cr3.folder === null, JSON.stringify(cr3));
+  } finally {
+    run(`closePicker()`);
+  }
+
+  // With no valid pre-selection, Top level is what is selected and sent —
+  // never the server's stored default, which nothing on screen shows.
+  await paint({ home_folder_default: null });
+  try {
+    run(`openPicker(nowState.homes, nowFile, nowCreateAndFile, null)`);
+    run(`$("picker-filter").value = "Night drive"; $("picker-filter").oninput({ target: { value: "night drive" } })`);
+    const kids = () => $$("picker-list").children;
+    const c4 = kids().find((c) => c.className === "picker-folders");
+    check("FH with no default, Top level is selected",
+          /<button class="chip on" data-path="">Top level</.test(c4?.innerHTML || ""), c4?.innerHTML);
+    resetLog();
+    await kids().find((c) => /Create home/.test(c.innerHTML))?.onclick();
+    await tick(); await tick();
+    const cr4 = bodies("/api/playlists/create").slice(-1)[0];
+    check("FH ...and is sent as folder: null", cr4 && "folder" in cr4 && cr4.folder === null,
+          JSON.stringify(cr4));
   } finally {
     run(`closePicker()`);
   }

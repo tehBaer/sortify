@@ -118,3 +118,53 @@ def test_an_archived_playlist_in_home_ids_is_not_a_home():
 def test_an_archived_playlist_is_not_a_fallback_home_either():
     listing = [pl("H1", "DARK SOAR"), pl("H2", "🗄️ OLD HOME")]
     assert [p["id"] for p in appmod._resolve_homes({}, listing, "", set())] == ["H1"]
+
+
+def test_unmarking_reports_the_role_of_the_new_name(renames):
+    # "🐾 [x]" is no input (the pattern needs the bracket first); "[x]" is.
+    seed([pl("P1", "🐾 [x]")], input_sets=[{"key": "buffer", "pattern": r"^\[.+\]$"}])
+    assert post("P1", False).json() == {"playlist_id": "P1", "name": "[x]", "role": "input"}
+
+
+def test_marking_an_archived_home_is_not_refused(renames):
+    # An archived name is no role, so the id still sitting in home_ids must
+    # not 409 the Subset chip — it is the way back from 🗄️.
+    seed([pl("H2", "🗄️ OLD HOME")], home_ids=["H2"])
+    r = post("H2", True)
+    assert r.status_code == 200 and renames == [("H2", "🐾 OLD HOME")]
+
+
+def test_a_mark_reaches_the_subset_picker_at_once(renames, monkeypatch):
+    # The picker reads the cached listing — the same input as /api/act's
+    # guard — not the profile snapshot, which can lag by PROFILE_TTL.
+    seed([pl("P1", "tabletop")])
+    monkeypatch.setitem(appmod._profile_state, "playlists", [pl("P1", "tabletop")])
+    assert appmod._subset_targets_payload() == []
+    post("P1", True)
+    assert [(t["id"], t["name"]) for t in appmod._subset_targets_payload()] == [("P1", "🐾 tabletop")]
+
+
+def test_the_subset_picker_never_fetches_a_cold_listing(monkeypatch):
+    cache = appmod.store.cache()
+    cache.pop("playlist_list", None)
+    appmod.store.save_cache(cache)
+    def boom(*a, **k):
+        raise AssertionError("must not fetch")
+    monkeypatch.setattr(appmod.sp, "my_playlists", boom)
+    assert appmod._subset_targets_payload() == []
+
+
+def test_saving_roles_keeps_the_marks_of_archived_playlists():
+    # Archived rows load with no role and hide their Buffer/Home chips, so a
+    # Save never lists them; their marks must survive it, ready for the day
+    # the 🗄️ comes off. A live home dropped from the save is still dropped.
+    seed([pl("H1", "DARK SOAR"), pl("H2", "🗄️ OLD HOME"), pl("H3", "GONE HOME"),
+          pl("I2", "🗄️ [old]")],
+         home_ids=["H1", "H2", "H3"], input_ids=["I2"], sticky_home_ids=["H2", "H3"])
+    r = TestClient(appmod.app).post("/api/config", json={
+        "input_ids": [], "home_ids": ["H1"], "home_hints": {}})
+    assert r.status_code == 200
+    cfg = appmod.store.config()
+    assert sorted(cfg["home_ids"]) == ["H1", "H2"]
+    assert cfg["input_ids"] == ["I2"]
+    assert cfg["sticky_home_ids"] == ["H2"]

@@ -309,8 +309,13 @@ def test_a_failed_filing_is_logged(caplog):
 def test_home_folder_choices(monkeypatch):
     monkeypatch.setattr(appmod.store, "folders", lambda: {
         "H1": {"path": "ROOT / Hazy"}, "H2": {"path": "ROOT / Hominin"},
-        "X1": {"path": "ROOT / Hominin / OLD"}, "B1": {"path": "[Filter]"}})
-    cfg = {"home_ids": ["H1", "H2"], "create_folders": {"home": None}}
+        "X1": {"path": "ROOT / Hominin / OLD"}, "B1": {"path": "[Filter]"},
+        # Homes can sit outside the home folders (sticky ones, made in Lists
+        # and filed anywhere): a new home is never offered those folders.
+        "H3": {"path": "Misc"}, "H4": {"path": "ROOT / NEUE"}})
+    cfg = {"home_ids": ["H1", "H2", "H3", "H4"], "create_folders": {"home": None},
+           "home_folder_prefixes": ["ROOT"],
+           "home_folder_exclude": ["ARCHIVED", "OLD", "NEUE"]}
     choices, default = appmod._home_folder_choices(cfg, "H1")
     assert [c["path"] for c in choices] == ["ROOT / Hazy", "ROOT / Hominin"]
     assert choices[0]["blocked"] is None and "ROOT / Hominin / OLD" in choices[1]["blocked"]
@@ -318,3 +323,14 @@ def test_home_folder_choices(monkeypatch):
     assert appmod._home_folder_choices(cfg, "H2")[1] is None      # top guess's folder is blocked
     cfg["create_folders"]["home"] = "ROOT / Hazy"
     assert appmod._home_folder_choices(cfg, None)[1] == "ROOT / Hazy"
+    cfg["create_folders"]["home"] = "Misc"            # last used, but not a home folder
+    assert appmod._home_folder_choices(cfg, "H3")[1] is None
+
+
+def test_root_itself_is_offered_only_when_a_home_lives_there(monkeypatch):
+    folders = {"H1": {"path": "ROOT / Hazy"}, "H5": {"path": "ROOT"}}
+    monkeypatch.setattr(appmod.store, "folders", lambda: folders)
+    cfg = {"home_ids": ["H1"], "home_folder_prefixes": ["ROOT"], "home_folder_exclude": []}
+    assert [c["path"] for c in appmod._home_folder_choices(cfg, None)[0]] == ["ROOT / Hazy"]
+    cfg["home_ids"] = ["H1", "H5"]
+    assert [c["path"] for c in appmod._home_folder_choices(cfg, None)[0]] == ["ROOT", "ROOT / Hazy"]

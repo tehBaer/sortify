@@ -229,8 +229,8 @@ function splitDisabledReason(p) {
 // Whether a row may be marked as a subset is the server's answer, read from
 // `subset_eligible`, not re-derived here — so the chip can never disagree
 // with what the rename would actually do. Eligibility is "ours, and not a
-// home or input" (an archived list is no role either, so no chip) — the
-// server's fact, since it alone knows the roles. A pure function, same
+// home or input" — an archived list (no role) included, since marking it is
+// how it comes back — the server's fact, since it alone knows the roles. A pure function, same
 // reasoning as splitDisabledReason above: unit-testable without the DOM.
 function subsetChipHidden(p) {
   return !p.subset_eligible;
@@ -266,7 +266,11 @@ function makeListRow(p) {
   const paint = () => {
     bIn.classList.toggle("on-input", roles[p.id] === "input");
     bHome.classList.toggle("on-home", roles[p.id] === "home");
-    bHome.hidden = p.id === "liked" || !p.editable;
+    // An archived list (🗄️) has no role, and a Buffer or Home toggle on it
+    // would be saved to no effect. Its one chip is Subset: marking takes the
+    // 🗄️ off, which is the way back from the archive.
+    bIn.hidden = !!p.archived;
+    bHome.hidden = p.id === "liked" || !p.editable || !!p.archived;
     bSubset.classList.toggle("on-subset", roles[p.id] === "subset");
     bSubset.hidden = subsetChipHidden(p);
     bSort.hidden = roles[p.id] !== "input";
@@ -295,7 +299,10 @@ function makeListRow(p) {
     try {
       const res = await api(`/api/playlists/${encodeURIComponent(p.id)}/subset`, { on });
       p.name = res.name;
-      roles[p.id] = res.role === "subset" ? "subset" : null;
+      // The role of the NEW name, which may be input or home (unmarking
+      // "🐾 [x]" leaves "[x]", an input). Marking never leaves a 🗄️ name.
+      roles[p.id] = res.role || null;
+      if (on) p.archived = false;
       row.querySelector(".name").textContent = res.name;
     } catch (e) {
       toast(e.message);
@@ -540,9 +547,10 @@ $("btn-save-config").onclick = async () => {
 // marked, with no Refresh. The folder path stays blank until the next
 // desktop-client folder export — not an error, neither role needs one.
 //
-// `role` is the server's business as much as this one's: a subset is marked
-// `subset_ids` and never home/sticky, or the Add to… picker would offer it as
-// a filing destination on the next request. Keeping the Lists view's own
+// `role` is the server's business as much as this one's: a subset is created
+// with an emoji-led name (🐾 unless it already has one) — the name IS the
+// role — and never marked home/sticky, or the Add to… picker would offer it
+// as a filing destination on the next request. Keeping the Lists view's own
 // state in step here costs nothing when that view has never been opened —
 // playlistData starts as an array either way.
 async function createPlaylist(name, role = "home", folder) {
@@ -550,8 +558,10 @@ async function createPlaylist(name, role = "home", folder) {
   // and LEAVING THE ARGUMENT OUT omits the field entirely — which the server
   // reads as "this role's stored default". The create row always passes a
   // value (its dropdown has a top-level option, and choosing it must beat
-  // the old default); the Now card passes nothing, so a home created while
-  // filing a song lands in the same folder as the ones created in Lists.
+  // the old default), and so do the Now card's folder chips for a new home
+  // (a path, or null for their Top level chip). Only the Now card's new
+  // buffers and subsets — and a new home when no home folder is known, so
+  // no chips are drawn — pass nothing and take the stored default.
   const res = await api("/api/playlists/create", { name, role, folder });
   const p = res.playlist;
   playlistData.unshift(p);
@@ -2617,7 +2627,9 @@ async function nowFile(toId, label) {
 // `m` keyboard shortcut get the create row (previously only the button did).
 async function nowCreateAndFile(name, folder) {
   try {
-    // `folder` undefined -> omitted -> the server's default for homes.
+    // A path files it there, null is the top level (the folder chips always
+    // pass one of the two); undefined — no chips drawn, because no home
+    // folder is known — omits the field: the server's default for homes.
     const { p, note, filing } = await createPlaylist(name, "home", folder);
     if (filing) pollFiling(p.id, p.name);
     // Stamped now: it just received this track, so the recency sort keeps it
@@ -2979,6 +2991,15 @@ async function nowCreateBufferAndMove(typed) {
 function openPicker(homesMap, onPick, onCreate, onHomeless, verb = "File here",
                     role = "home", opts = {}) {
   const list = $("picker-list");
+  // The folder a new home is created in, when the create row offers folder
+  // chips (Now card only). Kept out here, not in paint(): every keystroke in
+  // the filter repaints the list, and the choice must survive that. null is
+  // the top level — sent as null, so the server's stored default (which
+  // nothing on screen shows) never applies. Starts on the server's
+  // pre-selection only when that is a folder actually offered.
+  const offered = (nowState?.home_folders || []).filter((f) => !f.blocked).map((f) => f.path);
+  let chosenFolder = offered.includes(nowState?.home_folder_default)
+    ? nowState.home_folder_default : null;
   const paint = (filter) => {
     list.innerHTML = "";
     // Pinned above the homes and never filtered out: "none of these fit" is
@@ -3061,27 +3082,40 @@ function openPicker(homesMap, onPick, onCreate, onHomeless, verb = "File here",
           : `Create home “${esc(typed)}” and file this track there`}</span>` +
           `<span class="p-sub">${price}</span>`;
         // A new home is filed into a folder you pick (2026-10-01): the
-        // folders today's homes live in, the top guess's pre-selected. A
-        // folder the client's search cannot single out is shown disabled
-        // with why, never offered and then failed after the create.
+        // folders today's homes live in, the top guess's pre-selected, and
+        // "Top level" as the explicit way out — tapping the selected chip
+        // again lands there too. A folder the client's search cannot single
+        // out is shown disabled, and why is written under the chips: this
+        // app runs on a phone, where a `title` tooltip never shows.
         if (!subset && !buffer && onCreate === nowCreateAndFile && nowState?.home_folders?.length) {
           folders = document.createElement("div");
           folders.className = "picker-folders";
-          folders.dataset.chosen = nowState.home_folder_default || "";
           const paintChips = () => {
-            folders.innerHTML = nowState.home_folders.map((f) => f.blocked
-              ? `<button class="chip" disabled title="${esc(f.blocked)}">${esc(f.path)}</button>`
-              : `<button class="chip${f.path === folders.dataset.chosen ? " on" : ""}" data-path="${esc(f.path)}">${esc(f.path)}</button>`
-            ).join("");
+            folders.dataset.chosen = chosenFolder ?? "";
+            const chip = (path, label) =>
+              `<button class="chip${path === (chosenFolder ?? "") ? " on" : ""}" data-path="${esc(path)}">${esc(label)}</button>`;
+            const blocked = nowState.home_folders.filter((f) => f.blocked);
+            folders.innerHTML = chip("", "Top level") + nowState.home_folders.map((f) => f.blocked
+              ? `<button class="chip" disabled>${esc(f.path)}</button>`
+              : chip(f.path, f.path)
+            ).join("") + (blocked.length
+              ? `<span class="p-sub picker-folders-why">${blocked.map((f) =>
+                  `${esc(f.path)}: ${esc(f.blocked)}`).join("<br>")}</span>`
+              : "");
             for (const c of folders.querySelectorAll("button[data-path]")) {
-              c.onclick = (ev) => { ev.stopPropagation(); folders.dataset.chosen = c.dataset.path; paintChips(); };
+              c.onclick = (ev) => {
+                ev.stopPropagation();
+                const path = c.dataset.path || null;
+                chosenFolder = path === chosenFolder ? null : path;
+                paintChips();
+              };
             }
           };
           paintChips();
         }
         b.onclick = () => {
           closePicker();
-          if (folders) onCreate(typed, folders.dataset.chosen || undefined);
+          if (folders) onCreate(typed, chosenFolder);
           else onCreate(typed);
         };
       }

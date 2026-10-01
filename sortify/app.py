@@ -265,9 +265,10 @@ def playlists():
         p["role"] = None if role == "archived" else role
         # The Subset chip renames: the paw on, the leading emoji off. Only on
         # our own playlists, and never on a home or input — those roles win
-        # anyway.
+        # anyway. An archived list keeps it: marking takes the 🗄️ off, and
+        # that chip is the only way back from the archive on the phone.
         p["subset_eligible"] = (bool(p.get("editable")) and p["id"] != LIKED_ID
-                                and role in (None, "subset"))
+                                and role in (None, "subset", "archived"))
         p["input_set"] = (
             inputsets.set_of(p["name"], p.get("folder"), _sets) or inputsets.DEFAULT_KEY
         ) if p["role"] == "input" else None
@@ -445,7 +446,10 @@ def mark_subset(playlist_id: str, body: SubsetMarkIn):
     if not p.get("editable"):
         raise HTTPException(400, "not yours to rename, so it cannot be marked a subset")
     inputs = _effective_input_ids(cfg, listing)
-    is_home = playlist_id in (cfg.get("home_ids") or [])
+    # An archived name is no role at all, so an id left in home_ids under a
+    # 🗄️ name is not a home here — the chip that marks it is the way back.
+    in_home_ids = playlist_id in (cfg.get("home_ids") or [])
+    is_home = in_home_ids and not roles.is_archived(p["name"])
     if body.on and (playlist_id in inputs or is_home):
         raise HTTPException(
             409, f"{p['name']!r} is {'an input' if playlist_id in inputs else 'a home'} — "
@@ -460,22 +464,36 @@ def mark_subset(playlist_id: str, body: SubsetMarkIn):
         raise HTTPException(400, f"{p['name']!r} is only an emoji — removing it would leave no name")
     if new != p["name"]:
         sp.rename_playlist(playlist_id, new)
-    role = roles.role_of(new, is_input=playlist_id in inputs, is_home=is_home, editable=True)
+    # The role of the NEW name: for a pattern set the name is the membership,
+    # so unmarking "🐾 [x]" makes "[x]" an input the old name was not.
+    is_input = (playlist_id in (cfg.get("input_ids") or []) or bool(inputsets.set_of(
+        new, (store.folders().get(playlist_id) or {}).get("path"), inputsets.resolve_sets(cfg))))
+    role = roles.role_of(new, is_input=is_input, is_home=in_home_ids, editable=True)
     return {"playlist_id": playlist_id, "name": new, "role": None if role == "archived" else role}
 
 
 @app.post("/api/config")
 def set_config(body: ConfigIn):
     # Subsets are not saved here: a subset is its name (the Subset chip renames).
+    cfg = store.config()
+    # An archived playlist loads in the Lists view with no role and no
+    # Buffer/Home chips, so a Save never lists it. Its marks are kept, not
+    # read as "toggled off": they are what it gets back when the 🗄️ comes
+    # off. Cached listing only — with none cached, nothing is known archived.
+    listing = (store.cache().get("playlist_list") or {}).get("items") or []
+    archived = {p["id"] for p in listing if roles.is_archived(p.get("name", ""))}
+
+    def kept(saved: list[str], key: str) -> list[str]:
+        return saved + [i for i in (cfg.get(key) or []) if i in archived and i not in saved]
+
+    home_ids = kept(body.home_ids, "home_ids")
     store.update_config(
-        input_ids=body.input_ids, home_ids=body.home_ids,
+        input_ids=kept(body.input_ids, "input_ids"), home_ids=home_ids,
         home_hints={k: v.strip() for k, v in body.home_hints.items() if v.strip()},
         # A sticky role must still be revocable: Home toggled off in the
         # Playlists view drops the id here too, or the next folder ingest
         # would resurrect it. (Spec §2.)
-        sticky_home_ids=sorted(
-            set(store.config().get("sticky_home_ids") or []) & set(body.home_ids)
-        ),
+        sticky_home_ids=sorted(set(cfg.get("sticky_home_ids") or []) & set(home_ids)),
     )
     # Hints feed the tag profiles, which otherwise sit cached for PROFILE_TTL —
     # a save should be visible on the very next suggestion, not 10 min later.
@@ -849,17 +867,24 @@ def _homes_payload(state: dict, exclude: str = "") -> list[dict]:
     ]
 
 
-def _subset_targets_payload(state: dict) -> list[dict]:
+def _subset_targets_payload() -> list[dict]:
     """The subsets — the Add-to-subset picker's list: every playlist of ours
     named with an emoji (the archive marker excepted). See
     `_effective_subset_ids`.
+
+    Built from the cached listing, the same input /api/act's subset guard
+    reads, so the picker and the guard cannot disagree — and a mark (a
+    rename, which updates that listing) shows at once instead of after
+    PROFILE_TTL, as it did when this read the profile snapshot. A cold
+    listing gives an empty picker, never a fetch.
     """
-    ids = _effective_subset_ids(store.config(), state.get("playlists", []))
+    listing = (store.cache().get("playlist_list") or {}).get("items") or []
+    ids = _effective_subset_ids(store.config(), listing)
     folders = store.folders()
     return [
         {"id": p["id"], "name": p["name"], "total": p.get("total"),
          "folder": (folders.get(p["id"]) or {}).get("path")}
-        for p in state.get("playlists", []) if p["id"] in ids
+        for p in listing if p["id"] in ids
     ]
 
 
@@ -3888,15 +3913,31 @@ def _home_folder_choices(cfg: dict, top_home_id: str | None) -> tuple[list[dict]
     """The folders a new home can be filed into from the Now card, and which
     one to pre-select. 0 calls: folders.json only.
 
-    The choices are the folders today's homes live in. One the desktop
-    client's folder search cannot single out (subfolders, or a name inside
-    another folder's) is listed with the reason instead of offered — the
-    mover would refuse it after the create (foldermove._check_leaf_unique).
-    Pre-selected: the top guess's folder, else the last folder used for homes.
+    The choices are the folders today's homes live in, and only those that
+    are home folders by config (under `home_folder_prefixes`, no
+    `home_folder_exclude` segment) — a sticky home filed somewhere else does
+    not make that folder a place for new homes. One the desktop client's
+    folder search cannot single out (subfolders, or a name inside another
+    folder's) is listed with the reason instead of offered — the mover would
+    refuse it after the create (foldermove._check_leaf_unique).
+    Pre-selected: the top guess's folder, else the last folder used for
+    homes; None when neither is an offered folder (the client then selects
+    the top level, so nothing invisible applies).
     """
     folders = store.folders()
     every = folder_paths(folders)
-    homes = sorted({(folders.get(h) or {}).get("path") for h in cfg.get("home_ids") or []} - {None, ""})
+    prefixes = cfg.get("home_folder_prefixes") or []
+    excludes = cfg.get("home_folder_exclude") or []
+
+    def home_folder(path: str) -> bool:
+        if not prefixes:       # the ALL-CAPS fallback has no prefix to check
+            return not any(seg.upper() in {e.upper() for e in excludes}
+                           for seg in path.split(" / "))
+        return bool(select_home_ids({"_": {"path": path}}, prefixes, excludes))
+
+    homes = sorted(p for p in {(folders.get(h) or {}).get("path")
+                               for h in cfg.get("home_ids") or []} - {None, ""}
+                   if home_folder(p))
     choices = []
     for path in homes:
         hits = foldermove.leaf_collisions(every, path)
@@ -3948,7 +3989,7 @@ def _suggestion_payload(np: dict) -> dict:
         "suggestions": suggestions,
         "home_folders": home_folders,
         "home_folder_default": home_folder_default,
-        "subset_targets": _subset_targets_payload(state),
+        "subset_targets": _subset_targets_payload(),
         "quick_adds": _quick_adds_payload(state, track["uri"]),
         "homes": _homes_payload(state),
         "inputs": [

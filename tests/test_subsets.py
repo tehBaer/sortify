@@ -125,8 +125,9 @@ def test_subsets_build_no_profile(wired):
 def test_subset_targets_are_the_emoji_led_playlists_of_ours(wired):
     """The picker offers every playlist of ours whose name starts with an
     emoji (archive marker excepted) — the same set the act guard enforces,
-    because both go through `_effective_subset_ids`."""
-    ids = {t["id"] for t in appmod._subset_targets_payload(wired)}
+    because both go through `_effective_subset_ids` over the cached listing."""
+    _seed_listing(wired["playlists"])
+    ids = {t["id"] for t in appmod._subset_targets_payload()}
     assert ids == {"s1", "s2"}
     assert "plain" not in ids       # editable, but no emoji
     assert "notmine" not in ids     # emoji-led, but not ours to edit
@@ -134,10 +135,10 @@ def test_subset_targets_are_the_emoji_led_playlists_of_ours(wired):
 
 
 def test_renaming_a_playlist_puts_it_in_the_picker(wired):
-    """The name is the whole definition, so a state that lists an emoji-led
-    playlist offers it, whatever else is in it."""
-    state = {"playlists": wired["playlists"] + [_pl("new", "\U0001F984 unicorns")]}
-    ids = {t["id"] for t in appmod._subset_targets_payload(state)}
+    """The name is the whole definition, so a listing that holds an
+    emoji-led playlist offers it — whatever the profile snapshot says."""
+    _seed_listing(wired["playlists"] + [_pl("new", "\U0001F984 unicorns")])
+    ids = {t["id"] for t in appmod._subset_targets_payload()}
     assert ids == {"s1", "s2", "new"}
 
 
@@ -150,7 +151,8 @@ def client():
 
 
 def test_playlists_view_marks_role_archived_and_eligibility(client, monkeypatch):
-    listing = SUBSET_LISTING + [_pl("h1", "Home One")]
+    listing = SUBSET_LISTING + [_pl("h1", "Home One"),
+                                _pl("arch_theirs", "\U0001F5C4\uFE0F theirs", editable=False)]
     appmod.store.save_config(_cfg(home_ids=["h1"]))
     monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: listing)
     monkeypatch.setattr(appmod, "_split_summary", lambda pid, splits: None)
@@ -162,6 +164,10 @@ def test_playlists_view_marks_role_archived_and_eligibility(client, monkeypatch)
     assert rows["notmine"]["role"] is None and rows["notmine"]["subset_eligible"] is False
     assert rows["inp"]["role"] == "input" and rows["inp"]["subset_eligible"] is False
     assert rows["h1"]["role"] == "home" and rows["h1"]["subset_eligible"] is False
+    # The Subset chip is the way back from 🗄️ (marking un-archives), so an
+    # archived list of ours keeps it; one that is not ours cannot be renamed.
+    assert rows["arch"]["subset_eligible"] is True
+    assert rows["arch_theirs"]["subset_eligible"] is False
 
 
 def _seed_listing(listing):
