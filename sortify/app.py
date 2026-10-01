@@ -3252,11 +3252,13 @@ def _currently_playing_shared(force: bool = False) -> tuple[dict | None, float]:
 #
 # Every fresh now-playing answer feeds the skip counter shared with
 # spotify-autoqueuer (~/state/spotify/skips.json, see skip_ledger.py): a song
-# that changed before min(60 s, 90% of it) had played counts as skipped, once,
+# that changed before min(60 s, 90% of it) had played counts as skipped, and one
+# that changed before its halfway mark counts in a second tally — once each,
 # whichever app saw it. Zero extra Spotify calls — it only reads answers we
 # already fetched. This app polls about once per track, so on its own it would
 # rarely see a skip early enough to be sure; player_next closes that gap by
-# telling the detector exactly where the song was when Next was pressed.
+# telling the detector exactly where the song was when Next was pressed, and
+# that the skip was ours ("sortify" rather than "spotify" in by_source).
 
 _skip_detector = SkipDetector()
 _skip_detector_lock = threading.Lock()
@@ -3280,6 +3282,7 @@ def _skip_observe(value: dict | None, at: float, progress_ms: float | None = Non
             at=at,
             name=track.get("name"),
             artists=[a.get("name") for a in track.get("artists") or [] if a.get("name")],
+            left_by="sortify" if left else None,
         )
         with _skip_detector_lock:
             ev = _skip_detector.observe(obs)

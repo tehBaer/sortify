@@ -66,10 +66,10 @@ def test_an_early_change_between_polls_counts(clock, monkeypatch):
 
 
 def test_a_song_that_played_on_is_not_counted(clock, monkeypatch):
-    answer = [playing("a", 50_000)]
+    answer = [playing("a", 95_000)]
     monkeypatch.setattr(appmod.sp, "currently_playing", lambda: answer[0])
     appmod._currently_playing_shared()
-    clock[0] += 12  # could have reached 62 s
+    clock[0] += 12  # could have reached 107 s: past a minute and past half of 200 s
     answer[0] = playing("b", 1_000)
     appmod._currently_playing_shared(force=True)
     assert counts() == {}
@@ -88,6 +88,47 @@ def test_next_supplies_the_exact_position(clock, monkeypatch):
     answer[0] = playing("b", 1_000)
     appmod._currently_playing_shared(force=True)
     assert counts() == {"a": 1}
+
+
+def ledger_tracks():
+    return json.load(open(os.environ["SPOTIFY_SKIP_LEDGER"]))["tracks"]
+
+
+def test_next_names_sortify_as_the_source(clock, monkeypatch):
+    answer = [playing("a", 5_000)]
+    monkeypatch.setattr(appmod.sp, "currently_playing", lambda: answer[0])
+    monkeypatch.setattr(appmod.sp, "skip_next", lambda: None)
+    appmod._currently_playing_shared()
+    clock[0] += 20
+    TestClient(appmod.app).post("/api/player/next")
+    clock[0] += 3
+    answer[0] = playing("b", 1_000)
+    appmod._currently_playing_shared(force=True)
+    assert ledger_tracks()["a"]["by_source"] == {"sortify": 1}
+
+
+def test_a_change_made_elsewhere_is_spotify(clock, monkeypatch):
+    answer = [playing("a", 5_000)]
+    monkeypatch.setattr(appmod.sp, "currently_playing", lambda: answer[0])
+    appmod._currently_playing_shared()
+    clock[0] += 12
+    answer[0] = playing("b", 1_000)
+    appmod._currently_playing_shared(force=True)
+    assert ledger_tracks()["a"]["by_source"] == {"spotify": 1}
+
+
+def test_left_past_a_minute_but_before_half_counts_as_half_only(clock, monkeypatch):
+    answer = [playing("a", 70_000)]  # 200 s song: half is 100 s
+    monkeypatch.setattr(appmod.sp, "currently_playing", lambda: answer[0])
+    monkeypatch.setattr(appmod.sp, "skip_next", lambda: None)
+    appmod._currently_playing_shared()
+    clock[0] += 10  # at 80 s when Next is pressed
+    TestClient(appmod.app).post("/api/player/next")
+    clock[0] += 3
+    answer[0] = playing("b", 1_000)
+    appmod._currently_playing_shared(force=True)
+    entry = ledger_tracks()["a"]
+    assert (entry["count"], entry["half_count"]) == (0, 1)
 
 
 def test_next_with_an_expired_answer_says_nothing(clock, monkeypatch):
