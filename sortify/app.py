@@ -85,9 +85,6 @@ class ConfigIn(BaseModel):
     # {playlist_id: "ambient, piano"} — the user's own matching hints per
     # home, free text split on commas at profile-build time.
     home_hints: dict[str, str] = {}
-    # Subsets that may suggest themselves. Opt-in: marking one is what earns
-    # it a profile, and so the read that builds it.
-    subset_ids: list[str] = []
 
 
 class CreatePlaylistIn(BaseModel):
@@ -425,16 +422,53 @@ def apply_naming_rename(playlist_id: str):
                         "from": row["current"], "to": row["proposed"]}}
 
 
+class SubsetMarkIn(BaseModel):
+    on: bool
+
+
+@app.post("/api/playlists/{playlist_id}/subset")
+def mark_subset(playlist_id: str, body: SubsetMarkIn):
+    """Make a playlist a subset, or stop it being one — by renaming it.
+
+    A subset is its name (an emoji first, 🗄️ excepted; playlist_roles.py), so
+    marking puts 🐾 on and unmarking takes the leading emoji off. One Spotify
+    call, none when the name already says so. Reads the cached listing only.
+    Unmarking only ever renames a subset name: a plain or archived name is
+    returned unchanged, so "unmark" can never silently un-archive a list.
+    """
+    cfg = store.config()
+    listing = (store.cache().get("playlist_list") or {}).get("items") or []
+    p = next((x for x in listing if x["id"] == playlist_id), None)
+    if p is None:
+        raise HTTPException(404, "that playlist is not in the cached listing — Refresh first")
+    if not p.get("editable"):
+        raise HTTPException(400, "not yours to rename, so it cannot be marked a subset")
+    inputs = _effective_input_ids(cfg, listing)
+    is_home = playlist_id in (cfg.get("home_ids") or [])
+    if body.on and (playlist_id in inputs or is_home):
+        raise HTTPException(
+            409, f"{p['name']!r} is {'an input' if playlist_id in inputs else 'a home'} — "
+                 "that role wins over subset, so a 🐾 would change nothing")
+    if body.on:
+        new = roles.mark_subset_name(p["name"])
+    elif roles.is_subset_name(p["name"]):
+        new = roles.unmark_subset_name(p["name"])
+    else:
+        new = p["name"]
+    if not new.strip():
+        raise HTTPException(400, f"{p['name']!r} is only an emoji — removing it would leave no name")
+    if new != p["name"]:
+        sp.rename_playlist(playlist_id, new)
+    role = roles.role_of(new, is_input=playlist_id in inputs, is_home=is_home, editable=True)
+    return {"playlist_id": playlist_id, "name": new, "role": None if role == "archived" else role}
+
+
 @app.post("/api/config")
 def set_config(body: ConfigIn):
-    # Marking subsets used to be refused past a call budget, because each new
-    # mark meant reading that playlist to build a profile for scoring. Subsets
-    # are no longer scored, so marking reads nothing and costs nothing — there
-    # is no budget left to police, and mark as many as you like.
+    # Subsets are not saved here: a subset is its name (the Subset chip renames).
     store.update_config(
         input_ids=body.input_ids, home_ids=body.home_ids,
         home_hints={k: v.strip() for k, v in body.home_hints.items() if v.strip()},
-        subset_ids=sorted(set(body.subset_ids)),
         # A sticky role must still be revocable: Home toggled off in the
         # Playlists view drops the id here too, or the next folder ingest
         # would resurrect it. (Spec §2.)
@@ -653,11 +687,14 @@ def _cached_tracks(pid: str, snapshot_id: str | None) -> list[dict]:
 
 
 def _resolve_homes(cfg: dict, playlists: list[dict], exclude: str, input_ids: set[str]) -> list[dict]:
+    # An archived name (🗄️) has no role at all, so it is never a home even
+    # when its id is still listed in home_ids.
     home_ids = cfg.get("home_ids") or []
+    live = [p for p in playlists if not roles.is_archived(p.get("name", ""))]
     if home_ids:
-        chosen = [p for p in playlists if p["id"] in home_ids and p["id"] not in input_ids]
+        chosen = [p for p in live if p["id"] in home_ids and p["id"] not in input_ids]
     else:
-        chosen = [p for p in playlists if p["editable"] and p["id"] not in input_ids]
+        chosen = [p for p in live if p["editable"] and p["id"] not in input_ids]
     return [p for p in chosen if p["id"] != exclude]
 
 
@@ -4278,12 +4315,8 @@ def act(body: ActIn):
     # rule belongs here, where every caller passes, rather than in whichever
     # button happens to be current.
     #
-    # Keyed on the OPT-IN LIST. It used to key on the destination's `{}` name,
-    # because back then the picker reached every {}-named playlist and a
-    # name-blind guard would have missed most of them. With the name
-    # requirement gone, being marked is the entire definition of a subset —
-    # so the marked set is both what the picker offers and what the guard
-    # must cover, and the two can no longer drift apart.
+    # Keyed on the same name rule as the picker (`_effective_subset_ids`), so
+    # what the picker offers and what this guard covers cannot drift apart.
     #
     # Reads the cached listing directly rather than `sp.my_playlists()`,
     # which fetches (~21 paginated calls, ~60s stall) when

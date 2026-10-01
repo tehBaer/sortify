@@ -228,9 +228,9 @@ function splitDisabledReason(p) {
 
 // Whether a row may be marked as a subset is the server's answer, read from
 // `subset_eligible`, not re-derived here — so the chip can never disagree
-// with what a save would actually do. That mattered more when eligibility
-// was a name pattern; it still holds now that it is simply "do you own it",
-// because ownership is the server's fact too. A pure function, same
+// with what the rename would actually do. Eligibility is "ours, and not a
+// home or input" (an archived list is no role either, so no chip) — the
+// server's fact, since it alone knows the roles. A pure function, same
 // reasoning as splitDisabledReason above: unit-testable without the DOM.
 function subsetChipHidden(p) {
   return !p.subset_eligible;
@@ -287,9 +287,22 @@ function makeListRow(p) {
   };
   bIn.onclick = () => { roles[p.id] = roles[p.id] === "input" ? null : "input"; paint(); };
   bHome.onclick = () => { roles[p.id] = roles[p.id] === "home" ? null : "home"; paint(); };
-  bSubset.onclick = () => {
-    roles[p.id] = roles[p.id] === "subset" ? null : "subset";
-    paint();
+  // A subset is its NAME (an emoji first, 🗄️ excepted — shared with
+  // spotify-autoqueuer), so the chip renames on the spot: one call, no Save.
+  bSubset.onclick = async () => {
+    const on = roles[p.id] !== "subset";
+    bSubset.disabled = true;
+    try {
+      const res = await api(`/api/playlists/${encodeURIComponent(p.id)}/subset`, { on });
+      p.name = res.name;
+      roles[p.id] = res.role === "subset" ? "subset" : null;
+      row.querySelector(".name").textContent = res.name;
+    } catch (e) {
+      toast(e.message);
+    } finally {
+      bSubset.disabled = false;
+      paint();
+    }
   };
   bSort.onclick = () => { saveConfig().then(() => startTriage(p.id, p.name)); };
   bSplit.onclick = () => openSplit(p.id, p.name);
@@ -508,8 +521,7 @@ $("btn-folders-refresh").onclick = async () => {
 async function saveConfig() {
   const input_ids = Object.keys(roles).filter((k) => roles[k] === "input");
   const home_ids = Object.keys(roles).filter((k) => roles[k] === "home");
-  const subset_ids = Object.keys(roles).filter((k) => roles[k] === "subset");
-  await api("/api/config", { input_ids, home_ids, home_hints: hintTexts, subset_ids });
+  await api("/api/config", { input_ids, home_ids, home_hints: hintTexts });
 }
 
 // Save used to price itself: marking a subset meant reading that playlist

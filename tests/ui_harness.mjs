@@ -86,7 +86,10 @@ class El {
   }
   // Assigning innerHTML replaces the subtree — so appended children go too,
   // exactly as in a real DOM. renderPiles() relies on this to clear rows.
-  set innerHTML(v) { this._html = String(v); this.children = []; registerIds(this._html); }
+  set innerHTML(v) {
+    this._html = String(v); this.children = []; this._btns = null; this._qs = null;
+    registerIds(this._html);
+  }
   get innerHTML() { return this._html; }
   // "button" is modeled for real (one fresh El per <button> tag in document
   // order) because makeListRow destructures its role chips positionally and
@@ -94,11 +97,20 @@ class El {
   // before the row's markup (what SM's checks actually read) ever gets
   // built. Other selectors stay unmodeled: nothing else needs them, and O1
   // pins the pure gating function specifically to avoid depending on this.
+  //
+  // The buttons (and each querySelector() answer) are memoised until the next
+  // innerHTML assignment, as a real DOM's would be — SR needs the SAME chip
+  // element that makeListRow wired its onclick onto, and `.name` to stay
+  // readable after the click wrote to it.
   querySelectorAll(sel) {
-    if (sel === "button") return [...this._html.matchAll(/<button[^>]*>/g)].map(() => new El("_btn"));
-    return [];
+    if (sel !== "button") return [];
+    this._btns ||= [...this._html.matchAll(/<button[^>]*>/g)].map(() => new El("_btn"));
+    return this._btns;
   }
-  querySelector() { return new El("_anon"); }
+  querySelector(sel) {
+    this._qs ||= {};
+    return (this._qs[sel] ||= new El("_anon"));
+  }
   appendChild(c) { this.children.push(c); }
   setAttribute(k, v) { this[k] = String(v); }
   scrollIntoView() {} focus() {} addEventListener() {}
@@ -2500,9 +2512,8 @@ run("stopNowPolling()");
   await run(`saveConfig()`);
   await tick();
   const sent = bodies("/api/config").slice(-1)[0];
-  check("SM saving sends subset_ids",
-        Array.isArray(sent.subset_ids) && sent.subset_ids.includes("s1"),
-        JSON.stringify(sent));
+  check("SM saving roles no longer sends subset_ids — a subset is its name",
+        sent && !("subset_ids" in sent), JSON.stringify(sent));
   check("SM and does not put it in home_ids",
         !(sent.home_ids || []).includes("s1"), JSON.stringify(sent.home_ids));
 }
@@ -4861,6 +4872,35 @@ run("stopNowPolling()");
         run(`bufferName("[x]")`) === "[x]" && run(`bufferName(" y ")`) === "[y]", "");
 
   run(`show("lists")`);
+}
+
+// ============================================================================
+// SR — the Subset chip renames: 🐾 on, the leading emoji off, one call each.
+{
+  routes["GET /api/playlists"] = { status: 200, body: {
+    playlists: [{ id: "PS1", name: "tabletop", role: null, editable: true, total: 3,
+                  subset_eligible: true, folder: null, split: null, hints: "" }],
+    fetched_at: 1, sitting_orphans: [] } };
+  routes["POST /api/playlists/PS1/subset"] = { status: 200, body:
+    { playlist_id: "PS1", name: "\u{1F43E} tabletop", role: "subset" } };
+  try {
+    run(`show("lists")`);
+    await run(`loadLists()`);
+    await tick();
+    const row = $$("playlists").children.find((c) => /tabletop/.test(c.innerHTML));
+    const chip = row?.querySelectorAll("button")[2];
+    resetLog();
+    await chip.onclick();
+    await tick();
+    const b = bodies("/api/playlists/PS1/subset").slice(-1)[0];
+    check("SR tapping Subset posts on:true for that playlist", b && b.on === true, JSON.stringify(b));
+    check("SR ...and the row shows the new name",
+          row.querySelector(".name").textContent === "\u{1F43E} tabletop",
+          row.querySelector(".name").textContent);
+    check("SR ...and the chip is on", run(`roles["PS1"]`) === "subset", String(run(`roles["PS1"]`)));
+  } finally {
+    run(`roles = {}`);
+  }
 }
 
 // ---- summary ---------------------------------------------------------------
