@@ -97,28 +97,31 @@ escalating penalties. Therefore:
   `__x__`/`{x}`/`<x>` marker names. NEUE was excluded 2026-08-24: they are
   staging buckets for new finds, not filing destinations.
 - **Subsets** are non-exclusive selections: never a filing home, never an
-  input, and a song in one still needs its home. `subset_ids` is the whole
-  definition — **any playlist you own can be marked one**; there is no name
-  convention. (There was, `{braced}`, until 2026-08-28: the chip that marks a
-  subset only renders on rows the Playlists view draws, 200 of ~990, so a
-  name rule left most of the library unmarkable. Don't reinstate it.)
-  **Subsets are never suggested** — no profile is built for them, so marking
-  one reads nothing and costs nothing. They were scored for a few hours on
-  2026-08-28 and the user rejected it; `_subset_matches`, `SUBSET_TOP_N` and
-  the `SUBSET_WARM_BUDGET` guard were deleted with it, and the warm budget
-  only ever existed because scoring needed the tracks. Reinstating any of it
-  reinstates a per-poll cost that is currently zero. The picker and the
-  `/api/act` guard both key on the marked set, so their reach cannot drift
-  apart. `suggest.py` is shared with homes and was never modified for
-  subsets.
+  input, and a song in one still needs its home. **A subset is its NAME**
+  since 2026-10-01: our playlist whose name starts with an emoji, except 🗄️,
+  which means **archived** — no role at all, not even input. The rule lives
+  in `~/kode/spotify/spotify-ledger/playlist_roles.py` (symlinked in as
+  `sortify/playlist_roles.py`; spotify-autoqueuer copies its JS port), with
+  precedence archived > input > home > subset. Marking is a rename (the
+  Subset chip, `POST /api/playlists/{id}/subset`, 1 call): 🐾 on, the leading
+  emoji off. `subset_ids` is gone. It was an id list from 2026-08-28 because
+  the chip could only reach the ~200 rows the view draws and a name rule
+  left most of the library unmarkable; a rename from the chip removes that
+  objection, and only a name lets other tools see the role. **Subsets are
+  never suggested** — no profile is built for them, so a subset costs
+  nothing per poll. They were scored for a few hours on 2026-08-28 and the
+  user rejected it; `_subset_matches`, `SUBSET_TOP_N` and the
+  `SUBSET_WARM_BUDGET` guard were deleted with it. The picker and the
+  `/api/act` guard both key on the same rule, so their reach cannot drift
+  apart. `suggest.py` is shared with homes and was never modified for subsets.
 - **Quick adds** (`quick_adds` in config, `sortify/quickadds.py`) are the Now
   card's one-tap destinations — Star, Explore artist, Add to rotation. Each is
   an ordinary subset add with the picker skipped: same `/api/act` shape
   (`from_id: null`), same undo, same "a selection is not a filing" rule, so
-  the targets must be marked subsets. A button whose target already holds the
+  the targets must be subsets (emoji-named). A button whose target already holds the
   song spends nothing — membership comes off the cached track list, free.
   The explore entry starts with `playlist_id: null` + `create_name`;
-  `POST /api/explore` creates it once (1 call), marks it a subset, writes the
+  `POST /api/explore` creates it once (1 call), names it with 🐾, writes the
   id back into config, and records the artist in `data/explore.json` — that
   log is the seed for exploring those artists later, and nothing else writes it.
 - The client speaks the Feb-2026 dev-mode API (`items`/`item`, `/me/library`)
