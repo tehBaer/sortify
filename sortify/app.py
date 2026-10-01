@@ -493,16 +493,10 @@ def create_playlist_api(body: CreatePlaylistIn):
     we know is empty — spec §3), the role marking, and a profile cache clear
     so the new playlist is usable now, not in PROFILE_TTL.
 
-    The two roles differ in exactly two places, and both are about what a
-    subset IS. It is never a filing destination, so it is marked `subset_ids`
-    and never home/sticky — marking it home would put it in the Add to…
-    picker on the next request. And it has no name convention at all
-    (marking is the whole definition), so the home name rules — `{}`, `<>`,
-    `__x__`, emoji prefixes — must not be applied to it; those names are
-    ordinary subset names. The one rule that survives is the input pattern,
-    because `_effective_input_ids` unions pattern matches over the config
-    list: a subset named "[Foo]" comes back as an input regardless of what
-    this endpoint wrote.
+    A subset is never a filing destination, so it is never marked
+    home/sticky, and it is created with an emoji-led name — which is what
+    makes it a subset (playlist_roles.py). The home name rules are not applied
+    to it; the input pattern still is.
     """
     if body.role not in ("home", "subset", "input"):
         raise HTTPException(
@@ -527,6 +521,10 @@ def create_playlist_api(body: CreatePlaylistIn):
                      "re-import")
 
     name = body.name.strip()
+    if subset:
+        # A subset is its name (playlist_roles.py): created with 🐾 unless it
+        # already starts with an emoji.
+        name = roles.mark_subset_name(name)
     if is_input:
         # For a pattern set the NAME is the membership. Marking `input_ids`
         # without it would produce an input that belongs to no set at all,
@@ -541,6 +539,9 @@ def create_playlist_api(body: CreatePlaylistIn):
                 400, f"{name!r} matches no input set rule ({rules}) — it would be "
                      "marked an input belonging to no set")
     else:
+        # The TYPED name is what is checked: marking blanks to "🐾" and hides
+        # an input shape ("[Foo]" -> "🐾 [Foo]") that the user did not mean as
+        # a subset name.
         problem = creatable_home_name_problem(
             body.name,
             input_pattern=cfg.get("input_name_pattern"),
@@ -574,13 +575,10 @@ def create_playlist_api(body: CreatePlaylistIn):
     sp.remember_playlist(item)
 
     cfg = store.config()
-    if subset:
-        store.update_config(
-            subset_ids=sorted(set(cfg.get("subset_ids") or []) | {new_id}))
-    elif is_input:
+    if is_input:
         store.update_config(
             input_ids=sorted(set(cfg.get("input_ids") or []) | {new_id}))
-    else:
+    elif not subset:
         store.update_config(
             home_ids=sorted(set(cfg.get("home_ids") or []) | {new_id}),
             sticky_home_ids=sorted(set(cfg.get("sticky_home_ids") or []) | {new_id}),
@@ -3726,8 +3724,8 @@ def explore(body: ExploreIn):
     """Resolve the Explore artist button's playlist, creating it once.
 
     Two jobs, both of which have to happen before the add: make sure there
-    IS a playlist (the first press creates it — one Spotify call — marks it
-    a subset so it can never become a filing home, and writes its id back
+    IS a playlist (the first press creates it — one Spotify call — names it
+    as a subset (🐾) so it can never become a filing home, and writes its id back
     into `quick_adds`), and record the artist in data/explore.json, which
     is what the exploring still to come will read.
 
@@ -3749,6 +3747,7 @@ def explore(body: ExploreIn):
             raise HTTPException(
                 400, "the explore button has neither a playlist nor a name to "
                      "create one with")
+        name = roles.mark_subset_name(name)
         pid, snapshot = sp.create_playlist_full(name)
         created = True
         sp.remember_playlist({
@@ -3760,7 +3759,6 @@ def explore(body: ExploreIn):
         })
         cfg = store.config()
         store.update_config(
-            subset_ids=sorted(set(cfg.get("subset_ids") or []) | {pid}),
             quick_adds=quickadds.with_target(cfg, "explore", pid),
         )
         _profile_state.clear()

@@ -1,15 +1,16 @@
 """Creating a subset playlist from the Now card.
 
 A subset is a non-exclusive selection: never a home, never an input, and a
-song put in one still needs its home. So creation writes `subset_ids` and
-nothing else — marking it home or sticky would make the picker offer it as a
+song put in one still needs its home. A subset is its name (an emoji-led
+one, playlist_roles.py), so creation names it that way and writes no id list
+at all — marking it home or sticky would make the picker offer it as a
 filing destination on the very next request.
 
-Names: subsets have NO name convention (data/config.json's `subset_ids` is
-the whole definition), so the home name rules — `{}`/`<>`/`__x__`, emoji
-prefixes — must not apply here. The ONE rule that survives is the input
-pattern, because `_effective_input_ids` unions pattern matches over the
-config list: a subset called "[Foo]" would come back as an input.
+Names: the typed name gets a paw unless it already starts with an emoji, and
+the home name rules — `{}`/`<>`/`__x__`, emoji prefixes — do not apply here.
+The ONE rule that survives is the input pattern, because
+`_effective_input_ids` unions pattern matches over the config list: a subset
+called "[Foo]" would come back as an input.
 
 Zero Spotify calls: the create is faked.
 """
@@ -42,10 +43,11 @@ def client(monkeypatch):
         "playlists": {}, "artists": {}, "me": {"id": "me"},
         "playlist_list": {"fetched_at": 1.0, "items": list(LISTING)},
     })
-    calls = {"create": 0}
+    calls = {"create": 0, "names": []}
 
     def fake_full(name, description="", bulk=False, spend_reserve=False, public=False):
         calls["create"] += 1
+        calls["names"].append(name)
         return "made1", "snap-new"
 
     monkeypatch.setattr(appmod.sp, "create_playlist_full", fake_full)
@@ -63,11 +65,24 @@ def _create(client, name):
     return client.post("/api/playlists/create", json={"name": name, "role": "subset"})
 
 
+def test_a_new_subset_is_created_with_a_paw(client):
+    r = _create(client, "tabletop")
+    assert r.status_code == 200
+    assert client.calls["names"][-1] == "🐾 tabletop"      # the name sent to Spotify
+    assert r.json()["playlist"]["name"] == "🐾 tabletop"
+    assert not appmod.store.config().get("subset_ids")
+
+
+def test_a_typed_emoji_name_is_kept(client):
+    _create(client, "🧸 cosy")
+    assert client.calls["names"][-1] == "🧸 cosy"
+
+
 def test_creating_a_subset_marks_it_a_subset_and_nothing_else(client):
     res = _create(client, "best of the bomb")
     assert res.status_code == 200
     cfg = appmod.store.config()
-    assert cfg["subset_ids"] == ["made1"]
+    assert not cfg.get("subset_ids")
     assert "made1" not in cfg["home_ids"]
     assert "made1" not in (cfg.get("sticky_home_ids") or [])
     assert res.json()["playlist"]["role"] == "subset"
@@ -85,7 +100,6 @@ def test_the_track_cache_is_seeded_so_no_rebuild_refetches_it(client):
 def test_home_name_rules_do_not_apply_to_subsets(client):
     # Every one of these is refused as a HOME name and must be fine here.
     for name in ("{alle sanger}", "<motor>", "__start__", "🐾 derived"):
-        appmod.store.update_config(subset_ids=[])
         assert _create(client, name).status_code == 200, name
 
 

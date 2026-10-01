@@ -104,10 +104,11 @@ def client(monkeypatch):
         "playlist_list": {"fetched_at": 1.0, "items": list(LISTING)},
     })
     appmod.store.save_explore({})
-    calls = {"create": 0}
+    calls = {"create": 0, "names": []}
 
     def fake_full(name, description="", bulk=False, spend_reserve=False, public=False):
         calls["create"] += 1
+        calls["names"].append(name)
         return "utf1", "snap-utf"
 
     monkeypatch.setattr(appmod.sp, "create_playlist_full", fake_full)
@@ -130,14 +131,15 @@ def test_the_first_press_creates_the_playlist_and_says_so(client):
     body = res.json()
     assert body["created"] is True
     assert body["playlist_id"] == "utf1"
-    assert body["name"] == "Utforsk"
+    assert body["name"] == "🐾 Utforsk"
+    assert client.calls["names"] == ["🐾 Utforsk"]
     assert client.calls["create"] == 1
 
 
 def test_the_new_playlist_is_a_subset_so_it_never_becomes_a_filing_home(client):
     client.post("/api/explore", json=BODY)
     cfg = appmod.store.config()
-    assert "utf1" in cfg["subset_ids"]
+    assert not cfg.get("subset_ids")
     assert "utf1" not in (cfg.get("home_ids") or [])
     assert "utf1" not in (cfg.get("sticky_home_ids") or [])
 
