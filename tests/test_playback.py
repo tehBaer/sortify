@@ -138,6 +138,25 @@ def test_now_playing_art_is_the_mid_size_image(sp, monkeypatch):
     assert sp.currently_playing()["track"]["image"] == "http://img/300"
 
 
+def test_now_playing_full_screen_art_is_the_largest_image(sp, monkeypatch):
+    """The cover button opens the art full screen, where the 300px upscales
+    soft on a phone — so the largest image rides along as image_large. Same
+    response, no extra call."""
+    payload = {
+        "item": {
+            "uri": "spotify:track:x", "id": "x", "name": "X", "type": "track",
+            "artists": [], "duration_ms": 1000,
+            "album": {"name": "Alb", "images": [
+                {"url": "http://img/640"}, {"url": "http://img/300"}, {"url": "http://img/64"},
+            ]},
+        },
+        "is_playing": True, "progress_ms": 0,
+    }
+    record(sp, monkeypatch, FakeResponse(200, payload))
+
+    assert sp.currently_playing()["track"]["image_large"] == "http://img/640"
+
+
 def test_now_playing_art_survives_a_single_image(sp, monkeypatch):
     payload = {
         "item": {
@@ -150,6 +169,7 @@ def test_now_playing_art_survives_a_single_image(sp, monkeypatch):
     record(sp, monkeypatch, FakeResponse(200, payload))
 
     assert sp.currently_playing()["track"]["image"] == "http://img/only"
+    assert sp.currently_playing()["track"]["image_large"] == "http://img/only"
 
 
 # ---- endpoints -------------------------------------------------------------

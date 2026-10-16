@@ -1713,6 +1713,52 @@ run("stopNowPolling()");
         !$$("btn-reveal").classList.contains("on"),
         `peeked=${document.body.classList.contains("peeked")} ` +
         `peekedUri=${run("peekedUri")}`);
+
+  // The cover is its own button: full screen, the large image, names nothing.
+  routes["GET /api/now?light=1"].body.track =
+    { uri: "spotify:track:br3", name: "Cover Song", artists: [{ name: "Cover Artist" }],
+      sortable: true, image: "http://img/300", image_large: "http://img/640" };
+  routes["GET /api/now/suggest?force=1"].body.track_uri = "spotify:track:br3";
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  run(`closeCover()`);
+  run(`$("btn-cover").onclick()`);
+  check("CV the cover button opens the large cover full screen",
+        $$("cover-pop").hidden === false && /src="http:\/\/img\/640"/.test($$("cover-pop").innerHTML) &&
+        $$("btn-cover").classList.contains("on"),
+        `hidden=${$$("cover-pop").hidden} html=${$$("cover-pop").innerHTML}`);
+  check("CV ...without naming the song or revealing the details",
+        !/Cover Song|Cover Artist/.test($$("cover-pop").innerHTML) &&
+        !document.body.classList.contains("peeked"), $$("cover-pop").innerHTML);
+  run(`$("cover-pop").onclick()`);
+  check("CV a tap on it closes it",
+        $$("cover-pop").hidden === true && !$$("btn-cover").classList.contains("on"), "");
+  run(`$("btn-reveal").onclick()`);
+  check("CV the eye reveals the details without opening the cover",
+        document.body.classList.contains("peeked") && $$("cover-pop").hidden === true, "");
+  run(`setReveal(false)`);
+
+  run(`$("btn-cover").onclick()`);
+  routes["GET /api/now?light=1"].body.track =
+    { uri: "spotify:track:br4", name: "After Song", artists: [{ name: "After Artist" }],
+      sortable: true, image: "http://img/x" };
+  routes["GET /api/now/suggest?force=1"].body.track_uri = "spotify:track:br4";
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  check("CV the cover closes when the next track starts",
+        $$("cover-pop").hidden === true && !$$("btn-cover").classList.contains("on"),
+        `hidden=${$$("cover-pop").hidden}`);
+
+  routes["GET /api/now?light=1"].body.track.image = null;
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  run(`$("btn-cover").onclick()`);
+  check("CV no cover, no overlay — a toast says so",
+        $$("cover-pop").hidden === true && /no cover/.test($$("toast").textContent),
+        `toast=${JSON.stringify($$("toast").textContent)}`);
 }
 
 // ============================================================================
@@ -4683,13 +4729,12 @@ run("stopNowPolling()");
   const html = () => $$("now-card").innerHTML;
   await paint({});
 
-  // What is playing lives in one panel, shown only on request: the big
-  // cover with the details under it.
-  check("NC the song's details and the cover share one reveal panel",
-        /class="t-reveal"/.test(html()), html().slice(0, 300));
-  check("NC ...cover first, the details under it",
-        html().indexOf('class="art"') < html().indexOf('class="t-meta"') &&
-        html().indexOf('class="art"') > -1, html().slice(0, 400));
+  // What is playing lives in one panel, shown only on request. The cover is
+  // not in it: it has its own button and opens full screen.
+  check("NC the song's details sit in one reveal panel",
+        /class="t-reveal"[\s\S]*class="t-meta"/.test(html()), html().slice(0, 300));
+  check("NC ...and the cover is not in the card at all",
+        !html().includes('class="art"') && !html().includes("<img"), html().slice(0, 400));
 
   // The filing controls: out of the scroll box.
   const scroll = () => {

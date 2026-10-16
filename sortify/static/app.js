@@ -1899,6 +1899,7 @@ function renderNow() {
   // A reveal lasts exactly one track: it falls away the moment the playing
   // uri is no longer the one it was opened for.
   if (document.body.classList.contains("peeked") && d.track?.uri !== peekedUri) setReveal(false);
+  if (!$("cover-pop").hidden && (d.track?.uri || null) !== coverUri) closeCover();
   // Same expiry, same reason: the strip's undo offer belongs to one track.
   if (removedUri && d.track?.uri !== removedUri) removedUri = null;
   // Next's completion signal. What the press was FOR is a different track, so
@@ -1953,16 +1954,14 @@ function renderNow() {
   const tr = d.track;
   const ctx = d.context;
 
-  const img = tr.image ? `<img src="${esc(tr.image)}" alt="">` : '<div class="noimg"></div>';
   const artists = tr.artists.map((a) => a.name).join(", ");
 
   const body = inSitting ? sittingCardBody(tr, d.sitting) : ordinaryCardBody(d, tr, ctx);
 
   // Share needs a real track on screen; local files and episodes have no
   // spotify:track: uri and the tablet flow can't find them by title anyway.
-  // It rides the card's corner beside the cover — the whitespace flanking
-  // the art is exactly where a once-in-a-while control can sit without
-  // costing the layout anything.
+  // It rides the reveal panel, the once-in-a-while place where it costs the
+  // layout nothing.
   const shareBtn = tr.uri?.startsWith("spotify:track:")
     ? `<button id="btn-share" class="icon-btn np-share" title="Send this song to a friend — Spotify Messages, via the tablet">
         <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>
@@ -1974,13 +1973,10 @@ function renderNow() {
   // Fresh only for a track this card has not drawn yet: a re-render (a poll,
   // a pause toggle, the suggestions arriving) is not an arrival.
   const cardFresh = enterOnce("card", tr.uri) ? " card-fresh" : "";
-  // The header is one row, not a stack: the cover used to take 230px of a
-  // phone's height before the first control, and this app is only ever used
-  // on a phone. Text first in the markup so it takes the width the shrunken
-  // cover leaves, rather than being what gets squeezed.
+  // The cover is not in here: it has its own button and opens full screen
+  // (openCover), so looking at the art never names the song.
   $("now-card").innerHTML = `<div class="track-card${cardFresh}${d.is_playing ? "" : " is-paused"}">
     <div class="t-reveal">
-      <div class="art">${img}${d.is_playing ? "" : '<span class="paused-chip">paused</span>'}</div>
       <div class="t-meta">
         <div class="t-name">${esc(tr.name)}</div>
         <div class="t-artist">${esc(artists)}</div>
@@ -2839,12 +2835,14 @@ async function undoStripAction() {
 // ---- blind by default -------------------------------------------------------
 //
 // The card never names what is playing: the ear decides, not the name. The
-// title, artist, album and cover are not blurred but left out of the layout
+// title, artist and album are not blurred but left out of the layout
 // altogether, which is what gives the transport and the filing rows the
-// room. The eye in the bar opens them as one panel — big cover, the details,
-// share — and the suggestion REASONS unblur with it (they leak artist
-// names). The reveal lasts one track: renderNow drops it as soon as the
-// playing uri is no longer the one it was opened for.
+// room. The eye in the bar opens them as one panel — the details, share —
+// and the suggestion REASONS unblur with it (they leak artist names). The
+// cover is the other button: it opens the art full screen and names
+// nothing, so you can look at it and still not know what is playing. Both
+// last one track: renderNow drops them as soon as the playing uri is no
+// longer the one they were opened for.
 
 let peekedUri = null;
 // The track whose removal the strip is currently offering to undo. Expires
@@ -2859,6 +2857,35 @@ function setReveal(on) {
   $("btn-reveal").setAttribute("aria-pressed", peekedUri ? "true" : "false");
 }
 $("btn-reveal").onclick = () => setReveal(!document.body.classList.contains("peeked"));
+
+// The track whose cover is open full screen. Only read while #cover-pop is
+// shown; a local file has no uri, so null here does not mean "closed".
+let coverUri = null;
+
+function setCoverBtn(on) {
+  $("btn-cover").classList.toggle("on", on);
+  $("btn-cover").setAttribute("aria-pressed", on ? "true" : "false");
+}
+function openCover() {
+  const t = nowState?.track;
+  if (!t) { toast("nothing playing"); return; }
+  if (!t.image) { toast("no cover for this one"); return; }
+  coverUri = t.uri || null;
+  // The grow-in is a CSS animation, so it runs on every hidden → shown.
+  $("cover-pop").innerHTML = `<img src="${esc(t.image_large || t.image)}" alt="">`;
+  $("cover-pop").hidden = false;
+  setCoverBtn(true);
+}
+function closeCover() {
+  coverUri = null;
+  $("cover-pop").hidden = true;
+  $("cover-pop").innerHTML = "";
+  setCoverBtn(false);
+}
+$("btn-cover").onclick = () => ($("cover-pop").hidden ? openCover() : closeCover());
+// Tap anywhere on it to close: the overlay is the whole screen, so there is
+// no outside to tap.
+$("cover-pop").onclick = closeCover;
 
 // ---- tablet share (Spotify Messages via the tablet — see /api/share) -------
 

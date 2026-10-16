@@ -26,6 +26,9 @@
   <button id="btn-nav-menu" class="icon-btn" aria-haspopup="true" aria-expanded="false" title="Menu">
     <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
   </button>
+  <button id="btn-cover" class="icon-btn" title="Show the album cover" aria-pressed="false">
+    <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+  </button>
   <h1 id="home-link">sortify</h1>
   <button id="btn-input-switch" class="input-switch placeholder" disabled title="Play a different input playlist">
     <span id="input-switch-label">checking…</span>
@@ -34,7 +37,7 @@
   <span class="now-top-actions">
     <button id="btn-undo-now" disabled hidden>Undo</button>
     <button id="btn-now-manual" class="mode-chip">auto</button>
-    <button id="btn-reveal" class="icon-btn" title="Show what's playing — cover, title, artist" aria-pressed="false">
+    <button id="btn-reveal" class="icon-btn" title="Show what's playing — title, artist, and the reasons" aria-pressed="false">
       <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>
     </button>
     <button id="btn-now-refresh" class="icon-btn" title="Check what's playing now">
@@ -191,6 +194,7 @@
 
 <div id="preview-pop" aria-live="polite" hidden></div>
 <div id="share-pop" hidden></div>
+<div id="cover-pop" hidden></div>
 <div id="toast" hidden></div>
 
 <script src="/static/app.js"></script>

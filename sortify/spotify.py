@@ -799,6 +799,9 @@ class Spotify:
                 # which upscaled to card size as a blur.
                 "image": (lambda imgs: imgs[(len(imgs) - 1) // 2].get("url"))(
                     (t.get("album") or {}).get("images") or [{}]),
+                # The largest, for the cover button's full-screen view, where
+                # the ~300px one upscales soft on a phone.
+                "image_large": ((t.get("album") or {}).get("images") or [{}])[0].get("url"),
             },
             "is_playing": data.get("is_playing", False),
             "progress_ms": data.get("progress_ms"),
