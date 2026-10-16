@@ -142,13 +142,17 @@ page carries the line".
 
 ## Funnel port
 
-Funnel allows only 443, 8443 and 10000. 443 (→ :8899) and 8443
-(soknatur, → :8830) are taken. 10000 is free since skannonser's guest
-copy was archived on 2026-10-08, but that copy's revival instructions use
-10000. **Needs the user's ruling:** take 10000 for sortify (and give the
-skannonser revival another route if it ever comes back), or put sortify
-on a path under an existing port, which needs every absolute URL in
-sortify made prefix-aware: much more work.
+Funnel allows only 443, 8443 and 10000 per node. 443 (→ :8899) and 8443
+(soknatur, → :8830) are taken. **Decided 2026-10-16: sortify takes
+10000.** It has been free since skannonser's guest copy was archived on
+2026-10-08; if that copy is ever revived, it needs another route (a path
+under an existing port, or its own node, below).
+
+More public routes later do not need more ports on this node: each
+Funnel port can serve several apps by path (`tailscale funnel
+--set-path=/x ...`), at the cost of making the app prefix-aware, and a
+tailscale sidecar container joins the tailnet as its own node with its
+own hostname and its own three Funnel ports.
 
 ## Phone wrinkles
 
@@ -207,6 +211,6 @@ stay; nothing reaches it.
 
 ## Open questions for the user
 
-1. Funnel port 10000 for sortify: OK?
+1. ~~Funnel port 10000 for sortify: OK?~~ Yes (2026-10-16).
 2. Is "no public page carries the button" the right reading of the
    button rule for a service with a tailnet port and a public port?
