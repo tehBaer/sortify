@@ -31,6 +31,7 @@ def gate_on(monkeypatch):
     monkeypatch.setattr(appmod, "PUBLIC_ORIGIN", ORIGIN)
     monkeypatch.setattr(appmod, "GATE_REDIRECT_URI", ORIGIN + "/gate/callback")
     monkeypatch.setattr(appmod, "_gate_counter", gate.DailyCounter())
+    monkeypatch.setattr(appmod, "_exchange_counter", gate.DailyCounter(cap=gate.DAILY_EXCHANGE_CAP))
     monkeypatch.setenv("SORTIFY_GATE_SECRET", SECRET)
     prev_client = appmod.store.config().get("client_id")
     appmod.store.update_config(gate_owner_id=OWNER, client_id="a" * 32)
@@ -392,7 +393,11 @@ def test_during_a_cooldown_sign_in_says_so_and_calls_nothing(spotify_says, monke
     assert calls == []
 
 
-def test_sign_ins_are_capped_per_day(spotify_says, monkeypatch):
+def test_the_verify_cap_still_caps_whoami_calls(spotify_says, monkeypatch):
+    # The verify cap (_gate_counter) is taken only after a successful
+    # exchange, right before whoami — so a second round still reaches
+    # exchange_code (that is the exchange cap's job), but is stopped
+    # before whoami is ever called.
     calls = spotify_says("someone-else")
     monkeypatch.setattr(appmod, "_gate_counter", gate.DailyCounter(cap=1))
     c = public()
@@ -401,7 +406,45 @@ def test_sign_ins_are_capped_per_day(spotify_says, monkeypatch):
     r = sign_in(c)
 
     assert r.status_code == 429
+    assert [k[0] for k in calls] == ["exchange", "whoami", "exchange"]
+
+
+def test_the_exchange_cap_caps_exchanges(spotify_says, monkeypatch):
+    calls = spotify_says(OWNER)
+    monkeypatch.setattr(appmod, "_exchange_counter", gate.DailyCounter(cap=1))
+    c = public()
+
+    sign_in(c)
+    r = sign_in(c)
+
+    assert r.status_code == 429
     assert [k[0] for k in calls] == ["exchange", "whoami"]
+
+
+def test_bogus_codes_spend_only_the_exchange_cap_not_the_owners_sign_in(monkeypatch):
+    # The exchange cap protects the token endpoint from garbage codes; it
+    # must not be the same counter the owner's own sign-in depends on, or
+    # a stranger throwing bad codes at /gate/callback could exhaust the
+    # owner's daily allowance before the owner ever gets there.
+    def refuse(*a, **kw):
+        raise appmod.SpotifyError(400, "invalid_grant")
+
+    monkeypatch.setattr(appmod.sp, "exchange_code", refuse)
+    c = public()
+    for _ in range(gate.DAILY_VERIFY_CAP):
+        r = sign_in(c)
+        assert r.status_code == 502
+
+    calls = []
+    monkeypatch.setattr(appmod.sp, "exchange_code",
+                        lambda code, verifier, client_id, redirect_uri=None:
+                        calls.append("exchange") or {"access_token": "owner-token"})
+    monkeypatch.setattr(appmod.sp, "whoami", lambda token: calls.append("whoami") or OWNER)
+
+    r = sign_in(c)
+
+    assert r.status_code == 303
+    assert calls == ["exchange", "whoami"]
 
 
 def test_a_refused_code_gets_a_page_not_an_error(monkeypatch):

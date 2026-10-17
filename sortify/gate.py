@@ -26,6 +26,10 @@ RENEW_AFTER = 24 * 3600
 PENDING_MAX_AGE = 10 * 60
 SECRET_MIN = 32
 DAILY_VERIFY_CAP = 20
+# Taken before exchange_code, so a stranger throwing garbage codes at
+# /gate/callback can only spend this counter, never the one guarding the
+# owner's own account check (DAILY_VERIFY_CAP) below.
+DAILY_EXCHANGE_CAP = 100
 
 # The manifest and icons are fetched by the browser without cookies, so
 # gating them breaks add-to-home-screen. They reveal nothing.

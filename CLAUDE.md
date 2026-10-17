@@ -78,12 +78,20 @@ escalating penalties. Therefore:
   arrived on (`scope["server"]`) is what separates the routes — never headers.
   The Claude button is stripped from public pages and stays on the tailnet
   port. Each sign-in costs one `/me` call. Secret: `SORTIFY_GATE_SECRET` in
-  the git-ignored `.env`; without it the public socket stays closed. Spec:
+  the git-ignored `.env`; **without it `_sockets()` logs an error and opens
+  only the tailnet socket — that stops sortify's own gate from running, it
+  does not close port 8801 to the world.** Funnel points at 127.0.0.1:8801
+  regardless of what sortify does, so **port 8801 is reserved**: whatever
+  listens there is on the internet with no gate of its own. Never run a dev
+  or prototype server on it. Spec:
   `docs/superpowers/specs/2026-10-16-spotify-login-gate-design.md`.
-  The 20/day sign-in cap counts code exchanges before the account is checked,
-  so anyone who reaches /gate/callback can spend the day's 20 and block fresh
-  public sign-ins until midnight; existing cookies and the tailnet route keep
-  working. Accepted, because it keeps the token endpoint protected.
+  Two separate daily caps protect sign-in: `DAILY_EXCHANGE_CAP` (100/day)
+  is taken before the code exchange, so a stranger throwing garbage codes
+  at /gate/callback only spends that counter; `DAILY_VERIFY_CAP` (20/day,
+  `_gate_counter`) is taken only after a successful exchange, right before
+  the account check, so bogus codes can never spend the owner's 20
+  sign-ins. Accepted, because it keeps the token endpoint protected without
+  letting a stranger block the owner.
   On the public port, `/static/index.html` (any spelling StaticFiles would
   resolve to it) redirects to `/`, because the raw file carries the Claude
   button line.

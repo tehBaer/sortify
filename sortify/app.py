@@ -95,7 +95,13 @@ PUBLIC_ORIGIN = os.environ.get(
     "SORTIFY_PUBLIC_ORIGIN", "https://mbp.tail916fc5.ts.net:10000"
 ).rstrip("/")
 GATE_REDIRECT_URI = PUBLIC_ORIGIN + "/gate/callback"
+# Two separate counters: _exchange_counter protects the token endpoint
+# itself (taken before exchange_code, so garbage codes spend only this),
+# _gate_counter protects the account check (taken only after a successful
+# exchange, right before whoami) — a bogus code must never be able to
+# spend the owner's own daily sign-in allowance.
 _gate_counter = gate.DailyCounter()
+_exchange_counter = gate.DailyCounter(cap=gate.DAILY_EXCHANGE_CAP)
 
 
 def _gate_secret() -> str | None:
@@ -374,13 +380,17 @@ def gate_callback(request: Request, code: str | None = None, state: str | None =
         until = datetime.fromtimestamp(cooldown).strftime("%H:%M")
         return _auth_page(503, f"Spotify is cooling down. Sign-in works again at {until}, "
                                "or use the tailnet address.")
-    if not _gate_counter.take(time.strftime("%Y-%m-%d")):
+    today = time.strftime("%Y-%m-%d")
+    if not _exchange_counter.take(today):
         return _auth_page(429, "Too many sign-ins today. Try again tomorrow, or use the tailnet address.")
     try:
         tokens = sp.exchange_code(code, verifier, store.config()["client_id"],
                                   redirect_uri=GATE_REDIRECT_URI)
+        if not _gate_counter.take(today):
+            return _auth_page(429,
+                              "Too many sign-ins today. Try again tomorrow, or use the tailnet address.")
         uid = sp.whoami(tokens["access_token"])
-    except SpotifyError as e:
+    except (SpotifyError, httpx.HTTPError, KeyError) as e:
         log.warning("gate: sign-in failed: %s", e)
         return _auth_page(502, "Couldn't complete the Spotify sign-in. Please try again.")
     if uid != owner:
