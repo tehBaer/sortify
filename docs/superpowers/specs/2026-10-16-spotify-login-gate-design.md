@@ -1,6 +1,6 @@
 # Public sortify behind a "Sign in with Spotify" gate — design
 
-Date: 2026-10-16. Status: draft, for review before any code.
+Date: 2026-10-16. Status: approved 2026-10-17; both open questions decided.
 
 ## Why
 
@@ -136,9 +136,8 @@ button. With two ports, `/` on the public port strips the `rc-button.js`
 line from index.html (the same place that already stamps asset versions),
 and the tailnet port keeps it. The button's script lives on boxdash's
 tailnet-only origin and refuses public addresses, so a stray line would
-also stay inert. **Needs the user's ruling:** the rule talks about a
-*service* reachable from the internet; this design reads it as "no public
-page carries the line".
+also stay inert. **Decided 2026-10-17:** the button stays on the tailnet
+port and never appears on a public page.
 
 ## Funnel port
 
@@ -212,5 +211,6 @@ stay; nothing reaches it.
 ## Open questions for the user
 
 1. ~~Funnel port 10000 for sortify: OK?~~ Yes (2026-10-16).
-2. Is "no public page carries the button" the right reading of the
-   button rule for a service with a tailnet port and a public port?
+2. ~~Is "no public page carries the button" the right reading of the
+   button rule for a service with a tailnet port and a public port?~~
+   Yes: tailnet only (2026-10-17).
