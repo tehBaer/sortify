@@ -282,6 +282,11 @@ async def public_gate(request: Request, call_next):
     if not _arrived_public(request.scope):
         return await call_next(request)
     path = request.url.path
+    if path == "/static/index.html":
+        # StaticFiles would serve the raw file, rc-button.js line and all —
+        # the strip in _index_response only runs for "/". Signed in or not,
+        # the button must never reach the public port.
+        return RedirectResponse("/", status_code=302)
     if gate.is_open_path(path):
         return await call_next(request)
     secret = _gate_secret()

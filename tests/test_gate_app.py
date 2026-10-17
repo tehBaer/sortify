@@ -113,6 +113,20 @@ def test_static_scripts_are_gated_but_the_install_files_are_not():
     assert c.get("/static/icon-192.png").status_code == 200
 
 
+def test_the_raw_static_index_html_never_reaches_the_public_port_signed_in():
+    r = signed_in(public()).get("/static/index.html")
+
+    assert r.status_code == 302
+    assert r.headers["location"] == "/"
+
+
+def test_the_raw_static_index_html_is_unchanged_on_the_tailnet():
+    r = tailnet().get("/static/index.html")
+
+    assert r.status_code == 200
+    assert "rc-button.js" in r.text
+
+
 def test_the_owners_cookie_opens_the_public_page_without_the_button():
     r = signed_in(public()).get("/")
 
