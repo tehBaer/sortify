@@ -7,6 +7,7 @@ import html
 import json
 import logging
 import os
+import posixpath
 import re
 import secrets
 import threading
@@ -269,6 +270,17 @@ def auth_callback(code: str | None = None, state: str | None = None, error: str 
 _UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
+def _is_raw_index(path: str) -> bool:
+    """True for every spelling of /static/index.html that StaticFiles (no
+    html=True) would still resolve to that file: doubled slashes, a "."
+    or ".." segment, a trailing slash. An exact string match on the raw
+    path missed all of these, so this normalizes the same way StaticFiles
+    does before comparing — collapse empty segments (handles doubled and
+    trailing slashes), then posixpath.normpath (resolves "." and "..")."""
+    collapsed = "/" + "/".join(p for p in path.split("/") if p)
+    return posixpath.normpath(collapsed) == "/static/index.html"
+
+
 def _set_session(response, secret: str, uid: str) -> None:
     response.set_cookie(
         gate.SESSION_COOKIE, gate.session_value(secret, uid),
@@ -282,7 +294,7 @@ async def public_gate(request: Request, call_next):
     if not _arrived_public(request.scope):
         return await call_next(request)
     path = request.url.path
-    if path == "/static/index.html":
+    if _is_raw_index(path):
         # StaticFiles would serve the raw file, rc-button.js line and all —
         # the strip in _index_response only runs for "/". Signed in or not,
         # the button must never reach the public port.

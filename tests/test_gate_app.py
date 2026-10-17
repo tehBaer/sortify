@@ -6,6 +6,7 @@ real two-socket server does. The default client (port 80) is tailnet traffic.
 Spotify is never called: exchange_code and whoami are faked.
 """
 
+import asyncio
 import time
 
 import pytest
@@ -74,6 +75,45 @@ def sign_in(c):
     return c.get(f"/gate/callback?code=c1&state={state}")
 
 
+def _public_scope(path: str) -> dict:
+    """A minimal ASGI http scope for a GET on the public port, with the
+    owner's session cookie attached and `path`/`raw_path` set verbatim —
+    bypassing httpx, which normalizes dot segments and doubled slashes
+    before a request ever leaves the client, so it cannot exercise the
+    spellings this is testing."""
+    cookie = f"{gate.SESSION_COOKIE}={gate.session_value(SECRET, OWNER)}".encode()
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "https",
+        "server": ("testserver", 8801),
+        "client": ("testclient", 50000),
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "headers": [(b"host", b"testserver:8801"), (b"cookie", cookie)],
+    }
+
+
+def _call_asgi(scope: dict) -> tuple[int, dict[str, str]]:
+    """Drive appmod.app directly as an ASGI callable and return
+    (status_code, headers)."""
+    result = {}
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            result["status"] = message["status"]
+            result["headers"] = {k.decode(): v.decode() for k, v in message["headers"]}
+
+    asyncio.run(appmod.app(scope, receive, send))
+    return result["status"], result["headers"]
+
+
 # ---- who is let through ----------------------------------------------------
 
 
@@ -125,6 +165,39 @@ def test_the_raw_static_index_html_is_unchanged_on_the_tailnet():
 
     assert r.status_code == 200
     assert "rc-button.js" in r.text
+
+
+# httpx (TestClient) normalizes dot segments and doubled slashes before a
+# request leaves the client, so these spellings go straight through the ASGI
+# app instead — that is what the real two-socket server actually receives.
+RAW_INDEX_SPELLINGS = [
+    "/static/index.html",
+    "/static/./index.html",
+    "/static//index.html",
+    "/static/index.html/",
+]
+
+
+@pytest.mark.parametrize("path", RAW_INDEX_SPELLINGS)
+def test_every_spelling_of_raw_index_html_is_redirected_signed_in(path):
+    status, headers = _call_asgi(_public_scope(path))
+
+    assert status == 302
+    assert headers["location"] == "/"
+
+
+@pytest.mark.parametrize("path,expected", [
+    ("/static/index.html", True),
+    ("/static/./index.html", True),
+    ("/static//index.html", True),
+    ("/static/index.html/", True),
+    ("/static/../static/index.html", True),
+    ("/static/app.js", False),
+    ("/static/index.htmlx", False),
+    ("/", False),
+])
+def test_is_raw_index_matches_every_spelling(path, expected):
+    assert appmod._is_raw_index(path) is expected
 
 
 def test_the_owners_cookie_opens_the_public_page_without_the_button():
