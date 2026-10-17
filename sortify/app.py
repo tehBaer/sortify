@@ -10,6 +10,7 @@ import os
 import posixpath
 import re
 import secrets
+import socket
 import threading
 import time
 import uuid
@@ -4744,12 +4745,34 @@ def index(request: Request):
     return _index_response(_arrived_public(request.scope))
 
 
+def _bind(host: str, port: int) -> socket.socket:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((host, port))
+    return s
+
+
+def _sockets(host: str, port: int, public_port: int, secret: str | None) -> list[socket.socket]:
+    """The tailnet socket always; the public one only with a usable secret,
+    so a lost secret closes the public door instead of opening it."""
+    socks = [_bind(host, port)]
+    if public_port:
+        if gate.secret_ok(secret):
+            socks.append(_bind(host, public_port))
+        else:
+            log.error("public port %s NOT opened: SORTIFY_GATE_SECRET missing or under %s bytes",
+                      public_port, gate.SECRET_MIN)
+    return socks
+
+
 def main():
-    uvicorn.run(
-        app,
-        host=os.environ.get("SORTIFY_HOST", "0.0.0.0"),
-        port=int(os.environ.get("SORTIFY_PORT", "8800")),
+    socks = _sockets(
+        os.environ.get("SORTIFY_HOST", "0.0.0.0"),
+        int(os.environ.get("SORTIFY_PORT", "8800")),
+        PUBLIC_PORT,
+        _gate_secret(),
     )
+    uvicorn.Server(uvicorn.Config(app)).run(sockets=socks)
 
 
 if __name__ == "__main__":
