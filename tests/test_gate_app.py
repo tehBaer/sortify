@@ -9,6 +9,7 @@ Spotify is never called: exchange_code and whoami are faked.
 import asyncio
 import time
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -452,6 +453,28 @@ def test_a_refused_code_gets_a_page_not_an_error(monkeypatch):
         raise appmod.SpotifyError(400, "invalid_grant")
 
     monkeypatch.setattr(appmod.sp, "exchange_code", refuse)
+
+    r = sign_in(public())
+
+    assert r.status_code == 502
+
+
+def test_a_network_error_during_exchange_gets_a_page_not_a_bare_500(monkeypatch):
+    def break_connection(*a, **kw):
+        raise httpx.ConnectError("x")
+
+    monkeypatch.setattr(appmod.sp, "exchange_code", break_connection)
+
+    r = sign_in(public())
+
+    assert r.status_code == 502
+
+
+def test_a_tokenless_exchange_response_gets_a_page_not_a_bare_500(monkeypatch):
+    # A real-world shape Spotify could send back without an access_token
+    # key would otherwise raise a bare KeyError on tokens["access_token"].
+    monkeypatch.setattr(appmod.sp, "exchange_code",
+                        lambda code, verifier, client_id, redirect_uri=None: {})
 
     r = sign_in(public())
 
