@@ -210,6 +210,8 @@ const ctx = vm.createContext({
              setItem: (k, v) => m.set(k, String(v)),
              removeItem: (k) => m.delete(k) };
   })(),
+  // The public gate sends the page to /gate/start by assigning this.
+  location: { href: "" },
 });
 Object.defineProperty(ctx, "globalThis", { value: ctx });
 
@@ -5126,6 +5128,22 @@ run("stopNowPolling()");
   } finally {
     run(`closePicker()`);
   }
+}
+
+// ============================================================================
+// GT — the public port's gate. A 401 that says `gate` means the visitor is
+// not signed in on the public port: go sign in with Spotify. It must not be
+// mistaken for the owner's Spotify login having lapsed (needs_auth), which
+// shows the setup view instead.
+{
+  run(`show("now"); location.href = ""`);
+  routes["GET /api/status"] = { status: 401, body: { detail: "sign in with Spotify", gate: true } };
+  await run(`api("/api/status").catch(() => {})`);
+  check("GT a gate 401 sends the page to /gate/start",
+        run("location.href") === "/gate/start", `href=${run("location.href")}`);
+  check("GT ...and does not show the Spotify setup view",
+        $$("view-setup").hidden === true, `setup hidden=${$$("view-setup").hidden}`);
+  delete routes["GET /api/status"];
 }
 
 // ---- summary ---------------------------------------------------------------

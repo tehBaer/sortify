@@ -36,6 +36,10 @@ async function api(path, body, method) {
   const resp = await fetch(path, opts);
   let data = {};
   try { data = await resp.json(); } catch (_) {}
+  // The public port's gate (not the owner's Spotify login): sign in with
+  // Spotify, then come back. A redirect would be followed silently by
+  // fetch, so the server answers API calls with this 401 instead.
+  if (resp.status === 401 && data.gate) { location.href = "/gate/start"; throw new Error("sign-in needed"); }
   if (resp.status === 401 && data.needs_auth) { show("setup"); loadSetup(); throw new Error("auth needed"); }
   if (!resp.ok) {
     // .status lets a caller tell "not split yet" (404) apart from a
