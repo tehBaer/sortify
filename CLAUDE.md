@@ -71,6 +71,15 @@ escalating penalties. Therefore:
   A browser check against `192.168.1.109:8800` will fail and the failure
   looks like the app being down, which it is not. Do not run ad-hoc
   `sortify` processes alongside the unit.
+- **Public route (since 2026-10):** Tailscale Funnel `https://mbp.tail916fc5.ts.net:10000`
+  → `127.0.0.1:8801`, a second socket of the same process
+  (`SORTIFY_PUBLIC_PORT`). Everything on it is behind Sign in with Spotify,
+  owner only (`gate_owner_id` in config; `sortify/gate.py`). The port a request
+  arrived on (`scope["server"]`) is what separates the routes — never headers.
+  The Claude button is stripped from public pages and stays on the tailnet
+  port. Each sign-in costs one `/me` call. Secret: `SORTIFY_GATE_SECRET` in
+  the git-ignored `.env`; without it the public socket stays closed. Spec:
+  `docs/superpowers/specs/2026-10-16-spotify-login-gate-design.md`.
 - Tests: `.venv/bin/pytest -q` — keep them green; they cost zero API calls.
   Frontend: `node tests/ui_harness.mjs` (no framework, no build step — a
   hand-run harness of 189 checks against a stub DOM, also zero API calls).
