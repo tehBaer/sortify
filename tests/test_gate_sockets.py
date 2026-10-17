@@ -102,6 +102,27 @@ def test_a_refused_public_socket_logs_only_the_tailnet_line(caplog):
             s.close()
 
 
+def test_a_bind_failure_on_the_public_port_leaves_the_tailnet_socket_up(caplog):
+    """A public port already in use (EADDRINUSE — e.g. a dev sortify left
+    running on it) must not take the whole process down with it: the
+    tailnet route is unrelated and has to keep working."""
+    occupied = appmod._bind("127.0.0.1", 0)
+    occupied.listen(1)
+    occupied_port = occupied.getsockname()[1]
+    try:
+        with caplog.at_level("ERROR", logger="uvicorn.error"):
+            socks = appmod._sockets("127.0.0.1", 0, occupied_port, SECRET)
+        try:
+            assert len(socks) == 1
+            assert "NOT opened" in caplog.text
+            assert str(occupied_port) in caplog.text
+        finally:
+            for s in socks:
+                s.close()
+    finally:
+        occupied.close()
+
+
 def test_main_configures_logging_before_opening_sockets(monkeypatch):
     """caplog forces the "uvicorn.error" logger's level, which would hide an
     ordering bug: it is uvicorn.Config.__init__ -> configure_logging() that

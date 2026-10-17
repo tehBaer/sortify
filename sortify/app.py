@@ -4777,10 +4777,18 @@ def _sockets(host: str, port: int, public_port: int, secret: str | None) -> list
     log.info("sortify listening on %s:%s (tailnet)", tail_host, tail_port)
     if public_port:
         if gate.secret_ok(secret):
-            pub = _bind(host, public_port)
-            socks.append(pub)
-            pub_host, pub_port = pub.getsockname()[:2]
-            log.info("sortify listening on %s:%s (public, gated)", pub_host, pub_port)
+            try:
+                pub = _bind(host, public_port)
+            except OSError as e:
+                # A bind failure (EADDRINUSE from a stray dev process, a
+                # permissions error, ...) is unrelated to the tailnet
+                # socket above, which is already open — the public route
+                # failing to start is no reason to take it down too.
+                log.error("public port %s NOT opened: %s", public_port, e)
+            else:
+                socks.append(pub)
+                pub_host, pub_port = pub.getsockname()[:2]
+                log.info("sortify listening on %s:%s (public, gated)", pub_host, pub_port)
         else:
             log.error("public port %s NOT opened: SORTIFY_GATE_SECRET missing or under %s bytes",
                       public_port, gate.SECRET_MIN)
