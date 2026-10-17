@@ -20,7 +20,7 @@ def body(resp) -> str:
 
 
 def test_assets_are_versioned():
-    html = body(appmod.index())
+    html = body(appmod._index_response(public=False))
 
     assert re.search(r"/static/app\.js\?v=\d+", html)
     assert re.search(r"/static/style\.css\?v=\d+", html)
@@ -29,14 +29,14 @@ def test_assets_are_versioned():
 def test_the_version_follows_the_file(tmp_path, monkeypatch):
     """A hand-bumped constant is one I will forget on the deploy that matters,
     so the version has to come from the file itself."""
-    before = re.search(r"/static/app\.js\?v=(\d+)", body(appmod.index())).group(1)
+    before = re.search(r"/static/app\.js\?v=(\d+)", body(appmod._index_response(public=False))).group(1)
 
     real = appmod.STATIC / "app.js"
     monkeypatch.setattr(
         appmod.Path, "stat",
         lambda self: type("S", (), {"st_mtime": 9_999_999})() if self.name == "app.js" else real.stat(),
     )
-    after = re.search(r"/static/app\.js\?v=(\d+)", body(appmod.index())).group(1)
+    after = re.search(r"/static/app\.js\?v=(\d+)", body(appmod._index_response(public=False))).group(1)
 
     assert before != after
 
@@ -44,4 +44,4 @@ def test_the_version_follows_the_file(tmp_path, monkeypatch):
 def test_the_page_itself_is_never_cached():
     """Versioned assets are safe to cache hard, but only if the document that
     names them is always re-fetched — otherwise the new URLs never arrive."""
-    assert "no-cache" in appmod.index().headers.get("cache-control", "")
+    assert "no-cache" in appmod._index_response(public=False).headers.get("cache-control", "")

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -17,13 +18,14 @@ from typing import Any
 
 import httpx
 import uvicorn
-from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import filing
 from . import foldermove
+from . import gate
 from . import quickadds
 from . import rootlist
 from . import suggest as sugg
@@ -51,6 +53,8 @@ from .spotify import (
     AuthNeeded,
     Spotify,
     SpotifyError,
+    build_auth_url,
+    pkce_pair,
 )
 from .split import (
     SITTING_DESCRIPTION,
@@ -74,6 +78,33 @@ app = FastAPI(title="sortify")
 store = Store()
 sp = Spotify(store)
 undo_stack: list[dict] = []
+
+
+# ---- the public port (spec: 2026-10-16 login gate) -------------------------
+#
+# A second socket for Tailscale Funnel. Requests that arrive on it go through
+# the Sign in with Spotify gate; the tailnet socket is untouched. Which socket
+# a request came in on is read from scope["server"] (the local address of the
+# connection), never from headers, which a client can forge. Both routes
+# reach us from 127.0.0.1 via tailscaled, so the address cannot tell them
+# apart either.
+PUBLIC_PORT = int(os.environ.get("SORTIFY_PUBLIC_PORT", "0") or 0)
+PUBLIC_ORIGIN = os.environ.get(
+    "SORTIFY_PUBLIC_ORIGIN", "https://mbp.tail916fc5.ts.net:10000"
+).rstrip("/")
+GATE_REDIRECT_URI = PUBLIC_ORIGIN + "/gate/callback"
+_gate_counter = gate.DailyCounter()
+
+
+def _gate_secret() -> str | None:
+    # Read per request, not at import: tests set it, and a missing one must
+    # close the gate the moment it is gone.
+    return os.environ.get("SORTIFY_GATE_SECRET")
+
+
+def _arrived_public(scope: dict) -> bool:
+    server = scope.get("server") or (None, None)
+    return bool(PUBLIC_PORT) and server[1] == PUBLIC_PORT
 
 
 class AuthStart(BaseModel):
@@ -231,6 +262,106 @@ def auth_callback(code: str | None = None, state: str | None = None, error: str 
         return _auth_page(502, "Couldn't complete the Spotify sign-in. Please try again.")
     log.info("auth callback: connected as %s", me.get("name"))
     return RedirectResponse("/", status_code=303)
+
+
+# ---- the public gate -------------------------------------------------------
+
+_UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _set_session(response, secret: str, uid: str) -> None:
+    response.set_cookie(
+        gate.SESSION_COOKIE, gate.session_value(secret, uid),
+        max_age=gate.SESSION_MAX_AGE, httponly=True, secure=True, samesite="lax", path="/",
+    )
+
+
+@app.middleware("http")
+async def public_gate(request: Request, call_next):
+    """Owner only on the public port; a no-op on the tailnet one."""
+    if not _arrived_public(request.scope):
+        return await call_next(request)
+    path = request.url.path
+    if gate.is_open_path(path):
+        return await call_next(request)
+    secret = _gate_secret()
+    value = request.cookies.get(gate.SESSION_COOKIE)
+    owner = store.config().get("gate_owner_id")
+    if not gate.session_uid(secret, value, owner):
+        # fetch() follows redirects silently, so an API call (or any write)
+        # gets a 401 that app.js turns into a trip to /gate/start.
+        if path.startswith("/api/") or request.method not in ("GET", "HEAD"):
+            return JSONResponse({"detail": "sign in with Spotify", "gate": True}, status_code=401)
+        return RedirectResponse("/gate/start", status_code=302)
+    # SameSite=Lax already keeps the cookie off cross-site writes; this is
+    # the second layer. Browsers send Origin on every POST, same-origin too.
+    if request.method in _UNSAFE_METHODS and request.headers.get("origin") != PUBLIC_ORIGIN:
+        return JSONResponse({"detail": "cross-origin request refused"}, status_code=403)
+    response = await call_next(request)
+    if gate.needs_renewal(secret, value):
+        _set_session(response, secret, owner)
+    return response
+
+
+@app.get("/gate/start")
+def gate_start(request: Request):
+    secret = _gate_secret()
+    if not _arrived_public(request.scope) or not gate.secret_ok(secret):
+        raise HTTPException(404)
+    client_id = store.config().get("client_id")
+    if not client_id:
+        return _auth_page(503, "sortify has no Spotify app set up yet. Connect it over the tailnet first.")
+    verifier, challenge = pkce_pair()
+    state = secrets.token_urlsafe(16)
+    resp = RedirectResponse(
+        build_auth_url(client_id, challenge, state, redirect_uri=GATE_REDIRECT_URI, scope=""),
+        status_code=302,
+    )
+    # The pending login lives in this cookie, not in tokens.json, where the
+    # owner's own Reconnect keeps its pending state.
+    resp.set_cookie(
+        gate.PENDING_COOKIE, gate.pending_value(secret, state, verifier),
+        max_age=gate.PENDING_MAX_AGE, httponly=True, secure=True, samesite="lax", path="/gate",
+    )
+    return resp
+
+
+@app.get("/gate/callback")
+def gate_callback(request: Request, code: str | None = None, state: str | None = None,
+                  error: str | None = None):
+    secret = _gate_secret()
+    if not _arrived_public(request.scope) or not gate.secret_ok(secret):
+        raise HTTPException(404)
+    if error:
+        return _auth_page(400, "Spotify sign-in was cancelled.")
+    verifier = gate.pending_verifier(secret, request.cookies.get(gate.PENDING_COOKIE), state)
+    if not code or not verifier:
+        return _auth_page(400, "That sign-in expired or didn't match. Please start again.")
+    owner = store.config().get("gate_owner_id")
+    if not owner:
+        return _auth_page(403, "This sortify has no owner set, so nobody can sign in here.")
+    cooldown = sp.effective_cooldown_until()
+    if time.time() < cooldown:
+        until = datetime.fromtimestamp(cooldown).strftime("%H:%M")
+        return _auth_page(503, f"Spotify is cooling down. Sign-in works again at {until}, "
+                               "or use the tailnet address.")
+    if not _gate_counter.take(time.strftime("%Y-%m-%d")):
+        return _auth_page(429, "Too many sign-ins today. Try again tomorrow, or use the tailnet address.")
+    try:
+        tokens = sp.exchange_code(code, verifier, store.config()["client_id"],
+                                  redirect_uri=GATE_REDIRECT_URI)
+        uid = sp.whoami(tokens["access_token"])
+    except SpotifyError as e:
+        log.warning("gate: sign-in failed: %s", e)
+        return _auth_page(502, "Couldn't complete the Spotify sign-in. Please try again.")
+    if uid != owner:
+        log.warning("gate: refused a sign-in by another Spotify account")
+        return _auth_page(403, "This sortify belongs to someone else.")
+    log.info("gate: owner signed in on the public port")
+    resp = RedirectResponse("/", status_code=303)
+    _set_session(resp, secret, owner)
+    resp.delete_cookie(gate.PENDING_COOKIE, path="/gate")
+    return resp
 
 
 # ---- playlists & config ----------------------------------------------------
@@ -4565,9 +4696,12 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 _ASSET_REF = re.compile(r"/static/(app\.js|style\.css)")
 
+# The Claude remote-session button: tailnet only, never on a public page
+# (standing rule; decided for sortify 2026-10-17).
+_RC_BUTTON = re.compile(r'^<script src="[^"]*/rc-button\.js"[^>]*></script>\n', re.M)
 
-@app.get("/")
-def index():
+
+def _index_response(public: bool) -> HTMLResponse:
     """index.html with each asset URL stamped by that file's mtime.
 
     An unversioned /static/app.js meant a tab opened before a deploy kept
@@ -4583,7 +4717,14 @@ def index():
         lambda m: f"/static/{m.group(1)}?v={int((STATIC / m.group(1)).stat().st_mtime)}",
         (STATIC / "index.html").read_text(),
     )
+    if public:
+        html = _RC_BUTTON.sub("", html)
     return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/")
+def index(request: Request):
+    return _index_response(_arrived_public(request.scope))
 
 
 def main():
