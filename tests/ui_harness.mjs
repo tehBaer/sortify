@@ -5137,7 +5137,7 @@ run("stopNowPolling()");
 // shows the setup view instead.
 {
   run(`show("now"); location.href = ""`);
-  routes["GET /api/status"] = { status: 401, body: { detail: "sign in with Spotify", gate: true } };
+  routes["GET /api/status"] = { status: 401, body: { detail: "sign in with Spotify", gate: true, needs_auth: true } };
   await run(`api("/api/status").catch(() => {})`);
   check("GT a gate 401 sends the page to /gate/start",
         run("location.href") === "/gate/start", `href=${run("location.href")}`);
