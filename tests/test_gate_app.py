@@ -75,13 +75,21 @@ def sign_in(c):
     return c.get(f"/gate/callback?code=c1&state={state}")
 
 
-def _public_scope(path: str) -> dict:
-    """A minimal ASGI http scope for a GET on the public port, with the
-    owner's session cookie attached and `path`/`raw_path` set verbatim —
-    bypassing httpx, which normalizes dot segments and doubled slashes
-    before a request ever leaves the client, so it cannot exercise the
-    spellings this is testing."""
-    cookie = f"{gate.SESSION_COOKIE}={gate.session_value(SECRET, OWNER)}".encode()
+def _public_scope(path: str, *, cookie: bool = True, raw_path: str | None = None) -> dict:
+    """A minimal ASGI http scope for a GET on the public port, with
+    `path`/`raw_path` set verbatim — bypassing httpx, which normalizes dot
+    segments and doubled slashes before a request ever leaves the client,
+    so it cannot exercise the spellings this is testing. `raw_path`
+    defaults to `path` re-encoded as bytes (the ordinary case where the
+    decoded and raw forms agree); pass it explicitly to simulate a request
+    whose raw, encoded bytes differ from the decoded `path` a real ASGI
+    server reports — e.g. a literal `#` or `?` that arrived percent-encoded
+    (`%23`, `%3F`) and was decoded before the app ever saw it. The owner's
+    session cookie is attached unless `cookie=False`."""
+    headers = [(b"host", b"testserver:8801")]
+    if cookie:
+        value = f"{gate.SESSION_COOKIE}={gate.session_value(SECRET, OWNER)}".encode()
+        headers.append((b"cookie", value))
     return {
         "type": "http",
         "asgi": {"version": "3.0"},
@@ -91,9 +99,9 @@ def _public_scope(path: str) -> dict:
         "server": ("testserver", 8801),
         "client": ("testclient", 50000),
         "path": path,
-        "raw_path": path.encode(),
+        "raw_path": (raw_path or path).encode(),
         "query_string": b"",
-        "headers": [(b"host", b"testserver:8801"), (b"cookie", cookie)],
+        "headers": headers,
     }
 
 
@@ -186,6 +194,42 @@ def test_every_spelling_of_raw_index_html_is_redirected_signed_in(path):
     assert headers["location"] == "/"
 
 
+# A decoded '#' or '?' in scope["path"] used to truncate request.url.path
+# (Starlette rebuilds request.url by re-parsing a URL string, so an
+# embedded '#' or '?' is read back as a fragment/query separator), which
+# let an unauthenticated request past both the open-path check and the raw
+# index.html redirect — confirmed on a real two-socket uvicorn, public
+# port, no cookie: each of these resolved (via StaticFiles routing on the
+# untruncated scope["path"]) to the file after the "..", not the open file
+# the truncated path named. `raw_path` below is what a real server would
+# have received before decoding; `path` is what it decodes to and is what
+# the app actually sees in scope["path"].
+ENCODED_BYPASS_SPELLINGS = [
+    ("/static/manifest.webmanifest#/../app.js", "/static/manifest.webmanifest%23/../app.js"),
+    ("/static/manifest.webmanifest?/../app.js", "/static/manifest.webmanifest%3F/../app.js"),
+    ("/static/icon-192.png#/../style.css", "/static/icon-192.png%23/../style.css"),
+    ("/static/manifest.webmanifest#/../index.html", "/static/manifest.webmanifest%23/../index.html"),
+]
+
+
+@pytest.mark.parametrize("path,raw_path", ENCODED_BYPASS_SPELLINGS)
+def test_encoded_hash_or_question_mark_does_not_bypass_the_gate_without_a_cookie(path, raw_path):
+    status, headers = _call_asgi(_public_scope(path, cookie=False, raw_path=raw_path))
+
+    assert status == 302
+    assert headers["location"] == "/gate/start"
+
+
+def test_encoded_hash_index_html_spelling_redirects_home_signed_in():
+    path = "/static/manifest.webmanifest#/../index.html"
+    raw_path = "/static/manifest.webmanifest%23/../index.html"
+
+    status, headers = _call_asgi(_public_scope(path, cookie=True, raw_path=raw_path))
+
+    assert status == 302
+    assert headers["location"] == "/"
+
+
 @pytest.mark.parametrize("path,expected", [
     ("/static/index.html", True),
     ("/static/./index.html", True),
@@ -227,6 +271,16 @@ def test_a_cross_origin_post_is_refused_even_signed_in():
 
     assert c.post("/api/act", json={}, headers={"Origin": "https://evil.example"}).status_code == 403
     assert c.post("/api/act", json={}).status_code == 403
+
+
+def test_an_unsafe_non_standard_method_without_origin_is_refused_even_signed_in():
+    # The old check was a block-list of {POST, PUT, PATCH, DELETE}: any
+    # other method (PROPFIND, a WebDAV verb, anything made up) skipped the
+    # Origin check entirely. It must now need Origin like every other
+    # non-GET/HEAD/OPTIONS method.
+    c = signed_in(public())
+
+    assert c.request("PROPFIND", "/api/status").status_code == 403
 
 
 def test_a_day_old_cookie_is_renewed():

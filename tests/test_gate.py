@@ -111,6 +111,13 @@ def test_only_the_gate_routes_and_the_install_files_are_open():
         assert not gate.is_open_path(path), path
 
 
+def test_is_open_path_refuses_any_character_outside_the_safe_set():
+    for path in ("/gate/start#x", "/gate/start?x", "/gate/start%2e%2e",
+                 "/static/manifest.webmanifest#/../app.js",
+                 "/static/icon-192.png?/../style.css"):
+        assert not gate.is_open_path(path), path
+
+
 def test_the_daily_counter_caps_and_resets_with_the_day():
     c = gate.DailyCounter(cap=2)
 

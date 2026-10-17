@@ -31,6 +31,12 @@ DAILY_VERIFY_CAP = 20
 # gating them breaks add-to-home-screen. They reveal nothing.
 _OPEN_PATHS = {"/gate/start", "/gate/callback", "/static/manifest.webmanifest"}
 _ICON = re.compile(r"^/static/[a-z0-9-]+\.png$")
+# Anything outside this set (in particular '#', '?' and '%') has no business
+# in a path we match by exact string or regex: it means either a decoded
+# fragment/query separator smuggled into scope["path"], or an encoded
+# segment the app never decoded. Either way, it is not one of our clean
+# path strings, so it is never "open".
+_SAFE_PATH = re.compile(r"^[A-Za-z0-9/._-]+$")
 
 
 def _b64e(raw: bytes) -> str:
@@ -115,6 +121,8 @@ def pending_verifier(secret: str | None, value: str | None, state: str | None) -
 
 
 def is_open_path(path: str) -> bool:
+    if not _SAFE_PATH.match(path):
+        return False
     return path in _OPEN_PATHS or bool(_ICON.match(path))
 
 

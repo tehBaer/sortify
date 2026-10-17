@@ -268,7 +268,9 @@ def auth_callback(code: str | None = None, state: str | None = None, error: str 
 
 # ---- the public gate -------------------------------------------------------
 
-_UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+# An allow-list, not a block-list: any method outside this set (not just
+# the common write verbs) needs a matching Origin on the public port.
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
 def _is_raw_index(path: str) -> bool:
@@ -294,18 +296,27 @@ async def public_gate(request: Request, call_next):
     """Owner only on the public port; a no-op on the tailnet one."""
     if not _arrived_public(request.scope):
         return await call_next(request)
-    path = request.url.path
-    if _is_raw_index(path):
-        # StaticFiles would serve the raw file, rc-button.js line and all —
-        # the strip in _index_response only runs for "/". Signed in or not,
-        # the button must never reach the public port.
-        return RedirectResponse("/", status_code=302)
+    # scope["path"] is the decoded path the router and StaticFiles route on.
+    # request.url.path is NOT the same thing: Starlette's Request.url is
+    # built by re-parsing a reassembled URL string, so a decoded '#' or '?'
+    # in the path is read back as a fragment/query separator and truncates
+    # it there. Matching on the truncated value let a path with an encoded
+    # '#'/'?' read as an open path (or not-the-raw-index) while StaticFiles
+    # went on to resolve the untruncated path to a different file.
+    path = request.scope["path"]
     if gate.is_open_path(path):
         return await call_next(request)
     secret = _gate_secret()
     value = request.cookies.get(gate.SESSION_COOKIE)
     owner = store.config().get("gate_owner_id")
-    if not gate.session_uid(secret, value, owner):
+    signed_in = gate.session_uid(secret, value, owner)
+    if _is_raw_index(path) and signed_in:
+        # StaticFiles would serve the raw file, rc-button.js line and all —
+        # the strip in _index_response only runs for "/". An unauthenticated
+        # request falls through to the ordinary gate check below instead,
+        # so this never tells a stranger which path spellings resolve to it.
+        return RedirectResponse("/", status_code=302)
+    if not signed_in:
         # fetch() follows redirects silently, so an API call (or any write)
         # gets a 401 that app.js turns into a trip to /gate/start.
         if path.startswith("/api/") or request.method not in ("GET", "HEAD"):
@@ -313,7 +324,7 @@ async def public_gate(request: Request, call_next):
         return RedirectResponse("/gate/start", status_code=302)
     # SameSite=Lax already keeps the cookie off cross-site writes; this is
     # the second layer. Browsers send Origin on every POST, same-origin too.
-    if request.method in _UNSAFE_METHODS and request.headers.get("origin") != PUBLIC_ORIGIN:
+    if request.method not in _SAFE_METHODS and request.headers.get("origin") != PUBLIC_ORIGIN:
         return JSONResponse({"detail": "cross-origin request refused"}, status_code=403)
     response = await call_next(request)
     if gate.needs_renewal(secret, value):
