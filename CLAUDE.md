@@ -90,11 +90,12 @@ escalating penalties. Therefore:
   at /gate/callback only spends that counter; `DAILY_VERIFY_CAP` (20/day,
   `_gate_counter`) is taken only after a successful exchange, right before
   the account check, so bogus codes can never spend the owner's 20
-  sign-ins. Accepted, because it keeps the token endpoint protected without
-  letting a stranger block the owner.
+  sign-ins. A stranger can still spend the 100 exchanges and so block fresh
+  public sign-ins until midnight (or a restart); existing cookies and the
+  tailnet route keep working. Accepted: the token endpoint stays protected.
   On the public port, `/static/index.html` (any spelling StaticFiles would
-  resolve to it) redirects to `/`, because the raw file carries the Claude
-  button line.
+  resolve to it) never serves the raw file, which carries the Claude button
+  line: signed in it redirects to `/`, signed out to `/gate/start`.
 - Tests: `.venv/bin/pytest -q` — keep them green; they cost zero API calls.
   Frontend: `node tests/ui_harness.mjs` (no framework, no build step — a
   hand-run harness of 189 checks against a stub DOM, also zero API calls).
