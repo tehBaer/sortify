@@ -4777,13 +4777,18 @@ def _sockets(host: str, port: int, public_port: int, secret: str | None) -> list
 
 
 def main():
+    # Config.__init__ calls configure_logging(), which is what raises the
+    # "uvicorn.error" logger from its default WARNING to INFO. Build it
+    # before _sockets() runs, or the "listening on ..." lines there are
+    # filtered out and a successful start stays silent in the journal.
+    config = uvicorn.Config(app)
     socks = _sockets(
         os.environ.get("SORTIFY_HOST", "0.0.0.0"),
         int(os.environ.get("SORTIFY_PORT", "8800")),
         PUBLIC_PORT,
         _gate_secret(),
     )
-    uvicorn.Server(uvicorn.Config(app)).run(sockets=socks)
+    uvicorn.Server(config).run(sockets=socks)
 
 
 if __name__ == "__main__":
