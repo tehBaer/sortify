@@ -1291,6 +1291,12 @@ EnvironmentFile=/home/mbp2016/kode/spotify/sortify/.env
 
 Then `systemctl --user daemon-reload`.
 
+- [ ] **Step 6b: update the device list.** `~/.claude/CLAUDE.md` still names
+  port `:10000` as skannonser's archived Funnel route (its "web-public"
+  guest copy, stopped 2026-10-08). Once this plan reassigns `:10000` to
+  sortify's gated public route, update that entry so the device list
+  doesn't point two different services at the same port.
+
 - [ ] **Step 7 (human-coordinated): restart.** Follow the restart memory: check `data/queue.json` for an active materialiser run, announce to every live sortify session and wait for each, then `systemctl --user restart sortify`. Confirm both sockets: `ss -ltn | grep -E ':880[01]'` shows 8800 and 8801 on 127.0.0.1. Confirm the commit predates the start: `systemctl --user show sortify -p ExecMainStartTimestamp`.
 
 - [ ] **Step 8 (human approval): open Funnel.** This publishes the port to the internet; ask before running:
@@ -1299,12 +1305,29 @@ Then `systemctl --user daemon-reload`.
 tailscale funnel --bg --https=10000 http://127.0.0.1:8801 && tailscale funnel status
 ```
 
-- [ ] **Step 9: verify.** From the box, unauthenticated (no API calls):
+- [ ] **Step 9: verify.** From the box, unauthenticated (no API calls), through
+  the Funnel URL:
 
 ```bash
 .venv/bin/python -c "import urllib.request as u; r=u.urlopen(u.Request('https://mbp.tail916fc5.ts.net:10000/api/status')); print(r.status)" 2>&1 | tail -1
 ```
 
-Expected: an HTTP 401 error. Then ask the user to open `https://mbp.tail916fc5.ts.net:10000` on the phone **with Tailscale off**, sign in (1 API call), and see the Now card without the Claude button. Report `spx budget` before and after.
+Expected: an HTTP 401 error. Also check, still unauthenticated and still
+through the Funnel URL (no API calls — these are all redirects or refusals,
+never a completed request):
+
+- `GET /static/app.js` → 302 (to `/gate/start`), not the raw script.
+- `GET /static/manifest.webmanifest%23/../app.js` → anything but 200 — this
+  spelling must not resolve to app.js without a cookie (the encoded-`#`
+  bypass this branch fixed).
+- `GET /static/index.html` → 302, not the raw file with the Claude button.
+- `POST` with no `Origin` header → 401, not a bare write going through.
+
+Then ask the user to open `https://mbp.tail916fc5.ts.net:10000` on the phone
+**with Tailscale off**, sign in (1 API call), and see the Now card without
+the Claude button. Verify with the **installed home-screen app**, not only a
+browser tab — iOS keeps a separate cookie jar for a home-screen-installed
+PWA, so a tab that is already signed in proves nothing about the app icon
+the user actually taps. Report `spx budget` before and after.
 
 Rollback at any point: `tailscale funnel --https=10000 off`.
