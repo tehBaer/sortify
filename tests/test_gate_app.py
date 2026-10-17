@@ -134,6 +134,18 @@ def test_the_tailnet_port_is_untouched():
     assert "rc-button.js" in r.text
 
 
+def test_a_tailnet_post_with_no_origin_and_no_cookie_is_not_refused_by_the_gate():
+    # The gate middleware is a no-op off the public port (checked first,
+    # via _arrived_public). A write with no Origin header and no session
+    # cookie must go straight through to the route, not be mistaken for an
+    # unauthenticated or cross-origin public-port request.
+    r = tailnet().post("/api/auth/start", json={"client_id": "a" * 32})
+
+    assert r.status_code != 401 or r.json().get("gate") is not True
+    assert r.json() != {"detail": "cross-origin request refused"}
+    assert r.status_code == 200
+
+
 def test_a_public_page_without_a_cookie_goes_to_the_gate():
     r = public().get("/")
 
@@ -257,6 +269,18 @@ def test_the_owners_cookie_opens_the_public_page_without_the_button():
 def test_without_a_secret_the_owners_cookie_is_refused(monkeypatch):
     c = signed_in(public())
     monkeypatch.delenv("SORTIFY_GATE_SECRET")
+
+    assert c.get("/api/status").status_code == 401
+
+
+def test_a_cookie_signed_with_a_too_short_secret_is_refused(monkeypatch):
+    # gate.SECRET_MIN is 32; a 20-character secret is unusable even though
+    # it is exactly what SORTIFY_GATE_SECRET holds and exactly what signed
+    # the cookie — secret_ok fails closed on length alone.
+    short_secret = "x" * 20
+    monkeypatch.setenv("SORTIFY_GATE_SECRET", short_secret)
+    c = public()
+    c.cookies.set(gate.SESSION_COOKIE, gate.session_value(short_secret, OWNER))
 
     assert c.get("/api/status").status_code == 401
 
