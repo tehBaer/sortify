@@ -63,3 +63,39 @@ def test_each_socket_is_told_apart(monkeypatch):
     finally:
         server.should_exit = True
         t.join(timeout=5)
+
+
+def test_a_successful_bind_logs_both_sockets(caplog):
+    """uvicorn.Server.startup() only prints its own "Uvicorn running on ..."
+    line when sockets is None; since main() always passes an explicit list,
+    _sockets must log each one itself or a successful start is silent in the
+    journal."""
+    probe = appmod._bind("127.0.0.1", 0)
+    public_port = probe.getsockname()[1]
+    probe.close()
+
+    with caplog.at_level("INFO", logger="uvicorn.error"):
+        socks = appmod._sockets("127.0.0.1", 0, public_port, SECRET)
+    try:
+        assert len(socks) == 2
+        tail_port = socks[0].getsockname()[1]
+        pub_port = socks[1].getsockname()[1]
+        assert f"{tail_port} (tailnet)" in caplog.text
+        assert f"{pub_port} (public, gated)" in caplog.text
+    finally:
+        for s in socks:
+            s.close()
+
+
+def test_a_refused_public_socket_logs_only_the_tailnet_line(caplog):
+    with caplog.at_level("INFO", logger="uvicorn.error"):
+        socks = appmod._sockets("127.0.0.1", 0, 1, None)
+    try:
+        assert len(socks) == 1
+        tail_port = socks[0].getsockname()[1]
+        assert f"{tail_port} (tailnet)" in caplog.text
+        assert "(public" not in caplog.text
+        assert "NOT opened" in caplog.text
+    finally:
+        for s in socks:
+            s.close()

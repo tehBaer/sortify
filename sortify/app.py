@@ -4754,11 +4754,22 @@ def _bind(host: str, port: int) -> socket.socket:
 
 def _sockets(host: str, port: int, public_port: int, secret: str | None) -> list[socket.socket]:
     """The tailnet socket always; the public one only with a usable secret,
-    so a lost secret closes the public door instead of opening it."""
-    socks = [_bind(host, port)]
+    so a lost secret closes the public door instead of opening it.
+
+    uvicorn.Server.startup() only logs its "Uvicorn running on ..." line
+    when sockets is None (we always pass an explicit list), so without this
+    an operator has no journal line saying which addresses actually came up.
+    """
+    tail = _bind(host, port)
+    socks = [tail]
+    tail_host, tail_port = tail.getsockname()[:2]
+    log.info("sortify listening on %s:%s (tailnet)", tail_host, tail_port)
     if public_port:
         if gate.secret_ok(secret):
-            socks.append(_bind(host, public_port))
+            pub = _bind(host, public_port)
+            socks.append(pub)
+            pub_host, pub_port = pub.getsockname()[:2]
+            log.info("sortify listening on %s:%s (public, gated)", pub_host, pub_port)
         else:
             log.error("public port %s NOT opened: SORTIFY_GATE_SECRET missing or under %s bytes",
                       public_port, gate.SECRET_MIN)
