@@ -80,6 +80,13 @@ escalating penalties. Therefore:
   port. Each sign-in costs one `/me` call. Secret: `SORTIFY_GATE_SECRET` in
   the git-ignored `.env`; without it the public socket stays closed. Spec:
   `docs/superpowers/specs/2026-10-16-spotify-login-gate-design.md`.
+  The 20/day sign-in cap counts code exchanges before the account is checked,
+  so anyone who reaches /gate/callback can spend the day's 20 and block fresh
+  public sign-ins until midnight; existing cookies and the tailnet route keep
+  working. Accepted, because it keeps the token endpoint protected.
+  On the public port, `/static/index.html` (any spelling StaticFiles would
+  resolve to it) redirects to `/`, because the raw file carries the Claude
+  button line.
 - Tests: `.venv/bin/pytest -q` — keep them green; they cost zero API calls.
   Frontend: `node tests/ui_harness.mjs` (no framework, no build step — a
   hand-run harness of 189 checks against a stub DOM, also zero API calls).
