@@ -535,3 +535,100 @@ def test_setting_repeat_repositions_the_now_cache_rather_than_dropping_it(appmod
     assert appmod._now_cache["at"] == 9_999_999.0
     # Looping changes nothing about how long the rest of the answer stays true.
     assert appmod._now_cache["ttl"] == 123.0
+
+
+# ---- the public gate's login (spec: 2026-10-16 login gate) ----------------
+
+
+def test_the_gate_login_asks_for_no_scopes_and_its_own_redirect():
+    from urllib.parse import parse_qs, urlparse
+
+    from sortify.spotify import REDIRECT_URI, build_auth_url
+
+    url = build_auth_url("cid", "chal", "st", redirect_uri="https://x/gate/callback", scope="")
+    q = parse_qs(urlparse(url).query)
+
+    assert "scope" not in q
+    assert q["redirect_uri"] == ["https://x/gate/callback"]
+    # The owner's Reconnect login is unchanged.
+    q2 = parse_qs(urlparse(build_auth_url("cid", "chal", "st")).query)
+    assert q2["redirect_uri"] == [REDIRECT_URI]
+    assert q2["scope"] == [SCOPES]
+
+
+def test_exchange_code_returns_the_tokens_and_persists_nothing(sp, monkeypatch):
+    before = sp.store.tokens()
+    sent = {}
+
+    def fake_post(url, data=None, **kw):
+        sent.update(url=url, data=data)
+        return FakeResponse(200, {"access_token": "visitor", "expires_in": 3600})
+
+    monkeypatch.setattr(sp.http, "post", fake_post)
+
+    out = sp.exchange_code("code1", "ver1", "cid", redirect_uri="https://x/gate/callback")
+
+    assert out["access_token"] == "visitor"
+    assert sent["data"]["redirect_uri"] == "https://x/gate/callback"
+    assert sent["data"]["code_verifier"] == "ver1"
+    assert sp.store.tokens() == before
+
+
+def test_exchange_code_raises_on_a_refused_code(sp, monkeypatch):
+    monkeypatch.setattr(sp.http, "post",
+                        lambda url, data=None, **kw: FakeResponse(400, None, text="invalid_grant"))
+
+    with pytest.raises(SpotifyError):
+        sp.exchange_code("used", "ver1", "cid")
+
+
+def test_whoami_sends_the_visitors_token_not_the_owners(sp, monkeypatch):
+    sent = {}
+
+    def fake_request(method, url, headers=None, **kw):
+        sent.update(method=method, url=url, auth=(headers or {}).get("Authorization"))
+        return FakeResponse(200, {"id": "visitor-id"})
+
+    monkeypatch.setattr(sp.http, "request", fake_request)
+
+    assert sp.whoami("visitor-token") == "visitor-id"
+    assert sent["url"].endswith("/me")
+    assert sent["auth"] == "Bearer visitor-token"
+
+
+def test_whoami_spends_one_call_on_the_ledger(sp, monkeypatch):
+    monkeypatch.setattr(sp.http, "request",
+                        lambda method, url, headers=None, **kw: FakeResponse(200, {"id": "v"}))
+    before = sp.budget_spent()
+
+    sp.whoami("visitor-token")
+
+    assert sp.budget_spent() == before + 1
+
+
+def test_a_401_on_the_visitors_token_does_not_touch_the_owners(sp, monkeypatch):
+    sp.store.save_tokens({"refresh_token": "owner-rt", "expires_at": 9e12, "access_token": "owner"})
+    before = sp.store.tokens()
+    monkeypatch.setattr(sp.http, "request",
+                        lambda method, url, headers=None, **kw: FakeResponse(401, None, text="bad token"))
+
+    with pytest.raises(SpotifyError) as e:
+        sp.whoami("visitor-token")
+
+    assert e.value.status == 401
+    assert sp.store.tokens() == before
+
+
+def test_whoami_makes_no_call_during_a_cooldown(sp, monkeypatch):
+    import time as _time
+
+    sp.cooldown_until = _time.time() + 3600
+    called = []
+    monkeypatch.setattr(sp.http, "request",
+                        lambda *a, **kw: called.append(1) or FakeResponse(200, {"id": "v"}))
+
+    with pytest.raises(SpotifyError) as e:
+        sp.whoami("visitor-token")
+
+    assert e.value.status == 429
+    assert called == []

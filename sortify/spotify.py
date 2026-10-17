@@ -147,18 +147,21 @@ def code_challenge(verifier: str) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 
-def build_auth_url(client_id: str, challenge: str, state: str) -> str:
-    return AUTH_URL + "?" + urlencode(
-        {
-            "client_id": client_id,
-            "response_type": "code",
-            "redirect_uri": REDIRECT_URI,
-            "scope": SCOPES,
-            "code_challenge_method": "S256",
-            "code_challenge": challenge,
-            "state": state,
-        }
-    )
+def build_auth_url(client_id: str, challenge: str, state: str, *,
+                   redirect_uri: str | None = None, scope: str | None = None) -> str:
+    """The authorize URL. Defaults are the owner's Reconnect login; the public
+    gate passes its own redirect URI and scope="" (identity only, no
+    permissions), which leaves the scope parameter out altogether."""
+    scope = SCOPES if scope is None else scope
+    params = {
+        "client_id": client_id,
+        "response_type": "code",
+        "redirect_uri": redirect_uri or REDIRECT_URI,
+    }
+    if scope:
+        params["scope"] = scope
+    params.update(code_challenge_method="S256", code_challenge=challenge, state=state)
+    return AUTH_URL + "?" + urlencode(params)
 
 
 class Spotify:
@@ -348,6 +351,25 @@ class Spotify:
         self.store.save_tokens(tokens)
         return build_auth_url(client_id, challenge, state)
 
+    def exchange_code(self, code: str, verifier: str, client_id: str,
+                      redirect_uri: str | None = None) -> dict:
+        """Trade an authorization code for tokens. Persists nothing: the
+        owner's Reconnect stores them (finish_auth), the public gate only
+        reads the access token once and drops it."""
+        resp = self.http.post(
+            TOKEN_URL,
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri or REDIRECT_URI,
+                "client_id": client_id,
+                "code_verifier": verifier,
+            },
+        )
+        if resp.status_code != 200:
+            raise SpotifyError(resp.status_code, resp.text)
+        return resp.json()
+
     def finish_auth(self, code: str, state: str) -> dict:
         tokens = self.store.tokens()
         pending = tokens.get("pending")
@@ -356,20 +378,9 @@ class Spotify:
         if state != pending["state"]:
             raise AuthFlowError(400, "state mismatch — start the auth again")
         client_id = pending.get("client_id") or self.store.config()["client_id"]
-        resp = self.http.post(
-            TOKEN_URL,
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": REDIRECT_URI,
-                "client_id": client_id,
-                "code_verifier": pending["verifier"],
-            },
-        )
-        if resp.status_code != 200:
-            raise SpotifyError(resp.status_code, resp.text)
+        payload = self.exchange_code(code, pending["verifier"], client_id)
         self.store.update_config(client_id=client_id)
-        self._store_token_response(resp.json(), clear_pending=True)
+        self._store_token_response(payload, clear_pending=True)
         # The token exchange (accounts.spotify.com) can succeed while the API
         # (api.spotify.com) is rate-cooled — auth is done either way.
         cache = self.store.cache()
@@ -440,7 +451,7 @@ class Spotify:
     # ---- request plumbing -------------------------------------------------
 
     def request(self, method: str, path: str, background: bool = False, bulk: bool = False,
-                spend_reserve: bool = False, **kwargs) -> dict | None:
+                spend_reserve: bool = False, bearer: str | None = None, **kwargs) -> dict | None:
         if time.time() < self.effective_cooldown_until():
             mins = int(self.cooldown_until - time.time()) // 60 + 1
             raise SpotifyError(429, f"in Spotify rate-limit cooldown — try again in ~{mins} min")
@@ -452,10 +463,15 @@ class Spotify:
             if wait > 0:
                 time.sleep(wait)
             self._last_call = time.time()
+            token = bearer if bearer is not None else self._access_token()
             resp = self.http.request(
-                method, url, headers={"Authorization": f"Bearer {self._access_token()}"}, **kwargs
+                method, url, headers={"Authorization": f"Bearer {token}"}, **kwargs
             )
             if resp.status_code == 401:
+                # Someone else's token (the public gate's visitor): a refresh
+                # would rewrite the OWNER's tokens and cannot fix theirs.
+                if bearer is not None:
+                    raise SpotifyError(401, resp.text[:300])
                 # "Permissions missing" = insufficient scope: a refresh can't
                 # fix that, and retrying one per poll hammers the token
                 # endpoint until Spotify slow-walks us. Fail fast instead.
@@ -517,6 +533,16 @@ class Spotify:
     def get_background(self, path: str, **kwargs) -> dict:
         """A GET that draws on the small proactive allowance, not the user's."""
         return self.request("GET", path, background=True, **kwargs)
+
+    def whoami(self, access_token: str) -> str:
+        """The Spotify user id behind a visitor's token: the public gate's
+        one call per sign-in. Through `request`, so it is on the ledger and
+        refused during a cooldown like any other call."""
+        me = self.request("GET", "/me", bearer=access_token) or {}
+        uid = me.get("id")
+        if not uid:
+            raise SpotifyError(502, "/me answered without an id")
+        return uid
 
     def _paginate(self, path: str, params: dict | None = None, **kw) -> Iterator[dict]:
         page = self.get(path, params=params or {}, **kw)
