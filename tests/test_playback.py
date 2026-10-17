@@ -556,6 +556,25 @@ def test_the_gate_login_asks_for_no_scopes_and_its_own_redirect():
     assert q2["scope"] == [SCOPES]
 
 
+def test_show_dialog_is_off_by_default_but_the_gate_asks_for_it():
+    # Spotify silently re-approves a no-scope login for whichever account
+    # is already signed in on the device, so a phone signed in to another
+    # Spotify account loops on "belongs to someone else" with no way to
+    # switch. show_dialog=true forces the account chooser back up; it must
+    # stay off for the owner's own Reconnect, which has no such problem and
+    # should not force a re-pick every time.
+    from urllib.parse import parse_qs, urlparse
+
+    from sortify.spotify import build_auth_url
+
+    default = parse_qs(urlparse(build_auth_url("cid", "chal", "st")).query)
+    assert "show_dialog" not in default
+
+    forced = parse_qs(urlparse(
+        build_auth_url("cid", "chal", "st", show_dialog=True)).query)
+    assert forced["show_dialog"] == ["true"]
+
+
 def test_exchange_code_returns_the_tokens_and_persists_nothing(sp, monkeypatch):
     before = sp.store.tokens()
     sent = {}

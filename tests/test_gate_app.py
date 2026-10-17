@@ -310,6 +310,16 @@ def test_start_sends_to_spotify_with_no_scopes_and_the_public_callback():
     assert gate.PENDING_COOKIE in r.headers["set-cookie"]
 
 
+def test_start_forces_the_spotify_account_chooser():
+    # Spotify silently re-approves a no-scope login for whichever account
+    # the device already has signed in, so a phone on another Spotify
+    # account loops on "belongs to someone else" with no way to switch —
+    # show_dialog=true forces the chooser back up so the owner can pick.
+    r = public().get("/gate/start")
+
+    assert "show_dialog=true" in r.headers["location"]
+
+
 def test_the_gate_routes_do_not_exist_on_the_tailnet():
     assert tailnet().get("/gate/start").status_code == 404
     assert tailnet().get("/gate/callback?code=c&state=s").status_code == 404

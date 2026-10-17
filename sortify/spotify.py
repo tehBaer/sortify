@@ -148,10 +148,17 @@ def code_challenge(verifier: str) -> str:
 
 
 def build_auth_url(client_id: str, challenge: str, state: str, *,
-                   redirect_uri: str | None = None, scope: str | None = None) -> str:
+                   redirect_uri: str | None = None, scope: str | None = None,
+                   show_dialog: bool = False) -> str:
     """The authorize URL. Defaults are the owner's Reconnect login; the public
     gate passes its own redirect URI and scope="" (identity only, no
-    permissions), which leaves the scope parameter out altogether."""
+    permissions), which leaves the scope parameter out altogether.
+
+    show_dialog forces Spotify's account chooser back up instead of
+    silently re-approving whichever account the device already has signed
+    in. Only the gate's own /gate/start passes it — the owner's Reconnect
+    has no "wrong account" problem and gains nothing from an extra click.
+    """
     scope = SCOPES if scope is None else scope
     params = {
         "client_id": client_id,
@@ -161,6 +168,8 @@ def build_auth_url(client_id: str, challenge: str, state: str, *,
     if scope:
         params["scope"] = scope
     params.update(code_challenge_method="S256", code_challenge=challenge, state=state)
+    if show_dialog:
+        params["show_dialog"] = "true"
     return AUTH_URL + "?" + urlencode(params)
 
 

@@ -349,7 +349,8 @@ def gate_start(request: Request):
     verifier, challenge = pkce_pair()
     state = secrets.token_urlsafe(16)
     resp = RedirectResponse(
-        build_auth_url(client_id, challenge, state, redirect_uri=GATE_REDIRECT_URI, scope=""),
+        build_auth_url(client_id, challenge, state, redirect_uri=GATE_REDIRECT_URI, scope="",
+                       show_dialog=True),
         status_code=302,
     )
     # The pending login lives in this cookie, not in tokens.json, where the
