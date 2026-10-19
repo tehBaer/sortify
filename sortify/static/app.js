@@ -1903,7 +1903,7 @@ function renderNow() {
   // A reveal lasts exactly one track: it falls away the moment the playing
   // uri is no longer the one it was opened for.
   if (document.body.classList.contains("peeked") && d.track?.uri !== peekedUri) setReveal(false);
-  if (!$("cover-pop").hidden && (d.track?.uri || null) !== coverUri) closeCover();
+  if (coverOpen && (d.track?.uri || null) !== coverUri) closeCover(false);
   // Same expiry, same reason: the strip's undo offer belongs to one track.
   if (removedUri && d.track?.uri !== removedUri) removedUri = null;
   // Next's completion signal. What the press was FOR is a different track, so
@@ -1965,10 +1965,10 @@ function renderNow() {
   // Fresh only for a track this card has not drawn yet: a re-render (a poll,
   // a pause toggle, the suggestions arriving) is not an arrival.
   const cardFresh = enterOnce("card", tr.uri) ? " card-fresh" : "";
-  // The card never names the song: no title, artist or album anywhere in it.
-  // The cover opens full screen from its own button (openCover), and share
-  // rides that overlay.
+  // Before filing the card names the song in one place only: the cover
+  // panel, opened by its own button (openCover). Nothing else on it does.
   $("now-card").innerHTML = `<div class="track-card${cardFresh}${d.is_playing ? "" : " is-paused"}">
+    ${coverOpen && tr.image ? coverPanel(tr) : ""}
     ${playbackStrip(d, tr)}
     ${body}
   </div>`;
@@ -1990,6 +1990,7 @@ function renderNow() {
   if (both) both.onclick = nowBoth;
   const undoRem = $("btn-now-undo-remove");
   if (undoRem) undoRem.onclick = undoStripAction;
+  wireCoverPanel();
   startNowTicker(d, tr);
   wireSeekBar(tr);
 
@@ -2826,7 +2827,7 @@ async function undoStripAction() {
 // title, artist and album are not on the card at all. The eye in the bar
 // only unblurs the suggestion REASONS (they leak artist names), so pressing
 // it moves nothing on screen. The cover is the other button: it opens the
-// art full screen, with share, and names nothing. Both last one track:
+// art inside the card with the title, artist and share. Both last one track:
 // renderNow drops them as soon as the playing uri is no longer the one they
 // were opened for.
 
@@ -2844,9 +2845,16 @@ function setReveal(on) {
 }
 $("btn-reveal").onclick = () => setReveal(!document.body.classList.contains("peeked"));
 
-// The track whose cover is open full screen. Only read while #cover-pop is
-// shown; a local file has no uri, so null here does not mean "closed".
+// The cover opens INSIDE the card, at its top, full card width, with the
+// title, artist and share under it — the one place before filing that names
+// the song, because you asked to look. Open state lives here, not in the
+// DOM, because every poll re-renders the card. A local file has no uri, so
+// coverUri null does not mean "closed"; coverOpen does.
+let coverOpen = false;
 let coverUri = null;
+// The expand animation plays on the render that opens the panel, not on
+// every poll's re-render after it.
+let coverFresh = false;
 
 function setCoverBtn(on) {
   $("btn-cover").classList.toggle("on", on);
@@ -2856,33 +2864,53 @@ function openCover() {
   const t = nowState?.track;
   if (!t) { toast("nothing playing"); return; }
   if (!t.image) { toast("no cover for this one"); return; }
+  coverOpen = true;
   coverUri = t.uri || null;
+  coverFresh = true;
+  setCoverBtn(true);
+  renderNow();
+}
+// `rerender` is false only from inside renderNow, which is already drawing.
+function closeCover(rerender = true) {
+  coverOpen = false;
+  coverUri = null;
+  setCoverBtn(false);
+  if (rerender) renderNow();
+}
+$("btn-cover").onclick = () => (coverOpen ? closeCover() : openCover());
+
+function coverPanel(tr) {
+  const fresh = coverFresh ? " cover-in" : "";
+  coverFresh = false;
+  const artists = tr.artists.map((a) => a.name).join(", ");
   // Share needs a real track; local files and episodes have no
   // spotify:track: uri and the tablet flow can't find them by title anyway.
-  const share = t.uri?.startsWith("spotify:track:")
+  const share = tr.uri?.startsWith("spotify:track:")
     ? `<button id="btn-share" class="icon-btn cover-share" title="Send this song to a friend — Spotify Messages, via the tablet">
         <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>
       </button>`
     : "";
-  // The grow-in is a CSS animation, so it runs on every hidden → shown.
-  $("cover-pop").innerHTML = `<img src="${esc(t.image_large || t.image)}" alt="">${share}`;
-  $("cover-pop").hidden = false;
-  setCoverBtn(true);
+  return `<div id="cover-panel" class="cover-panel${fresh}"><div class="cover-panel-inner">
+      <img src="${esc(tr.image_large || tr.image)}" alt="">
+      <div class="cover-info">
+        <div class="cover-text">
+          <div class="cover-title">${esc(tr.name)}</div>
+          <div class="cover-artist">${esc(artists)}</div>
+        </div>
+        ${share}
+      </div>
+    </div></div>`;
+}
+// Wired after each render that draws the panel (renderNow).
+function wireCoverPanel() {
+  const panel = $("cover-panel");
+  if (!panel) return;
+  // A tap anywhere on the panel closes it, except on share, which closes it
+  // and opens the share sheet instead.
+  panel.onclick = () => closeCover();
   const sh = $("btn-share");
-  // Its own tap, not the overlay's: the cover closes and the share sheet
-  // opens in its place.
   if (sh) sh.onclick = (e) => { e?.stopPropagation(); closeCover(); openSharePop(); };
 }
-function closeCover() {
-  coverUri = null;
-  $("cover-pop").hidden = true;
-  $("cover-pop").innerHTML = "";
-  setCoverBtn(false);
-}
-$("btn-cover").onclick = () => ($("cover-pop").hidden ? openCover() : closeCover());
-// Tap anywhere on it to close: the overlay is the whole screen, so there is
-// no outside to tap.
-$("cover-pop").onclick = closeCover;
 
 // ---- tablet share (Spotify Messages via the tablet — see /api/share) -------
 
@@ -2933,8 +2961,8 @@ async function doShare(track, friend) {
   }
 }
 
-// btn-share lives in the cover overlay (rendered and wired by openCover) —
-// there is no static element left to wire here.
+// btn-share lives in the cover panel (rendered by coverPanel, wired by
+// wireCoverPanel) — there is no static element left to wire here.
 
 // ---- picker ----------------------------------------------------------------
 

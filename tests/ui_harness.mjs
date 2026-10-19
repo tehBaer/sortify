@@ -1717,7 +1717,8 @@ run("stopNowPolling()");
         `peeked=${document.body.classList.contains("peeked")} ` +
         `peekedUri=${run("peekedUri")}`);
 
-  // The cover is its own button: full screen, the large image, names nothing.
+  // The cover is its own button: it expands INSIDE the card, at the top,
+  // with the large image, the title and artist, and share under it.
   routes["GET /api/now?light=1"].body.track =
     { uri: "spotify:track:br3", name: "Cover Song", artists: [{ name: "Cover Artist" }],
       sortable: true, image: "http://img/300", image_large: "http://img/640" };
@@ -1725,32 +1726,47 @@ run("stopNowPolling()");
   run(`pollNow(true)`);
   await tick();
   run("stopNowPolling()");
-  run(`closeCover()`);
+  const card = () => $$("now-card").innerHTML;
+  const panelOpen = () => card().includes('id="cover-panel"');
+  run(`if (coverOpen) closeCover()`);
   run(`$("btn-cover").onclick()`);
-  check("CV the cover button opens the large cover full screen",
-        $$("cover-pop").hidden === false && /src="http:\/\/img\/640"/.test($$("cover-pop").innerHTML) &&
+  check("CV the cover button opens the large cover inside the card",
+        panelOpen() && /id="cover-panel"[\s\S]*src="http:\/\/img\/640"/.test(card()) &&
         $$("btn-cover").classList.contains("on"),
-        `hidden=${$$("cover-pop").hidden} html=${$$("cover-pop").innerHTML}`);
-  check("CV ...without naming the song or revealing the details",
-        !/Cover Song|Cover Artist/.test($$("cover-pop").innerHTML) &&
-        !document.body.classList.contains("peeked"), $$("cover-pop").innerHTML);
-  check("CV share rides the cover overlay",
-        $$("cover-pop").innerHTML.includes('id="btn-share"'), $$("cover-pop").innerHTML);
+        `card=${card().slice(0, 300)}`);
+  check("CV ...at the top of the card, above the playback strip",
+        card().indexOf('id="cover-panel"') < card().indexOf("np-progress"),
+        `panel@${card().indexOf('id="cover-panel"')} strip@${card().indexOf("np-progress")}`);
+  check("CV ...with the title and artist under it",
+        /id="cover-panel"[\s\S]*cover-title">Cover Song<[\s\S]*cover-artist">Cover Artist</.test(card()),
+        card().slice(0, 400));
+  check("CV ...expanding on the render that opens it",
+        card().includes("cover-panel cover-in"), card().slice(0, 200));
+  run(`renderNow()`);
+  check("CV ...but not again on the next re-render (a poll)",
+        panelOpen() && !card().includes("cover-panel cover-in"), card().slice(0, 200));
+  check("CV opening the cover does not reveal the reasons",
+        !document.body.classList.contains("peeked"), "");
+  check("CV share rides the cover panel",
+        /id="cover-panel"[\s\S]*id="btn-share"/.test(card()), card().slice(0, 400));
   $$("share-pop").hidden = true;
   run(`$("btn-share").onclick()`);
   await tick();
   check("CV tapping share closes the cover and opens the share sheet",
-        $$("cover-pop").hidden === true && $$("share-pop").hidden === false &&
+        !panelOpen() && $$("share-pop").hidden === false &&
         !$$("btn-cover").classList.contains("on"),
-        `cover hidden=${$$("cover-pop").hidden} share hidden=${$$("share-pop").hidden}`);
+        `panel=${panelOpen()} share hidden=${$$("share-pop").hidden}`);
   $$("share-pop").hidden = true;
   run(`$("btn-cover").onclick()`);
-  run(`$("cover-pop").onclick()`);
+  run(`$("cover-panel").onclick()`);
   check("CV a tap on it closes it",
-        $$("cover-pop").hidden === true && !$$("btn-cover").classList.contains("on"), "");
+        !panelOpen() && !$$("btn-cover").classList.contains("on"), "");
+  run(`$("btn-cover").onclick()`);
+  run(`$("btn-cover").onclick()`);
+  check("CV a second press of the button closes it too", !panelOpen(), "");
   run(`$("btn-reveal").onclick()`);
-  check("CV the eye reveals the details without opening the cover",
-        document.body.classList.contains("peeked") && $$("cover-pop").hidden === true, "");
+  check("CV the eye unblurs the reasons without opening the cover",
+        document.body.classList.contains("peeked") && !panelOpen(), "");
   run(`setReveal(false)`);
 
   run(`$("btn-cover").onclick()`);
@@ -1762,16 +1778,16 @@ run("stopNowPolling()");
   await tick();
   run("stopNowPolling()");
   check("CV the cover closes when the next track starts",
-        $$("cover-pop").hidden === true && !$$("btn-cover").classList.contains("on"),
-        `hidden=${$$("cover-pop").hidden}`);
+        !panelOpen() && !$$("btn-cover").classList.contains("on") && !/After Song/.test(card()),
+        `panel=${panelOpen()}`);
 
   routes["GET /api/now?light=1"].body.track.image = null;
   run(`pollNow(true)`);
   await tick();
   run("stopNowPolling()");
   run(`$("btn-cover").onclick()`);
-  check("CV no cover, no overlay — a toast says so",
-        $$("cover-pop").hidden === true && /no cover/.test($$("toast").textContent),
+  check("CV no cover, no panel — a toast says so",
+        !panelOpen() && /no cover/.test($$("toast").textContent),
         `toast=${JSON.stringify($$("toast").textContent)}`);
 }
 
