@@ -1958,36 +1958,17 @@ function renderNow() {
   const tr = d.track;
   const ctx = d.context;
 
-  const artists = tr.artists.map((a) => a.name).join(", ");
-
   const body = inSitting ? sittingCardBody(tr, d.sitting) : ordinaryCardBody(d, tr, ctx);
-
-  // Share needs a real track on screen; local files and episodes have no
-  // spotify:track: uri and the tablet flow can't find them by title anyway.
-  // It rides the reveal panel, the once-in-a-while place where it costs the
-  // layout nothing.
-  const shareBtn = tr.uri?.startsWith("spotify:track:")
-    ? `<button id="btn-share" class="icon-btn np-share" title="Send this song to a friend — Spotify Messages, via the tablet">
-        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>
-      </button>`
-    : "";
 
   rememberInput(d);
   nowProblem = false;  // a real card for a real track is about to go up
   // Fresh only for a track this card has not drawn yet: a re-render (a poll,
   // a pause toggle, the suggestions arriving) is not an arrival.
   const cardFresh = enterOnce("card", tr.uri) ? " card-fresh" : "";
-  // The cover is not in here: it has its own button and opens full screen
-  // (openCover), so looking at the art never names the song.
+  // The card never names the song: no title, artist or album anywhere in it.
+  // The cover opens full screen from its own button (openCover), and share
+  // rides that overlay.
   $("now-card").innerHTML = `<div class="track-card${cardFresh}${d.is_playing ? "" : " is-paused"}">
-    <div class="t-reveal">
-      <div class="t-meta">
-        <div class="t-name">${esc(tr.name)}</div>
-        <div class="t-artist">${esc(artists)}</div>
-        <div class="t-album">${tr.album ? esc(tr.album) : ""}</div>
-      </div>
-      ${shareBtn}
-    </div>
     ${playbackStrip(d, tr)}
     ${body}
   </div>`;
@@ -2009,8 +1990,6 @@ function renderNow() {
   if (both) both.onclick = nowBoth;
   const undoRem = $("btn-now-undo-remove");
   if (undoRem) undoRem.onclick = undoStripAction;
-  const sh = $("btn-share");
-  if (sh) sh.onclick = openSharePop;
   startNowTicker(d, tr);
   wireSeekBar(tr);
 
@@ -2839,14 +2818,12 @@ async function undoStripAction() {
 // ---- blind by default -------------------------------------------------------
 //
 // The card never names what is playing: the ear decides, not the name. The
-// title, artist and album are not blurred but left out of the layout
-// altogether, which is what gives the transport and the filing rows the
-// room. The eye in the bar opens them as one panel — the details, share —
-// and the suggestion REASONS unblur with it (they leak artist names). The
-// cover is the other button: it opens the art full screen and names
-// nothing, so you can look at it and still not know what is playing. Both
-// last one track: renderNow drops them as soon as the playing uri is no
-// longer the one they were opened for.
+// title, artist and album are not on the card at all. The eye in the bar
+// only unblurs the suggestion REASONS (they leak artist names), so pressing
+// it moves nothing on screen. The cover is the other button: it opens the
+// art full screen, with share, and names nothing. Both last one track:
+// renderNow drops them as soon as the playing uri is no longer the one they
+// were opened for.
 
 let peekedUri = null;
 // The track whose removal the strip is currently offering to undo. Expires
@@ -2875,10 +2852,21 @@ function openCover() {
   if (!t) { toast("nothing playing"); return; }
   if (!t.image) { toast("no cover for this one"); return; }
   coverUri = t.uri || null;
+  // Share needs a real track; local files and episodes have no
+  // spotify:track: uri and the tablet flow can't find them by title anyway.
+  const share = t.uri?.startsWith("spotify:track:")
+    ? `<button id="btn-share" class="icon-btn cover-share" title="Send this song to a friend — Spotify Messages, via the tablet">
+        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>
+      </button>`
+    : "";
   // The grow-in is a CSS animation, so it runs on every hidden → shown.
-  $("cover-pop").innerHTML = `<img src="${esc(t.image_large || t.image)}" alt="">`;
+  $("cover-pop").innerHTML = `<img src="${esc(t.image_large || t.image)}" alt="">${share}`;
   $("cover-pop").hidden = false;
   setCoverBtn(true);
+  const sh = $("btn-share");
+  // Its own tap, not the overlay's: the cover closes and the share sheet
+  // opens in its place.
+  if (sh) sh.onclick = (e) => { e?.stopPropagation(); closeCover(); openSharePop(); };
 }
 function closeCover() {
   coverUri = null;
@@ -2940,8 +2928,8 @@ async function doShare(track, friend) {
   }
 }
 
-// btn-share is card-internal now (rendered and wired by renderNow, like the
-// other strip controls) — there is no static element left to wire here.
+// btn-share lives in the cover overlay (rendered and wired by openCover) —
+// there is no static element left to wire here.
 
 // ---- picker ----------------------------------------------------------------
 

@@ -1676,8 +1676,9 @@ run("stopNowPolling()");
   check("BR the card opens blind — nothing revealed until asked",
         !document.body.classList.contains("peeked"),
         `peeked=${document.body.classList.contains("peeked")}`);
-  check("BR ...and the details are in the hidden panel, not the card's flow",
-        /class="t-reveal"[\s\S]*Removed Song/.test($$("now-card").innerHTML),
+  check("BR ...and the card never names the song, so the eye has nothing to move",
+        !/Removed Song|Removed Artist/.test($$("now-card").innerHTML) &&
+        !$$("now-card").innerHTML.includes("t-reveal"),
         $$("now-card").innerHTML.slice(0, 300));
 
   run(`$("btn-reveal").onclick()`);
@@ -1733,6 +1734,17 @@ run("stopNowPolling()");
   check("CV ...without naming the song or revealing the details",
         !/Cover Song|Cover Artist/.test($$("cover-pop").innerHTML) &&
         !document.body.classList.contains("peeked"), $$("cover-pop").innerHTML);
+  check("CV share rides the cover overlay",
+        $$("cover-pop").innerHTML.includes('id="btn-share"'), $$("cover-pop").innerHTML);
+  $$("share-pop").hidden = true;
+  run(`$("btn-share").onclick()`);
+  await tick();
+  check("CV tapping share closes the cover and opens the share sheet",
+        $$("cover-pop").hidden === true && $$("share-pop").hidden === false &&
+        !$$("btn-cover").classList.contains("on"),
+        `cover hidden=${$$("cover-pop").hidden} share hidden=${$$("share-pop").hidden}`);
+  $$("share-pop").hidden = true;
+  run(`$("btn-cover").onclick()`);
   run(`$("cover-pop").onclick()`);
   check("CV a tap on it closes it",
         $$("cover-pop").hidden === true && !$$("btn-cover").classList.contains("on"), "");
@@ -2208,11 +2220,9 @@ run("stopNowPolling()");
         at('id="btn-now-toggle"') < at('np-buttons'),
         `prev@${at('id="btn-now-prev"')} bar@${at('np-bar')} ` +
         `toggle@${at('id="btn-now-toggle"')} buttons@${at('np-buttons')}`);
-  // Share lives on the card itself, in the corner beside the cover — not in
-  // the top bar. It renders only for a real spotify:track uri.
-  check("RB the share button rides the card, in the reveal panel",
-        at('id="btn-share"') !== -1 && at('id="btn-share"') < at('np-progress'),
-        `share@${at('id="btn-share"')} progress@${at('np-progress')}`);
+  // Share is not on the card: it rides the full-screen cover (see CV).
+  check("RB the share button is not on the card",
+        at('id="btn-share"') === -1, `share@${at('id="btn-share"')}`);
 
   setNow(nowBody(false));
   run(`filedUris = {}; pollNow(true)`);
@@ -2649,7 +2659,7 @@ run("stopNowPolling()");
   run(`pollNow(true)`);
   await tick();
   check("TP the track card is up before the suggest answer lands",
-        html().includes("Two Phase") && /finding a home…/.test(html()),
+        html().includes('class="track-card') && /finding a home…/.test(html()),
         JSON.stringify(html().slice(0, 160)));
   check("TP no suggestion buttons render while pending",
         !html().includes('class="sugg"'), "");
@@ -4121,12 +4131,12 @@ run("stopNowPolling()");
 }
 
 // ============================================================================
-// AA — artist and album get a line each.
+// AA — the card names neither artist nor album.
 //
-// They shared one line joined by an em dash, which reads as one long string
-// on a phone and truncates the album first. Separate elements also let blind
-// mode blur both (an album name leaks the artist just as well) and let a tap
-// on either one peek the card.
+// They once had a line each in a panel the eye opened, which pushed the
+// card down. Since 2026-10-19 the card carries no title, artist or album at
+// all (an album name leaks the artist just as well), so the eye only
+// unblurs the reasons and nothing moves.
 // ============================================================================
 {
   resetLog();
@@ -4145,12 +4155,9 @@ run("stopNowPolling()");
   run("stopNowPolling()");
   const html = () => $$("now-card").innerHTML;
 
-  check("AA the album has an element of its own",
-        /class="t-album"[^>]*>The Album</.test(html()),
-        JSON.stringify((html().match(/<div class="t-a[^>]*>[^<]*</g) || [])));
-  check("AA ...and the artist line is artists alone, no dash",
-        /class="t-artist">Ar One, Ar Two</.test(html()) && !html().includes(" — The Album"),
-        JSON.stringify((html().match(/class="t-artist">[^<]*/) || [""])[0]));
+  check("AA the card names neither the artists nor the album",
+        !/Ar One|Ar Two|The Album/.test(html()) && html().includes('class="track-card'),
+        JSON.stringify(html().slice(0, 200)));
 
   // A track with no album must not leave a stray dash or a visible gap.
   setNow({
@@ -4165,9 +4172,9 @@ run("stopNowPolling()");
   run(`pollNow(true)`);
   await tick();
   run("stopNowPolling()");
-  check("AA a track with no album draws no dash",
-        !/—/.test((html().match(/class="t-artist">[^<]*/) || [""])[0]),
-        JSON.stringify((html().match(/class="t-artist">[^<]*/) || [""])[0]));
+  check("AA ...nor does a track with no album",
+        !/Ar One/.test(html()) && html().includes('class="track-card'),
+        JSON.stringify(html().slice(0, 200)));
   run(`show("lists")`);
 }
 
@@ -4731,11 +4738,10 @@ run("stopNowPolling()");
   const html = () => $$("now-card").innerHTML;
   await paint({});
 
-  // What is playing lives in one panel, shown only on request. The cover is
-  // not in it: it has its own button and opens full screen.
-  check("NC the song's details sit in one reveal panel",
-        /class="t-reveal"[\s\S]*class="t-meta"/.test(html()), html().slice(0, 300));
-  check("NC ...and the cover is not in the card at all",
+  // The card names nothing — no title, artist, album or cover — so pressing
+  // the eye (which only unblurs the reasons) moves nothing on screen.
+  check("NC the card carries no title, artist, album or cover",
+        !/t-reveal|t-name|t-artist|t-album/.test(html()) &&
         !html().includes('class="art"') && !html().includes("<img"), html().slice(0, 400));
 
   // The filing controls: out of the scroll box.

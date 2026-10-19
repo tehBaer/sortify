@@ -360,18 +360,6 @@ header .icon-btn::after {
   .skel-bar { animation: none; }
   button:active { transform: none; }
 }
-/* What is playing, shown only on request (the eye in the bar). Absent from
-   the layout until then, not blurred in place: the room it would take is
-   what the transport and the filing rows get instead. Opened, it is the
-   details — the one moment you asked to look. The cover is not in it: it
-   has its own button and opens full screen (#cover-pop). */
-.track-card .t-reveal { display: none; }
-body.peeked .track-card .t-reveal {
-  display: flex; flex-direction: column; align-items: center;
-  gap: .6rem; text-align: center; margin-bottom: .9rem;
-  animation: card-in .18s ease-out;
-}
-.track-card .t-meta { min-width: 0; max-width: 100%; }
 .track-card .art {
   position: relative; display: block; line-height: 0; flex: 0 0 auto;
 }
@@ -408,13 +396,6 @@ body.peeked .track-card .t-reveal {
   color: var(--muted); font-size: .85rem; opacity: .8;
   margin-top: .1rem;
 }
-/* Share lives in the panel: sending a song is something you do having
-   looked at it. */
-.np-share {
-  position: static; flex: 0 0 auto; color: var(--muted);
-  background: none; border: 0; opacity: .75; min-height: 40px;
-}
-.np-share svg { width: 20px; height: 20px; display: block; }
 /* Hidden by request, not deleted: renderNow and the undo stack still drive
    btn-undo-now (the strip's own undo covers removals; keyboard u remains),
    and the auto/manual chip keeps its logic for if it ever comes back. */
@@ -1079,6 +1060,11 @@ body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
   animation: cover-fade .2s ease-out;
 }
 #cover-pop[hidden] { display: none; }
+/* Share rides the overlay, under the cover; its own tap, not a close. */
+#cover-pop { flex-direction: column; gap: 1rem; }
+#cover-pop .cover-share {
+  color: #fff; background: color-mix(in srgb, #fff 14%, transparent);
+}
 #cover-pop img {
   width: min(100%, calc(100dvh - 2rem)); aspect-ratio: 1; height: auto;
   border-radius: 12px; object-fit: cover; box-shadow: var(--shadow-art);
