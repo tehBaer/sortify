@@ -795,7 +795,7 @@ body.on-now header h1 { visibility: hidden; }
    card that ended right under it. Inside the reserved block there IS room
    around it — that is the point of the block — and keeping the padding
    pushed the card past the height it is meant to be holding. */
-.filed-region > .done-msg { padding: 0; }
+.filed-region > .done-msg { padding: 0; min-width: 0; max-width: 100%; }
 .homeless-row { display: flex; gap: .6rem; margin-top: .6rem; }
 .homeless-btn { flex: 1; }
 /* Drawn but refused: the four cases where the move would be wrong keep the
@@ -867,6 +867,13 @@ body:not(.on-now) #adrift-strip { display: none; }
 .danger { color: var(--danger); }
 .done-msg { text-align: center; padding: 3rem 0; color: var(--muted); }
 .done-msg p { margin: 0; }
+/* The filed card names the song: the choice is made, so blind mode is done
+   with it. One line each, cut with an ellipsis like the rest of the card. */
+.done-msg .filed-song { margin-bottom: .5rem; max-width: 100%; }
+.done-msg .filed-title, .done-msg .filed-artist {
+  display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.done-msg .filed-title { color: var(--fg); font-weight: 600; }
 /* The resolved-card check: big enough to feel like a reward, in the accent
    green. Its opposite, .gone-mark, is the same mark in the destructive colour
    for a track that left an input instead of finding a home — a removal ends

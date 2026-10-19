@@ -3094,6 +3094,10 @@ run("stopNowPolling()");
         /removed from/.test(html()) && html().includes("[Hazy]"), `html=${html()}`);
   check("XM no 'filed to nowhere' left anywhere on it",
         !/filed to/.test(html()), `html=${html()}`);
+  // Once decided, the card may name the song: blind mode is about choosing
+  // by ear, and the choice is made.
+  check("XM the removed card names the song, title and artist",
+        /class="filed-song"[\s\S]*Song[\s\S]*Artist/.test(html()), `html=${html()}`);
 
   await paint();
   await run(`nowFile("H1")`);
@@ -3101,6 +3105,8 @@ run("stopNowPolling()");
   check("XM filing is untouched — still the check, still 'filed to'",
         html().includes("done-mark") && !html().includes("gone-mark") &&
         /filed to/.test(html()), `html=${html()}`);
+  check("XM the filed card names the song too, above 'filed to'",
+        /class="filed-song"[\s\S]*Song[\s\S]*Artist[\s\S]*filed to/.test(html()), `html=${html()}`);
 
   // The draw-on is granted by the render that first shows the mark and by no
   // other. Every poll — and every press of Next — rebuilds this card, and the

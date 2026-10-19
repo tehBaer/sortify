@@ -2202,10 +2202,15 @@ function ordinaryCardBody(d, tr, ctx) {
     // and everything under it would jump up under the thumb that just
     // pressed. The region's own measured height is held instead, and the
     // check sits in the middle of it.
+    // The decision is made, so the card may now say what the song was —
+    // blind mode is for choosing by ear, not for after.
+    const artists = tr.artists.map((a) => a.name).join(", ");
     return subsetButtonRow() +
            `<div class="filing-region filed-region" style="min-height:${lastRegionHeight}px">` +
            `<div class="done-msg${removed ? " gone-msg" : ""}${fresh}">` +
            `${removed ? GONE_MARK : DONE_MARK}` +
+           `<p class="filed-song"><span class="filed-title">${esc(tr.name)}</span>` +
+           `<span class="filed-artist">${esc(artists)}</span></p>` +
            `<p>${removed ? "removed from" : "filed to"} <b>${esc(filedTo)}</b></p></div></div>`;
   }
   // Nothing resolved on screen — arm the draw for whatever this card resolves
