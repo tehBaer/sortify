@@ -857,3 +857,55 @@ def test_a_first_attempt_still_refuses_an_unoffered_folder(env):
 
     assert res.status_code == 400
     assert env.log == [] and env.filed == []
+
+
+# ---- final review fixes ------------------------------------------------------
+
+
+INPUT_SETS = [{"key": "buffer", "label": "buffer", "pattern": r"^\[.+\]$"},
+              {"key": "other", "label": "other", "pattern": r"^<.*>$"},
+              {"key": "the-bomb", "label": "the bomb", "path_segment": "THE BOMB"}]
+
+
+@pytest.fixture
+def sets_env(env):
+    """Input sets configured, and no `input_name_pattern` at all — the shape
+    the live config has."""
+    appmod.store.update_config(input_name_pattern=None, input_sets=INPUT_SETS)
+    appmod.store.save_folders({"H2": {"path": "ROOT / Mix"}, "H3": {"path": "ROOT / THE BOMB"}})
+    return env
+
+
+@pytest.mark.parametrize("name", ["[Oops]", "<Oops>"])
+def test_a_part_name_an_input_set_would_claim_is_refused(sets_env, name):
+    res = sets_env.post("/api/splitparts/H1/done", json={
+        "names": {"p1": name}, "folder": None, "original": "subset"})
+
+    assert res.status_code == 400
+    assert "input" in res.json()["detail"]
+    assert sets_env.log == [] and sets_env.calls == []
+
+
+def test_a_folder_that_defines_an_input_set_is_refused(sets_env):
+    res = sets_env.post("/api/splitparts/H1/done", json={
+        "names": {"p1": "Rocky", "p2": "Jazzy"}, "folder": "ROOT / THE BOMB", "original": "subset"})
+
+    assert res.status_code == 400
+    assert "input set" in res.json()["detail"]
+    assert sets_env.log == [] and sets_env.filed == []
+
+
+def test_the_plan_marks_an_input_set_folder_blocked(sets_env):
+    folders = sets_env.get("/api/splitparts/H1/plan", params={"original": "subset"}).json()["folders"]
+
+    by_path = {f["path"]: f["blocked"] for f in folders}
+    assert by_path["ROOT / Mix"] is None
+    assert "input set" in by_path["ROOT / THE BOMB"]
+
+
+def test_ordinary_names_and_folders_still_pass_with_input_sets(sets_env):
+    res = sets_env.post("/api/splitparts/H1/done", json={
+        "names": {"p1": "Rocky", "p2": "Jazzy"}, "folder": "ROOT / Mix", "original": "subset"})
+
+    assert res.status_code == 200
+    assert progress(sets_env)["state"] == "done"

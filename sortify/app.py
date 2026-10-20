@@ -931,7 +931,12 @@ class SplitDoneIn(BaseModel):
 
 
 def _splitparts_name_problem(names: list[str]) -> str | None:
+    """Why one of these part names cannot become a home. Input sets count
+    as much as the single `input_name_pattern`: with sets configured that
+    pattern is usually absent, and a "[x]" part would be read back as a
+    buffer on the very next request."""
     cfg = store.config()
+    sets = inputsets.resolve_sets(cfg)
     for name in names:
         problem = creatable_home_name_problem(
             name,
@@ -939,8 +944,25 @@ def _splitparts_name_problem(names: list[str]) -> str | None:
             exclude_patterns=cfg.get("home_name_exclude_patterns") or [],
             exclude_emoji=bool(cfg.get("home_exclude_emoji_names")),
         )
+        if not problem and inputsets.set_of(name, None, sets):
+            problem = (f"{name.strip()!r} matches an input set's name rule — it would "
+                       "become an input, not a home")
         if problem:
             return f"{name!r}: {problem}"
+    return None
+
+
+def _splitparts_input_set_folder(folder: str | None) -> str | None:
+    """Why a part cannot be filed into this folder: a folder-defined input
+    set claims everything inside it, so a part there would be an input."""
+    if not folder:
+        return None
+    segments = folder.split(" / ")
+    for s in inputsets.resolve_sets(store.config()):
+        seg = s.get("path_segment")
+        if seg and seg in segments:
+            return (f"{folder!r} is inside {seg!r}, which defines an input set — "
+                    "a part filed there would be an input, not a home")
     return None
 
 
@@ -952,6 +974,10 @@ def splitparts_plan(pid: str, original: str = "subset", part: str | None = None)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     choices, default = _home_folder_choices(store.config(), pid)
+    for c in choices:
+        c["blocked"] = c["blocked"] or _splitparts_input_set_folder(c["path"])
+    if default and any(c["path"] == default and c["blocked"] for c in choices):
+        default = None
     return {"calls": plan["calls"], "creates": plan["creates"], "empty": plan["empty"],
             "local": plan["local"], "removals": len(plan["removals"]),
             "folders": choices, "folder": default}
@@ -1146,6 +1172,9 @@ def splitparts_done(pid: str, body: SplitDoneIn):
         choices, _ = _home_folder_choices(store.config(), pid)
         if not any(c["path"] == check["folder"] and not c["blocked"] for c in choices):
             raise HTTPException(400, f"{check['folder']!r} is not an offered folder")
+        problem = _splitparts_input_set_folder(check["folder"])
+        if problem:
+            raise HTTPException(400, problem)
     with _splitparts_job_lock:
         if _splitparts_job.get("state") == "running":
             raise HTTPException(409, "already running")
