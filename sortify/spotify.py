@@ -138,7 +138,8 @@ class AuthFlowError(SpotifyError):
 
 
 # Serialises read-modify-write on cache["playlist_list"] between the refresh
-# that replaces the listing and the prune that removes swept sittings from it.
+# that replaces the listing and the prune that removes an unfollowed
+# playlist from it.
 _LIST_LOCK = threading.Lock()
 
 
@@ -594,9 +595,9 @@ class Spotify:
         """Drop ids from the cached listing after they have been unfollowed.
 
         Costs nothing and touches no network. Without it the listing keeps
-        advertising playlists that no longer exist, so a swept sitting would
-        be re-offered as an orphan on every Playlists view until the next
-        manual refresh — cleanup that visibly does nothing.
+        advertising playlists that no longer exist, so an unfollowed
+        playlist would be re-offered as an orphan on every Playlists view
+        until the next manual refresh — cleanup that visibly does nothing.
 
         Read-modify-write under a lock local to this file, which is the same
         lock the refresh path takes. A refresh that lands between this read
@@ -685,11 +686,10 @@ class Spotify:
                     "total": meta.get("total"),
                     "snapshot_id": p.get("snapshot_id"),
                     "image": images[-1].get("url") if images else None,
-                    # Kept so a sitting playlist can be recognised from the
-                    # cached listing alone, at zero calls. It arrives in this
-                    # same response either way; discarding it was what forced
-                    # sitting cleanup to trust splits.json instead of the
-                    # account. `or ""` because Spotify sends null here.
+                    # Kept so a playlist sortify created can be recognised
+                    # from the cached listing alone, at zero calls. It
+                    # arrives in this same response either way. `or ""`
+                    # because Spotify sends null here.
                     "description": p.get("description") or "",
                 }
             )
@@ -915,7 +915,7 @@ class Spotify:
         without ever probing for it.
 
         `public` defaults False, which is what every caller in the app wants:
-        a filing destination, a sitting, a split output — none of them are
+        a filing destination, a split output — none of them are
         for an audience. Whether the CREATE honours `public=True` is
         unverified, unlike `PUT /playlists/{id}` with `{"public": true}`,
         which was read back and confirmed on 2026-08-31. So a caller who
@@ -947,9 +947,10 @@ class Spotify:
     def unfollow_playlist(self, playlist_id: str) -> None:
         """Discard a whole playlist in one call.
 
-        Why a sitting is disposable: one call removes the whole playlist.
-        (The old reason, "no batch delete", was wrong — removing several
-        tracks in one DELETE works, probed 2026-10-20 — but discarding the
-        playlist is still the cheapest way to clear it.)
+        Why discarding a disposable playlist outright is cheap: one call
+        removes the whole thing. (The old reason, "no batch delete", was
+        wrong — removing several tracks in one DELETE works, probed
+        2026-10-20 — but discarding the playlist is still the cheapest way
+        to clear it.)
         """
         self.request("DELETE", f"/playlists/{playlist_id}/followers")

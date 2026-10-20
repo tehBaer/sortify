@@ -178,7 +178,7 @@ def test_store_round_trips_tags(tmp_path):
 
 
 def test_store_tag_artists_unwraps_the_envelope(tmp_path):
-    """enrich and split_tracks both want the inner map, never the envelope."""
+    """enrich and the splitting code both want the inner map, never the envelope."""
     from sortify.store import TAGS_VERSION, Store
     s = Store(tmp_path)
     s.save_tag_artists({"a1": {"name": "A", "tags": [], "miss": True}})
