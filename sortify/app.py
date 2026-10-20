@@ -1135,7 +1135,14 @@ def splitparts_done(pid: str, body: SplitDoneIn):
     problem = _splitparts_name_problem([p["name"] for p in plan["new_parts"]])
     if problem:
         raise HTTPException(400, problem)
-    if check.get("folder"):
+    # The folder check is for a FIRST attempt only. On a resume it would
+    # refuse forever with no escape — moves, suggest and discard all 409
+    # once Done has started, so a folder that stopped being offered (the
+    # tree changed, a re-import dropped it) would strand the split with no
+    # way to finish it. Filing is post-hoc and best-effort: it fails
+    # without touching the created playlists or the original, so skipping
+    # this check on a resume costs nothing but an unfiled playlist.
+    if started is None and check.get("folder"):
         choices, _ = _home_folder_choices(store.config(), pid)
         if not any(c["path"] == check["folder"] and not c["blocked"] for c in choices):
             raise HTTPException(400, f"{check['folder']!r} is not an offered folder")

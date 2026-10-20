@@ -811,3 +811,49 @@ def test_a_resumed_done_validates_against_the_stored_opts_not_the_retry_body(env
     assert not any(e[0] == "rename" for e in env.log)      # the stored "part" choice ran
     assert any(e[0] == "remove" for e in env.log)
     assert env.filed == []                                  # the stored folder (None) ran, not "ROOT / Deep"
+
+
+# ---- fix round 2 (Task 10 re-review) -----------------------------------
+
+
+def test_a_resumed_done_with_an_unoffered_folder_still_runs(env, monkeypatch):
+    """The first attempt used "ROOT / Mix" (offered at the time) and crashed
+    mid-way. The folder tree changes before the retry — "ROOT / Mix" is no
+    longer offered at all. Every other escape (moves, a fresh suggest,
+    discard) already 409s once Done has started, so refusing the retry too
+    would strand the split with literally nothing left to press. Filing is
+    post-hoc and best-effort, so the resume must still run (and still try
+    to file into the now-unoffered folder, exactly as stored)."""
+    real_add = appmod.sp.add_to_playlist
+    failed = []
+
+    def flaky(pid, uris, bulk=False, spend_reserve=False):
+        if not failed:
+            failed.append(1)
+            raise SpotifyError(429, "rate limited")
+        return real_add(pid, uris)
+
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", flaky)
+    env.post("/api/splitparts/H1/done",
+             json={"names": {"p1": "Rocky", "p2": "Jazzy"}, "folder": "ROOT / Mix", "original": "subset"})
+    assert progress(env)["state"] == "error"
+
+    appmod.store.save_folders({})   # the tree changed: "ROOT / Mix" is gone
+
+    res = env.post("/api/splitparts/H1/done",
+                   json={"names": {}, "folder": "ROOT / Mix", "original": "subset"})
+
+    assert res.status_code == 200
+    assert progress(env)["state"] == "done"
+    assert [f[2] for f in env.filed] == ["ROOT / Mix", "ROOT / Mix"]
+
+
+def test_a_first_attempt_still_refuses_an_unoffered_folder(env):
+    """The folder check is skipped only for a RESUME — a first attempt
+    (draft["done"] is still null) must keep refusing an unoffered folder
+    before any call, same as before this round."""
+    res = env.post("/api/splitparts/H1/done", json={
+        "names": {}, "folder": "ROOT / Nowhere", "original": "subset"})
+
+    assert res.status_code == 400
+    assert env.log == [] and env.filed == []

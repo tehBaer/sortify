@@ -3848,6 +3848,7 @@ async function spAddPart() {
     toast(e.message);
     return;
   }
+  spInvalidateDoneChoice();   // the part set changed shape — any typed Done choice is stale
   spShown = spDraft.parts[spDraft.parts.length - 1].key;
   renderSpParts();
 }
@@ -3874,6 +3875,7 @@ async function spRemovePart(key) {
     toast(e.message);
     return;
   }
+  spInvalidateDoneChoice();   // the part set changed shape — any typed Done choice is stale
   if (spShown === key) spShown = spDraft.parts[0]?.key || null;
   renderSpParts();
 }
@@ -3925,7 +3927,8 @@ $("sp-filter").oninput = renderSpHomes;
 
 async function openSpHome(home) {
   spStopPolling();
-  spPid = home.id;
+  const pid = home.id;   // captured once; spPid can move out from under an await below
+  spPid = pid;
   spDraft = null;
   $("sp-title").textContent = home.name;
   spSection("sp-work");
@@ -3934,30 +3937,40 @@ async function openSpHome(home) {
   // "pick a count" screen underneath it. A failed progress fetch is treated
   // as idle: there is nothing in flight worth showing instead.
   let prog = null;
-  try { prog = await api(spUrl("/progress")); } catch (e) { /* idle */ }
+  try { prog = await api(spUrl("/progress", pid)); } catch (e) { /* idle */ }
+  if (pid !== spPid) return;   // a different home opened while that was in flight
   if (prog && prog.state === "running") {
     spPanel("sp-progress");
     $("sp-progress").innerHTML = '<div class="spinner"></div><p class="hint">starting…</p>';
-    await spPoll(prog.kind === "done" ? "done" : "suggest");
+    await spPoll(prog.kind === "done" ? "done" : "suggest", pid);
     return;
   }
   try {
-    spDraft = await api(spUrl());
+    spDraft = await api(spUrl("", pid));
   } catch (e) {
     if (e.status !== 404) { toast(e.message); }
   }
+  if (pid !== spPid) return;
   if (spDraft) {
     // Done has started (and written something) but is not running right
     // now — the choices it started with are locked in; offering a fresh
     // editable form here could disagree with what a resume will actually do.
-    if (spDraft.done) { renderSpFinish(); return; }
+    if (spDraft.done) { await renderSpFinish(); return; }
     spShown = spDraft.parts[0]?.key || null;
     renderSpParts();
     return;
   }
   // The draft is gone (Done finished and dropped it) but the last job
-  // recorded for this pid is still the one that holds the summary.
-  if (prog && prog.state === "done" && prog.summary) { renderSpSummary(prog.summary); return; }
+  // recorded for this pid is still the one that holds the summary — UNLESS
+  // this client already showed that exact summary once (spShownSummaryKey),
+  // in which case showing it again would trap the home: every escape
+  // (Suggest again, discard) is a fresh job this same held "done" record
+  // would otherwise keep overriding back to the summary on every reopen.
+  if (prog && prog.state === "done" && prog.summary) {
+    if (spSummaryKey(pid, prog.summary) === spShownSummaryKey) { spN = 2; renderSpSetup(""); return; }
+    renderSpSummary(prog.summary);
+    return;
+  }
   spN = 2; renderSpSetup("");
 }
 $("sp-back").onclick = () => { spStopPolling(); spStopPreview(); showSplit(); };
@@ -4023,6 +4036,7 @@ async function spPoll(kind, pid = spPid) {
     return;
   }
   if (pid !== spPid) return;
+  spInvalidateDoneChoice();   // a fresh (or re-)suggestion is a new part set — any typed Done choice is stale
   spShown = spDraft.parts[0]?.key || null;
   renderSpParts();
 }
@@ -4043,6 +4057,28 @@ let spPlanSeq = 0;
 // buttons reuse it too), and a disabled attribute only stops a second real
 // tap on a real button — it would not catch a double call made directly.
 let spConfirmBusy = false;
+// The job slot's own "done" record for a pid never clears itself once a
+// client has seen it — only a NEW job (another Suggest, another Done)
+// overwrites it. Without tracking what THIS client already showed,
+// reopening a home after its summary (or the summary's own "Split this
+// home again") would show that same summary forever, since nothing else
+// in the job record changes. Keyed on pid + the created ids, not just pid,
+// so a FRESH summary for the same pid (started right after) is shown.
+let spShownSummaryKey = null;
+function spSummaryKey(pid, summary) {
+  return `${pid}:${(summary.created || []).map((c) => c.id).join(",")}`;
+}
+
+// Any typed names/folder/choice stop applying the moment the part SET
+// itself changes shape (a fresh Suggest, Start over, add/remove part) —
+// otherwise a name typed for the old p2 could land on a same-keyed but
+// entirely different p2 (or, after a remove, on whichever part inherited
+// the removed one's position). Moves never call this: they reshuffle
+// songs between the SAME parts, so the choice stays meaningful.
+function spInvalidateDoneChoice() {
+  spDoneChoicePid = null;
+  spPlan = null;
+}
 
 async function spOpenDone() {
   spStopPreview();   // no clip plays on under the Done screen
@@ -4058,9 +4094,20 @@ async function spOpenDone() {
 }
 
 async function spRefreshPlan() {
-  spReadNames();
-  const seq = ++spPlanSeq;
+  // Only ever read from a form that is genuinely the one on screen: with
+  // no previous plan, #sp-done holds nothing but a spinner (or belongs to
+  // a different pid/choice that was just invalidated) — there are no
+  // current name fields worth reading, and the stub-or-not DOM may still
+  // have same-id leftovers from an unrelated earlier render.
   const hadPlan = !!spPlan;
+  if (hadPlan) spReadNames();
+  const seq = ++spPlanSeq;
+  // A part the choice pointed at can be gone by the time this runs (the
+  // structural-change path already resets the whole choice, but this is
+  // the backstop for anything that reaches here with a dead key anyway).
+  if (spDoneChoice.original === "part" && !spPart(spDoneChoice.part)) {
+    spDoneChoice.part = spDraft.parts[0]?.key || null;
+  }
   if (hadPlan) renderSpDone({ pending: true });
   const q = spDoneChoice.original === "part"
     ? `?original=part&part=${encodeURIComponent(spDoneChoice.part)}`
@@ -4072,7 +4119,11 @@ async function spRefreshPlan() {
     // A later choice (or leaving the Done screen entirely) already won —
     // this answer belongs to a question nobody is asking any more.
     if (seq !== spPlanSeq || $("sp-done").hidden) return;
-    if (hadPlan) { renderSpDone({ error: e.message }); return; }
+    if (hadPlan) {
+      spReadNames();   // whatever was typed while this one was pending
+      renderSpDone({ error: e.message });
+      return;
+    }
     $("sp-done").innerHTML = `<p class="hint">${esc(e.message)}</p>
       <div class="row"><button id="sp-done-back">Back</button></div>`;
     $("sp-done-back").onclick = renderSpParts;
@@ -4081,16 +4132,21 @@ async function spRefreshPlan() {
   if (seq !== spPlanSeq || $("sp-done").hidden) return;
   spPlan = plan;
   if (spDoneChoice.folder === undefined) spDoneChoice.folder = spPlan.folder || "";
+  if (hadPlan) spReadNames();   // whatever was typed while this one was pending
   renderSpDone();
 }
 
 // What the name fields hold now; an emptied field falls back to the
 // suggested name (the server does the same) — never to whatever was typed
-// and then cleared, which a stale `|| spDoneChoice.names[p.key]` used to do.
+// and then cleared, which a stale `|| spDoneChoice.names[p.key]` used to
+// do. Keyed by part key, not position: `spDraft.parts[i]` can be a
+// DIFFERENT part than whichever one last rendered at index i (a remove
+// shifts everything after it up by one), so reading `sp-name-${i}` into
+// `spDraft.parts[i].key` could cross-wire an old name onto a new part.
 function spReadNames() {
   if (!spDraft) return;
-  spDraft.parts.forEach((p, i) => {
-    const el = $(`sp-name-${i}`);
+  spDraft.parts.forEach((p) => {
+    const el = $(`sp-name-${p.key}`);
     const v = el && typeof el.value === "string" ? el.value.trim() : "";
     if (el && !el.disabled) spDoneChoice.names[p.key] = v || p.name;
   });
@@ -4105,13 +4161,25 @@ function spCostLine(plan, isPart) {
   return `${made} · ${orig} · about ${plan.calls} calls`;
 }
 
+// Shared by the editable Done screen and the locked finish screen — the
+// exact phrase a local-file warning uses, so the two screens never drift.
+function spLocalWarning(plan) {
+  const n = plan.local.length;
+  return `${n} local file${n === 1 ? "" : "s"} cannot be added through Spotify's API and stay${n === 1 ? "s" : ""} in the original only: ${plan.local.map(esc).join(", ")}`;
+}
+
 // `opts.pending` (a fresh /plan request is in flight for the current
 // choice) and `opts.error` (the last one was refused, e.g. "at least 2
 // parts need songs in them") both keep every control live — including the
 // radios and selects that got the user into this choice — so the only way
 // out of a refused choice is to pick a different one; only Confirm itself
 // is disabled, and the cost line carries the status instead of a price.
+// Guarded against a stray late call: `spDraft` can already be null (the
+// summary clears it) and `#sp-work` can already be hidden (the user left
+// the Split tab, or backed out to the home picker) by the time an awaited
+// caller gets back here.
 function renderSpDone(opts = {}) {
+  if (!spDraft || $("sp-work").hidden) return;
   const isPart = spDoneChoice.original === "part";
   const pending = !!opts.pending;
   const errMsg = opts.error || null;
@@ -4128,18 +4196,20 @@ function renderSpDone(opts = {}) {
     const keeps = isPart && p.key === spDoneChoice.part;
     return `<label class="sp-name-row">
         <span class="hint">${p.uris.length} song${p.uris.length === 1 ? "" : "s"}${keeps ? ` · keeps the name “${esc(spDraft.name)}”` : ""}</span>
-        <input id="sp-name-${i}" value="${esc(nameVals[i])}" placeholder="${esc(p.name)}" autocomplete="off"${keeps ? " disabled" : ""}>
+        <input id="sp-name-${esc(p.key)}" value="${esc(nameVals[i])}" placeholder="${esc(p.name)}" autocomplete="off"${keeps ? " disabled" : ""}>
       </label>`;
   }).join("");
   const folders = [`<option value="">${esc(FOLDER_TOP_LEVEL)}</option>`].concat(
     (spPlan.folders || []).map((f) => `<option value="${esc(f.path)}"${f.blocked ? " disabled" : ""}>${esc(f.path)}${f.blocked ? " — file by hand" : ""}</option>`)).join("");
   const parts = spDraft.parts.map((p) =>
     `<option value="${esc(p.key)}"${p.key === spDoneChoice.part ? " selected" : ""}>${esc(p.name)}</option>`).join("");
+  // A stale answer's own local/empty warnings never belong to the CURRENT
+  // choice's error — they'd be describing a different plan entirely.
   const warn = [];
-  if (spPlan.local.length) {
-    warn.push(`${spPlan.local.length} local file${spPlan.local.length === 1 ? "" : "s"} cannot be added through Spotify's API and stay${spPlan.local.length === 1 ? "s" : ""} in the original only: ${spPlan.local.map(esc).join(", ")}`);
+  if (!errMsg) {
+    if (spPlan.local.length) warn.push(spLocalWarning(spPlan));
+    if (spPlan.empty.length) warn.push(`Not created, no songs: ${spPlan.empty.map(esc).join(", ")}`);
   }
-  if (spPlan.empty.length) warn.push(`Not created, no songs: ${spPlan.empty.map(esc).join(", ")}`);
   const costText = errMsg ? esc(errMsg) : (pending ? "pricing…" : spCostLine(spPlan, isPart));
   const confirmDisabled = pending || !!errMsg;
   $("sp-done").innerHTML = `
@@ -4153,7 +4223,7 @@ function renderSpDone(opts = {}) {
     ${warn.map((w) => `<p class="hint sp-warn">${w}</p>`).join("")}
     <p id="sp-cost" class="sp-cost">${costText}</p>
     <div class="row"><button id="sp-done-back">Back</button><button id="sp-confirm" class="primary"${confirmDisabled ? " disabled" : ""}>Confirm</button></div>`;
-  spDraft.parts.forEach((p, i) => { $(`sp-name-${i}`).value = nameVals[i]; });
+  spDraft.parts.forEach((p, i) => { $(`sp-name-${p.key}`).value = nameVals[i]; });
   $("sp-folder").value = spDoneChoice.folder || "";
   $("sp-confirm").disabled = confirmDisabled;
   $("sp-folder").onchange = () => { spDoneChoice.folder = $("sp-folder").value; };
@@ -4168,16 +4238,33 @@ function renderSpDone(opts = {}) {
 // (spDraft.done is set) but is not running right now — no editable fields,
 // since the stored opts are the only truth from here on; its button posts
 // exactly spDraft.done.opts, same as a resumed run itself always does.
-function renderSpFinish(errorMessage) {
+// Draws its price/warnings from a real /plan for those exact stored opts
+// (the ONLY numbers that can disagree with what the server will actually
+// do are the ones it would compute itself) — a /plan failure still shows
+// the locked screen, just without that detail, since Finish Done must
+// never become unreachable over a transient read.
+async function renderSpFinish(errorMessage) {
   const opts = spDraft.done.opts;
   const isPart = opts.original === "part";
+  const pid = spPid;
+  const q = isPart ? `?original=part&part=${encodeURIComponent(opts.part)}` : "?original=subset";
+  spPanel("sp-done");
+  $("sp-done").innerHTML = '<div class="spinner"></div>';
+  let plan = null;
+  try { plan = await api(spUrl("/plan" + q, pid)); } catch (e) { /* show the locked screen anyway */ }
+  if (pid !== spPid || !spDraft || !spDraft.done) return;   // left, or no longer the one to show
+  const displayName = (p) => (opts.names && opts.names[p.key]) || p.name;
   const newParts = spDraft.parts.filter((p) => !(isPart && p.key === opts.part));
-  const names = newParts.map((p) =>
-    `<li>${esc((opts.names && opts.names[p.key]) || p.name)}</li>`).join("");
+  // Only the parts the server will actually create — an empty or
+  // local-only one (named in the plan's own `empty`) never becomes one.
+  const kept = plan ? newParts.filter((p) => !plan.empty.includes(displayName(p))) : newParts;
+  const names = kept.map((p) => `<li>${esc(displayName(p))}</li>`).join("");
   const folderText = opts.folder || FOLDER_TOP_LEVEL;
   const origText = isPart
-    ? `the original keeps the name “${esc(spDraft.name)}” — the other parts' songs are removed from it`
-    : "the original is renamed with the subset mark";
+    ? `“${esc(spDraft.name)}” keeps its name and becomes the part “${esc(spPart(opts.part)?.name || opts.part)}” — the other parts' songs are removed from it`
+    : "The original is kept as a subset — it keeps every song, is renamed with the subset mark and stops being a home";
+  const warn = plan && plan.local.length ? [spLocalWarning(plan)] : [];
+  const priceLine = plan ? `<p class="sp-cost">${spCostLine(plan, isPart)}</p>` : "";
   spPanel("sp-done");
   $("sp-done").innerHTML = `
     ${errorMessage ? `<p class="hint sp-warn">${esc(errorMessage)}</p>` : ""}
@@ -4186,6 +4273,8 @@ function renderSpFinish(errorMessage) {
     <h3>New parts</h3><ul class="sp-summary">${names}</ul>
     <h3>Folder</h3><p>${esc(folderText)}</p>
     <h3>The original, “${esc(spDraft.name)}”</h3><p>${origText}</p>
+    ${warn.map((w) => `<p class="hint sp-warn">${w}</p>`).join("")}
+    ${priceLine}
     <div class="row"><button id="sp-finish-done" class="primary">Finish Done</button></div>`;
   $("sp-finish-done").onclick = spConfirmDone;
 }
@@ -4241,12 +4330,23 @@ async function spDoneFinished(p) {
   // it has, the stored opts are the only truth from here on — the locked
   // finish screen, not an editable form that could now disagree with what
   // a resume will actually do.
+  const pid = spPid;
+  const homeName = $("sp-title").textContent;
+  let refetched;
   try {
-    spDraft = await api(spUrl(""));
+    refetched = await api(spUrl("", pid));
   } catch (e) {
-    // the draft is already gone — nothing locked left to show
+    // The draft couldn't be re-read at all — never guess with the stale
+    // editable form; offer to reopen the home fresh instead.
+    if (pid !== spPid) return;
+    $("sp-done").innerHTML = `<p>${esc(p.message || "Done did not finish")}</p>
+      <div class="row"><button id="sp-try-again" class="primary">Try again</button></div>`;
+    $("sp-try-again").onclick = () => openSpHome({ id: pid, name: homeName });
+    return;
   }
-  if (spDraft && spDraft.done) { renderSpFinish(p.message); return; }
+  if (pid !== spPid) return;
+  spDraft = refetched;
+  if (spDraft.done) { await renderSpFinish(p.message); return; }
   $("sp-done").innerHTML = `<p>${esc(p.message || "Done did not finish")}</p>
     <div class="row"><button id="sp-done-back">Back</button><button id="sp-retry" class="primary">Done again</button></div>`;
   $("sp-done-back").onclick = renderSpParts;
@@ -4254,6 +4354,7 @@ async function spDoneFinished(p) {
 }
 
 function renderSpSummary(s) {
+  spShownSummaryKey = spSummaryKey(spPid, s);
   spDraft = null;
   const rows = s.created.map((c) => `<li><b>${esc(c.name)}</b> — ${c.count} song${c.count === 1 ? "" : "s"}</li>`).join("");
   const orig = s.original === "subset"
@@ -4262,7 +4363,8 @@ function renderSpSummary(s) {
   const local = s.local.length ? `<p class="hint">Local files left in the original: ${s.local.map(esc).join(", ")}</p>` : "";
   spPanel("sp-done");
   $("sp-done").innerHTML = `<h3>Done</h3><ul class="sp-summary">${rows}</ul><p class="hint">${orig}</p>${local}
-    <div class="row"><button id="sp-finish" class="primary">Back to homes</button></div>`;
+    <div class="row"><button id="sp-split-again">Split this home again</button><button id="sp-finish" class="primary">Back to homes</button></div>`;
+  $("sp-split-again").onclick = () => { spN = 2; renderSpSetup(""); };
   $("sp-finish").onclick = showSplit;
 }
 
