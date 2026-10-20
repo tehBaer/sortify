@@ -1103,9 +1103,13 @@ body.on-now header { touch-action: none; user-select: none; -webkit-user-select:
 body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { touch-action: auto; }
 /* The cover behind the bar: its middle, blurred and grey, as a thin
    lip under the bar, with a grab pill. Grey because it is still hidden:
-   the colour comes with the cover. Overlaid, so it moves no layout. */
+   the colour comes with the cover. Overlaid, so it moves no layout. Exactly
+   as wide as the cover it opens into, and lined up with it: main's 640px
+   cap, less main's 1rem sides, the card's 1px border and .85rem padding —
+   full-bleed, it stuck out past the card on both sides. */
 #cover-peek {
-  position: absolute; left: 0; right: 0; top: 100%; height: 10px;
+  position: absolute; top: 100%; height: 10px; left: 50%;
+  width: calc(min(100%, 640px) - 3.7rem - 2px); transform: translateX(-50%);
   overflow: hidden; cursor: pointer;
   border-radius: 0 0 8px 8px;
 }
