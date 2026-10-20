@@ -5522,8 +5522,9 @@ run("stopNowPolling()");
     u6: { name: "Six", artists: "F", local: false } }, tracks: [], done: null };
   routes["GET /api/splitparts/H1"] = { status: 200, body: RESUGGESTED };
   await run(`spStartOver(2)`);
-  check("SPD2 Start over invalidates the choice too",
-        run("spDoneChoicePid") === null, run("spDoneChoicePid"));
+  check("SPD2 Start over bumps the draft generation, so the stale choice no longer matches",
+        run("spDoneChoiceGen !== spDraftGen") === true,
+        `gen=${run("spDraftGen")} choiceGen=${run("spDoneChoiceGen")}`);
   routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
     calls: 3, creates: 2, empty: [], local: [], removals: 0, folders: [], folder: "" } };
   await run(`spOpenDone()`);
@@ -5552,6 +5553,8 @@ run("stopNowPolling()");
   await run(`openSpHome({ id: "H1", name: "Big Home" })`);
   check("SPD2 the first reopen after Done shows the held summary",
         /id="sp-finish"/.test(doneHtml2()) && $$("sp-done").hidden === false, doneHtml2());
+  check("SPD2 ...and offers no Split this home again in SUBSET mode — the original is no longer a home",
+        !/id="sp-split-again"/.test(doneHtml2()), doneHtml2());
 
   run(`spPid = null`);   // left, then reopened — the job record for H1 is unchanged
   resetLog();
@@ -5559,9 +5562,9 @@ run("stopNowPolling()");
   check("SPD2 reopening AGAIN after the summary was shown goes to the counter, not the same summary",
         $$("sp-setup").hidden === false && $$("sp-done").hidden === true, "");
 
-  const SUMMARY2 = { created: [{ id: "N2", name: "folk", count: 1 }], original: "subset", empty: [], local: [] };
+  const SUMMARY2 = { created: [{ id: "N2", name: "folk", count: 1 }], original: "part", empty: [], local: [] };
   run(`spPid = "H1"; renderSpSummary(${JSON.stringify(SUMMARY2)})`);
-  check("SPD2 the summary offers Split this home again",
+  check("SPD2 the summary offers Split this home again in PART mode — the original stayed a home",
         /id="sp-split-again"/.test(doneHtml2()), doneHtml2());
   run(`$("sp-split-again").onclick()`);
   check("SPD2 ...and it goes straight to the counter",
@@ -5680,6 +5683,189 @@ run("stopNowPolling()");
   await tick();
   check("SPD2 ...and H1's stale /progress answer landing late does not clobber it",
         $$("sp-progress").hidden === true && /chill/.test($$("sp-chips").innerHTML), "");
+
+  run(`spStopPolling(); show("lists")`);
+}
+
+// ============================================================================
+// SPD3 — Done fix round 3: stale state made structurally impossible.
+// #sp-done is wiped the moment it is not the panel on screen; a draft
+// generation (spDraftGen) lets every awaited answer tell a fresh load
+// from a stale one; add/remove edit spDoneChoice surgically instead of a
+// blunt reset.
+// ============================================================================
+{
+  resetLog();
+  const doneHtml3 = () => $$("sp-done").innerHTML;
+
+  // ---- the structural fix itself ------------------------------------------
+  run(`show("split"); spPid = "H1"; spSection("sp-work"); $("sp-done").innerHTML = "<p>stale</p>"; spPanel("sp-parts");`);
+  check("SPD3 spPanel wipes a stale #sp-done form when switching to another panel",
+        doneHtml3() === "", doneHtml3());
+
+  // ---- scenario A: type, Back, Start over, leave via header Back while it
+  // runs, the suggestion lands, reopen → Done… shows the NEW defaults ------
+
+  const songsA = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false } };
+  const DRAFT_A = { playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2,
+    parts: [{ key: "p1", name: "rock", uris: ["u1"] }, { key: "p2", name: "jazz", uris: ["u2"] }],
+    unknown: [], hint: null, scores: {}, songs: songsA, tracks: [], done: null };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null } };
+  routes["GET /api/splitparts/H1"] = { status: 200, body: DRAFT_A };
+  run(`spPid = null; spDraft = null;`);
+  await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 4, creates: 2, empty: [], local: [], removals: 0, folders: [], folder: "" } };
+  await run(`spOpenDone()`);
+  $$("sp-name-p1").value = "RockyTyped";
+  run(`$("sp-done-back").onclick()`);   // Back → parts, reading the typed name
+  check("SPD3 the typed name is captured before Start over",
+        run("spDoneChoice.names.p1") === "RockyTyped", run("spDoneChoice.names.p1"));
+
+  let resolveProgressA;
+  routes["POST /api/splitparts/H1/suggest"] = { status: 200, body: { started: true } };
+  routes["GET /api/splitparts/H1/progress"] = () => new Promise((resolve) => { resolveProgressA = resolve; });
+  run(`spStartOver(2)`);   // fire-and-forget: confirm() always answers yes
+  await tick();
+
+  // leave via the HEADER Back while the suggestion is still running — this
+  // never touches spPid, only the view.
+  routes["GET /api/splitparts/homes"] = { status: 200, body: { homes: [] } };
+  await run(`$("sp-back").onclick()`);
+  check("SPD3 leaving via header Back does not touch spPid",
+        run("spPid") === "H1", run("spPid"));
+
+  // the suggestion lands while we're away
+  const RESUGGESTED_A = { playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2,
+    parts: [{ key: "p1", name: "folk", uris: ["u3"] }, { key: "p2", name: "blues", uris: ["u4"] }],
+    unknown: [], hint: null, scores: {}, songs: { u3: { name: "Three", artists: "C", local: false },
+    u4: { name: "Four", artists: "D", local: false } }, tracks: [], done: null };
+  routes["GET /api/splitparts/H1"] = { status: 200, body: RESUGGESTED_A };
+  resolveProgressA({ status: 200, body: { state: "done", phase: "done", done: 0, total: 0, message: null, summary: null } });
+  await tick();
+
+  // reopen the home and open Done… again
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null } };
+  await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 4, creates: 2, empty: [], local: [], removals: 0, folders: [], folder: "" } };
+  await run(`spOpenDone()`);
+  check("SPD3 reopening Done… after the suggestion landed shows the NEW draft's suggested names",
+        /id="sp-name-p1"[^>]*value="folk"/.test(doneHtml3()) && !/RockyTyped/.test(doneHtml3()), doneHtml3());
+  run(`spStopPolling()`);
+
+  // ---- scenario B1: a pending EDITABLE /plan answer must not replace the
+  // locked finish screen once it is drawn ----------------------------------
+
+  const STARTED_B = { ...DRAFT_A, done: { opts: { original: "subset", part: null, names: {}, folder: null },
+                                           created: {}, filled: [], original_done: false } };
+  run(`spPid = "H1"; spDraft = ${JSON.stringify(STARTED_B)};`);   // draft.done already set; generation unchanged
+  let resolveEditablePlanB;
+  routes["GET /api/splitparts/H1/plan?original=subset"] = () => new Promise((resolve) => { resolveEditablePlanB = resolve; });
+  run(`spDoneChoice = { original: "subset", part: null, folder: "", names: {} }; spPlan = null;`);
+  run(`spRefreshPlan()`);   // a lingering editable request, fire-and-forget
+  await tick();
+
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 4, creates: 2, empty: [], local: [], removals: 0, folders: [], folder: "" } };
+  await run(`renderSpFinish()`);   // the screen moves to the locked view, same generation
+  check("SPD3 the locked finish screen is up",
+        /id="sp-finish-done"/.test(doneHtml3()), doneHtml3());
+  resolveEditablePlanB({ status: 200, body: { calls: 9, creates: 9, empty: [], local: [], removals: 0, folders: [], folder: "" } });
+  await tick();
+  check("SPD3 ...and the lingering editable /plan answer landing after it does not redraw over it",
+        /id="sp-finish-done"/.test(doneHtml3()) && !/about 9 calls/.test(doneHtml3()), doneHtml3());
+
+  // ---- scenario B2: a /plan answer for H1 landing while H2 is open draws
+  // nothing on H2 ------------------------------------------------------------
+
+  run(`spPid = "H1"; spDraft = ${JSON.stringify(DRAFT_A)}; spDoneChoicePid = null; spPlan = null;`);
+  let resolveH1Plan;
+  routes["GET /api/splitparts/H1/plan?original=subset"] = () => new Promise((resolve) => { resolveH1Plan = resolve; });
+  run(`spOpenDone()`);   // fire-and-forget: in flight on its own /plan
+  await tick();
+
+  const DRAFT_H2 = { playlist_id: "H2", name: "Second Home", snapshot_id: "s2", n: 2,
+    parts: [{ key: "p1", name: "pop", uris: ["w1"] }, { key: "p2", name: "soul", uris: ["w2"] }],
+    unknown: [], hint: null, scores: {}, songs: { w1: { name: "W1", artists: "X", local: false },
+    w2: { name: "W2", artists: "Y", local: false } }, tracks: [], done: null };
+  routes["GET /api/splitparts/H2/progress"] = { status: 200, body: { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null } };
+  routes["GET /api/splitparts/H2"] = { status: 200, body: DRAFT_H2 };
+  await run(`openSpHome({ id: "H2", name: "Second Home" })`);
+  check("SPD3 H2 is open on its own parts screen",
+        /pop/.test($$("sp-chips").innerHTML) && $$("sp-parts").hidden === false, $$("sp-chips").innerHTML);
+
+  resolveH1Plan({ status: 200, body: { calls: 4, creates: 2, empty: [], local: [], removals: 0, folders: [], folder: "" } });
+  await tick();
+  check("SPD3 H1's stale /plan answer landing while H2 is open draws nothing on H2",
+        $$("sp-parts").hidden === false && /pop/.test($$("sp-chips").innerHTML) && doneHtml3() === "",
+        `parts.hidden=${$$("sp-parts").hidden} done=${doneHtml3()}`);
+  run(`spStopPolling()`);
+
+  // ---- scenario C: H1's draft landing late while H2 opens changes nothing
+
+  let resolveH1Draft;
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null } };
+  routes["GET /api/splitparts/H1"] = () => new Promise((resolve) => { resolveH1Draft = resolve; });
+  run(`spPid = null; spDraft = null;`);
+  run(`openSpHome({ id: "H1", name: "Big Home" })`);   // fire-and-forget: in flight on its own draft fetch
+  await tick();
+
+  await run(`openSpHome({ id: "H2", name: "Second Home" })`);
+  check("SPD3 opening H2 while H1's draft fetch is still in flight shows H2",
+        /pop/.test($$("sp-chips").innerHTML), $$("sp-chips").innerHTML);
+
+  const draftBefore = run(`JSON.stringify(spDraft)`);
+  resolveH1Draft({ status: 200, body: DRAFT_A });
+  await tick();
+  check("SPD3 H1's late draft does not change spDraft or the screen",
+        run(`JSON.stringify(spDraft)`) === draftBefore && /pop/.test($$("sp-chips").innerHTML),
+        run(`JSON.stringify(spDraft)`));
+  run(`spStopPolling()`);
+
+  // ---- item D: "which parts get created" is decided by key/content, never
+  // by matching a possibly-renamed display name against /plan's own
+  // suggested-name-based `empty` list ---------------------------------------
+
+  const songsD = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: true } };
+  const DRAFT_D = { playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2,
+    parts: [{ key: "p1", name: "rock", uris: ["u1"] }, { key: "p2", name: "jazz", uris: ["u2"] }],
+    unknown: [], hint: null, scores: {}, songs: songsD, tracks: [], done: null };
+  run(`spPid = "H1"; spDraft = ${JSON.stringify(DRAFT_D)}; spDoneChoicePid = null; spPlan = null;`);
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 2, creates: 1, empty: ["jazz"], local: ["Two"], removals: 0, folders: [], folder: "" } };
+  await run(`spOpenDone()`);
+  run(`spDoneChoice.names.p2 = "RenamedJazz"`);   // a custom name for the local-only (never-created) part
+  run(`renderSpDone()`);
+  check("SPD3 the editable screen's 'Not created' line matches by key/content, surviving a rename",
+        /Not created, no songs: RenamedJazz/.test(doneHtml3()), doneHtml3());
+  run(`spStopPolling()`);
+
+  const STARTED_D = { ...DRAFT_D, done: { opts: { original: "subset", part: null, names: { p2: "RenamedJazz" }, folder: null },
+                                           created: {}, filled: [], original_done: false } };
+  routes["GET /api/splitparts/H1"] = { status: 200, body: STARTED_D };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null } };
+  run(`spPid = null; spDraft = null;`);
+  resetLog();
+  await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+  check("SPD3 the locked finish screen excludes the renamed local-only part too, by key",
+        !/RenamedJazz/.test(doneHtml3()) && /rock/.test(doneHtml3()), doneHtml3());
+
+  // ---- item F: a non-404 draft-fetch failure in openSpHome offers Try
+  // again, not a silent fall-through to the counter screen -----------------
+
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null } };
+  routes["GET /api/splitparts/H1"] = { status: 500, body: { detail: "boom" } };
+  run(`spPid = null; spDraft = null;`);
+  resetLog();
+  await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+  check("SPD3 a non-404 draft-fetch failure shows the message with Try again, not the counter",
+        /boom/.test(doneHtml3()) && /id="sp-try-again"/.test(doneHtml3()) && $$("sp-setup").hidden === true,
+        doneHtml3());
+  routes["GET /api/splitparts/H1"] = { status: 200, body: DRAFT_A };
+  await run(`$("sp-try-again").onclick()`);
+  check("SPD3 ...and Try again reopens the home successfully",
+        $$("sp-parts").hidden === false, "");
 
   run(`spStopPolling(); show("lists")`);
 }
