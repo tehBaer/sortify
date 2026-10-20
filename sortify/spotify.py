@@ -64,6 +64,11 @@ SCOPES = " ".join(
 
 LIKED_ID = "liked"  # pseudo-playlist id for the user's Liked Songs
 
+# Tracks per DELETE /playlists/{id}/items. Batch removal works (two tracks in
+# one call, read back, probed 2026-10-20); the ceiling is set from the probe
+# recorded in CLAUDE.md, the same way batch add's 100 was.
+REMOVE_BATCH = 100
+
 # Local demand ceilings — the hard guarantee against ever earning another
 # multi-hour 429 cooldown. Feb-2026 dev-mode quotas are undocumented and
 # brutal, so these are set from observed damage rather than from the docs.
@@ -869,6 +874,30 @@ class Spotify:
         resp = self.request(
             "DELETE", f"/playlists/{playlist_id}/items", json={"items": [{"uri": uri}]}
         )
+        return (resp or {}).get("snapshot_id")
+
+    def remove_many(self, playlist_id: str, uris: list[str]) -> str | None:
+        """Remove tracks in batches of REMOVE_BATCH, one call per batch.
+
+        Every occurrence of a uri goes (Spotify removes by uri), so a
+        duplicate in `uris` is sent once. Returns the last batch's
+        snapshot_id, or None when there was nothing to remove (no call).
+        """
+        unique = list(dict.fromkeys(u for u in uris if u))
+        snap = None
+        for i in range(0, len(unique), REMOVE_BATCH):
+            batch = unique[i:i + REMOVE_BATCH]
+            resp = self.request(
+                "DELETE", f"/playlists/{playlist_id}/items",
+                json={"items": [{"uri": u} for u in batch]},
+            )
+            snap = (resp or {}).get("snapshot_id") or snap
+        return snap
+
+    def snapshot(self, playlist_id: str) -> str | None:
+        """The playlist's current snapshot_id: one call, nothing else read."""
+        resp = self.request("GET", f"/playlists/{playlist_id}",
+                            params={"fields": "snapshot_id"})
         return (resp or {}).get("snapshot_id")
 
     def save_to_liked(self, uri: str) -> None:
