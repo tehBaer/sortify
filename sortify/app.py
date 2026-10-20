@@ -858,6 +858,9 @@ def splitparts_get(pid: str):
 
 @app.delete("/api/splitparts/{pid}")
 def splitparts_discard(pid: str):
+    draft = spa.get_draft(store, pid)
+    if draft is not None and draft.get("done") is not None:
+        raise HTTPException(409, _SPLITPARTS_DONE_STARTED_MSG)
     spa.drop_draft(store, pid)
     return {"ok": True}
 
@@ -971,10 +974,15 @@ def _splitparts_seed_tracks(pid: str, snapshot_id: str | None, uris: list[str],
 
 def _splitparts_file(created: list[dict], folder: str) -> None:
     """File the new parts one after another: the mover drives one desktop
-    client, so the jobs must not overlap."""
+    client, so the jobs must not overlap. The listing comes from the cache
+    (zero calls), not `sp.my_playlists()` (~21 unpriced calls on a cold
+    one) — and it is re-read for every part, not once up front, because
+    remembering a part (sp.remember_playlist, called for each one in turn)
+    changes it."""
     def run():
         for c in created:
-            filing.start(c["id"], c["name"], folder, items=sp.my_playlists(),
+            items = (store.cache().get("playlist_list") or {}).get("items") or []
+            filing.start(c["id"], c["name"], folder, items=items,
                          on_success=lambda path, p=c["id"]: store.set_folder_path(p, path),
                          threaded=False)
     if _splitparts_threaded:
@@ -1027,21 +1035,37 @@ def _splitparts_run_done(pid: str, opts: dict) -> None:
             new_id = state["created"].get(key)
             if not new_id:
                 new_id, _ = sp.create_playlist_full(name)
+                # Record it before the config write below: a crash between
+                # the two must not leave this id unrecorded — that would
+                # make resume create a second playlist for the same part
+                # and orphan the first, forever untracked.
                 state["created"][key] = new_id
+                save()
                 cfg = store.config()
                 store.update_config(
                     home_ids=sorted(set(cfg.get("home_ids") or []) | {new_id}),
                     sticky_home_ids=sorted(set(cfg.get("sticky_home_ids") or []) | {new_id}))
-                save()
             if key not in state["filled"]:
-                snap = None
-                for b in range(0, len(part["uris"]), 100):
-                    snap = sp.add_to_playlist(new_id, part["uris"][b:b + 100]) or snap
+                uris = part["uris"]
+                added = state.setdefault("added", {})
+                snaps = state.setdefault("snap", {})
+                offset = added.get(key, 0)
+                snap = snaps.get(key)
+                # Resume from the batch that failed, not batch 0 — `added`
+                # and a per-batch save() are what make a part's add calls
+                # resumable without re-adding (and duplicating) songs
+                # already landed in a part bigger than one batch.
+                for b in range(offset, len(uris), 100):
+                    batch = uris[b:b + 100]
+                    snap = sp.add_to_playlist(new_id, batch) or snap
+                    added[key] = b + len(batch)
+                    snaps[key] = snap
+                    save()
                 snap = snap or f"created:{new_id}"
                 sp.remember_playlist({"id": new_id, "name": name, "owner": me,
-                                      "editable": True, "total": len(part["uris"]),
+                                      "editable": True, "total": len(uris),
                                       "snapshot_id": snap, "image": None, "description": ""})
-                _splitparts_seed_tracks(new_id, snap, part["uris"], full)
+                _splitparts_seed_tracks(new_id, snap, uris, full)
                 state["filled"].append(key)
                 save()
             created.append({"id": new_id, "name": name, "count": len(part["uris"])})
@@ -1091,6 +1115,10 @@ def splitparts_done(pid: str, body: SplitDoneIn):
     problem = _splitparts_name_problem([p["name"] for p in plan["new_parts"]])
     if problem:
         raise HTTPException(400, problem)
+    if body.folder:
+        choices, _ = _home_folder_choices(store.config(), pid)
+        if not any(c["path"] == body.folder and not c["blocked"] for c in choices):
+            raise HTTPException(400, f"{body.folder!r} is not an offered folder")
     with _splitparts_job_lock:
         if _splitparts_job.get("state") == "running":
             raise HTTPException(409, "already running")

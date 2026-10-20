@@ -418,7 +418,14 @@ from sortify.spotify import SpotifyError
 
 @pytest.fixture
 def env(drafted, monkeypatch):
-    appmod.store.update_config(input_name_pattern=r"^\[.+\]$")
+    appmod.store.update_config(input_name_pattern=r"^\[.+\]$",
+                               home_ids=["H1", "H2", "H3"],
+                               home_folder_prefixes=["ROOT"], home_folder_exclude=[])
+    # "ROOT / Mix" is offered (unblocked); "ROOT / Deep" is blocked because
+    # "ROOT / Deep / Sub" also exists — the client's folder search for "Deep"
+    # would also hit that subfolder (foldermove._check_leaf_unique).
+    appmod.store.save_folders({"H2": {"path": "ROOT / Mix"}, "H3": {"path": "ROOT / Deep"},
+                               "X9": {"path": "ROOT / Deep / Sub"}})
     log = []
     ids = iter(["N1", "N2", "N3", "N4", "N5"])
 
@@ -637,3 +644,112 @@ def test_reread_refuses_when_done_has_already_started(env):
 
     assert res.status_code == 409
     assert "Done has already started" in res.json()["detail"]
+
+
+# ---- fix round 1 -------------------------------------------------------
+
+
+def test_done_resumes_mid_batch_without_duplicating_added_songs(env, monkeypatch):
+    """p1 grows past 100 songs (two add batches). The second add call (the
+    second batch of p1) fails; resuming must continue from the batch that
+    failed, not redo the first batch, or every uri of the big part would be
+    added twice."""
+    def grow(dr):
+        p1 = dr["parts"][0]
+        p1["uris"] = p1["uris"] + [f"spotify:track:extra{i}" for i in range(140)]
+    edit_draft(grow)
+    big_uris = list(spa.get_draft(appmod.store, "H1")["parts"][0]["uris"])
+    assert len(big_uris) == 154
+
+    real_add = appmod.sp.add_to_playlist
+    calls = {"n": 0}
+
+    def flaky(pid, uris, bulk=False, spend_reserve=False):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise SpotifyError(429, "rate limited")
+        return real_add(pid, uris)
+
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", flaky)
+    body = {"names": {}, "folder": None, "original": "subset"}
+
+    env.post("/api/splitparts/H1/done", json=body)
+    assert progress(env)["state"] == "error"
+
+    env.post("/api/splitparts/H1/done", json=body)
+    assert progress(env)["state"] == "done"
+
+    adds = [e for e in env.log if e[0] == "add"]
+    added_to_p1 = [u for e in adds for u in e[2] if e[1] == "N1"]
+    assert sorted(added_to_p1) == sorted(big_uris)
+    assert len(added_to_p1) == len(set(added_to_p1)) == 154
+    all_added = [u for e in adds for u in e[2]]
+    assert len(all_added) == len(set(all_added))
+
+
+def test_done_refuses_an_unknown_folder_before_any_call(env):
+    res = env.post("/api/splitparts/H1/done", json={
+        "names": {}, "folder": "ROOT / Nowhere", "original": "subset"})
+
+    assert res.status_code == 400
+    assert env.log == [] and env.filed == []
+
+
+def test_done_refuses_a_blocked_folder_before_any_call(env):
+    res = env.post("/api/splitparts/H1/done", json={
+        "names": {}, "folder": "ROOT / Deep", "original": "subset"})
+
+    assert res.status_code == 400
+    assert env.log == [] and env.filed == []
+
+
+def test_discard_refuses_when_done_has_already_started(env):
+    draft = spa.get_draft(appmod.store, "H1")
+    draft["done"] = {"created": {"p1": "N1"}}
+    spa.put_draft(appmod.store, draft)
+
+    res = env.delete("/api/splitparts/H1")
+
+    assert res.status_code == 409
+    assert "Done has already started" in res.json()["detail"]
+    assert env.get("/api/splitparts/H1").status_code == 200
+
+
+def test_filing_uses_the_cached_listing_not_my_playlists(env, monkeypatch):
+    def boom(refresh=False):
+        raise AssertionError("filing must not pay for sp.my_playlists()")
+    monkeypatch.setattr(appmod.sp, "my_playlists", boom)
+
+    res = env.post("/api/splitparts/H1/done", json={
+        "names": {"p1": "Rocky", "p2": "Jazzy"}, "folder": "ROOT / Mix", "original": "subset"})
+
+    assert res.status_code == 200
+    assert progress(env)["state"] == "done"
+    assert [f[1] for f in env.filed] == ["Rocky", "Jazzy"]
+
+
+def test_created_id_is_saved_before_home_ids_are_updated(env, monkeypatch):
+    """A crash right after creating a part's playlist must not leave it an
+    unrecorded orphan: the draft needs to know about it before the
+    config write that marks it a home, not after."""
+    real_update_config = appmod.store.update_config
+    calls = {"n": 0}
+
+    def flaky_update_config(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom")
+        return real_update_config(**kwargs)
+
+    monkeypatch.setattr(appmod.store, "update_config", flaky_update_config)
+    body = {"names": {}, "folder": None, "original": "subset"}
+
+    env.post("/api/splitparts/H1/done", json=body)
+    assert progress(env)["state"] == "error"
+
+    draft = appmod.store.splitparts()["drafts"]["H1"]
+    assert draft["done"]["created"].get("p1") is not None
+
+    env.post("/api/splitparts/H1/done", json=body)
+    assert progress(env)["state"] == "done"
+    assert [e[0] for e in env.log].count("create") == 2   # p1 was not created twice
