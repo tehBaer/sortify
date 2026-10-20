@@ -71,7 +71,8 @@ class El {
   constructor(id) {
     this.id = id; this._html = ""; this.hidden = false; this.disabled = false;
     this.textContent = ""; this.value = ""; this.className = "";
-    this.dataset = {}; this.children = []; this.href = ""; this.style = {};
+    this.dataset = {}; this.children = []; this.href = "";
+    this.style = { setProperty(k, v) { this[k] = String(v); } };
     const cls = new Set();
     this.classList = {
       add: (c) => cls.add(c),
@@ -119,7 +120,9 @@ class El {
   }
   appendChild(c) { this.children.push(c); }
   setAttribute(k, v) { this[k] = String(v); }
-  scrollIntoView() {} focus() {} addEventListener() {}
+  scrollIntoView() {} focus() {}
+  // Recorded, not run: a check that needs one fires it itself (fireClick).
+  addEventListener(type, h) { ((this._ls ||= {})[type] ||= []).push(h); }
 }
 
 const reg = {};
@@ -1717,8 +1720,9 @@ run("stopNowPolling()");
         `peeked=${document.body.classList.contains("peeked")} ` +
         `peekedUri=${run("peekedUri")}`);
 
-  // The cover is its own button: it expands INSIDE the card, at the top,
-  // with the large image, the title and artist, and share under it.
+  // The cover hides behind the bar: tapping its peek (or pulling the bar,
+  // below) expands it INSIDE the card, at the top, with the large image, the
+  // title and artist, and share under it.
   routes["GET /api/now?light=1"].body.track =
     { uri: "spotify:track:br3", name: "Cover Song", artists: [{ name: "Cover Artist" }],
       sortable: true, image: "http://img/300", image_large: "http://img/640" };
@@ -1729,10 +1733,9 @@ run("stopNowPolling()");
   const card = () => $$("now-card").innerHTML;
   const panelOpen = () => card().includes('id="cover-panel"');
   run(`if (coverOpen) closeCover()`);
-  run(`$("btn-cover").onclick()`);
-  check("CV the cover button opens the large cover inside the card",
-        panelOpen() && /id="cover-panel"[\s\S]*src="http:\/\/img\/640"/.test(card()) &&
-        $$("btn-cover").classList.contains("on"),
+  run(`$("cover-peek").onclick()`);
+  check("CV the peek opens the large cover inside the card",
+        panelOpen() && /id="cover-panel"[\s\S]*src="http:\/\/img\/640"/.test(card()),
         `card=${card().slice(0, 300)}`);
   check("CV ...at the top of the card, above the playback strip",
         card().indexOf('id="cover-panel"') < card().indexOf("np-progress"),
@@ -1753,23 +1756,20 @@ run("stopNowPolling()");
   run(`$("btn-share").onclick()`);
   await tick();
   check("CV tapping share closes the cover and opens the share sheet",
-        !panelOpen() && $$("share-pop").hidden === false &&
-        !$$("btn-cover").classList.contains("on"),
+        !panelOpen() && $$("share-pop").hidden === false,
         `panel=${panelOpen()} share hidden=${$$("share-pop").hidden}`);
   $$("share-pop").hidden = true;
-  run(`$("btn-cover").onclick()`);
+  run(`$("cover-peek").onclick()`);
   run(`$("cover-panel").onclick()`);
-  check("CV a tap on it closes it",
-        !panelOpen() && !$$("btn-cover").classList.contains("on"), "");
-  run(`$("btn-cover").onclick()`);
-  run(`$("btn-cover").onclick()`);
-  check("CV a second press of the button closes it too", !panelOpen(), "");
+  check("CV a tap on it closes it", !panelOpen(), "");
+  check("CV the cover button is gone from the bar",
+        !/btn-cover/.test(fs.readFileSync(path.join(HERE, "..", "sortify", "static", "index.html"), "utf8")), "");
   run(`$("btn-reveal").onclick()`);
   check("CV the eye unblurs the reasons without opening the cover",
         document.body.classList.contains("peeked") && !panelOpen(), "");
   run(`setReveal(false)`);
 
-  run(`$("btn-cover").onclick()`);
+  run(`$("cover-peek").onclick()`);
   routes["GET /api/now?light=1"].body.track =
     { uri: "spotify:track:br4", name: "After Song", artists: [{ name: "After Artist" }],
       sortable: true, image: "http://img/x" };
@@ -1778,14 +1778,14 @@ run("stopNowPolling()");
   await tick();
   run("stopNowPolling()");
   check("CV the cover closes when the next track starts",
-        !panelOpen() && !$$("btn-cover").classList.contains("on") && !/After Song/.test(card()),
+        !panelOpen() && !/After Song/.test(card()),
         `panel=${panelOpen()}`);
 
   routes["GET /api/now?light=1"].body.track.image = null;
   run(`pollNow(true)`);
   await tick();
   run("stopNowPolling()");
-  run(`$("btn-cover").onclick()`);
+  run(`openCover()`);
   check("CV no cover, no panel — a toast says so",
         !panelOpen() && /no cover/.test($$("toast").textContent),
         `toast=${JSON.stringify($$("toast").textContent)}`);
@@ -1800,7 +1800,6 @@ run("stopNowPolling()");
   run(`pollNow(true)`);
   await tick();
   run("stopNowPolling()");
-  const btn = $$("btn-cover");
   const bar = $$("topbar");
   const pt = (y, t, x = 100) => ({ clientX: x, clientY: y, timeStamp: t, pointerId: 1 });
   check("PEEK the cover's edge peeks out under the bar, from this song's art",
@@ -1818,8 +1817,17 @@ run("stopNowPolling()");
   bar.onpointerup({});
   check("PULL with the menu open, the bar does not pull", !panelOpen() && !run("coverOpen"), "");
   $$("nav-pop").hidden = true;
-  // The click a real browser fires after every pointerup.
-  const click = () => btn.onclick();
+  // The click a real browser fires after every pointerup, through the bar's
+  // capture-phase listeners. Returns whether it was swallowed.
+  const click = () => {
+    let stopped = false;
+    const ev = { stopPropagation() { stopped = true; }, preventDefault() {} };
+    for (const h of bar._ls?.click || []) h(ev);
+    return stopped;
+  };
+  bar.onpointerdown(pt(10, 0));
+  bar.onpointerup(pt(10, 0));
+  check("PULL a plain tap on the bar reaches its button", click() === false, "");
   bar.onpointerdown(pt(10, 0));
   bar.onpointermove(pt(13, 50));
   check("PULL a few pixels is still a tap, not a pull",
@@ -1827,23 +1835,25 @@ run("stopNowPolling()");
   bar.onpointermove(pt(100, 400));
   check("PULL dragging down draws the panel at the finger's size",
         panelOpen() && Math.abs(run("coverPull") - 0.25) < 1e-9 &&
-        $$("cover-panel").style.gridTemplateRows === "0.25fr" && !card().includes("cover-panel cover-in"),
-        `pull=${run("coverPull")} rows=${$$("cover-panel").style.gridTemplateRows}`);
+        $$("cover-panel").style["--f"] === "0.25" && !card().includes("cover-panel cover-in"),
+        `pull=${run("coverPull")} f=${$$("cover-panel").style["--f"]}`);
   run(`renderNow()`);
   check("PULL a re-render mid-pull keeps the pulled size",
-        card().includes('style="grid-template-rows:0.25fr"'), card().slice(0, 200));
+        card().includes('style="--f:0.25"'), card().slice(0, 200));
   bar.onpointermove(pt(160, 1000));
   bar.onpointerup(pt(160, 1000));
-  click();
+  const swallowed = click();
   check("PULL released past the line, it opens and the click is not a tap",
-        panelOpen() && run("coverOpen") && run("coverPull") === null &&
-        btn.classList.contains("on"), `open=${run("coverOpen")} pull=${run("coverPull")}`);
+        panelOpen() && run("coverOpen") && run("coverPull") === null && swallowed,
+        `open=${run("coverOpen")} pull=${run("coverPull")} swallowed=${swallowed}`);
+  check("PULL ...and only that one click is swallowed", click() === false, "");
   bar.onpointerdown(pt(10, 0));
   bar.onpointermove(pt(100, 400));
   check("PULL an open cover is not pulled again", run("coverPull") === null, "");
   bar.onpointerup(pt(100, 400));
   click();
-  check("PULL ...a tap still closes it", !panelOpen() && !run("coverOpen"), "");
+  $$("cover-panel").onclick();
+  check("PULL ...a tap on it still closes it", !panelOpen() && !run("coverOpen"), "");
 
   bar.onpointerdown(pt(10, 0));
   bar.onpointermove(pt(40, 400));
@@ -1851,10 +1861,9 @@ run("stopNowPolling()");
   bar.onpointerup(pt(60, 800));
   click();
   check("PULL released short of the line, it collapses...",
-        run("coverPull") === 0 && $$("cover-panel").style.gridTemplateRows === "0fr", "");
+        run("coverPull") === 0 && $$("cover-panel").style["--f"] === "0", "");
   await new Promise((r) => setTimeout(r, 260));
-  check("PULL ...and then closes", !panelOpen() && !run("coverOpen") &&
-        !btn.classList.contains("on"), `open=${run("coverOpen")}`);
+  check("PULL ...and then closes", !panelOpen() && !run("coverOpen"), `open=${run("coverOpen")}`);
 
   bar.onpointerdown(pt(10, 0));
   bar.onpointermove(pt(30, 10));
@@ -1879,11 +1888,8 @@ run("stopNowPolling()");
   bar.onpointerdown(pt(10, 0));
   bar.onpointermove(pt(100, 400));
   bar.onpointerup(pt(100, 400));
-  btn.onclick();
   check("PEEK no art, no peek", $$("cover-peek").hidden === true, "");
-  check("PULL no cover: no pull, and the click's toast says why",
-        !panelOpen() && !run("coverOpen") && /no cover/.test($$("toast").textContent),
-        `toast=${JSON.stringify($$("toast").textContent)}`);
+  check("PULL no cover: the bar does not pull", !panelOpen() && !run("coverOpen"), "");
 
   // A poll that never reaches the server ("Failed to fetch") says so with a
   // Try again, which polls again at once instead of waiting out the 90s.

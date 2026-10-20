@@ -48,7 +48,6 @@ header {
 }
 h1 { font-size: 1.15rem; margin: 0; cursor: pointer; flex-shrink: 0; }
 body:not(.on-now) #btn-input-switch,
-body:not(.on-now) #btn-cover,
 body:not(.on-now) .now-top-actions { display: none; }
 nav { display: flex; gap: 1rem; }
 nav a { cursor: pointer; color: var(--muted); font-size: .95rem;
@@ -405,9 +404,7 @@ header .icon-btn::after {
    is what was in it. On the Now view the word "sortify" is the one thing on
    screen that tells you nothing — the hamburger still opens the nav, and the
    switcher in its place says what you are filing out of. Everywhere else the
-   title stays. The cover button sits in that left-hand space too: the
-   right end already holds the eye and refresh, and a third icon there
-   ran into the switcher at 390px. */
+   title stays. */
 body.on-now header h1 { visibility: hidden; }
 
 /* playback strip: elapsed / bar / total, then the two round buttons */
@@ -1055,23 +1052,42 @@ body.previewing .picker-inner { max-height: min(80vh, calc(100dvh - 19rem)); }
 body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
   filter: blur(5px);
 }
-#btn-reveal.on, #btn-cover.on { color: var(--accent); }
+#btn-reveal.on { color: var(--accent); }
 
-/* The cover, opened inside the card by its own button: full card width,
-   the title, artist and share under it. It expands open (the row grows from
-   nothing) and pushes the controls down; a tap on it closes it. */
-.cover-panel { display: grid; grid-template-rows: 1fr; margin-bottom: .9rem; cursor: pointer; }
-.cover-panel-inner { min-height: 0; overflow: hidden; }
-.cover-panel.cover-in { animation: cover-expand .3s cubic-bezier(.2, .8, .2, 1); }
-.cover-panel.cover-in img { animation: cover-grow .3s cubic-bezier(.2, .8, .2, 1); }
-@keyframes cover-expand { from { grid-template-rows: 0fr; } }
-@keyframes cover-grow { from { transform: scale(.6); opacity: 0; } }
-.track-card .cover-panel img {
-  display: block; width: 100%; height: auto; aspect-ratio: 1;
-  border-radius: 12px; object-fit: cover; box-shadow: none;
-  transform-origin: top center;
+/* The cover, pulled down from the bar into the card: full card width,
+   the title, artist and share under it; a tap on it closes it. It comes
+   down like a blind, continuing the grey edge that peeked under the bar:
+   the shade opens from nothing, anchored so the image's BOTTOM edge leads,
+   and the image goes from blurred grey to sharp colour as it opens. The
+   title and artist come in over the last stretch. Everything reads one
+   number, --f (0 shut, 1 open): a pull sets it inline, the tap's opening
+   animates it, a release transitions it. Registered so it can animate. */
+@property --f { syntax: "<number>"; inherits: true; initial-value: 1; }
+.cover-panel { margin-bottom: .9rem; cursor: pointer; }
+.cover-shade {
+  position: relative; overflow: hidden; border-radius: 12px;
+  /* Square, so its full height is its width: padding % reads the width. */
+  height: 0; padding-top: calc(var(--f) * 100%);
 }
-.cover-info { display: flex; align-items: center; gap: .5rem; margin-top: .7rem; }
+.track-card .cover-panel .cover-shade img {
+  position: absolute; left: 0; bottom: 0;
+  display: block; width: 100%; height: auto; aspect-ratio: 1;
+  object-fit: cover; box-shadow: none; border-radius: 0;
+  filter: grayscale(calc(1 - var(--f))) blur(calc((1 - var(--f)) * 8px));
+  /* Blur pulls the background in at the edges; a little overscale while it
+     is blurred pushes that soft rim outside the shade, which clips it. */
+  transform: scale(calc(1 + (1 - var(--f)) * .08));
+}
+.cover-panel.cover-in { animation: cover-down .35s cubic-bezier(.2, .8, .2, 1); }
+@keyframes cover-down { from { --f: 0; } }
+/* Takes its room only as it fades in, so a short pull does not open a gap
+   between the strip of cover and the controls under it. */
+.cover-info {
+  --in: clamp(0, calc((var(--f) - .7) * 3.4), 1);
+  display: flex; align-items: center; gap: .5rem; overflow: hidden;
+  margin-top: calc(var(--in) * .7rem); max-height: calc(var(--in) * 4rem);
+  opacity: var(--in);
+}
 .cover-text { flex: 1; min-width: 0; text-align: left; }
 .cover-title, .cover-artist { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cover-title { font-weight: 700; font-size: 1.05rem; }
@@ -1083,8 +1099,9 @@ body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
    release the rest plays out. */
 body.on-now header { touch-action: none; user-select: none; -webkit-user-select: none; }
 body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { touch-action: auto; }
-/* The cover behind the bar: its bottom edge, blurred to colour, as a thin
-   lip under the bar, with a grab pill. Overlaid, so it moves no layout. */
+/* The cover behind the bar: its bottom edge, blurred and grey, as a thin
+   lip under the bar, with a grab pill. Grey because it is still hidden:
+   the colour comes with the cover. Overlaid, so it moves no layout. */
 #cover-peek {
   position: absolute; left: 0; right: 0; top: 100%; height: 10px;
   overflow: hidden; cursor: pointer;
@@ -1094,7 +1111,7 @@ body:not(.on-now) #cover-peek { display: none; }
 #cover-peek-art {
   position: absolute; inset: -16px;
   background: center bottom / cover no-repeat;
-  filter: blur(8px) saturate(1.4);
+  filter: blur(8px) grayscale(1);
 }
 .peek-grip {
   position: absolute; left: 50%; top: 3px; width: 36px; height: 4px; margin-left: -18px;
@@ -1102,11 +1119,10 @@ body:not(.on-now) #cover-peek { display: none; }
   border-radius: 2px; background: rgba(255, 255, 255, .9);
   box-shadow: 0 0 0 1px rgba(0, 0, 0, .2);
 }
-.cover-panel.cover-settle { transition: grid-template-rows .2s cubic-bezier(.2, .8, .2, 1); }
-.cover-panel.cover-settle img { transition: transform .2s cubic-bezier(.2, .8, .2, 1), opacity .2s; }
+.cover-panel.cover-settle { transition: --f .2s cubic-bezier(.2, .8, .2, 1); }
 @media (prefers-reduced-motion: reduce) {
-  .cover-panel.cover-in, .cover-panel.cover-in img { animation: none; }
-  .cover-panel.cover-settle, .cover-panel.cover-settle img { transition: none; }
+  .cover-panel.cover-in { animation: none; }
+  .cover-panel.cover-settle { transition: none; }
 }
 
 #toast {

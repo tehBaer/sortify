@@ -1981,7 +1981,7 @@ function renderNow() {
   // a pause toggle, the suggestions arriving) is not an arrival.
   const cardFresh = enterOnce("card", tr.uri) ? " card-fresh" : "";
   // Before filing the card names the song in one place only: the cover
-  // panel, opened by its own button (openCover). Nothing else on it does.
+  // panel, pulled down from the bar (openCover). Nothing else on it does.
   $("now-card").innerHTML = `<div class="track-card${cardFresh}${d.is_playing ? "" : " is-paused"}">
     ${coverOpen && tr.image ? coverPanel(tr) : ""}
     ${playbackStrip(d, tr)}
@@ -2842,8 +2842,9 @@ async function undoStripAction() {
 // The card never names what is playing: the ear decides, not the name. The
 // title, artist and album are not on the card at all. The eye in the bar
 // only unblurs the suggestion REASONS (they leak artist names), so pressing
-// it moves nothing on screen. The cover is the other button: it opens the
-// art inside the card with the title, artist and share. Both last one track:
+// it moves nothing on screen. The cover hides behind the top bar: pulling the
+// bar down (or tapping its peek) opens the art inside the card with the
+// title, artist and share. Both last one track:
 // renderNow drops them as soon as the playing uri is no longer the one they
 // were opened for.
 
@@ -2877,10 +2878,6 @@ let coverFresh = false;
 let coverPull = null;
 let coverDragged = false;
 
-function setCoverBtn(on) {
-  $("btn-cover").classList.toggle("on", on);
-  $("btn-cover").setAttribute("aria-pressed", on ? "true" : "false");
-}
 function openCover() {
   const t = nowState?.track;
   if (!t) { toast("nothing playing"); return; }
@@ -2888,7 +2885,6 @@ function openCover() {
   coverOpen = true;
   coverUri = t.uri || null;
   coverFresh = true;
-  setCoverBtn(true);
   renderNow();
 }
 // `rerender` is false only from inside renderNow, which is already drawing.
@@ -2896,14 +2892,8 @@ function closeCover(rerender = true) {
   coverOpen = false;
   coverUri = null;
   coverPull = null;
-  setCoverBtn(false);
   if (rerender) renderNow();
 }
-$("btn-cover").onclick = () => {
-  // The click a drag ends with is not a tap.
-  if (coverDragged) { coverDragged = false; return; }
-  coverOpen ? closeCover() : openCover();
-};
 
 // The whole top bar can be pulled downward: the cover opens under the finger,
 // as far as it has travelled, and lets go into open past COVER_PULL_OPEN (or
@@ -2917,11 +2907,7 @@ const COVER_PULL_START = 6;     // px before a press becomes a pull
 const COVER_PULL_OPEN = 0.3;    // fraction past which a release opens
 const COVER_FLICK = 0.5;        // px/ms downward that opens regardless
 function paintCoverPull(f) {
-  const panel = $("cover-panel");
-  if (!panel) return;
-  panel.style.gridTemplateRows = `${f}fr`;
-  const img = panel.querySelector("img");
-  if (img) { img.style.transform = `scale(${0.6 + 0.4 * f})`; img.style.opacity = String(f); }
+  $("cover-panel")?.style.setProperty("--f", String(f));
 }
 
 // Let go: settle the panel the rest of the way, open or closed.
@@ -2931,7 +2917,6 @@ function settleCoverPull(open) {
   if (panel) panel.classList.add("cover-settle");
   if (open) {
     coverPull = null;
-    setCoverBtn(true);
     paintCoverPull(1);
     return;
   }
@@ -2944,8 +2929,8 @@ function settleCoverPull(open) {
 }
 
 // What says the cover is up there: the bottom edge of this song's art, peeking
-// out under the bar as a thin band with a grab pill on it. Blurred to colour
-// only, so it hints without naming the song. Shown while a track with art
+// out under the bar as a thin band with a grab pill on it. Blurred and grey,
+// so it hints without naming the song. Shown while a track with art
 // is on the card and the cover is shut; a tap on it opens the cover too.
 let coverPeekSrc = null;
 function paintCoverPeek(d) {
@@ -2994,8 +2979,8 @@ $("cover-peek").onclick = () => { if (!coverOpen) openCover(); };
       coverFresh = false;
       coverPull = 0;
       renderNow();
-      const inner = $("cover-panel")?.querySelector(".cover-panel-inner");
-      full = inner?.scrollHeight || 360;
+      // The cover is square and card-wide: fully down at one width of travel.
+      full = $("cover-panel")?.clientWidth || 360;
     }
     if (coverPull === null) { y0 = null; return; }   // the track changed under it
     if (e.timeStamp > lastT) speed = (e.clientY - lastY) / (e.timeStamp - lastT);
@@ -3019,9 +3004,7 @@ function coverPanel(tr) {
   const fresh = coverFresh ? " cover-in" : "";
   coverFresh = false;
   // Mid-pull the panel is drawn at the pull's size (see wireCoverPull).
-  const f = coverPull;
-  const pull = f === null ? "" : ` style="grid-template-rows:${f}fr"`;
-  const imgPull = f === null ? "" : ` style="transform:scale(${0.6 + 0.4 * f});opacity:${f}"`;
+  const pull = coverPull === null ? "" : ` style="--f:${coverPull}"`;
   const artists = tr.artists.map((a) => a.name).join(", ");
   // Share needs a real track; local files and episodes have no
   // spotify:track: uri and the tablet flow can't find them by title anyway.
@@ -3030,8 +3013,11 @@ function coverPanel(tr) {
         <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>
       </button>`
     : "";
-  return `<div id="cover-panel" class="cover-panel${fresh}"${pull}><div class="cover-panel-inner">
-      <img src="${esc(tr.image_large || tr.image)}" alt=""${imgPull}>
+  // The cover comes down like a blind: the shade shows the image's bottom
+  // edge first, the part that peeked out under the bar, and colour comes in
+  // as it opens. `--f` (0..1) is how far; style.css draws everything from it.
+  return `<div id="cover-panel" class="cover-panel${fresh}"${pull}>
+      <div class="cover-shade"><img src="${esc(tr.image_large || tr.image)}" alt=""></div>
       <div class="cover-info">
         <div class="cover-text">
           <div class="cover-title">${esc(tr.name)}</div>
@@ -3039,7 +3025,7 @@ function coverPanel(tr) {
         </div>
         ${share}
       </div>
-    </div></div>`;
+    </div>`;
 }
 // Wired after each render that draws the panel (renderNow).
 function wireCoverPanel() {
