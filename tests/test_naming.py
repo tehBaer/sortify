@@ -84,36 +84,6 @@ def test_violations_empty_when_everything_conforms():
     assert violations(ok, input_ids=set(), home_ids={"h2"}) == []
 
 
-# ---- split_output_name: {source} · pile ------------------------------------
-
-from sortify.naming import split_output_name
-
-
-def test_split_output_name_composes_with_the_pile_separator():
-    assert split_output_name("{teh bomb}", "jazz · funk · Bossa Nova") == \
-        "{teh bomb} · jazz · funk · Bossa Nova"
-
-
-def test_split_output_name_without_source_is_the_bare_pile_name():
-    assert split_output_name(None, "untagged") == "untagged"
-    assert split_output_name("  ", "untagged") == "untagged"
-
-
-def test_split_output_name_truncates_the_pile_half_not_the_source():
-    source = "S" * 40
-    out = split_output_name(source, "p" * 90)
-    assert len(out) <= 100
-    assert out.startswith(source + " · ")
-    assert out.endswith("…")
-
-
-def test_split_output_name_degenerate_source_survives_alone():
-    # A source name so long no pile half fits: the source is the grouping
-    # key, so it wins and the pile half is dropped entirely.
-    out = split_output_name("S" * 99, "jazz")
-    assert out == "S" * 99
-
-
 def test_split_output_titles_trip_no_naming_rules():
     # Design §3: split outputs are created unmarked, and the title shape must
     # not fullmatch the input pattern — so an unmarked output draws no

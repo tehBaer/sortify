@@ -64,6 +64,11 @@ SCOPES = " ".join(
 
 LIKED_ID = "liked"  # pseudo-playlist id for the user's Liked Songs
 
+# Tracks per DELETE /playlists/{id}/items. Batch removal works (two tracks in
+# one call, read back, probed 2026-10-20), but its ceiling is unprobed: 100 is
+# assumed, like batch add's probed 100, until a probe says otherwise.
+REMOVE_BATCH = 100
+
 # Local demand ceilings — the hard guarantee against ever earning another
 # multi-hour 429 cooldown. Feb-2026 dev-mode quotas are undocumented and
 # brutal, so these are set from observed damage rather than from the docs.
@@ -90,12 +95,13 @@ WINDOW_CAP = 12       # calls per rolling 60s
 # more than a few dozen calls a day.
 BACKGROUND_DAILY_CAP = 40
 
-# The queued materialiser's spend class: user-initiated but unattended. It
+# The bulk spend class (`bulk=True`): user-approved but unattended work. It
 # counts toward DAILY_CAP, but the day's LAST 150 calls are reserved for the
-# user's own interactive clicks — the bulk job sleeps to local midnight
-# instead of spending them. (Spec 2026-08-18, decision 3.) A run enqueued
-# with spend_reserve=True opts out per run (2026-08-20): the reserve line
-# moves to DAILY_CAP itself, trading interactive headroom for finishing.
+# user's own interactive clicks — a bulk call is refused rather than spend
+# them. (Spec 2026-08-18, decision 3; the queued materialiser it was built
+# for is gone since 2026-10-20.) spend_reserve=True opts a caller out: the
+# reserve line moves to DAILY_CAP itself, trading interactive headroom for
+# finishing.
 BULK_RESERVE = 150
 
 # Background work also yields once the day is half spent: at that point the
@@ -142,7 +148,8 @@ class AuthFlowError(SpotifyError):
 
 
 # Serialises read-modify-write on cache["playlist_list"] between the refresh
-# that replaces the listing and the prune that removes swept sittings from it.
+# that replaces the listing and the prune that removes an unfollowed
+# playlist from it.
 _LIST_LOCK = threading.Lock()
 
 
@@ -272,16 +279,18 @@ class Spotify:
         return usage.get("bulk", 0)
 
     def bulk_block_reason(self, spend_reserve: bool = False) -> tuple[str, float] | None:
-        """Why the bulk worker must not call right now — None means go.
+        """Why an unattended bulk job must not call right now — None means go.
 
         Returns (reason, resume_at). QUIET_AFTER_COOLDOWN applies here on
         purpose: this rail survived the enricher's deletion named for "the
-        next proactive job", and the queued materialiser is that job.
+        next proactive job". The queued materialiser that used it is gone
+        (2026-10-20); no production caller remains, and the rail is kept for the next
+        unattended job rather than rebuilt from memory.
 
-        spend_reserve is the per-run opt-out (queue.json's flag): the reserve
-        line moves to DAILY_CAP itself, so the run finishes instead of
-        sleeping at DAILY_CAP - BULK_RESERVE. The cooldown/quiet rails are
-        not the reserve's business and always apply.
+        spend_reserve is the caller's opt-out: the reserve line moves to
+        DAILY_CAP itself, so a job finishes instead of stopping at
+        DAILY_CAP - BULK_RESERVE. The cooldown/quiet rails are not the
+        reserve's business and always apply.
         """
         floor = DAILY_CAP if spend_reserve else DAILY_CAP - BULK_RESERVE
         now = time.time()
@@ -601,9 +610,9 @@ class Spotify:
         """Drop ids from the cached listing after they have been unfollowed.
 
         Costs nothing and touches no network. Without it the listing keeps
-        advertising playlists that no longer exist, so a swept sitting would
-        be re-offered as an orphan on every Playlists view until the next
-        manual refresh — cleanup that visibly does nothing.
+        advertising playlists that no longer exist, so an unfollowed
+        playlist would be re-offered as an orphan on every Playlists view
+        until the next manual refresh — cleanup that visibly does nothing.
 
         Read-modify-write under a lock local to this file, which is the same
         lock the refresh path takes. A refresh that lands between this read
@@ -692,11 +701,10 @@ class Spotify:
                     "total": meta.get("total"),
                     "snapshot_id": p.get("snapshot_id"),
                     "image": images[-1].get("url") if images else None,
-                    # Kept so a sitting playlist can be recognised from the
-                    # cached listing alone, at zero calls. It arrives in this
-                    # same response either way; discarding it was what forced
-                    # sitting cleanup to trust splits.json instead of the
-                    # account. `or ""` because Spotify sends null here.
+                    # Kept so a playlist sortify created can be recognised
+                    # from the cached listing alone, at zero calls. It
+                    # arrives in this same response either way. `or ""`
+                    # because Spotify sends null here.
                     "description": p.get("description") or "",
                 }
             )
@@ -898,6 +906,30 @@ class Spotify:
         )
         return (resp or {}).get("snapshot_id")
 
+    def remove_many(self, playlist_id: str, uris: list[str]) -> str | None:
+        """Remove tracks in batches of REMOVE_BATCH, one call per batch.
+
+        Every occurrence of a uri goes (Spotify removes by uri), so a
+        duplicate in `uris` is sent once. Returns the last batch's
+        snapshot_id, or None when there was nothing to remove (no call).
+        """
+        unique = list(dict.fromkeys(u for u in uris if u))
+        snap = None
+        for i in range(0, len(unique), REMOVE_BATCH):
+            batch = unique[i:i + REMOVE_BATCH]
+            resp = self.request(
+                "DELETE", f"/playlists/{playlist_id}/items",
+                json={"items": [{"uri": u} for u in batch]},
+            )
+            snap = (resp or {}).get("snapshot_id") or snap
+        return snap
+
+    def snapshot(self, playlist_id: str) -> str | None:
+        """The playlist's current snapshot_id: one call, nothing else read."""
+        resp = self.request("GET", f"/playlists/{playlist_id}",
+                            params={"fields": "snapshot_id"})
+        return (resp or {}).get("snapshot_id")
+
     def save_to_liked(self, uri: str) -> None:
         self.request("PUT", "/me/library", json={"uris": [uri]})
 
@@ -913,7 +945,7 @@ class Spotify:
         without ever probing for it.
 
         `public` defaults False, which is what every caller in the app wants:
-        a filing destination, a sitting, a split output — none of them are
+        a filing destination, a split output — none of them are
         for an audience. Whether the CREATE honours `public=True` is
         unverified, unlike `PUT /playlists/{id}` with `{"public": true}`,
         which was read back and confirmed on 2026-08-31. So a caller who
@@ -945,9 +977,10 @@ class Spotify:
     def unfollow_playlist(self, playlist_id: str) -> None:
         """Discard a whole playlist in one call.
 
-        Why a sitting is disposable: one call removes the whole playlist.
-        (The old reason, "no batch delete", was wrong — removing several
-        tracks in one DELETE works, probed 2026-10-20 — but discarding the
-        playlist is still the cheapest way to clear it.)
+        Why discarding a disposable playlist outright is cheap: one call
+        removes the whole thing. (The old reason, "no batch delete", was
+        wrong — removing several tracks in one DELETE works, probed
+        2026-10-20 — but discarding the playlist is still the cheapest way
+        to clear it.)
         """
         self.request("DELETE", f"/playlists/{playlist_id}/followers")

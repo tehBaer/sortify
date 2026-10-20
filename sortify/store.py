@@ -58,8 +58,8 @@ class Store:
     # - usage.json and everything the budget ledger touches: the Spotify
     #   budget must never act on a stale read (CLAUDE.md), and the files are
     #   tiny anyway.
-    # - config/queue/pacing/splits/…: sub-millisecond parses; caching buys
-    #   nothing and widens the mutate-nothing contract for free.
+    # - config/…: sub-millisecond parses; caching buys nothing and widens
+    #   the mutate-nothing contract for free.
     # folders.json rides along (2026-08-28, sortify-d0's suggestion): 95KB
     # /~1.7ms but read on every light poll via _effective_input_ids and ~once
     # per input inside each profile build, and it is as write-once as the
@@ -183,6 +183,17 @@ class Store:
     def save_preview_rejects(self, mapping: dict) -> None:
         self._save("preview_rejects.json", mapping)
 
+    # splitparts.json: {version, drafts: {playlist_id: draft}} — the
+    # split-into-parts drafts. Every move the user makes is written here at
+    # once, so leaving the Split tab and coming back restores the split.
+    SPLITPARTS_DEFAULT = {"version": 1, "drafts": {}}
+
+    def splitparts(self) -> dict:
+        return self._versioned("splitparts.json", self.SPLITPARTS_DEFAULT)
+
+    def save_splitparts(self, payload: dict) -> None:
+        self._save("splitparts.json", payload)
+
     # usage.json: {day, count} — local daily API-call budget accounting
     def usage(self) -> dict:
         return self._load("usage.json", {"day": "", "count": 0})
@@ -214,10 +225,11 @@ class Store:
     def tag_artists(self) -> dict:
         """The inner `{artist_id: record}` map.
 
-        This is what `tags.enrich(cached=...)` and `split.split_tracks(tags=...)`
-        take. Handing either of them the envelope fails silently: enrich finds
-        no artist ids and re-fetches the whole library, split finds no tags and
-        calls every track untagged.
+        This is what `tags.enrich(cached=...)` and `splitparts.build_signals
+        (tag_artists=...)` take. Handing either of them the envelope fails
+        silently: enrich finds no artist ids and re-fetches the whole
+        library, build_signals finds no tags and treats every track as
+        untagged.
         """
         artists = self.tags().get("artists")
         return artists if isinstance(artists, dict) else {}
@@ -231,45 +243,14 @@ class Store:
         """Wrap an inner artists map in the current envelope and store it."""
         self._save("tags.json", {"version": TAGS_VERSION, "artists": artists})
 
-    # splits.json: {playlist_id: {piles, decided, params, ...}}
-    # Piles are virtual — materialising them all would cost ~1384 calls.
-    def splits(self) -> dict:
-        return self._load("splits.json", {"version": 1, "splits": {}})
-
-    def save_splits(self, payload: dict) -> None:
-        self._save("splits.json", payload)
-
-    # queue.json / pacing.json: the queued materialiser's persisted state.
-    # boxdash reads BOTH files directly (its house pattern), so their shape is
-    # a published contract: versioned envelopes, guard-on-read like tags.json,
-    # written atomically (0600 via mkstemp) so a half-written file is never
-    # visible and the card keeps working while sortify is down.
-    QUEUE_DEFAULT = {"version": 1, "playlist_id": None, "pending": [],
-                     "current": None, "state": "stopped", "stop_reason": None,
-                     "progress": {}, "enqueued_at": None, "updated_at": None}
-    PACING_DEFAULT = {"version": 1, "rate_per_min": 1.8, "ceiling": 7.0,
-                      "clean_since": None, "max_clean_rate": None,
-                      "history_429": [], "updated_at": None}
-
     def _versioned(self, name: str, default: dict) -> dict:
-        # dict(default) is a shallow copy: nested mutables like "pending": []
-        # would still be the SAME list object as QUEUE_DEFAULT's, so mutating
-        # a freshly-defaulted read (e.g. q["pending"].append(...)) silently
-        # poisons every later default read (ruling R-T8e) — deepcopy instead.
+        # dict(default) is a shallow copy: a nested mutable in `default`
+        # would still be the SAME object across every caller, so mutating
+        # a freshly-defaulted read (e.g. appending to a list inside it)
+        # silently poisons every later default read (ruling R-T8e) —
+        # deepcopy instead.
         data = self._load(name, copy.deepcopy(default))
         return data if isinstance(data, dict) and data.get("version") == default["version"] else copy.deepcopy(default)
-
-    def queue(self) -> dict:
-        return self._versioned("queue.json", self.QUEUE_DEFAULT)
-
-    def save_queue(self, payload: dict) -> None:
-        self._save("queue.json", payload)
-
-    def pacing(self) -> dict:
-        return self._versioned("pacing.json", self.PACING_DEFAULT)
-
-    def save_pacing(self, payload: dict) -> None:
-        self._save("pacing.json", payload)
 
     # lastfm_tracks.json: rebuildable Last.fm track-level cache (getSimilar +
     # track top tags), keyed by tags.track_key(artist, title). Deliberately

@@ -651,3 +651,57 @@ def test_whoami_makes_no_call_during_a_cooldown(sp, monkeypatch):
 
     assert e.value.status == 429
     assert called == []
+
+
+# ---- batched removal and snapshot reads (split into parts) -----------------
+
+
+def _recorder(sp, monkeypatch, payload=None):
+    sent = []
+
+    def fake_request(method, url, **kwargs):
+        sent.append({"method": method, "url": url, "json": kwargs.get("json"),
+                     "params": kwargs.get("params")})
+        return FakeResponse(200, payload if payload is not None else {"snapshot_id": f"s{len(sent)}"})
+
+    monkeypatch.setattr(sp.http, "request", fake_request)
+    return sent
+
+
+def test_remove_many_sends_one_call_per_batch(sp, monkeypatch):
+    from sortify import spotify as spmod
+
+    monkeypatch.setattr(spmod, "REMOVE_BATCH", 2)
+    sent = _recorder(sp, monkeypatch)
+
+    snap = sp.remove_many("P1", ["u1", "u2", "u3"])
+
+    assert [s["method"] for s in sent] == ["DELETE", "DELETE"]
+    assert sent[0]["url"].endswith("/playlists/P1/items")
+    assert sent[0]["json"] == {"items": [{"uri": "u1"}, {"uri": "u2"}]}
+    assert sent[1]["json"] == {"items": [{"uri": "u3"}]}
+    assert snap == "s2"
+
+
+def test_remove_many_sends_a_duplicate_once(sp, monkeypatch):
+    sent = _recorder(sp, monkeypatch)
+
+    sp.remove_many("P1", ["u1", "u1", "u2"])
+
+    assert sent[0]["json"] == {"items": [{"uri": "u1"}, {"uri": "u2"}]}
+
+
+def test_remove_many_with_nothing_makes_no_call(sp, monkeypatch):
+    sent = _recorder(sp, monkeypatch)
+
+    assert sp.remove_many("P1", []) is None
+    assert sent == []
+
+
+def test_snapshot_reads_only_the_snapshot_id(sp, monkeypatch):
+    sent = _recorder(sp, monkeypatch, {"snapshot_id": "abc"})
+
+    assert sp.snapshot("P1") == "abc"
+    assert sent[0]["method"] == "GET"
+    assert sent[0]["url"].endswith("/playlists/P1")
+    assert sent[0]["params"] == {"fields": "snapshot_id"}

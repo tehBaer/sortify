@@ -195,11 +195,11 @@ class FakeFmFull(FakeFm):
 @pytest.fixture
 def isolated_now(monkeypatch):
     """Same isolation as test_now_polling.py's route_client: a clean cache /
-    config / splits / tags snapshot restored after the test, and the shared
+    config / tags snapshot restored after the test, and the shared
     profile cache reset so it always rebuilds off this test's fixtures."""
     s = Store()
     original_cache, original_config = s.cache(), s.config()
-    original_splits, original_tags = s.splits(), s.tags()
+    original_tags = s.tags()
 
     cache = s.cache()
     cache["playlist_list"] = {"fetched_at": 0.0, "items": NOW_LISTING}
@@ -232,7 +232,6 @@ def isolated_now(monkeypatch):
         s = Store()
         s.save_cache(original_cache)
         s.save_config(original_config)
-        s.save_splits(original_splits)
         s.save_tags(original_tags)
         appmod._profile_state.clear()
         appmod._profile_state["built_at"] = 0.0

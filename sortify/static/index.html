@@ -57,10 +57,6 @@
 
 <main>
   <section id="view-now" hidden>
-    <div id="now-sitting-bar" class="row sitting-banner" hidden>
-      <span id="now-sitting-status" class="hint"></span>
-      <button id="btn-now-finish-sitting">Finish sitting</button>
-    </div>
     <div id="now-card"><p class="done-msg">Checking what's playing…</p></div>
   </section>
 
@@ -120,10 +116,6 @@
       <span id="folders-refresh-status" class="hint"></span>
     </div>
     <p id="pl-age" class="hint"></p>
-    <div id="pl-orphan-bar" class="row sitting-banner" hidden>
-      <span id="pl-orphan-status" class="hint"></span>
-      <button id="btn-clean-sittings">Remove</button>
-    </div>
     <div id="pl-naming-bar" class="row sitting-banner" hidden>
       <span id="pl-naming-status" class="hint"></span>
       <button id="btn-naming-toggle">Show</button>
@@ -145,39 +137,42 @@
     <div id="card"></div>
   </section>
 
-  <section id="view-splitpick" hidden>
-    <h2>Split a playlist</h2>
-    <p class="hint">Playlists with at least 100 tracks can be split into piles.
-       A split reads the playlist once, tags it via Last.fm, and saving piles
-       now takes a couple of minutes.</p>
-    <div id="splitpick-list"></div>
-  </section>
-
   <section id="view-split" hidden>
-    <div class="triage-top">
-      <button id="btn-split-back">‹ Back</button>
-      <span id="split-title"></span>
+    <div id="sp-pick">
+      <h2>Split a home</h2>
+      <p class="hint">Pick a home that has grown too big or too mixed. Nothing changes
+      in Spotify until you press Done.</p>
+      <input id="sp-filter" placeholder="Filter homes…" autocomplete="off">
+      <div id="sp-homes"></div>
     </div>
-    <div id="split-loading" hidden><div class="spinner"></div><p id="split-msg"></p></div>
-    <div id="split-progress" hidden></div>
-    <div id="split-sitting-bar" class="row sitting-banner" hidden>
-      <span id="split-sitting-status" class="hint"></span>
-      <button id="btn-split-finish-sitting">Finish sitting</button>
-    </div>
-    <div id="split-empty"></div>
-    <div id="split-save-all" class="row" hidden>
-      <button id="btn-save-all" class="primary"></button>
-      <label class="hint" title="Normally a queued run sleeps until midnight once the day's last 150 calls are all that's left, so your own clicking always has budget. Ticking this lets the run enqueued next spend those too — it finishes sooner, but interactive use can hit the daily cap.">
-        <input type="checkbox" id="chk-spend-reserve"> spend the interactive reserve too
-      </label>
-    </div>
-    <div id="queue-panel" hidden></div>
-    <button id="btn-rename-outputs" hidden></button>
-    <div id="piles"></div>
-    <div id="split-params" class="row" hidden>
-      <label>Resolution <input id="split-resolution" type="number" min="0.1" max="5" step="0.1" value="1"></label>
-      <label>Pile size <input id="split-minpile" type="number" min="2" max="200" value="15"></label>
-      <button id="btn-recluster">Re-cluster (0 calls)</button>
+    <div id="sp-work" hidden>
+      <div class="triage-top">
+        <button id="sp-back">‹ Back</button>
+        <span id="sp-title"></span>
+      </div>
+      <div id="sp-setup" hidden>
+        <p>Split into</p>
+        <div class="sp-counter">
+          <button id="sp-minus" class="icon-btn" aria-label="Fewer parts">−</button>
+          <span id="sp-n">2</span>
+          <button id="sp-plus" class="icon-btn" aria-label="More parts">+</button>
+          <span>parts</span>
+        </div>
+        <div class="row">
+          <button id="sp-setup-keep" hidden>Keep this split</button>
+          <button id="sp-suggest" class="primary">Suggest</button>
+        </div>
+        <p id="sp-setup-msg" class="hint"></p>
+      </div>
+      <div id="sp-progress" hidden></div>
+      <div id="sp-parts" hidden>
+        <div id="sp-chips"></div>
+        <div id="sp-done-row" class="row"></div>
+        <div id="sp-hint" hidden></div>
+        <div id="sp-list"></div>
+        <div id="sp-actions" class="row"></div>
+      </div>
+      <div id="sp-done" hidden></div>
     </div>
   </section>
 </main>

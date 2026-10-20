@@ -1,7 +1,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const views = ["setup", "lists", "triage", "now", "split", "splitpick"];
+const views = ["setup", "lists", "triage", "now", "split"];
 
 let statusData = null;
 let playlistData = [];   // lists view
@@ -11,24 +11,13 @@ let hintTexts = {};      // id -> "ambient, piano" — per-home matching hints
 // what "newly marked" means for the Save button's pending-cost label. A
 // subset opted in earlier (and so already cached) costs nothing to re-save.
 let triage = null;       // {id, name, homes:Map, tracks, idx, sorted, skipped, history}
-let split = null;        // {id, name, piles, decided, active_sitting} — the open split view
-// {splitId, sittingId, pileId, pileName, uris, decided} — a UI convenience,
-// NOT the source of truth. The Split view's own display reads split.active_sitting
-// directly (fresh on every open); the Now view's decide card reads
-// nowState.sitting (fresh on every poll, from the server). This global only
-// drives the persistent "a sitting is active" bar when neither of those is
-// in view, and remembers which split/pile to finish from that bar. Because
-// the backend allows one active sitting *per split*, this single pointer can
-// only ever reflect one of them at a time if more than one is live — see the
-// report.
-let sitting = null;
 
 // ---- plumbing --------------------------------------------------------------
 
 async function api(path, body, method) {
   // `method` is the escape hatch for verbs that carry no body — DELETE
-  // (cancelQueue) — everything else still just says "POST if there's a
-  // body, GET otherwise" the way every existing call site already relies on.
+  // (discarding a split) — everything else still just says "POST if there's
+  // a body, GET otherwise" the way every existing call site already relies on.
   const opts = (body || method)
     ? { method: method || "POST", headers: { "Content-Type": "application/json" },
         ...(body ? { body: JSON.stringify(body) } : {}) }
@@ -57,16 +46,16 @@ function show(view) {
   // held the auto-resume back until the user found their way back here.
   previewHold.stop();
   for (const v of views) $("view-" + v).hidden = v !== view;
-  // Triage is reached from (and exits back to) the Playlists view, so it
-  // keeps that link lit. Split has its own top-level tab now, and the
-  // split view itself counts as part of it (opened from the picker or, still,
-  // the per-row button).
+  // Leaving the Split tab must stop its progress polling and any live
+  // preview — otherwise either keeps running, unseen, behind whatever view
+  // comes next.
+  if (view !== "split") { spStopPolling(); spStopPreview(); }
   // The input switcher and now-actions live in the merged header; this class
   // is what shows them on the Now view and hides them everywhere else.
   document.body.classList.toggle("on-now", view === "now");
   $("nav-now").classList.toggle("active", view === "now");
   $("nav-lists").classList.toggle("active", view === "lists" || view === "triage");
-  $("nav-split").classList.toggle("active", view === "split" || view === "splitpick");
+  $("nav-split").classList.toggle("active", view === "split");
   $("nav-reconnect").classList.toggle("active", view === "setup");
 }
 
@@ -203,7 +192,6 @@ async function loadLists() {
     // The list is cached until refreshed by hand, so say how old it is rather
     // than present a stale list as current.
     $("pl-age").textContent = ageText(data.fetched_at);
-    renderOrphans(data.sitting_orphans || []);
     folderPaths = data.folder_paths || [];
     createFolders = data.create_folders || {};
     renderFolderChoices();
@@ -218,24 +206,12 @@ async function loadLists() {
   }
 }
 
-// A non-owned playlist can never be split, full stop: the Feb-2026 dev-mode
-// API 403s reading /playlists/{id}/items for anything this account doesn't
-// own (on the read's first page — the wasted call is one, not the whole
-// paginated read), so clicking through here would pay a call to discover
-// what `editable` (already in the cached listing, zero calls) says for
-// free — see create_split's pre-flight guard, which refuses the same thing
-// server-side. A pure function so the gating logic itself is unit-testable
-// without the DOM (see ui_harness.mjs).
-function splitDisabledReason(p) {
-  return p.editable ? null : "Not yours to split — make your own copy in Spotify first, then split that copy";
-}
-
 // Whether a row may be marked as a subset is the server's answer, read from
 // `subset_eligible`, not re-derived here — so the chip can never disagree
 // with what the rename would actually do. Eligibility is "ours, and not a
 // home or input" — an archived list (no role) included, since marking it is
-// how it comes back — the server's fact, since it alone knows the roles. A pure function, same
-// reasoning as splitDisabledReason above: unit-testable without the DOM.
+// how it comes back — the server's fact, since it alone knows the roles. A
+// pure function: unit-testable without the DOM.
 function subsetChipHidden(p) {
   return !p.subset_eligible;
 }
@@ -246,8 +222,7 @@ function makeListRow(p) {
   const img = p.image
     ? `<img src="${esc(p.image)}" alt="" loading="lazy">`
     : '<div class="noimg"></div>';
-  const splitNote = p.split ? `split into ${p.split.piles} pile${p.split.piles === 1 ? "" : "s"}, ${p.split.remaining} left` : null;
-  const sub = [p.folder, p.total != null ? `${p.total} tracks` : null, p.editable ? null : p.id === "liked" ? "library" : "not yours", splitNote]
+  const sub = [p.folder, p.total != null ? `${p.total} tracks` : null, p.editable ? null : p.id === "liked" ? "library" : "not yours"]
     .filter(Boolean).join(" · ");
   row.innerHTML = `${img}
     <div class="pl-meta"><div class="name">${esc(p.name)}</div><div class="sub">${esc(sub)}</div></div>
@@ -256,11 +231,10 @@ function makeListRow(p) {
       <button class="chip r-home">Home</button>
       <button class="chip r-subset">Subset</button>
       <button class="pl-sort" title="Sort this input">▶</button>
-      <button class="pl-split" title="Split into piles">⑃</button>
     </div>
     <input class="pl-hints" placeholder="matching hints, e.g. ambient, piano"
            title="Your own words about what belongs here — they join this home's tag profile (docs/matching.md)">`;
-  const [bIn, bHome, bSubset, bSort, bSplit] = row.querySelectorAll("button");
+  const [bIn, bHome, bSubset, bSort] = row.querySelectorAll("button");
   const hintsEl = row.querySelector(".pl-hints");
   hintsEl.value = hintTexts[p.id] || "";
   hintsEl.oninput = () => {
@@ -282,16 +256,6 @@ function makeListRow(p) {
     // matching profile. Kept visible if it has leftover text so the user
     // can still see (and clear) hints on a demoted playlist.
     hintsEl.hidden = roles[p.id] !== "home" && !hintsEl.value.trim();
-    // Splitting only earns its keep on a playlist too long to work through
-    // as-is — a 30-track input doesn't need piles.
-    bSplit.hidden = p.id === "liked" || (p.total ?? 0) < 100;
-    // Disabled rather than hidden when it's not owned: hiding leaves a
-    // 1372-track playlist with no visible split button and no
-    // explanation, where disabling teaches the actual fix on hover
-    // instead of just hiding the dead end.
-    const reason = splitDisabledReason(p);
-    bSplit.disabled = !!reason;
-    bSplit.title = reason || "Split into piles";
   };
   bIn.onclick = () => { roles[p.id] = roles[p.id] === "input" ? null : "input"; paint(); };
   bHome.onclick = () => { roles[p.id] = roles[p.id] === "home" ? null : "home"; paint(); };
@@ -316,7 +280,6 @@ function makeListRow(p) {
     }
   };
   bSort.onclick = () => { saveConfig().then(() => startTriage(p.id, p.name)); };
-  bSplit.onclick = () => openSplit(p.id, p.name);
   paint();
   return row;
 }
@@ -378,50 +341,6 @@ function renderLists() {
 }
 
 $("pl-filter").oninput = renderLists;
-
-// Leftover sitting playlists: ones sortify created and never managed to
-// remove — a lost response to the create call, or a crash before the record
-// was saved. They are found by reading the cached listing (zero Spotify
-// calls) and matching the marker every sitting playlist carries, so they can
-// only appear for a listing the user has actually refreshed. That is why this
-// lives next to Refresh: the button that reveals them is right here.
-let orphanCount = 0;
-function renderOrphans(orphans) {
-  orphanCount = orphans.length;
-  const bar = $("pl-orphan-bar");
-  bar.hidden = orphanCount === 0;
-  if (!orphanCount) return;
-  const names = orphans.slice(0, 3).map((o) => o.name).join(", ");
-  $("pl-orphan-status").textContent =
-    `${orphanCount} leftover sitting playlist${orphanCount === 1 ? "" : "s"} — ` +
-    `${names}${orphanCount > 3 ? "…" : ""}`;
-  // The price is on the button, the same way every other spending control in
-  // this app states its cost before it is pressed.
-  $("btn-clean-sittings").textContent =
-    `Remove (${Math.min(orphanCount, 10)} call${Math.min(orphanCount, 10) === 1 ? "" : "s"})`;
-}
-
-$("btn-clean-sittings").onclick = async () => {
-  const btn = $("btn-clean-sittings");
-  btn.disabled = true;
-  try {
-    const res = await api("/api/sittings/cleanup", {});
-    if (res.deferred) {
-      toast("a sitting is starting right now — try again once it has");
-    } else {
-      const n = res.removed.length;
-      toast(n
-        ? `removed ${n} leftover playlist${n === 1 ? "" : "s"}` +
-          (res.remaining ? ` — ${res.remaining} still to go, press Remove again` : "")
-        : "nothing could be removed — try again in a moment");
-    }
-    await loadLists();
-  } catch (e) {
-    toast(e.message);
-  } finally {
-    btn.disabled = false;
-  }
-};
 
 // Naming-convention violations: computed server-side from the cached
 // listing (zero Spotify calls), so checking on every view open is free.
@@ -834,18 +753,19 @@ $("nav-lists").onclick = () => {
   closeNavPop();
   stopNowPolling(); stopNowTicker(); triage = null; loadLists();
 };
-$("nav-split").onclick = () => { closeNavPop(); showSplitPicker(); };
+$("nav-split").onclick = () => { closeNavPop(); showSplit(); };
 
 // ---- now playing -----------------------------------------------------------
 
 let nowState = null;   // last /api/now payload + client flags
 // True exactly when the card on screen is an error/cooldown message rather
 // than a live track. `nowState` is deliberately NOT cleared on a failed poll
-// (the sitting bar and the toasts still want the last known truth), so it
-// alone cannot answer "is what the user is looking at current?" — and the
-// keyboard must not fire an irreversible keep against a track the screen
-// stopped showing. A keep spends a call and removes the track from every
-// future sitting; unlike /api/act there is no undo.
+// (the toasts still want the last known truth), so it alone cannot answer
+// "is what the user is looking at current?" — and the keyboard must not fire
+// a stray filing or removal against a track the screen stopped showing and no
+// longer names. Both go through /api/act and can be undone, but the undo
+// stack only knows about the track actually on screen — a keypress aimed at
+// a track the error card has hidden would act on the wrong one blind.
 let nowProblem = false;
 let nowTimer = null;
 let nowActions = 0;    // enables Undo
@@ -1026,32 +946,6 @@ async function fetchNowSuggest(uri, force = false) {
   }
 }
 
-// A sitting stays visible here no matter what's playing or whether Spotify
-// itself is in a cooldown — it costs a real Spotify call to finish, so its
-// status must never depend on the currently-playing poll succeeding. Prefers
-// the server's own answer (nowState.sitting, fresh every poll) when there is
-// one; falls back to the last-known client copy otherwise — e.g. while the
-// user is listening to something else and the poll no longer reports it.
-function paintSittingBar() {
-  const bar = $("now-sitting-bar");
-  const live = nowState?.sitting;
-  const s = live
-    ? { pileName: live.pile_name, uris: live.uris, decided: live.decided }
-    : sitting;
-  if (!s) { bar.hidden = true; return; }
-  const uris = s.uris || [];
-  const left = uris.filter((u) => !s.decided[u]).length;
-  // A reservation whose create_playlist failed carries no tracks at all —
-  // "0 of 0 left" would read as "done", so say what it actually is. Either
-  // way the Finish button beside this text is the escape.
-  $("now-sitting-status").innerHTML = uris.length
-    ? `Sitting: <b>${esc(s.pileName)}</b> · ${left} of ${uris.length} left
-       <span class="sb-bar"><span class="sb-fill" style="width:${Math.round(((uris.length - left) / uris.length) * 100)}%"></span></span>`
-    : `Sitting: <b>${esc(s.pileName)}</b> — reserved, no tracks added (finish it to release the split)`;
-  bar.hidden = false;
-}
-$("btn-now-finish-sitting").onclick = () => finishSitting(nowState?.sitting?.split_id || sitting?.splitId);
-
 // Cooldown countdown: ticks locally every second between polls — display
 // only, no extra requests of any kind. The total sizes the progress bar and
 // survives re-polls of the same cooldown (the server re-reports shrinking
@@ -1071,7 +965,6 @@ function fmtCountdown(ms) {
 
 function renderNowProblem(msg) {
   nowProblem = true;
-  paintSittingBar();
   parkInputSwitch(/cooldown/.test(msg) ? "Spotify is cooling down" : "waiting for Spotify");
   stopCooldownTicker();
   stopNowTicker();
@@ -1284,7 +1177,7 @@ function renderInputPop() {
       html += `<div class="ip-set">${esc(setLabel(key) + note)}</div>`;
     // Heads the buffer set, because that is the set it draws from — and only
     // when there is an actual draw to make. With one buffer list the row
-    // would be a second button for the list sitting right under it.
+    // would be a second button for the list directly under it.
     if (key === NOW_BUFFER_SET && lists.length > 1)
       html += `<button id="ip-random" class="ip-row ip-random" ` +
         `title="Put on one of your buffer lists at random">${ICON_DIE}` +
@@ -1583,7 +1476,7 @@ let playedOutUri = null;
 let playedOutWhileHidden = false;
 // A FRACTION of the runtime, not a fixed number of seconds: "back near the
 // beginning" is what distinguishes a track that started again (repeat-one)
-// from one still sitting at the end we already refetched for — and a fixed
+// from one still parked at the end we already refetched for — and a fixed
 // threshold reads a short track's ending as a restart.
 const PLAYED_OUT_RESTART_FRACTION = 0.25;
 
@@ -1737,8 +1630,7 @@ function playbackStrip(d, tr) {
   // slot offers the way back instead. The undo belongs where the hand
   // already is, not in the top bar, and it lasts exactly as long as the
   // track does (the log's top entry stops matching the moment the next
-  // track starts; removedUri has its own expiry in renderNow). Sittings are
-  // excluded: their decisions have no /api/undo.
+  // track starts; removedUri has its own expiry in renderNow).
   //
   // "Spent" is the whole point, and it used to be "any action at all". Three
   // of them leave the song exactly where it was in its inbox: adding it to a
@@ -1754,8 +1646,7 @@ function playbackStrip(d, tr) {
   // the strip would flash its Undo swap for the second the skip leg takes.
   const bothBusy = npPending?.verb === "both" && npPending.uri === tr.uri;
   const spent = lastAct && lastAct.uri === tr.uri && lastAct.kind === "home";
-  const undoable = !bothBusy && ((removedUri && removedUri === tr.uri) ||
-    (!d.sitting && spent));
+  const undoable = !bothBusy && ((removedUri && removedUri === tr.uri) || spent);
   const nextBusy = npPending?.verb === "next";
   const nextBtn = (shape) => `<button id="btn-now-next" class="${shape}${
     nextBusy ? " np-busy" : ""}"${nextBusy ? " disabled" : ""} title="${
@@ -1766,19 +1657,15 @@ function playbackStrip(d, tr) {
   // circle in the notch — the moat around the circle IS the mis-tap buffer
   // the old column gap used to be. It renders exactly when the left slot
   // holds a Remove; the circle mirrors that button's live/dead state. With
-  // an Undo on offer, or in a sitting, combining is moot and the row falls
-  // back to the two-slot layout below, so Next keeps its place either way.
-  if (!undoable && !d.sitting) {
+  // an Undo on offer, combining is moot and the row falls back to the
+  // two-slot layout below, so Next keeps its place either way.
+  if (!undoable) {
     // np-buttons-trio: the wrapper's grid is for the slot pair — a trio left
     // inside it lands in the first 1fr column, ~25px left of centre.
     return `${bar}<div class="np-buttons np-buttons-trio"><div class="np-trio">
       ${removeButton(d)}${bothButton(d)}${nextBtn("np-nshape np-nnext")}
     </div></div>`;
   }
-  // A sitting renders this strip too, and an input context never occurs
-  // there — an always-drawn Remove could only ever be dead weight, so the
-  // one place the slot still empties is the one place the verb can never
-  // apply.
   const removeBtn = undoable
     ? `<button id="btn-now-undo-remove" class="np-round np-wide np-undo"
                title="Undo the last action for this track (u)" aria-label="Undo the last action for this track">${ICON_UNDO}<span class="np-verb-label">Undo</span></button>`
@@ -1899,30 +1786,12 @@ function bothButton(d) {
     esc(title)}" aria-label="${esc(title)}">${ICON_REMOVE}${ICON_NEXT}</button>`;
 }
 
-// Keeps the client-side `sitting` convenience global roughly in step with
-// what the server just confirmed, so the persistent bar/Finish button have
-// something recent to show even after the user tabs away from the sitting's
-// track. Not load-bearing for correctness — decide() calls always go through
-// nowState.sitting directly while it's available (see decideKeep etc.).
-function syncSittingFromNow(d) {
-  if (!d.sitting) return;
-  sitting = {
-    splitId: d.sitting.split_id, sittingId: d.context?.id, pileId: d.sitting.pile_id,
-    pileName: d.sitting.pile_name, uris: d.sitting.uris, decided: { ...d.sitting.decided },
-  };
-}
-
 function renderNow() {
   const d = nowState;
-  // Callers that are not the poll — finishSitting's success and 404 paths,
-  // most of all — can reach this before any poll has ever succeeded, because
-  // paintSittingBar falls back to the `sitting` global and so a Finish
-  // button exists with nowState still null. Dereferencing d below then threw
-  // a TypeError that ate the success toast on one path and escaped as an
-  // unhandled rejection (from inside the catch, with nothing shown at all)
-  // on the other. The bar is the part that must still update here: the
-  // sitting it described is exactly what just went away.
-  if (!d) { paintSittingBar(); return; }
+  // Defensive: `nowState` starts null and only a successful poll sets it, so
+  // a re-render triggered before the first poll has landed must not
+  // dereference `d` blindly.
+  if (!d) { return; }
   // A reveal lasts exactly one track: it falls away the moment the playing
   // uri is no longer the one it was opened for.
   if (document.body.classList.contains("peeked") && d.track?.uri !== peekedUri) setReveal(false);
@@ -1933,21 +1802,13 @@ function renderNow() {
   // its arrival is the finish line — no callback to thread through the settle
   // repoll, and it works whichever poll happens to bring the new song.
   if (npPending && d.track?.uri && d.track.uri !== npPending.uri) clearNpPending();
-  // The server is authoritative here (see /api/now's `sitting` field): if it
-  // says this poll's context is a sitting, it is one, regardless of what
-  // this client remembers from before a reload. `/api/undo` knows nothing
-  // about split decisions, so it must not stay live just because an earlier,
-  // unrelated ordinary filing left nowActions > 0.
-  const inSitting = !!d.sitting;
   // Hidden, not just disabled: a permanently greyed-out button at top-right
   // is noise for the 95% of the time nothing is undoable.
   const undo = $("btn-undo-now");
-  undo.disabled = nowActions === 0 || inSitting;
+  undo.disabled = nowActions === 0;
   undo.hidden = undo.disabled;
   if (!d.cooldown) { stopCooldownTicker(); nowCooldownUntil = nowCooldownTotal = 0; }
   paintNowControls(d);
-  syncSittingFromNow(d);
-  paintSittingBar();
   if (d.needs_reauth) {
     nowProblem = true;
     stopNowTicker();
@@ -1981,7 +1842,7 @@ function renderNow() {
   const tr = d.track;
   const ctx = d.context;
 
-  const body = inSitting ? sittingCardBody(tr, d.sitting) : ordinaryCardBody(d, tr, ctx);
+  const body = ordinaryCardBody(d, tr, ctx);
 
   rememberInput(d);
   nowProblem = false;  // a real card for a real track is about to go up
@@ -2004,10 +1865,8 @@ function renderNow() {
   if (prv) prv.onclick = playerPrev;
   const loop = $("btn-now-loop");
   if (loop) loop.onclick = nowLoop;
-  // Wired with the other strip controls rather than in the ordinary-card
-  // branch below: the button is part of the strip now, and the strip renders
-  // for the sitting card too (where an input context — and so this button —
-  // simply never occurs).
+  // Wired with the other strip controls rather than in the card branch
+  // below: the button is part of the strip now.
   const rem = $("btn-now-remove");
   if (rem) rem.onclick = nowRemove;
   const both = $("btn-now-both");
@@ -2019,44 +1878,40 @@ function renderNow() {
   startNowTicker(d, tr);
   wireSeekBar(tr);
 
-  if (inSitting) {
-    wireSittingCard();
-  } else {
-    // [data-to]: the Add to… row is a .sugg for layout's sake but has no
-    // destination, and a preview hold on it would have nothing to play.
-    $("now-card").querySelectorAll(".sugg[data-to]").forEach((b) => {
-      b.onclick = () => { if (previewHold.consumeClick()) return; nowFile(b.dataset.to); };
-      previewHold.attach(b, b.dataset.to, nowState.homes.get(b.dataset.to)?.name,
-        { label: "File here", run: () => nowFile(b.dataset.to) });
-    });
-    $("now-card").querySelectorAll(".sugg-eject").forEach((b) => {
-      b.onclick = () => nowUnfile(b.dataset.out);
-    });
-    // The adrift card's inbox rows. No previewHold: these are inboxes, and
-    // hearing what is already in one tells you nothing about whether a song
-    // you have not judged belongs there — the hold is for homes, where the
-    // pile IS the answer to "does this fit".
-    $("now-card").querySelectorAll(".sugg[data-cap]").forEach((b) => {
-      b.onclick = () => nowCapture(b.dataset.cap);
-    });
-    const more = $("btn-now-more");
-    if (more) more.onclick = () => openNowPicker(false);
-    const search = $("btn-now-search");
-    if (search) search.onclick = () => openNowPicker(true);
-    for (const q of nowState?.quickAdds || []) {
-      const b = $(`qa-${q.key}`);
-      if (b) b.onclick = () => nowQuickAdd(q.key);
-    }
-    const sub = $("btn-now-subset");
-    if (sub) sub.onclick = () => openPicker(
-      nowState.subsetTargets, nowAddToSubset, nowCreateSubsetAndAdd, null,
-      "Add here", "subset");
-    const nh = $("btn-now-homeless");
-    if (nh) nh.onclick = nowHomeless;
-    const nb = $("btn-now-buffer");
-    if (nb) nb.onclick = openBufferPicker;
-    capSuggScroll();
+  // [data-to]: the Add to… row is a .sugg for layout's sake but has no
+  // destination, and a preview hold on it would have nothing to play.
+  $("now-card").querySelectorAll(".sugg[data-to]").forEach((b) => {
+    b.onclick = () => { if (previewHold.consumeClick()) return; nowFile(b.dataset.to); };
+    previewHold.attach(b, b.dataset.to, nowState.homes.get(b.dataset.to)?.name,
+      { label: "File here", run: () => nowFile(b.dataset.to) });
+  });
+  $("now-card").querySelectorAll(".sugg-eject").forEach((b) => {
+    b.onclick = () => nowUnfile(b.dataset.out);
+  });
+  // The adrift card's inbox rows. No previewHold: these are inboxes, and
+  // hearing what is already in one tells you nothing about whether a song
+  // you have not judged belongs there — the hold is for homes, where the
+  // pile IS the answer to "does this fit".
+  $("now-card").querySelectorAll(".sugg[data-cap]").forEach((b) => {
+    b.onclick = () => nowCapture(b.dataset.cap);
+  });
+  const more = $("btn-now-more");
+  if (more) more.onclick = () => openNowPicker(false);
+  const search = $("btn-now-search");
+  if (search) search.onclick = () => openNowPicker(true);
+  for (const q of nowState?.quickAdds || []) {
+    const b = $(`qa-${q.key}`);
+    if (b) b.onclick = () => nowQuickAdd(q.key);
   }
+  const sub = $("btn-now-subset");
+  if (sub) sub.onclick = () => openPicker(
+    nowState.subsetTargets, nowAddToSubset, nowCreateSubsetAndAdd, null,
+    "Add here", "subset");
+  const nh = $("btn-now-homeless");
+  if (nh) nh.onclick = nowHomeless;
+  const nb = $("btn-now-buffer");
+  if (nb) nb.onclick = openBufferPicker;
+  capSuggScroll();
 }
 
 // Three rows tall, always — the same height whether the card has one
@@ -2333,7 +2188,7 @@ function ordinaryCardBody(d, tr, ctx) {
         : btn;
     });
   }
-  // Add to… ends the list rather than sitting under it as a button: reaching
+  // Add to… ends the list rather than appearing below it as a button: reaching
   // past the suggestions is the same question the suggestions ask, so it is
   // the last and least confident answer to it, not a different control. It
   // keeps the rows' three-column shape so the list still scans as one column,
@@ -3817,1083 +3672,1092 @@ function closePicker() { previewHold.stop(); $("picker").hidden = true; }
 $("picker-close").onclick = closePicker;
 $("picker").onclick = (e) => { if (e.target.id === "picker") closePicker(); };
 
-// ---- splitting ---------------------------------------------------------------
+// ---- split a home into parts ------------------------------------------------
 //
-// A split turns one long, incoherent input into piles by musical character,
-// and a sitting materialises one pile as a disposable ~2h playlist to
-// actually listen through. Two different costs are in play here on purpose:
-//   - reading tracks + tagging (POST /api/split) spends real Spotify budget
-//     (~15 calls warm, ~35 cold) — never fired without the user asking for it.
-//   - reclustering is pure local math over what's already cached — 0 calls —
-//     so the UI says so every time, to make retuning feel free (because it
-//     is) while splitting still feels like the deliberate, costly step it is.
-// Keep/reject decisions live in the Now view, not here — see decideKeep below
-// for why.
+// Spec: docs/superpowers/specs/2026-10-20-split-into-parts-design.md. The
+// server holds the draft; this view draws what it was last sent and posts
+// one action at a time. Nothing reaches Spotify before Done.
 
-// The Split tab opens on a picker (design §2): same eligibility rule as the
-// per-row button (not Liked, 100+ tracks — splitDisabledReason handles
-// not-owned), any in-progress split pinned first. Both reads are free:
-// /api/playlists serves the cached listing and GET queue reads queue.json.
-async function showSplitPicker() {
-  stopQueuePolling();
-  stopNowPolling();
-  stopNowTicker();
-  split = null;
-  show("splitpick");
-  const wrap = $("splitpick-list");
-  wrap.innerHTML = '<p class="hint">Loading playlists…</p>';
-  try {
-    const data = await api("/api/playlists");
-    // "_" is fine: GET queue is deliberately global regardless of path id.
-    const qs = await api("/api/split/_/queue").catch(() => null);
-    const q = qs?.queue;
-    const activeId = q && (q.pending?.length || q.current) ? q.playlist_id : null;
-    const eligible = data.playlists.filter(
-      (p) => p.id !== "liked" && (p.total ?? 0) >= 100);
-    eligible.sort((a, b) => (b.id === activeId) - (a.id === activeId));
-    wrap.innerHTML = "";
-    if (!eligible.length) {
-      wrap.innerHTML = '<p class="hint">No playlist here has 100+ tracks — nothing needs splitting.</p>';
-      return;
-    }
-    for (const p of eligible) {
-      const row = document.createElement("div");
-      row.className = "pl-row";
-      const reason = splitDisabledReason(p);
-      const sub = [p.folder, `${p.total} tracks`,
-                   p.id === activeId ? "split in progress" :
-                     p.split ? `split into ${p.split.piles} pile${p.split.piles === 1 ? "" : "s"}` : null,
-                   reason]
-        .filter(Boolean).join(" · ");
-      row.innerHTML = `<div class="pl-meta"><div class="name">${esc(p.name)}</div>
-        <div class="sub">${esc(sub)}</div></div>`;
-      if (!reason) row.onclick = () => openSplit(p.id, p.name);
-      wrap.appendChild(row);
-    }
-  } catch (e) {
-    if (e.message === "auth needed") return;
-    wrap.innerHTML = `<p class="hint">Couldn't load playlists: ${esc(e.message)}</p>
-       <button id="btn-retry-splitpick">Retry</button>`;
-    $("btn-retry-splitpick").onclick = showSplitPicker;
+let spHomes = [];       // last /api/splitparts/homes
+let spDraft = null;     // the open draft, as the server last sent it
+// Bumped every time `spDraft` is REPLACED by a load (openSpHome, a
+// landed Suggest, a reread, or a re-fetch after Done finished) — never by
+// an add/remove/move, which edit the same draft in place. Anything that
+// awaited a server answer before touching `spDraft`/the screen captures
+// this (with `spPid`) first and checks both are still current afterward,
+// so a slow answer for a generation nobody is looking at any more can
+// never clobber a fresher one that landed first.
+let spDraftGen = 0;
+let spPid = null;       // the home being split
+let spShown = null;     // key of the part whose songs are listed
+let spN = 2;            // the counter
+let spPollTimer = null;
+// Bumped by every spStopPolling(): a poll (or the filing watch) captures it
+// before its first await and gives up — drawing nothing, re-arming
+// nothing — when it has moved. A cleared timeout cannot recall a request
+// already in flight; this is what stops that request's answer.
+let spPollToken = 0;
+let spFilingTimer = null;
+const SP_MIN = 2, SP_MAX = 6;
+
+// ---- tap = preview ----------------------------------------------------------
+// One clip at a time. Spotify is paused by the phone when the clip takes the
+// audio, and given back once when previewing ends — only if it was playing
+// when THIS session's first tap landed, and only once a clip of ours has
+// actually taken that focus (a 404 or a refused play never took it).
+let spAudio = null;
+let spAudioUri = null;
+let spAudioPending = false;   // spAudio exists but play() has not yet succeeded
+let spAudioRefused = false;   // play() was refused PERMISSION (iOS) — tap again to retry
+let spResumeOwed = false;
+let spSessionPlaying = false; // was Spotify playing when this preview session began
+
+function spStopPreview(resume = true) {
+  if (spAudio) { spAudio.onended = null; spAudio.onerror = null; spAudio.pause(); spAudio.src = ""; }
+  spAudio = null;
+  spAudioPending = false;
+  spAudioRefused = false;
+  const was = spAudioUri;
+  spAudioUri = null;
+  if (resume && spResumeOwed) {
+    spResumeOwed = false;
+    spSessionPlaying = false;
+    // Like the house player's own resume (previewHold.resumeSpotify): a
+    // failure — ok:false, or the call itself rejecting — says so rather
+    // than leaving Spotify silently paused with no visible way back.
+    api("/api/preview_resume", {}).then((r) => {
+      if (!r || r.ok === false) toast("preview over — press play in Spotify");
+    }).catch(() => toast("preview over — press play in Spotify"));
   }
+  if (was && spDraft && !$("sp-parts").hidden) renderSpList();
 }
 
-async function openSplit(id, name) {
-  stopQueuePolling();
-  queueStatus = null;
-  $("queue-panel").hidden = true;
-  $("queue-panel").innerHTML = "";
-  // A previous split's rename offer must not survive into a view that then
-  // fails to load below (404-that-isn't-"not split yet", 5xx, network) —
-  // otherwise the button's onclick still points at the old split's id.
-  $("btn-rename-outputs").hidden = true;
-  split = { id, name, piles: [], decided: {}, active_sitting: null };
-  show("split");
-  $("split-title").textContent = name;
-  $("split-empty").innerHTML = "";
-  $("piles").innerHTML = "";
-  $("split-params").hidden = true;
-  try {
-    const data = await api(`/api/split/${id}`);
-    applySplitData(data);
-    renderRenameOffer(data);
-    pollQueueStatus();
-  } catch (e) {
-    if (e.message === "auth needed") return;
-    if (e.status !== 404) {
-      // 404 ("no split for that playlist") is the one expected failure here
-      // and means genuinely "offer to split it". Anything else — a
-      // transient 5xx, a network hiccup — must NOT fall into that same
-      // branch: this playlist may already be split, and the offer below
-      // spends ~15-35 real Spotify calls if clicked.
-      $("split-empty").innerHTML =
-        `<p class="hint">Couldn't load this split: ${esc(e.message)}</p>
-         <button id="btn-retry-split">Retry</button>`;
-      $("btn-retry-split").onclick = () => openSplit(id, name);
-      return;
-    }
-    // Estimate follows the same pagination math as the read itself (~100
-    // tracks/call). A snapshot that hasn't moved since the last read costs
-    // 0 — only a cold or changed cache pays the full amount.
-    const total = playlistData.find((p) => p.id === id)?.total ?? 0;
-    const warm = Math.ceil(total / 100) + 1;
-    $("split-empty").innerHTML =
-      `<p class="hint">Not split yet. Reading ${total} tracks costs 0 Spotify
-       calls if nothing's changed since the last read, otherwise about
-       ${warm} — tagging them via Last.fm afterwards costs no Spotify calls
-       at all.</p>
-       <p class="hint">Splitting works from the playlist listing as of the last
-       <b>Refresh</b> on the Playlists view. If you edited or created this
-       playlist in the Spotify client since then, Refresh first — otherwise
-       this reads the old track list, or says it doesn't know the playlist.</p>
-       <button id="btn-do-split" class="primary">Split it (0–${warm} calls)</button>`;
-    $("btn-do-split").onclick = doSplit;
-  }
+// A clip that failed to LOAD or DECODE — an expired CDN token, a 403/404, a
+// network hiccup — is never a permission refusal: retrying play() on the
+// same dead element only rejects the same way forever. Fetch a fresh URL on
+// the next tap instead. Shared by a rejected play() and a later onerror (a
+// clip that dies mid-playback, not just at the start).
+function spClipFailed() {
+  if (!spAudio) return;
+  // true, not false: a clip that already took Spotify's focus (resume is
+  // owed) must give it back now — the owed flag only ever arms once play()
+  // has actually resolved, so this is a no-op for a clip that never played.
+  spStopPreview(true);
+  toast("this preview failed — tap to try again");
 }
 
-// Understated by design (design §2 judgement): shown only when this split
-// has saved playlists still carrying bare pile names. The count is computed
-// client-side from record names; the server re-derives it and 409s if they
-// disagree — same echo contract as every other priced action.
-function renderRenameOffer(data) {
-  const btn = $("btn-rename-outputs");
-  const prefix = split.name + " · ";
-  const todo = (data.piles || []).filter(
-    (p) => p.materialised?.playlist_id && p.materialised.name
-           && !p.materialised.name.startsWith(prefix));
-  btn.hidden = !todo.length;
-  if (!todo.length) return;
-  btn.textContent =
-    `Rename ${todo.length} saved playlist${todo.length === 1 ? "" : "s"} to “${split.name} · …” (${todo.length} calls)`;
-  btn.onclick = async () => {
-    btn.disabled = true;
+async function spPreview(uri) {
+  // iOS: a previous tap's play() on this exact row was refused PERMISSION
+  // (NotAllowedError). Retry it SYNCHRONOUSLY, before any await, on the
+  // same Audio object — no new fetch, no new Audio — since iOS only grants
+  // playback inside the very gesture handler that asks for it, never one
+  // that resumes after an awaited fetch has already returned.
+  if (spAudio && spAudioUri === uri && spAudioRefused) {
+    const a = spAudio;
+    // Cleared BEFORE awaiting, not after: while this retry's own play() is
+    // buffering it is no longer "refused", so a third tap landing in that
+    // window stops the clip (the branch below) instead of matching this one
+    // again and calling play() on it a second time.
+    spAudioRefused = false;
     try {
-      await api(`/api/split/${split.id}/rename_outputs`,
-                { expected_calls: todo.length });
-      toast("Renamed");
-      btn.hidden = true;
+      await a.play();
     } catch (e) {
-      if (e.message !== "auth needed") toast(e.message);
-    } finally {
-      btn.disabled = false;
-    }
-  };
-}
-
-// `#split-loading` is an in-flow spinner, not an overlay, and the paid offer
-// above it is only cleared once the POST resolves — so without this the
-// button stays live for the whole ~15-call read and every extra click buys
-// another one (3 clicks measured at 42 Spotify calls against a button
-// labelled "0–15"). Same disable-and-relabel pattern as btn-refresh-lists.
-// `create_split` is the one split-family endpoint with no server-side
-// in-flight guard of its own (start_sitting reserves under _split_lock,
-// decide uses _pending_keeps), so this is the only thing standing between a
-// double-click and a doubled spend.
-let splitInFlight = false;
-
-// ---- split progress --------------------------------------------------------
-//
-// GET /api/split/{id}/progress reads one module-level dict on the server and
-// cannot reach Spotify (pinned server-side by
-// test_split_progress_spends_no_api_calls), so none of the /api/now
-// call-budget rules apply to polling it — the same reasoning that lets the
-// queue panel poll. What DOES apply is stopping. This runs about once a second
-// for the ~3 minutes the Last.fm phase takes, and a timer left armed after the
-// split ends is the exact shape of the bug that once cost ~600 Spotify calls
-// an hour from a single open tab. Two independent gates hold it closed:
-// `splitInFlight` (the POST is still running) and the server's own
-// poll_after_ms, which is 0 the moment the run reaches a terminal state.
-
-// Last.fm is paced at one artist per MIN_INTERVAL (0.25s, tags.py), which is
-// what makes a count of remaining artists convertible into a time at all.
-const LASTFM_SECONDS_PER_ARTIST = 0.25;
-
-let splitProgress = null;
-let splitProgressTimer = null;
-
-function stopSplitProgressPolling() {
-  clearTimeout(splitProgressTimer);
-  splitProgressTimer = null;
-}
-
-function etaText(seconds) {
-  // Rounded coarsely on purpose: the estimate is only as good as Last.fm's
-  // latency, and "about 2 min left" ages better than a false "1:47".
-  if (seconds >= 90) return `about ${Math.round(seconds / 60)} min left`;
-  return `about ${Math.max(5, Math.round(seconds / 5) * 5)} sec left`;
-}
-
-// Pure — takes the exact shape GET /api/split/{id}/progress returns and gives
-// back markup, so ui_harness.mjs can exercise it without a DOM. Same shape as
-// renderQueuePanel. "" means there is nothing to show, which is also what
-// hides the bar.
-function renderSplitProgress(p) {
-  if (!p || p.state !== "running") return "";
-  if (p.phase === "reading") {
-    return `<p class="hint">Reading the playlist's tracks from Spotify…</p>`;
-  }
-  if (p.phase === "clustering") {
-    return `<p class="hint">Tagged. Sorting tracks into piles — local, no calls.</p>`;
-  }
-  if (p.phase !== "tagging" || !p.total) {
-    return `<p class="hint">Starting…</p>`;
-  }
-  const done = p.done || 0;
-  const pct = Math.min(100, Math.round((done / p.total) * 100));
-  const eta = etaText((p.total - done) * LASTFM_SECONDS_PER_ARTIST);
-  return `<div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
-     <p class="hint">Tagging artists via Last.fm — ${done} of ${p.total} (${pct}%),
-     ${eta}. This phase costs no Spotify calls.</p>`;
-}
-
-function paintSplitProgress() {
-  const el = $("split-progress");
-  const html = renderSplitProgress(splitProgress);
-  el.innerHTML = html;
-  el.hidden = !html;
-}
-
-async function pollSplitProgress(splitId) {
-  try {
-    const p = await api(`/api/split/${splitId}/progress`);
-    if (!split || split.id !== splitId) { stopSplitProgressPolling(); return; }
-    splitProgress = p;
-  } catch (_) {
-    // Local and free — a failed poll leaves the last-known state on screen
-    // rather than blanking the bar mid-run.
-  }
-  paintSplitProgress();
-  stopSplitProgressPolling();
-  const ms = splitProgress ? splitProgress.poll_after_ms : 0;
-  if (splitInFlight && ms > 0) {
-    splitProgressTimer = setTimeout(() => pollSplitProgress(splitId), ms);
-  }
-}
-
-async function doSplit() {
-  if (splitInFlight) return;
-  splitInFlight = true;
-  const btn = $("btn-do-split");
-  const label = btn ? btn.textContent : "";
-  if (btn) { btn.disabled = true; btn.textContent = "Splitting… (already spending)"; }
-  $("split-loading").hidden = false;
-  $("split-msg").textContent = "Reading tracks, then tagging artists via Last.fm…";
-  // Kicked off before the POST is awaited, so the first answer lands while the
-  // track read is still running rather than after everything is over.
-  splitProgress = null;
-  paintSplitProgress();
-  pollSplitProgress(split.id);
-  try {
-    const data = await api(`/api/split/${split.id}`, splitParams());
-    toast(`${data.tagged} tagged, ${data.untagged} untagged`);
-    // The split now exists — clear the paid "Split it" offer immediately,
-    // before risking a second request, so a failure below can never leave
-    // stale UI still inviting a spend that already happened.
-    $("split-empty").innerHTML = "";
-    try {
-      // The POST response is raw piles with no progress fields at all — and
-      // create_split PRESERVES any decisions from a previous split of this
-      // same playlist, so synthesising decided:0 here would show every pile
-      // as fully undecided even when it isn't. GET is a free, local read;
-      // it's also what seeds the resolution/pile-size inputs from what the
-      // server actually used.
-      const fresh = await api(`/api/split/${split.id}`);
-      applySplitData(fresh);
-    } catch (e2) {
-      // The split happened; only the follow-up read failed. Offering
-      // "Split it" again here would be confusing (it already exists) even
-      // though it'd actually be free and safe (create_split resumes rather
-      // than re-tagging) — so offer a plain retry of the read instead.
-      $("split-empty").innerHTML =
-        `<p class="hint">Split, but couldn't load the piles: ${esc(e2.message)}</p>
-         <button id="btn-retry-split-load">Retry</button>`;
-      $("btn-retry-split-load").onclick = () => openSplit(split.id, split.name);
-    }
-  } catch (e) {
-    if (e.status === 404) {
-      // 404 here is not "no split yet" (that's the GET) — create_split
-      // validates the id against the cached listing, so it means the playlist
-      // isn't in the listing sortify last read. The fix is a Refresh, which
-      // is not something the raw "unknown playlist" detail says.
-      toast("Spotify's listing here doesn't have this playlist — go back and press " +
-            "Refresh on the Playlists view (it re-reads the listing), then try again", 6000);
-    } else if (e.status === 403) {
-      // Not ours, and no retry can change that: the Feb-2026 dev-mode API will
-      // not read another user's playlist tracks at all. This is deliberately a
-      // different status from the two 502s so it can be told apart from
-      // something transient — re-offering the paid button here would invite a
-      // spend guaranteed to fail. A persistent card, because the fix ("make
-      // your own copy") is an instruction to follow, not a flash to catch.
-      $("split-empty").innerHTML = `<p class="hint">${esc(e.message)}</p>`;
-    } else if (e.status === 502 && /progress was saved/i.test(e.message)) {
-      // Partial Last.fm failure. The server has already persisted every artist
-      // it got an answer for, so this is resumable — but a 2600ms toast
-      // vanished long before a user could learn that, and "stopped after 431
-      // of 712 artists" reads like several hundred lost answers.
-      $("split-empty").innerHTML =
-        `<p class="hint">${esc(e.message)}</p>
-         <p class="hint">Nothing already fetched is lost. <b>Resume</b> picks up
-          where it stopped: it re-reads the track list (0 Spotify calls unless
-          the playlist changed since the last read) and asks Last.fm only about
-          the artists still missing.</p>
-         <button id="btn-resume-split" class="primary">Resume tagging</button>`;
-      $("btn-resume-split").onclick = doSplit;
-    } else {
-      toast(e.message);
-    }
-  } finally {
-    // Cleared before the timer is, so a poll already awaiting a response
-    // cannot re-arm itself on the way out.
-    splitInFlight = false;
-    stopSplitProgressPolling();
-    splitProgress = null;
-    paintSplitProgress();
-    $("split-loading").hidden = true;
-    // Gone from the DOM on the success path (split-empty was cleared above);
-    // still there after a failure, where re-offering the spend is correct.
-    const again = $("btn-do-split");
-    if (again) { again.disabled = false; again.textContent = label; }
-  }
-}
-
-function splitParams() {
-  return {
-    resolution: Number($("split-resolution").value) || 1,
-    min_pile: Number($("split-minpile").value) || 15,
-  };
-}
-
-function applySplitData(data) {
-  split.piles = data.piles;
-  split.decided = data.decided || {};
-  split.active_sitting = data.active_sitting || null;
-  // Seed the tuning inputs from what the server actually used — otherwise a
-  // split made at resolution 1.4 displays 1.0, and pressing Re-cluster to
-  // "keep the same shape" silently reshapes every pile.
-  if (data.params) {
-    $("split-resolution").value = data.params.resolution ?? 1;
-    $("split-minpile").value = data.params.min_pile ?? 15;
-  }
-  syncSitting(split.id, split.piles, split.decided, split.active_sitting);
-  renderPiles();
-}
-
-// Rebuilds the `sitting` convenience global from a split's own (piles,
-// decided, active_sitting) — used both when the split view is (re)opened
-// (recovering `sitting` after e.g. a page reload) and by finishSitting's
-// cleared:false path below. Always refreshes `decided` even for a sitting
-// already known: without that, revisiting this same split's view — the one
-// free resync path (GET /api/split, local read) the design relies on — did
-// nothing for the sitting it already recognised, and two tabs on one
-// sitting would drift permanently.
-//
-// Gated on the reservation merely EXISTING, exactly like the backend
-// (start_sitting/recluster/create_split all refuse on `active_sitting`
-// truthiness alone). A reservation is written with `playlist_id: None`
-// BEFORE the first Spotify call, so a 429 landing on create_playlist —
-// this project's documented failure mode — leaves one standing with no id.
-// Also requiring an id here used to hide that reservation from every
-// surface: no bar, no Finish button, Start buttons still enabled, and every
-// one of them 409ing with "finish it first" against a Finish button that
-// existed nowhere. The server-side escape is free; it just needs a click to
-// reach it.
-function syncSitting(splitId, piles, decided, activeSitting) {
-  if (!activeSitting) {
-    if (sitting && sitting.splitId === splitId) sitting = null;
-    return;
-  }
-  const uris = activeSitting.uris || [];
-  const decidedHere = {};
-  for (const u of uris) {
-    if (decided[u]) decidedHere[u] = decided[u];
-  }
-  const pile = piles.find((p) => p.id === activeSitting.pile_id);
-  sitting = {
-    splitId, sittingId: activeSitting.playlist_id, pileId: activeSitting.pile_id,
-    pileName: pile ? pile.name : activeSitting.pile_id, uris, decided: decidedHere,
-  };
-}
-
-function renderPiles() {
-  $("split-params").hidden = false;
-  renderSaveAll();
-  const wrap = $("piles");
-  wrap.innerHTML = "";
-  // Reads split.active_sitting directly, not the `sitting` global — the
-  // backend allows one active sitting PER split, so a sitting started on a
-  // different split must not disable or hide this one's own, correctly
-  // live, active_sitting (which GET /api/split refreshes every time this
-  // view opens, independent of whatever else the global currently points
-  // at).
-  //
-  // Existence alone, no playlist_id requirement — same gate the backend
-  // uses (see syncSitting). A reservation with no id still 409s every Start
-  // here, so leaving these buttons enabled only promises a spend the server
-  // will refuse.
-  const sittingActive = !!split.active_sitting;
-  for (const p of split.piles) {
-    const left = p.total - p.decided;
-    const row = document.createElement("div");
-    row.className = "pile-row";
-    const tags = p.tags && p.tags.length ? p.tags.join(" · ") : "";
-    const save = saveOffer(p);
-    const busy = saveAllBusy || pileSaveBusy.has(p.id);
-    row.innerHTML = `
-      <div class="pl-meta">
-        <div class="name">${esc(p.name)}</div>
-        <div class="sub">${left} of ${p.total} left${tags ? " · " + esc(tags) : ""}${
-          save.note ? " · " + esc(save.note) : ""}</div>
-      </div>
-      <button class="pile-save" ${save.disabled || busy ? "disabled" : ""} title="${esc(save.title)}">${
-        busy ? "Queuing… (already spending)" : esc(save.label)}</button>
-      <button class="pile-sitting primary" ${left === 0 || sittingActive ? "disabled" : ""}>Start ~2h sitting (~24 calls)</button>`;
-    row.querySelector(".pile-sitting").onclick = () => startSitting(p.id, p.name);
-    const saveBtn = row.querySelector(".pile-save");
-    saveBtn.onclick = () => queuePiles([p.id], save.calls);
-    wrap.appendChild(row);
-  }
-  renderSplitSittingBar();
-}
-
-// One header button that queues every pile with something left to save in
-// one go (`queuePiles(null, …)` — null is the server's "everything" sigil,
-// same contract as a single pile). The total is computed here, once, and
-// baked into the closure the button's click reads — never recomputed at
-// click time — so what gets echoed back to the server is guaranteed to be
-// the number that was actually on screen, the same misclick contract every
-// other priced button in this file keeps.
-let saveAllTotal = 0;
-
-function renderSaveAll() {
-  const wrap = $("split-save-all");
-  const btn = $("btn-save-all");
-  saveAllTotal = split.piles.reduce(
-    (sum, p) => sum + (Number.isInteger(p.materialise_calls) ? p.materialise_calls : 0), 0);
-  if (saveAllTotal <= 0) { wrap.hidden = true; return; }
-  btn.textContent = saveAllBusy ? "Queuing… (already spending)" : `Save all piles (${floorPrice(saveAllTotal)})`;
-  btn.title = renderSaveAllLabel(saveAllTotal);
-  btn.disabled = saveAllBusy;
-  wrap.hidden = false;
-}
-
-// Finding I2: every price this app shows is a FLOOR, not a ceiling —
-// request() retries a transient 429 up to 3x, and each attempt is a real
-// Spotify call the retry pays for, so the true spend can run over what was
-// quoted. Every displayed price says so: `≥ N calls` on the button itself,
-// and the disclosure spelled out in its title tooltip. One shared pair of
-// helpers so the wording can't drift between the per-pile buttons and the
-// save-all header button.
-function floorPrice(calls) {
-  return `≥ ${calls} call${calls === 1 ? "" : "s"}`;
-}
-
-function floorDisclosure(calls) {
-  return `at least ${calls} Spotify call${calls === 1 ? "" : "s"} — a retried ` +
-         `429 is charged per attempt.`;
-}
-
-// The save-all header button's price-floor disclosure — also unit-tested
-// directly (ui_harness.mjs) since a wrong number here is exactly the kind of
-// thing that would otherwise only surface after a misclick.
-function renderSaveAllLabel(calls) {
-  return `Save all piles (${floorPrice(calls)}) — ${floorDisclosure(calls)}`;
-}
-
-// What the "save this pile" button says, and what it will hand back as
-// `expected_calls`. The cost is NEVER computed here: the server sends
-// `materialise_calls` with every pile (a free, local read) and refuses the
-// enqueue unless the number comes back exactly, so a figure invented on this
-// side could only ever buy a refusal. A pile row from a server that didn't
-// send one is therefore offered as un-clickable rather than guessed at.
-//
-// One call per track — the Feb-2026 API has no batch add — queued and run by
-// a server-side worker, not this tab. The governor starts at 1.8 calls/min
-// and climbs (after clean stretches) to a 7.0/min ceiling, so the honest
-// estimate is a RANGE: ~calls/7.0 minutes if it's already at ceiling, up to
-// calls/1.8 if it's still at (or has just been knocked back to) the start
-// rate. For the 309-track pile that's ~45 min at ceiling, several hours at
-// the start rate.
-const QUEUE_CEILING_RATE = 7.0;  // calls/min, sortify/pacing.py CEILING_RATE
-const QUEUE_START_RATE = 1.8;    // calls/min, sortify/pacing.py START_RATE
-
-// Minutes -> a short human string, switching to hours once it's unwieldy.
-function formatQueueDuration(mins) {
-  if (mins < 60) return `${Math.max(1, Math.round(mins))} min`;
-  const hours = mins / 60;
-  return `${hours < 10 ? hours.toFixed(1) : Math.round(hours)} hr`;
-}
-
-function saveOffer(p) {
-  const calls = p.materialise_calls;
-  const m = p.materialised;
-  if (!Number.isInteger(calls)) {
-    return { calls: null, disabled: true, label: "Save as playlist",
-             note: "", title: "Reopen this split to see what saving it would cost." };
-  }
-  const fast = formatQueueDuration(calls / QUEUE_CEILING_RATE);
-  const slow = formatQueueDuration(calls / QUEUE_START_RATE);
-  const price = `${floorPrice(calls)} — one per track, paced by a server-side worker ` +
-    `(about ${fast} at sortify's fastest pace, up to ${slow} if it's still ramping up) ` +
-    `(${floorDisclosure(calls)}). This job runs on the server, not in this tab — closing ` +
-    `it doesn't stop it. If it's interrupted (a rate-limit cooldown, say) nothing is ` +
-    `lost — pressing it again, or letting it resume on its own, adds only the tracks ` +
-    `that are still missing.`;
-  if (calls === 0) {
-    return { calls: 0, disabled: true, label: "Saved as a playlist",
-             note: `saved as a playlist (${m && m.added} tracks)`,
-             title: "This pile is already a real playlist in your Spotify account. " +
-                    "sortify never deletes it — remove it there if you don't want it." };
-  }
-  if (m && m.stale) {
-    return { calls, disabled: false, label: `Save as a new playlist (${floorPrice(calls)})`,
-             note: "saved earlier, but the pile has changed since",
-             title: "This pile was saved before, but re-clustering has changed which " +
-                    "tracks are in it, so the old playlist is no longer this pile. " +
-                    "Saving now makes a separate one. " + price };
-  }
-  if (m && m.playlist_id) {
-    return { calls, disabled: false, label: `Resume saving (${floorPrice(calls)})`,
-             note: `${m.added} of ${p.total} saved so far`,
-             title: "Adds only the tracks still missing from the playlist this pile " +
-                    "already has. " + price };
-  }
-  return { calls, disabled: false, label: `Save as playlist (${floorPrice(calls)})`,
-           note: "", title: "Makes a permanent Spotify playlist named after this pile " +
-                            "and adds every track in it. " + price };
-}
-
-// One entry per (split, pile-set) signature currently mid-`queuePiles()` in
-// this tab — "save all" and "save this one pile" are different signatures
-// on purpose, so a save-all in flight doesn't lock out a single-pile retry
-// (or vice versa) even though the server ultimately allows only one queue at
-// a time; that invariant is enforced server-side (409) and handled below
-// like any other refusal. A save can run for a long time, so "disable the
-// button" alone is not enough — the button is re-rendered on every free
-// re-read of the split, and a re-render would hand a second click a fresh,
-// enabled one.
-const queueActionInFlight = new Set();
-let saveAllBusy = false;
-const pileSaveBusy = new Set();
-
-function queueActionKey(pileIds) {
-  return pileIds === null ? "*" : [...pileIds].sort().join(",");
-}
-
-// Replaces the old one-shot materialisePile (Task 7 removed its endpoint):
-// this posts to the queue instead of spending synchronously, so a save that
-// used to tie up the tab for up to ~26 minutes now returns almost instantly
-// and the worker drains it in the background — see renderQueuePanel below
-// for how that progress is shown. Same misclick contract as the one-shot
-// had: the POST echoes back exactly the number the button displayed
-// (`expectedCalls`), and `pileIds: null` is the server's "every pile" sigil
-// for the save-all button, never invented client-side.
-async function queuePiles(pileIds, expectedCalls) {
-  if (!split) return;
-  const splitId = split.id;
-  if (expectedCalls === null) return;
-  const key = splitId + " " + queueActionKey(pileIds);
-  if (queueActionInFlight.has(key)) return;
-  queueActionInFlight.add(key);
-  const targetIds = pileIds === null ? split.piles.map((p) => p.id) : pileIds;
-  if (pileIds === null) saveAllBusy = true;
-  for (const id of targetIds) pileSaveBusy.add(id);
-  renderPiles();
-  try {
-    const data = await api(`/api/split/${splitId}/queue`,
-                           { pile_ids: pileIds, expected_calls: expectedCalls,
-                             spend_reserve: $("chk-spend-reserve").checked });
-    toast(data.total_calls === 0
-      ? "already saved — nothing queued"
-      : `queued ${data.queued.length} pile${data.queued.length === 1 ? "" : "s"} — ` +
-        `${data.total_calls} Spotify calls, running in the background`, 5000);
-  } catch (e) {
-    if (e.message === "auth needed") return;
-    // A 409 here is either the cost guard (a stale row) or "a queue is
-    // already running" — neither is a conflict to retry blindly. The free
-    // re-read below puts the current truth back on screen either way.
-    toast(e.message, 6000);
-  } finally {
-    queueActionInFlight.delete(key);
-    if (pileIds === null) saveAllBusy = false;
-    for (const id of targetIds) pileSaveBusy.delete(id);
-  }
-  // Always re-read, on success and on failure alike — same behaviour the
-  // one-shot materialisePile had: a stale price or an already-landed queue
-  // needs the fresh row, not what was true before this click. Free and
-  // local — GET /api/split spends nothing.
-  try {
-    const fresh = await api(`/api/split/${splitId}`);
-    if (split && split.id === splitId) applySplitData(fresh);
-  } catch (_) {
-    // Leave the original message on screen; a failed re-read has nothing
-    // better to say than the failure that preceded it.
-  }
-  pollQueueStatus();
-}
-
-// Shown whenever a reservation exists at all — `playlist_id` only decides
-// the wording, never whether the Finish button is reachable. A reservation
-// with no id (create_playlist failed, e.g. a 429 on the sitting's very first
-// call) is precisely the state that needs this bar most: nothing else in the
-// UI can release it, and finishing it costs 0 Spotify calls.
-function renderSplitSittingBar() {
-  const bar = $("split-sitting-bar");
-  const a = split.active_sitting;
-  if (!a) { bar.hidden = true; return; }
-  const pile = split.piles.find((p) => p.id === a.pile_id);
-  const pileName = pile ? pile.name : a.pile_id;
-  const uris = a.uris || [];
-  const left = uris.filter((u) => !split.decided[u]).length;
-  $("split-sitting-status").textContent = a.playlist_id
-    ? `Listening: ${pileName} — ${left} of ${uris.length} left. ` +
-      `Open Spotify and the Now view to keep/reject, or finish here.`
-    : `A sitting on ${pileName} is reserved but its Spotify playlist was never ` +
-      `created — the call failed. Nothing was spent and nothing else can start ` +
-      `until it's cleared. Finish it here (0 Spotify calls).`;
-  bar.hidden = false;
-}
-
-// ---- the queued materialiser's status panel --------------------------------
-//
-// GET /api/split/{id}/queue never touches Spotify (it reads queue.json and
-// pacing.json, both local), so none of the /api/now call-budget rules apply
-// here — it's polled purely for UI freshness, gated on the panel actually
-// being on screen AND the queue actually being able to change on its own
-// (running/sleeping/quiet). A paused/stopped/done queue doesn't move without
-// a click, so polling it is pure waste.
-const QUEUE_ACTIVE_STATES = new Set(["running", "sleeping", "quiet"]);
-let queueStatus = null;     // last known {queue, pacing} for the open split
-let queuePanelTimer = null;
-
-function stopQueuePolling() { clearTimeout(queuePanelTimer); queuePanelTimer = null; }
-
-// Pure — takes the exact shape GET /api/split/{id}/queue returns and renders
-// it to a markup string, so it's testable without a DOM (ui_harness.mjs).
-function renderQueuePanel(status) {
-  const q = (status && status.queue) || {};
-  const p = (status && status.pacing) || {};
-  const prog = q.progress || {};
-  const state = q.state || "stopped";
-  const badge = `<span class="queue-state">${esc(state)}</span>`;
-  const bits = [];
-  if (prog.pile_count) {
-    bits.push(`pile ${prog.pile_index ?? 0}/${prog.pile_count} · ` +
-               `track ${prog.track ?? 0}/${prog.track_total ?? 0}`);
-  }
-  if (p.rate_per_min != null) {
-    bits.push(`rate ${p.rate_per_min}/min (ceiling ${p.ceiling ?? 7.0})`);
-  }
-  if (p.max_clean_rate != null) {
-    bits.push(`max clean rate ${p.max_clean_rate}/min`);
-  }
-  // M-3: spend vs. cap+reserve — the same numbers _queue_progress already
-  // sends with every GET (a free, local read), just not previously shown.
-  if (prog.daily_cap != null && prog.reserve != null) {
-    bits.push(`spend ${prog.spent_today ?? 0}/${prog.daily_cap} today ` +
-               `(bulk ${prog.bulk_today ?? 0}, reserve ${prog.reserve})`);
-  }
-  const summary = bits.length
-    ? `<div class="queue-summary">${badge}<span>${esc(bits.join(" · "))}</span></div>`
-    : `<div class="queue-summary">${badge}</div>`;
-  // stop_reason carries both permanent quota trips and the last 429's
-  // reason string (see app.py's classify_429/note_429) — surfaced verbatim
-  // rather than re-worded, since the exact reason is what tells a user
-  // whether Resume is worth clicking yet. A quota trip is the severe case
-  // (Development Mode's daily allowance, gone until the window resets — see
-  // CLAUDE.md's lockout history) and must not read like a routine 429 note,
-  // so it gets its own class and explicit wording rather than the raw
-  // "quota" string.
-  const stopLine = q.stop_reason === "quota"
-    ? `<p class="hint queue-stop-quota">daily quota tripped — resume is manual</p>`
-    : q.stop_reason
-      ? `<p class="hint">last stop: ${esc(q.stop_reason)}</p>` : "";
-  // M-3: the pacing side's own record of the last 429, whether or not it
-  // stopped the worker (a rate 429 the governor halved for and kept going
-  // through leaves no stop_reason at all, so this is the only place that
-  // history is visible in the UI).
-  const hist429 = Array.isArray(p.history_429) ? p.history_429 : [];
-  const last429 = hist429.length ? hist429[hist429.length - 1] : null;
-  const last429Line = last429
-    ? `<p class="hint queue-last-429">last 429: ${esc(last429.kind)} at ` +
-      `${last429.rate}/min (${esc(new Date(last429.when * 1000).toLocaleTimeString())})</p>`
-    : "";
-  const canPause = QUEUE_ACTIVE_STATES.has(state);
-  // Resume 409s ("nothing queued") whenever pending/current are both empty
-  // — cancel leaves the queue in exactly that state (stopped, pending: [],
-  // current: null), so gating on state alone left Resume permanently
-  // enabled-but-dead after a cancel. Both fields ride along in the same GET.
-  const hasWork = (Array.isArray(q.pending) && q.pending.length > 0) || !!q.current;
-  const canResume = (state === "paused" || state === "stopped") && hasWork;
-  const canCancel = state !== "done" && state !== "stopped";
-  return `${summary}${stopLine}${last429Line}
-    <div class="queue-controls">
-      <button id="btn-queue-pause" ${canPause ? "" : "disabled"}>Pause</button>
-      <button id="btn-queue-resume" ${canResume ? "" : "disabled"}>Resume</button>
-      <button id="btn-queue-cancel" ${canCancel ? "" : "disabled"}>Cancel</button>
-    </div>`;
-}
-
-function paintQueuePanel() {
-  const el = $("queue-panel");
-  // Only ever shown for the split that actually owns the current/last queue
-  // — GET stays global (M4, Task 9) so a split that never queued anything
-  // would otherwise render someone else's progress as its own.
-  if (!queueStatus || !queueStatus.queue || !split ||
-      queueStatus.queue.playlist_id !== split.id) {
-    el.hidden = true; el.innerHTML = "";
-    return;
-  }
-  el.innerHTML = renderQueuePanel(queueStatus);
-  el.hidden = false;
-  const pause = $("btn-queue-pause");
-  const resume = $("btn-queue-resume");
-  const cancel = $("btn-queue-cancel");
-  if (pause) pause.onclick = pauseQueue;
-  if (resume) resume.onclick = resumeQueue;
-  if (cancel) cancel.onclick = cancelQueue;
-}
-
-async function pollQueueStatus() {
-  if (!split) { stopQueuePolling(); return; }
-  const splitId = split.id;
-  try {
-    const status = await api(`/api/split/${splitId}/queue`);
-    if (!split || split.id !== splitId) return;   // navigated away mid-flight
-    queueStatus = status;
-  } catch (_) {
-    // Local and free — a failed poll leaves the last-known status on screen
-    // rather than erasing it.
-  }
-  paintQueuePanel();
-  const active = queueStatus && queueStatus.queue &&
-    queueStatus.queue.playlist_id === splitId &&
-    QUEUE_ACTIVE_STATES.has(queueStatus.queue.state);
-  stopQueuePolling();
-  if (!$("queue-panel").hidden && active) {
-    queuePanelTimer = setTimeout(pollQueueStatus, 10000);
-  }
-}
-
-// Same in-flight guard queuePiles uses (cheap consistency): the queue
-// control buttons are static ids, re-rendered whenever the panel repaints,
-// so a raw boolean would survive a repaint fine but a per-action key on the
-// same Set costs nothing extra and keeps every "is this already in flight"
-// question answered the same way in one place.
-function queueControlKey(action) {
-  return split ? split.id + " control:" + action : null;
-}
-
-// On success, the response IS the truth — no need to spend a second round
-// trip to confirm it. On failure (most commonly a 409 from a panel that was
-// already stale — the queue finished, or someone else cancelled it) the
-// on-screen state was never true to begin with, so re-polling is what
-// reconciles the UI immediately instead of leaving a dead Pause button
-// enabled until the next scheduled poll (or none, if polling had already
-// stopped). Same behaviour resumeQueue/cancelQueue already have below.
-async function pauseQueue() {
-  if (!split) return;
-  const key = queueControlKey("pause");
-  if (queueActionInFlight.has(key)) return;
-  queueActionInFlight.add(key);
-  try {
-    await api(`/api/split/${split.id}/queue/pause`, {});
-    if (queueStatus && queueStatus.queue) queueStatus.queue.state = "paused";
-    stopQueuePolling();
-    paintQueuePanel();
-  } catch (e) {
-    toast(e.message);
-    pollQueueStatus();
-  } finally {
-    queueActionInFlight.delete(key);
-  }
-}
-
-async function resumeQueue() {
-  if (!split) return;
-  const key = queueControlKey("resume");
-  if (queueActionInFlight.has(key)) return;
-  queueActionInFlight.add(key);
-  try {
-    await api(`/api/split/${split.id}/queue/resume`, {});
-  } catch (e) { toast(e.message); }
-  queueActionInFlight.delete(key);
-  pollQueueStatus();
-}
-
-async function cancelQueue() {
-  if (!split) return;
-  const key = queueControlKey("cancel");
-  if (queueActionInFlight.has(key)) return;
-  queueActionInFlight.add(key);
-  try {
-    await api(`/api/split/${split.id}/queue`, undefined, "DELETE");
-    toast("queue cancelled");
-  } catch (e) { toast(e.message); }
-  queueActionInFlight.delete(key);
-  pollQueueStatus();
-}
-
-async function startSitting(pileId, pileName) {
-  const splitId = split.id;
-  try {
-    const data = await api(`/api/split/${splitId}/sitting`, { pile_id: pileId, target_minutes: 120 });
-    split.active_sitting = { playlist_id: data.sitting_id, pile_id: pileId, uris: data.uris };
-    syncSitting(split.id, split.piles, split.decided, split.active_sitting);
-    toast(`${data.uris.length} tracks (~${data.minutes} min) — open it in Spotify, ` +
-          `then switch to Now to keep or reject as you go`, 4500);
-    renderPiles();
-  } catch (e) {
-    toast(e.message);
-    // A failure here does NOT mean nothing happened. start_sitting reserves
-    // the slot under the lock before spending anything and fills in the
-    // playlist id as soon as create_playlist returns, so a 429 on add #5 of
-    // 22 leaves a live reservation AND a real ▶ playlist in the account.
-    // Toasting and leaving `split.active_sitting` null would show no sitting
-    // and enabled Start buttons over both. Re-read the split — a local,
-    // 0-call read — and let the server's answer stand.
-    try {
-      const fresh = await api(`/api/split/${splitId}`);
-      if (split && split.id === splitId) applySplitData(fresh);
-    } catch (_) {
-      // Leave the original failure on screen; a resync that fails too has
-      // nothing better to say.
-    }
-  }
-}
-
-// Finishing is a real Spotify call (one unfollow) and it is not idempotent
-// from the user's side: a second click while the first is in flight spends a
-// second unfollow, loses the compare-and-swap in finish_sitting, and comes
-// back cleared:false. Both Finish buttons are static in the DOM, so
-// disabling them by id here is enough — nothing re-renders them away.
-let finishInFlight = false;
-
-function setFinishBusy(busy) {
-  for (const id of ["btn-now-finish-sitting", "btn-split-finish-sitting"]) {
-    const b = $(id);
-    if (!b) continue;
-    b.disabled = busy;
-    b.textContent = busy ? "Finishing…" : "Finish sitting";
-  }
-}
-
-// `targetSplitId` lets a caller finish a SPECIFIC split's sitting (the Split
-// view's own Finish button always means "this split", regardless of what the
-// `sitting` global last pointed at — see the note by its declaration). Falls
-// back to the global for the Now view's bar, which has no "current split" of
-// its own to hand over explicitly.
-async function finishSitting(targetSplitId) {
-  const finishedSplitId = targetSplitId || sitting?.splitId;
-  if (!finishedSplitId) return;
-  if (finishInFlight) return;
-  finishInFlight = true;
-  setFinishBusy(true);
-  try {
-    const data = await api(`/api/split/${finishedSplitId}/sitting/finish`, {});
-    if (data.cleared) {
-      toast("sitting finished — disposable playlist removed");
-      if (sitting && sitting.splitId === finishedSplitId) sitting = null;
-      if (split && split.id === finishedSplitId) { split.active_sitting = null; renderPiles(); }
-    } else {
-      // cleared:false means the reservation this call observed was NOT the
-      // one it cleared — most likely a newer sitting now occupies the slot.
-      // finish_sitting still unfollowed whatever it read, but treating this
-      // as "already finished" and wiping local state would make a real,
-      // live sitting invisible to every surface with no pointer left
-      // anywhere. Re-sync from the server (free, local) instead of guessing.
-      const fresh = await api(`/api/split/${finishedSplitId}`);
-      syncSitting(finishedSplitId, fresh.piles, fresh.decided || {}, fresh.active_sitting || null);
-      if (split && split.id === finishedSplitId) {
-        split.piles = fresh.piles;
-        split.decided = fresh.decided || {};
-        split.active_sitting = fresh.active_sitting || null;
-        renderPiles();
+      // Quiet when this exact attempt was superseded (spAudio !== a) or
+      // simply aborted by a stop that raced it — neither is a failure.
+      if (spAudio !== a || (e && e.name === "AbortError")) return;
+      if (e && e.name === "NotAllowedError") {
+        spAudioRefused = true;
+        toast("tap the song again to play its preview");
+        return;
       }
-      // Said only after the resync, and from what the resync found. The old
-      // wording ("finish it again") was unconditional, so the overwhelmingly
-      // common cause — a double-click, where the first click already
-      // finished everything — told the user to go spend a third unfollow on
-      // a split with nothing active on it at all.
-      toast(fresh.active_sitting
-        ? "a newer sitting is active on this split — press Finish again to end that one"
-        : "that sitting was already finished — nothing left to clear");
+      spClipFailed();
+      return;
     }
-    if (!$("view-now").hidden) renderNow();
+    if (spAudio !== a) return;
+    spAudioPending = false;
+    if (spSessionPlaying) spResumeOwed = true;
+    renderSpList();
+    return;
+  }
+  // Same row, not refused: either genuinely playing, or merely still
+  // buffering — either way a second tap means "stop", never "try again".
+  if (spAudioUri === uri) { spStopPreview(); return; }
+  // A session starts when nothing is playing or pending yet — captured once,
+  // so switching between songs mid-session never re-asks "was it playing".
+  const startingSession = !spAudio;
+  // Unknown counts as playing, as in the house player (previewHold): a
+  // resume owed and not needed costs less than music left paused.
+  if (startingSession) spSessionPlaying = nowState ? !!nowState.is_playing : true;
+  if (spAudio) spStopPreview(false);
+  spAudioUri = uri;
+  let r;
+  try {
+    r = await api(`/api/track_preview?pid=${encodeURIComponent(spPid)}&uri=${encodeURIComponent(uri)}`);
   } catch (e) {
-    if (e.status === 404) {
-      // No active sitting for this split at all — this client's pointer to
-      // one is stale (finished elsewhere, or left over from a session that
-      // never synced). Clearing it here is what stops every further Finish
-      // click from 404ing on the same stale pointer forever.
-      toast("no active sitting to finish — clearing it here too");
-      if (sitting && sitting.splitId === finishedSplitId) sitting = null;
-      if (split && split.id === finishedSplitId) { split.active_sitting = null; renderPiles(); }
-      if (!$("view-now").hidden) renderNow();
-    } else {
-      toast(e.message);
-    }
-  } finally {
-    finishInFlight = false;
-    setFinishBusy(false);
+    if (spAudioUri === uri) spAudioUri = null;
+    toast(e.status === 404 ? "no preview for this one" : e.message);
+    return;
   }
-}
-
-$("btn-split-back").onclick = () => { stopQueuePolling(); split = null; showSplitPicker(); };
-$("btn-split-finish-sitting").onclick = () => finishSitting(split?.id);
-$("btn-save-all").onclick = () => queuePiles(null, saveAllTotal);
-$("btn-recluster").onclick = async () => {
+  if (spAudioUri !== uri) return;        // another tap won the race
+  const a = spAudio = new Audio(r.url);
+  spAudioPending = true;
+  a.onended = () => { if (spAudio === a) spStopPreview(); };
+  a.onerror = () => { if (spAudio === a) spClipFailed(); };
   try {
-    const data = await api(`/api/split/${split.id}/recluster`, splitParams());
-    split.piles = data.piles;
-    renderPiles();
-    toast("re-clustered — 0 Spotify calls");
-  } catch (e) { toast(e.message); }
-};
-
-// ---- split decisions (decided from the Now view) ---------------------------
-//
-// Keep/reject controls live on the Now view's card rather than a card of
-// their own here, for one concrete reason: this app has no cheap way to
-// display a track's name/artist/art for an arbitrary Spotify uri — the
-// dev-mode API has no batch lookup, so getting that for up to 40 sitting
-// tracks up front would cost 40 extra calls, on top of the ~24 the sitting
-// itself already spent. /api/now already carries full track metadata for
-// free, as a side effect of the polling that already exists to show what's
-// playing. Piggybacking on it is the only way to show "what track is this"
-// without paying for it twice.
-//
-// It also keeps the two decision models honest instead of tangled: /api/act
-// (ordinary triage/Now filing, undo-able, 1–2 calls) and /api/split/.../decide
-// (a keep is final and costs 1 call, a reject touches nothing and costs 0)
-// have different guarantees. Reusing nowFile/nowRemove here would silently
-// route a "keep" through /api/act instead — no charge to the split's
-// `decided` bookkeeping, no pile-progress update, and the track could be
-// resurfaced by a future sitting from the same pile as if nothing happened.
-// Keeping them as separate code paths, gated on whether the currently-playing
-// context is the active sitting's playlist, is what makes that impossible.
-
-// `srvSitting` is always d.sitting from the most recent /api/now poll — the
-// server's own answer for "is the currently-playing context a sitting, and
-// what's already decided in it." Never the client-side `sitting` global:
-// that one only mirrors this for the cross-view convenience bar, and reading
-// it here would let a stale local guess override a fresh server answer (the
-// two-tab-drift and reload-gap bugs a review round caught).
-function sittingCardBody(tr, srvSitting) {
-  const dec = srvSitting.decided[tr.uri];
-  if (dec?.action === "keep") {
-    const homeName = dec.to_id === "liked" ? "Liked Songs" : (nowState.homes.get(dec.to_id)?.name || dec.to_id);
-    const fresh = enterOnce("mark", `${tr.uri}:keep`) ? " mark-in" : "";
-    return `<div class="done-msg${fresh}">${DONE_MARK}<p>kept to <b>${esc(homeName)}</b><br>
-      <span class="hint">final — edit it from the home playlist if that was wrong</span></p></div>`;
-  }
-  enterOnce("mark", null);
-  if (dec?.action === "reject") {
-    return `<p class="hint">✗ rejected.</p>
-      <div class="minor-actions"><button id="btn-decide-unreject">Undo reject (free)</button></div>`;
-  }
-  let html = "";
-  if (!tr.sortable) {
-    html += '<p class="hint">Can\'t be kept via the API (local file or episode) — reject it instead.</p>';
-  } else if (nowState.suggPending) {
-    html += suggSkeleton();
-  } else {
-    const sugg = nowState.suggestions || [];
-    if (sugg.length && sugg[0].weak) {
-      html += '<p class="hint">No confident match — closest guesses:</p>';
+    await a.play();
+  } catch (e) {
+    if (spAudio !== a || (e && e.name === "AbortError")) return;
+    if (e && e.name === "NotAllowedError") {
+      // Keep spAudio/spAudioUri/spAudioPending: the next tap on this same
+      // row retries play() on this object instead of refetching.
+      spAudioRefused = true;
+      toast("tap the song again to play its preview");
+      return;
     }
-    sugg.forEach((s, i) => {
-      const home = nowState.homes.get(s.playlist_id);
-      if (!home) return;
-      html += `<button class="sugg${s.already ? " already" : ""}${s.weak ? " weak" : ""}" data-keep="${esc(s.playlist_id)}" style="--pct:${s.already ? 100 : s.pct}%">
-        <span class="s-pct">${s.already ? '<span class="s-badge">already there</span>' : s.pct + "%"}</span>
-        <span class="s-name"><kbd>${i + 1}</kbd> Keep → ${esc(home.name)}</span>
-        <span class="s-why">${esc([folderLeaf(home.folder), ...s.reasons].filter(Boolean).join(" · "))}</span>
-      </button>`;
-    });
-    if (!nowState.suggestions.length) html += '<p class="hint">No confident match — use Keep to… below.</p>';
+    spClipFailed();
+    return;
   }
-  html += `<div class="minor-actions">
-    ${tr.sortable && (!nowState.suggPending || nowState.homes.size)
-      ? `<button id="btn-decide-more"><kbd>m</kbd> Keep to…</button>` : ""}
-    <button id="btn-decide-reject" class="danger"><kbd>r</kbd> Reject (free)</button>
-  </div>`;
-  return html;
+  if (spAudio !== a) return;
+  spAudioPending = false;
+  if (spSessionPlaying) spResumeOwed = true;
+  renderSpList();
 }
 
-function wireSittingCard() {
-  $("now-card").querySelectorAll("[data-keep]").forEach((b) => {
-    b.onclick = () => { if (previewHold.consumeClick()) return; decideKeep(b.dataset.keep); };
-    previewHold.attach(b, b.dataset.keep, nowState.homes.get(b.dataset.keep)?.name,
-      { label: "Keep here", run: () => decideKeep(b.dataset.keep) });
+// ---- touch that moves = drag -------------------------------------------------
+const SP_LIFT_PX = 8;
+let spDrag = null;      // {uri, x0, y0, lifted, ghost, pointerId}
+let spDropKey = null;   // the chip under a lifted song
+
+function spChipAt(x, y) {
+  const el = document.elementFromPoint ? document.elementFromPoint(x, y) : null;
+  const chip = el && el.closest ? el.closest(".sp-chip[data-key]") : null;
+  return chip ? chip.dataset.key : null;
+}
+
+function spHighlight(key) {
+  spDropKey = key;
+  $("sp-chips").querySelectorAll("button").forEach((b, i) => {
+    const part = spDraft.parts[i];
+    if (part) b.classList.toggle("drop", part.key === key);
   });
-  const more = $("btn-decide-more");
-  if (more) more.onclick = () => openPicker(nowState.homes, decideKeep);
-  const rej = $("btn-decide-reject");
-  if (rej) rej.onclick = decideReject;
-  const un = $("btn-decide-unreject");
-  if (un) un.onclick = decideUndecide;
 }
 
-// Applies whatever the server says actually stands for `uri` — `decision` is
-// res.decision from a decide() response: {action, to_id} if something is
-// decided, or null if not (a successful undecide, or nothing ever landed).
-// NEVER the action this client just attempted: decide() reports
-// `changed: false` exactly when a different outcome already won (a
-// throttled add still in flight when a second click landed, for instance),
-// and recording the attempt instead of the true outcome is how a card ends
-// up reading "kept to Jazz" for a track that is actually in Rock.
-function applyDecision(uri, decision) {
-  if (nowState?.sitting) {
-    if (decision) nowState.sitting.decided[uri] = decision;
-    else delete nowState.sitting.decided[uri];
+function spPointerDown(uri, x, y, id) {
+  // A new touch always ends whatever drag is already in progress — without
+  // this a second finger silently overwrote spDrag, orphaning the first
+  // finger's ghost and leaving its eventual pointerup to act on someone
+  // else's drag.
+  spEndDrag();
+  spDrag = { uri, x0: x, y0: y, lifted: false, ghost: null, pointerId: id };
+}
+
+function spPointerMove(x, y, id) {
+  if (!spDrag || id !== spDrag.pointerId) return;
+  if (!spDrag.lifted && Math.hypot(x - spDrag.x0, y - spDrag.y0) >= SP_LIFT_PX) {
+    spDrag.lifted = true;
+    const g = document.createElement("div");
+    g.className = "sp-ghost";
+    g.textContent = spSongLabel(spDrag.uri);
+    document.body.appendChild(g);
+    spDrag.ghost = g;
   }
-  if (sitting) {
-    if (decision) sitting.decided[uri] = decision;
-    else delete sitting.decided[uri];
+  if (!spDrag.lifted) return;
+  spDrag.ghost.style.left = `${x}px`;
+  spDrag.ghost.style.top = `${y}px`;
+  const key = spChipAt(x, y);
+  spHighlight(key && key !== spShown ? key : null);
+}
+
+function spEndDrag() {
+  const d = spDrag;
+  spDrag = null;
+  // Only ever the element's own remove() — a real HTMLCollection (what
+  // document.body.children actually is) has no indexOf, so searching it by
+  // hand threw before this ever got as far as clearing the highlight or
+  // moving the song.
+  if (d && d.ghost) d.ghost.remove();
+  spHighlight(null);
+  return d;
+}
+
+async function spPointerUp(x, y, id) {
+  if (!spDrag || id !== spDrag.pointerId) return;
+  const lifted = spDrag.lifted;
+  const key = lifted ? spChipAt(x, y) : null;
+  const d = spEndDrag();
+  if (!lifted) { await spPreview(d.uri); return; }
+  if (key && key !== spShown) await spMove(d.uri, key);
+}
+
+function spPointerCancel(id) {
+  if (!spDrag || id !== spDrag.pointerId) return;
+  spEndDrag();
+}
+
+function spListPointerDown(e) {
+  const row = e.target && e.target.closest ? e.target.closest(".sp-song") : null;
+  if (!row || (e.button !== undefined && e.button > 0)) return;
+  e.preventDefault();
+  spPointerDown(row.dataset.uri, e.clientX, e.clientY, e.pointerId);
+}
+document.addEventListener("pointermove", (e) => {
+  if (!spDrag) return;
+  if (e.preventDefault) e.preventDefault();
+  spPointerMove(e.clientX, e.clientY, e.pointerId);
+}, { passive: false });
+document.addEventListener("pointerup", (e) => { if (spDrag) spPointerUp(e.clientX, e.clientY, e.pointerId); });
+document.addEventListener("pointercancel", (e) => { if (spDrag) spPointerCancel(e.pointerId); });
+
+async function spMove(uri, key) {
+  try {
+    spDraft = await api(spUrl("/move"), { uri, to: key });
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  renderSpParts();
+  toast(`moved to ${spPart(key)?.name || "the other part"}`);
+}
+
+// ---- parts come and go ---------------------------------------------------------
+// Adding or removing a part is a SURGICAL edit, not a full invalidation —
+// it does not bump `spDraftGen`, so a typed name/choice for any part that
+// wasn't touched keeps working. (A fresh Suggest/Start-over/reread IS a
+// full reset, via the generation bump in `spPoll`/`spReread`.)
+async function spAddPart() {
+  try {
+    spDraft = await api(spUrl("/parts"), {});
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  // A brand new key: nothing was ever typed for it, so there is nothing to
+  // carry or drop — it falls back to its own suggested name on its own.
+  spShown = spDraft.parts[spDraft.parts.length - 1].key;
+  renderSpParts();
+}
+
+async function spRemovePart(key) {
+  const part = spPart(key);
+  if (!part) return;
+  let dry;
+  try {
+    dry = await api(spUrl(`/parts/${encodeURIComponent(key)}/remove`), { dry: true });
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  const where = Object.entries(dry.moves || {})
+    .map(([k, n]) => `${spPart(k)?.name || k}: ${n}`).join(", ");
+  const msg = part.uris.length
+    ? `Remove “${part.name}”? Its ${part.uris.length} songs go to the parts they fit best — ${where}.`
+    : `Remove the empty part “${part.name}”?`;
+  if (!confirm(msg)) return;
+  try {
+    spDraft = await api(spUrl(`/parts/${encodeURIComponent(key)}/remove`), { dry: false });
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  // Drop only what belonged to the removed key — never a blunt reset of
+  // every other part's typed name. A dangling `spDoneChoice.part` falls
+  // back right away, not lazily: `add_part` reuses `max(existing)+1` for
+  // its new key, so a removed HIGHEST key can come back on a later add —
+  // leaving the choice pointed at the dead key could silently start
+  // meaning that unrelated new part instead of being caught as stale.
+  delete spDoneChoice.names[key];
+  if (spDoneChoice.part === key) spDoneChoice.part = spDraft.parts[0]?.key || null;
+  if (spShown === key) spShown = spDraft.parts[0]?.key || null;
+  renderSpParts();
+}
+
+// A new suggestion replaces the draft. Ask only when that loses something:
+// the server marks a draft `edited` once a song was moved or a part added
+// or removed.
+function spConfirmReplace(n) {
+  if (!spDraft || !spDraft.edited) return true;
+  return confirm(`Start over with ${n} parts? Your moves and added or removed parts are lost.`);
+}
+
+// The hint's "try N": straight to a new suggestion with that count.
+async function spResuggest(n) {
+  if (!spConfirmReplace(n)) return;
+  await spSuggest(n);
+}
+
+// Start over opens the counter, at the current count; Suggest from there
+// replaces the draft, and "Keep this split" goes back to it untouched.
+function spStartOver() {
+  spStopPreview();
+  spN = spDraft?.n || 2;
+  renderSpSetup("");
+}
+
+async function spDiscard() {
+  if (spDraft.edited && !confirm("Discard this split? Your moves and part changes are lost. Nothing in Spotify changes.")) return;
+  const pid = spPid, gen = spDraftGen;
+  spStopPreview();
+  try {
+    await api(spUrl("", pid), null, "DELETE");
+  } catch (e) {
+    if (pid === spPid && gen === spDraftGen) toast(e.message);
+    return;
+  }
+  if (pid !== spPid || gen !== spDraftGen) return;
+  spDraft = null;
+  spDraftGen++;
+  toast("split discarded");
+  await showSplit();
+}
+
+function spSection(id) {
+  for (const s of ["sp-pick", "sp-work"]) $(s).hidden = s !== id;
+}
+function spPanel(id) {
+  // #sp-done holds a live form only while it is the panel on screen —
+  // switching to any other panel empties it outright, rather than leaving
+  // a hidden, stale form whose inputs a later spReadNames() could still
+  // read from (a real DOM would drop those nodes the moment something
+  // else replaces them; nothing here was doing that on its own).
+  if (id !== "sp-done") $("sp-done").innerHTML = "";
+  for (const s of ["sp-setup", "sp-progress", "sp-parts", "sp-done"]) $(s).hidden = s !== id;
+}
+function spStopPolling() {
+  clearTimeout(spPollTimer); spPollTimer = null;
+  clearTimeout(spFilingTimer); spFilingTimer = null;
+  spPollToken++;
+}
+const spUrl = (tail = "", pid = spPid) => `/api/splitparts/${encodeURIComponent(pid)}${tail}`;
+
+async function showSplit() {
+  spStopPolling();
+  spStopPreview();
+  show("split");
+  spSection("sp-pick");
+  $("sp-homes").innerHTML = '<p class="hint">loading…</p>';
+  const token = spPollToken;
+  // A Done that finished while nobody watched (the view was left mid-run)
+  // holds its summary in the job slot. For a subset-mode Done the original
+  // is no longer a home, so this is the only way back to it.
+  let last = null;
+  try { last = await api("/api/splitparts/progress"); } catch (e) { /* the list still loads */ }
+  if (token !== spPollToken) return;
+  if (last && last.kind === "done" && last.state === "done" && last.summary && last.pid &&
+      spSummaryKey(last.pid, last.summary) !== spShownSummaryKey) {
+    spPid = last.pid;
+    spDraft = null;
+    spDraftGen++;
+    $("sp-title").textContent = last.summary.name || "";
+    spSection("sp-work");
+    renderSpSummary(last.summary);
+    return;
+  }
+  try {
+    spHomes = (await api("/api/splitparts/homes")).homes;
+  } catch (e) {
+    if (token !== spPollToken) return;
+    $("sp-homes").innerHTML = `<p class="hint">${esc(e.message)}</p>`;
+    return;
+  }
+  if (token !== spPollToken) return;
+  renderSpHomes();
+}
+
+function renderSpHomes() {
+  const q = ($("sp-filter").value || "").trim().toLowerCase();
+  const rows = spHomes.filter((h) => !q || h.name.toLowerCase().includes(q));
+  $("sp-homes").innerHTML = rows.length
+    ? rows.map((h) => `<button class="sp-home picker-row" data-id="${esc(h.id)}"${h.splittable ? "" : " disabled"}>
+        <span class="p-name">${esc(h.name)}</span>
+        <span class="p-sub">${h.total} songs${h.draft ? " · split in progress" : ""}${h.reason ? " · " + esc(h.reason) : ""}</span>
+      </button>`).join("")
+    : '<p class="hint">no homes match</p>';
+  // Buttons come back in markup order, so the i-th one is rows[i].
+  $("sp-homes").querySelectorAll("button").forEach((b, i) => {
+    if (rows[i].splittable) b.onclick = () => openSpHome(rows[i]);
+  });
+}
+$("sp-filter").oninput = renderSpHomes;
+
+async function openSpHome(home) {
+  // Before anything else: a hidden, stale Done form must never outlive
+  // the screen it belonged to — this also covers leaving via the HEADER
+  // Back (showSplit), which never itself touches #sp-done.
+  $("sp-done").innerHTML = "";
+  spStopPolling();
+  const pid = home.id;     // captured once; spPid can move out from under an await below
+  const gen = spDraftGen;  // ditto — something else can land a newer draft for THIS pid while we load
+  spPid = pid;
+  spDraft = null;
+  $("sp-title").textContent = home.name;
+  spSection("sp-work");
+  // A Done (or a Suggest) can still be running for this very pid — reopening
+  // the home must land back on its progress, not a draft screen or a stale
+  // "pick a count" screen underneath it. A failed progress fetch is treated
+  // as idle: there is nothing in flight worth showing instead.
+  let prog = null;
+  try { prog = await api(spUrl("/progress", pid)); } catch (e) { /* idle */ }
+  if (pid !== spPid || gen !== spDraftGen) return;   // a newer load already won
+  if (prog && prog.state === "running") {
+    spPanel("sp-progress");
+    $("sp-progress").innerHTML = '<div class="spinner"></div><p class="hint">starting…</p>';
+    await spPoll(prog.kind === "done" ? "done" : "suggest", pid);
+    return;
+  }
+  // Fetched into a LOCAL first, never straight into `spDraft` — assigning
+  // the global before the pid/gen check below would clobber a fresher
+  // load that already landed while this fetch was still in flight (the
+  // actual bug behind "a stale draft can outrace a fresh one in").
+  let fetched = null, fetchErr = null;
+  try { fetched = await api(spUrl("", pid)); } catch (e) { fetchErr = e; }
+  if (pid !== spPid || gen !== spDraftGen) return;
+  if (fetchErr) {
+    if (fetchErr.status !== 404) {
+      // A real failure (not "nothing split here yet") must not be read as
+      // "no draft, show the counter" — that would hide the problem.
+      spPanel("sp-done");
+      $("sp-done").innerHTML = `<p>${esc(fetchErr.message)}</p>
+        <div class="row"><button id="sp-try-again" class="primary">Try again</button></div>`;
+      $("sp-try-again").onclick = () => openSpHome(home);
+      return;
+    }
+  } else {
+    spDraft = fetched;
+    spDraftGen++;
+    // Done has started (and written something) but is not running right
+    // now — the choices it started with are locked in; offering a fresh
+    // editable form here could disagree with what a resume will actually do.
+    if (spDraft.done) { await renderSpFinish(); return; }
+    spShown = spDraft.parts[0]?.key || null;
+    renderSpParts();
+    return;
+  }
+  // The draft is gone (Done finished and dropped it, or never existed) but
+  // the last job recorded for this pid is still the one that holds the
+  // summary — UNLESS this client already showed that exact summary once
+  // (spShownSummaryKey), in which case showing it again would trap the
+  // home: every escape (Suggest again, discard) is a fresh job this same
+  // held "done" record would otherwise keep overriding back to the
+  // summary on every reopen.
+  if (prog && prog.state === "done" && prog.summary) {
+    if (spSummaryKey(pid, prog.summary) === spShownSummaryKey) { spN = 2; renderSpSetup(""); return; }
+    renderSpSummary(prog.summary);
+    return;
+  }
+  spN = 2; renderSpSetup("");
+}
+$("sp-back").onclick = () => { spStopPolling(); spStopPreview(); showSplit(); };
+
+function renderSpSetup(msg) {
+  spPanel("sp-setup");
+  $("sp-n").textContent = String(spN);
+  $("sp-setup-msg").textContent = msg || "";
+  // Reached from Start over (or a failed re-suggest): the draft is still
+  // there, untouched, and this is the way back to it.
+  $("sp-setup-keep").hidden = !spDraft;
+}
+$("sp-setup-keep").onclick = () => { if (spDraft) renderSpParts(); };
+$("sp-minus").onclick = () => { spN = Math.max(SP_MIN, spN - 1); $("sp-n").textContent = String(spN); };
+$("sp-plus").onclick = () => { spN = Math.min(SP_MAX, spN + 1); $("sp-n").textContent = String(spN); };
+$("sp-suggest").onclick = () => { if (spConfirmReplace(spN)) return spSuggest(spN); };
+
+async function spSuggest(n) {
+  spStopPreview();
+  spN = n;
+  try {
+    await api(spUrl("/suggest"), { n });
+  } catch (e) {
+    renderSpSetup(e.message);
+    return;
+  }
+  spPanel("sp-progress");
+  $("sp-progress").innerHTML = '<div class="spinner"></div><p class="hint">starting…</p>';
+  await spPoll("suggest");
+}
+
+// One poll; schedules the next while the server job runs. `kind` says what
+// a finished job means: a fresh draft ("suggest") or a finished Done ("done",
+// handled in Task 10's spDoneFinished). `pid` is captured at the moment this
+// poll chain started (default: whatever home was open then) and carried
+// through every re-schedule — opening a different home moves `spPid` out
+// from under it, and without a pid of its own this kept building URLs from
+// the live global and, worse, kept re-arming itself against whatever home
+// happened to be open when it next fired. `spStopPolling()` at the top of
+// `showSplit`/`openSpHome` cancels the still-pending timer outright; the
+// `pid !== spPid` checks below are the fallback for a request already in
+// flight at the moment of the switch, which a cleared timeout cannot recall.
+async function spPoll(kind, pid = spPid) {
+  spStopPolling();
+  const token = spPollToken;   // after the stop above, which moves it
+  let p;
+  try {
+    p = await api(spUrl("/progress", pid));
+  } catch (e) {
+    if (pid !== spPid || token !== spPollToken) return;
+    spPollTimer = setTimeout(() => spPoll(kind, pid), 2000);
+    return;
+  }
+  // The view was left (or another poll started) while this was in flight:
+  // drawing a summary now would mark it shown on a screen nobody sees.
+  if (token !== spPollToken) return;
+  if (pid !== spPid) return;   // a different home opened while this was in flight
+  if (p.state === "running") {
+    const count = p.total ? ` — ${p.done} of ${p.total}` : "";
+    $("sp-progress").innerHTML = `<div class="spinner"></div><p class="hint">${esc(p.phase || "working")}${count}</p>`;
+    spPollTimer = setTimeout(() => spPoll(kind, pid), 1000);
+    return;
+  }
+  if (kind === "done") { await spDoneFinished(p, token); return; }
+  if (p.state === "error") { renderSpSetup(p.message || "the suggestion failed"); return; }
+  // Into a LOCAL first — see openSpHome's own fetch for why: assigning
+  // `spDraft` before the pid check could clobber a fresher load.
+  let fetched;
+  try {
+    fetched = await api(spUrl("", pid));
+  } catch (e) {
+    if (pid !== spPid || token !== spPollToken) return;
+    renderSpSetup(e.message);
+    return;
+  }
+  if (pid !== spPid || token !== spPollToken) return;
+  spDraft = fetched;
+  spDraftGen++;   // a landed Suggest is a fresh part set — any typed Done choice for the old one is stale
+  spShown = spDraft.parts[0]?.key || null;
+  renderSpParts();
+}
+
+// ---- Done ---------------------------------------------------------------------
+let spDoneChoice = { original: "subset", part: null, folder: null, names: {} };
+// Which pid AND draft generation spDoneChoice (typed names, folder,
+// original/part choice) was built for — reopening Done… for the SAME
+// split, SAME generation (Back → parts → Done…, or after an add/remove,
+// which never bump the generation) must keep what was typed; a different
+// pid, or a fresh load/Suggest/reread for the SAME pid (a new generation),
+// must not inherit it.
+let spDoneChoicePid = null;
+let spDoneChoiceGen = null;
+let spPlan = null;
+// The latest /plan request wins — an earlier one's answer, landing after a
+// faster later one, must never redraw the cost line over a fresher choice.
+let spPlanSeq = 0;
+// A plain flag, not the Confirm button's `disabled` attribute: the guard
+// must stop a second CALL to spConfirmDone (the Done-again and Finish Done
+// buttons reuse it too), and a disabled attribute only stops a second real
+// tap on a real button — it would not catch a double call made directly.
+let spConfirmBusy = false;
+// The job slot's own "done" record for a pid never clears itself once a
+// client has seen it — only a NEW job (another Suggest, another Done)
+// overwrites it. Without tracking what THIS client already showed,
+// reopening a home after its summary (or the summary's own "Split this
+// home again") would show that same summary forever, since nothing else
+// in the job record changes. Keyed on pid + the created ids, not just pid,
+// so a FRESH summary for the same pid (started right after) is shown.
+let spShownSummaryKey = null;
+function spSummaryKey(pid, summary) {
+  return `${pid}:${(summary.created || []).map((c) => c.id).join(",")}`;
+}
+
+async function spOpenDone() {
+  spStopPreview();   // no clip plays on under the Done screen
+  if (spDoneChoicePid !== spPid || spDoneChoiceGen !== spDraftGen) {
+    spDoneChoice = { original: "subset", part: spDraft.parts[0]?.key || null,
+                     folder: undefined, names: {} };
+    spDoneChoicePid = spPid;
+    spDoneChoiceGen = spDraftGen;
+    spPlan = null;
+  }
+  spPanel("sp-done");
+  if (!spPlan) $("sp-done").innerHTML = '<div class="spinner"></div>';
+  await spRefreshPlan();
+}
+
+async function spRefreshPlan() {
+  // Only ever read from a form that is genuinely the one on screen: with
+  // no previous plan, #sp-done holds nothing but a spinner (or belongs to
+  // a different pid/choice that was just invalidated) — there are no
+  // current name fields worth reading, and the stub-or-not DOM may still
+  // have same-id leftovers from an unrelated earlier render.
+  const pid = spPid, gen = spDraftGen;
+  const hadPlan = !!spPlan;
+  if (hadPlan) spReadNames();
+  const seq = ++spPlanSeq;
+  // A part the choice pointed at can be gone by the time this runs (the
+  // structural-change path already resets the whole choice, but this is
+  // the backstop for anything that reaches here with a dead key anyway).
+  if (spDoneChoice.original === "part" && !spPart(spDoneChoice.part)) {
+    spDoneChoice.part = spDraft.parts[0]?.key || null;
+  }
+  if (hadPlan) renderSpDone({ pending: true });
+  const q = spDoneChoice.original === "part"
+    ? `?original=part&part=${encodeURIComponent(spDoneChoice.part)}`
+    : "?original=subset";
+  // Into a LOCAL first — the pid/gen/seq check below decides whether this
+  // answer is even still relevant before it touches `spPlan` at all.
+  let plan;
+  try {
+    plan = await api(spUrl("/plan" + q, pid));
+  } catch (e) {
+    // A later choice (or leaving the Done screen, or a different home, or
+    // a fresh load for this same home) already won — this answer belongs
+    // to a question nobody is asking any more.
+    if (seq !== spPlanSeq || pid !== spPid || gen !== spDraftGen || $("sp-done").hidden) return;
+    if (hadPlan) {
+      spReadNames();   // whatever was typed while this one was pending
+      renderSpDone({ error: e.message });
+      return;
+    }
+    $("sp-done").innerHTML = `<p class="hint">${esc(e.message)}</p>
+      <div class="row"><button id="sp-done-back">Back</button></div>`;
+    $("sp-done-back").onclick = renderSpParts;
+    return;
+  }
+  if (seq !== spPlanSeq || pid !== spPid || gen !== spDraftGen || $("sp-done").hidden) return;
+  spPlan = plan;
+  if (spDoneChoice.folder === undefined) spDoneChoice.folder = spPlan.folder || "";
+  if (hadPlan) spReadNames();   // whatever was typed while this one was pending
+  renderSpDone();
+}
+
+// What the name fields hold now; an emptied field falls back to the
+// suggested name (the server does the same) — never to whatever was typed
+// and then cleared, which a stale `|| spDoneChoice.names[p.key]` used to
+// do. Keyed by part key, not position: `spDraft.parts[i]` can be a
+// DIFFERENT part than whichever one last rendered at index i (a remove
+// shifts everything after it up by one), so reading `sp-name-${i}` into
+// `spDraft.parts[i].key` could cross-wire an old name onto a new part.
+function spReadNames() {
+  if (!spDraft) return;
+  spDraft.parts.forEach((p) => {
+    const el = $(`sp-name-${p.key}`);
+    const v = el && typeof el.value === "string" ? el.value.trim() : "";
+    if (el && !el.disabled) spDoneChoice.names[p.key] = v || p.name;
+  });
+}
+
+function spCostLine(plan, isPart) {
+  const n = plan.creates;
+  const made = `${n} new playlist${n === 1 ? "" : "s"}`;
+  const orig = isPart
+    ? `removes ${plan.removals} song${plan.removals === 1 ? "" : "s"} from the original`
+    : "renames the original with the subset mark";
+  return `${made} · ${orig} · about ${plan.calls} calls`;
+}
+
+// Shared by the editable Done screen and the locked finish screen — the
+// exact phrase a local-file warning uses, so the two screens never drift.
+function spLocalWarning(plan) {
+  const n = plan.local.length;
+  return `${n} local file${n === 1 ? "" : "s"} cannot be added through Spotify's API and stay${n === 1 ? "s" : ""} in the original only: ${plan.local.map(esc).join(", ")}`;
+}
+
+// Whether a part will actually become a new playlist: GET /plan's own
+// `empty` list names it by its SUGGESTED name, never the typed one — so
+// matching a (possibly renamed) display name against it mismatches the
+// moment a custom name is typed. Decided here the same way the server
+// decides it (a part with no non-local uri creates nothing), straight off
+// `spDraft.songs`, so a rename never changes the answer.
+function spPartWillBeCreated(p) {
+  return p.uris.some((u) => !((spDraft.songs[u] || {}).local));
+}
+
+// `opts.pending` (a fresh /plan request is in flight for the current
+// choice) and `opts.error` (the last one was refused, e.g. "at least 2
+// parts need songs in them") both keep every control live — including the
+// radios and selects that got the user into this choice — so the only way
+// out of a refused choice is to pick a different one; only Confirm itself
+// is disabled, and the cost line carries the status instead of a price.
+// Guarded against a stray late call: `spDraft` can already be null (the
+// summary clears it), `spDraft.done` can already be set (Confirm landed
+// while an old plan answer was still pending), and `#sp-work` can already
+// be hidden (the user left the Split tab, or backed out to the home
+// picker) by the time an awaited caller gets back here.
+function renderSpDone(opts = {}) {
+  if (!spDraft || spDraft.done || $("sp-work").hidden) return;
+  const isPart = spDoneChoice.original === "part";
+  const pending = !!opts.pending;
+  const errMsg = opts.error || null;
+  // Both the markup's own `value=` AND an explicit `.value =` afterward
+  // (below, with the folder select) — same belt-and-suspenders as every
+  // other prefilled input in this file (new-home-name, client-id, …):
+  // a freshly reassigned element does pick up its attribute in a real
+  // browser, but nothing here is left to rely on that alone.
+  const nameVals = spDraft.parts.map((p) => {
+    const keeps = isPart && p.key === spDoneChoice.part;
+    return keeps ? spDraft.name : (spDoneChoice.names[p.key] || p.name);
+  });
+  const names = spDraft.parts.map((p, i) => {
+    const keeps = isPart && p.key === spDoneChoice.part;
+    return `<label class="sp-name-row">
+        <span class="hint">${p.uris.length} song${p.uris.length === 1 ? "" : "s"}${keeps ? ` · keeps the name “${esc(spDraft.name)}”` : ""}</span>
+        <input id="sp-name-${esc(p.key)}" value="${esc(nameVals[i])}" placeholder="${esc(p.name)}" autocomplete="off"${keeps ? " disabled" : ""}>
+      </label>`;
+  }).join("");
+  const folders = [`<option value="">${esc(FOLDER_TOP_LEVEL)}</option>`].concat(
+    (spPlan.folders || []).map((f) => `<option value="${esc(f.path)}"${f.blocked ? " disabled" : ""}>${esc(f.path)}${f.blocked ? (/input set/.test(f.blocked) ? " — an input set's folder" : " — file by hand") : ""}</option>`)).join("");
+  // Named as typed above (falling back to the suggestion), so the pick
+  // reads the same as the field it refers to.
+  const partOptions = () => spDraft.parts.map((p) =>
+    `<option value="${esc(p.key)}"${p.key === spDoneChoice.part ? " selected" : ""}>${esc(spDoneChoice.names[p.key] || p.name)}</option>`).join("");
+  const parts = partOptions();
+  // A stale answer's own local/empty warnings never belong to the CURRENT
+  // choice's error — they'd be describing a different plan entirely.
+  const warn = [];
+  if (!errMsg) {
+    if (spPlan.local.length) warn.push(spLocalWarning(spPlan));
+    // By key/content, not by matching spPlan.empty's suggested-name
+    // strings against a possibly-renamed display name (see
+    // spPartWillBeCreated).
+    const emptyNames = spDraft.parts
+      .filter((p) => !(isPart && p.key === spDoneChoice.part))
+      .filter((p) => !spPartWillBeCreated(p))
+      .map((p) => spDoneChoice.names[p.key] || p.name);
+    if (emptyNames.length) warn.push(`Not created, no songs: ${emptyNames.map(esc).join(", ")}`);
+  }
+  const costText = errMsg ? esc(errMsg) : (pending ? "pricing…" : spCostLine(spPlan, isPart));
+  const confirmDisabled = pending || !!errMsg;
+  $("sp-done").innerHTML = `
+    <h3>Name the parts</h3>${names}
+    <h3>Folder</h3><select id="sp-folder">${folders}</select>
+    <h3>The original, “${esc(spDraft.name)}”</h3>
+    <label class="sp-orig"><input type="radio" name="sp-orig" id="sp-orig-subset"${isPart ? "" : " checked"}>
+      Keep it as a subset — it keeps every song, is renamed with the subset mark and stops being a home</label>
+    <label class="sp-orig"><input type="radio" name="sp-orig" id="sp-orig-part"${isPart ? " checked" : ""}>
+      It becomes the part <select id="sp-orig-part-key"${isPart ? "" : " disabled"}>${parts}</select></label>
+    ${warn.map((w) => `<p class="hint sp-warn">${w}</p>`).join("")}
+    <p id="sp-cost" class="sp-cost">${costText}</p>
+    <div class="row"><button id="sp-done-back">Back</button><button id="sp-confirm" class="primary"${confirmDisabled ? " disabled" : ""}>Confirm</button></div>`;
+  spDraft.parts.forEach((p, i) => { $(`sp-name-${p.key}`).value = nameVals[i]; });
+  spDraft.parts.forEach((p) => {
+    $(`sp-name-${p.key}`).oninput = () => {
+      spReadNames();
+      $("sp-orig-part-key").innerHTML = partOptions();
+      $("sp-orig-part-key").value = spDoneChoice.part || "";
+    };
+  });
+  $("sp-folder").value = spDoneChoice.folder || "";
+  $("sp-confirm").disabled = confirmDisabled;
+  $("sp-folder").onchange = () => { spDoneChoice.folder = $("sp-folder").value; };
+  $("sp-orig-subset").onchange = () => { spDoneChoice.original = "subset"; spRefreshPlan(); };
+  $("sp-orig-part").onchange = () => { spDoneChoice.original = "part"; spRefreshPlan(); };
+  $("sp-orig-part-key").onchange = () => { spDoneChoice.part = $("sp-orig-part-key").value; spRefreshPlan(); };
+  $("sp-done-back").onclick = () => { spReadNames(); renderSpParts(); };
+  $("sp-confirm").onclick = spConfirmDone;
+}
+
+// The locked screen for a Done that has already started writing something
+// (spDraft.done is set) but is not running right now — no editable fields,
+// since the stored opts are the only truth from here on; its button posts
+// exactly spDraft.done.opts, same as a resumed run itself always does.
+// Draws its price/warnings from a real /plan for those exact stored opts
+// (the ONLY numbers that can disagree with what the server will actually
+// do are the ones it would compute itself) — a /plan failure still shows
+// the locked screen, just without that detail, since Finish Done must
+// never become unreachable over a transient read.
+async function renderSpFinish(errorMessage) {
+  // Any plan answer still pending for the EDITABLE screen must never win
+  // back over this one, however this screen was reached (an error on an
+  // already-started Done calls this straight from spDoneFinished, with
+  // no spRefreshPlan involved at all) — bumping the sequence here is
+  // enough to make spRefreshPlan's own staleness check reject it.
+  spPlanSeq++;
+  const opts = spDraft.done.opts;
+  const isPart = opts.original === "part";
+  const pid = spPid, gen = spDraftGen;
+  const q = isPart ? `?original=part&part=${encodeURIComponent(opts.part)}` : "?original=subset";
+  spPanel("sp-done");
+  $("sp-done").innerHTML = '<div class="spinner"></div>';
+  let plan = null;
+  try { plan = await api(spUrl("/plan" + q, pid)); } catch (e) { /* show the locked screen anyway */ }
+  if (pid !== spPid || gen !== spDraftGen || !spDraft || !spDraft.done) return;   // left, or no longer the one to show
+  const displayName = (p) => (opts.names && opts.names[p.key]) || p.name;
+  const newParts = spDraft.parts.filter((p) => !(isPart && p.key === opts.part));
+  // Only the parts the server will actually create, decided by KEY (via
+  // spDraft.songs), never by matching a (possibly renamed) display name
+  // against /plan's suggested-name-based `empty` list — see
+  // spPartWillBeCreated.
+  const kept = newParts.filter((p) => spPartWillBeCreated(p));
+  const names = kept.map((p) => `<li>${esc(displayName(p))}</li>`).join("");
+  const folderText = opts.folder || FOLDER_TOP_LEVEL;
+  const origText = isPart
+    ? `“${esc(spDraft.name)}” keeps its name and becomes the part “${esc(spPart(opts.part)?.name || opts.part)}” — the other parts' songs are removed from it`
+    : "The original is kept as a subset — it keeps every song, is renamed with the subset mark and stops being a home";
+  const warn = plan && plan.local.length ? [spLocalWarning(plan)] : [];
+  const priceLine = plan ? `<p class="sp-cost">${spCostLine(plan, isPart)}</p>` : "";
+  spPanel("sp-done");
+  $("sp-done").innerHTML = `
+    ${errorMessage ? `<p class="hint sp-warn">${esc(errorMessage)}</p>` : ""}
+    <h3>Finishing this split</h3>
+    <p class="hint">This split already started — the choices below are locked in and can no longer be changed.</p>
+    <h3>New parts</h3><ul class="sp-summary">${names}</ul>
+    <h3>Folder</h3><p>${esc(folderText)}</p>
+    <h3>The original, “${esc(spDraft.name)}”</h3><p>${origText}</p>
+    ${warn.map((w) => `<p class="hint sp-warn">${w}</p>`).join("")}
+    ${priceLine}
+    <div class="row"><button id="sp-abandon">Abandon — keep what was made</button><button id="sp-finish-done" class="primary">Finish Done</button></div>`;
+  $("sp-finish-done").onclick = spConfirmDone;
+  $("sp-abandon").onclick = spAbandon;
+}
+
+// The way out when Finish Done keeps failing the same way (a created part
+// deleted in Spotify, the original unfollowed): drops the draft, zero
+// calls, and says what already exists — nothing made is undone.
+async function spAbandon() {
+  if (!confirm("Abandon this split? The playlists it already created stay in Spotify as homes, " +
+               "and the original is left as it is now. Nothing is undone.")) return;
+  const pid = spPid, gen = spDraftGen;
+  let r;
+  try {
+    r = await api(spUrl("/abandon", pid), {});
+  } catch (e) {
+    if (pid === spPid && gen === spDraftGen) toast(e.message, 6000);
+    return;
+  }
+  if (pid !== spPid || gen !== spDraftGen) return;
+  spDraft = null;
+  spDraftGen++;
+  const made = r.created.length
+    ? `<p class="hint">Already created, and kept as homes:</p><ul class="sp-summary">${r.created.map((c) => `<li>${esc(c.name)}</li>`).join("")}</ul>`
+    : '<p class="hint">Nothing had been created yet.</p>';
+  const orig = r.original_done ? "The original had already been updated." : "The original is as it was.";
+  spPanel("sp-done");
+  $("sp-done").innerHTML = `<h3>Split abandoned</h3>${made}<p class="hint">${orig}</p>
+    <div class="row"><button id="sp-abandon-back" class="primary">Back to homes</button></div>`;
+  $("sp-abandon-back").onclick = showSplit;
+}
+
+async function spConfirmDone() {
+  // A double tap (or a Done-again/Finish Done retry landing while a first
+  // POST is still in flight) must not post twice — the server would 409
+  // the second one, but the screen must not flash "already running" over
+  // what the user just confirmed.
+  if (spConfirmBusy) return;
+  spConfirmBusy = true;
+  if ($("sp-confirm")) $("sp-confirm").disabled = true;
+  if ($("sp-finish-done")) $("sp-finish-done").disabled = true;
+  // A Done that has already started keeps the choices it started with —
+  // the server itself ignores anything else on a resume — so the locked
+  // Finish Done screen posts spDraft.done.opts verbatim rather than
+  // whatever spDoneChoice (freshly defaulted, quite possibly never even
+  // shown) happens to hold.
+  let body;
+  if (spDraft && spDraft.done) {
+    body = spDraft.done.opts;
+  } else {
+    spReadNames();
+    const isPart = spDoneChoice.original === "part";
+    body = { names: spDoneChoice.names, folder: spDoneChoice.folder || null,
+             original: spDoneChoice.original, part: isPart ? spDoneChoice.part : null };
+  }
+  try {
+    await api(spUrl("/done"), body);
+  } catch (e) {
+    spConfirmBusy = false;
+    if ($("sp-confirm")) $("sp-confirm").disabled = false;
+    if ($("sp-finish-done")) $("sp-finish-done").disabled = false;
+    toast(e.message, 6000);
+    return;
+  }
+  spConfirmBusy = false;
+  spPanel("sp-progress");
+  $("sp-progress").innerHTML = '<div class="spinner"></div><p class="hint">starting…</p>';
+  await spPoll("done");
+}
+
+async function spDoneFinished(p, token = spPollToken) {
+  if (p.state === "done" && p.summary) { renderSpSummary(p.summary); return; }
+  spPanel("sp-done");
+  if (p.state === "changed") {
+    $("sp-done").innerHTML = `<p>${esc(p.message)}</p>
+      <div class="row"><button id="sp-reread" class="primary">Re-read the playlist</button></div>`;
+    $("sp-reread").onclick = spReread;
+    return;
+  }
+  // An error: find out whether Done actually started writing anything. If
+  // it has, the stored opts are the only truth from here on — the locked
+  // finish screen, not an editable form that could now disagree with what
+  // a resume will actually do.
+  const pid = spPid, gen = spDraftGen;
+  const homeName = $("sp-title").textContent;
+  $("sp-done").innerHTML = '<div class="spinner"></div>';   // no live (stale) form visible during the re-fetch
+  let refetched;
+  try {
+    refetched = await api(spUrl("", pid));
+  } catch (e) {
+    // The draft couldn't be re-read at all — never guess with the stale
+    // editable form; offer to reopen the home fresh instead.
+    if (pid !== spPid || gen !== spDraftGen || token !== spPollToken) return;
+    $("sp-done").innerHTML = `<p>${esc(p.message || "Done did not finish")}</p>
+      <div class="row"><button id="sp-try-again" class="primary">Try again</button></div>`;
+    $("sp-try-again").onclick = () => openSpHome({ id: pid, name: homeName });
+    return;
+  }
+  if (pid !== spPid || gen !== spDraftGen || token !== spPollToken) return;
+  spDraft = refetched;
+  spDraftGen++;
+  if (spDraft.done) { await renderSpFinish(p.message); return; }
+  $("sp-done").innerHTML = `<p>${esc(p.message || "Done did not finish")}</p>
+    <div class="row"><button id="sp-done-back">Back</button><button id="sp-retry" class="primary">Done again</button></div>`;
+  $("sp-done-back").onclick = renderSpParts;
+  $("sp-retry").onclick = spConfirmDone;
+}
+
+function renderSpSummary(s) {
+  spShownSummaryKey = spSummaryKey(spPid, s);
+  spDraft = null;
+  const filing = (c) => (s.folder ? `<span class="hint" id="sp-filing-${esc(c.id)}"> · filing…</span>` : "");
+  const rows = s.created.map((c) => `<li><b>${esc(c.name)}</b> — ${c.count} song${c.count === 1 ? "" : "s"}${filing(c)}</li>`).join("");
+  const orig = s.original === "subset"
+    ? "The original is now a subset and keeps every song."
+    : "The original kept its name and now holds its part's songs.";
+  const local = s.local.length ? `<p class="hint">Local files left in the original: ${s.local.map(esc).join(", ")}</p>` : "";
+  spPanel("sp-done");
+  // Only when the original is still a home ("part" mode) — in subset mode
+  // it stopped being one, so there is no home left here to split again.
+  const again = s.original === "part" ? '<button id="sp-split-again">Split this home again</button>' : "";
+  $("sp-done").innerHTML = `<h3>Done</h3><ul class="sp-summary">${rows}</ul><p class="hint">${orig}</p>${local}
+    <div class="row">${again}<button id="sp-finish" class="primary">Back to homes</button></div>`;
+  if (again) $("sp-split-again").onclick = () => { spStopPolling(); spN = 2; renderSpSetup(""); };
+  $("sp-finish").onclick = showSplit;
+  if (s.folder) spWatchFiling(s.created);
+}
+
+// Filing drives the desktop client after Done, about a minute per part, one
+// part after another — so a part not reached yet reads "idle" for a while,
+// and only "filed"/"failed" are final. Two polls in a row with nothing
+// filing and parts still idle means the queue is not moving (the server
+// restarted, the thread died): those parts stayed at the top level.
+let SP_FILING_POLL_MS = 3000;
+
+async function spWatchFiling(created) {
+  const token = spPollToken;
+  const open = new Map(created.map((c) => [c.id, c]));
+  const say = (id, text) => { const el = $(`sp-filing-${id}`); if (el) el.textContent = ` · ${text}`; };
+  let stalls = 0;
+  while (open.size) {
+    let moving = false;
+    for (const c of [...open.values()]) {
+      let st;
+      try {
+        st = await api(`/api/playlists/filing/${encodeURIComponent(c.id)}`);
+      } catch (e) {
+        if (token !== spPollToken) return;
+        say(c.id, `filing status unreadable — ${e.message}`);
+        open.delete(c.id);
+        continue;
+      }
+      if (token !== spPollToken) return;
+      if (st.state === "filed") {
+        say(c.id, `filed in ${st.folder}`);
+        open.delete(c.id);
+      } else if (st.state === "failed") {
+        say(c.id, `left at the top level — ${st.error || "the move failed"}`);
+        open.delete(c.id);
+      } else if (st.state === "filing") {
+        say(c.id, "filing…");
+        moving = true;
+      } else {
+        say(c.id, "waiting to be filed…");
+      }
+    }
+    if (!open.size) return;
+    stalls = moving ? 0 : stalls + 1;
+    if (stalls >= 2) {
+      for (const id of open.keys()) say(id, "left at the top level — the move never started");
+      return;
+    }
+    await new Promise((r) => { spFilingTimer = setTimeout(r, SP_FILING_POLL_MS); });
+    if (token !== spPollToken) return;
   }
 }
 
-function homeNameFor(id) {
-  if (id === "liked") return "Liked Songs";
-  return nowState.homes.get(id)?.name || id;
-}
-
-// Describes res.decision — the standing decision a no-op left untouched —
-// for a toast. Shared so a hardcoded "already rejected"/"nothing to undo"
-// can never say something the card itself contradicts (e.g. the card
-// correctly showing "kept to Jazz" while a hardcoded toast said "already
-// rejected").
-function describeStanding(decision) {
-  if (!decision) return "no change";
-  return decision.action === "keep" ? `kept to ${homeNameFor(decision.to_id)}` : decision.action;
-}
-
-async function decideKeep(homeId) {
-  if (!nowState?.sitting) return;
-  const splitId = nowState.sitting.split_id;
-  const tr = nowState.track;
+async function spReread() {
+  const pid = spPid, gen = spDraftGen;
+  let fetched;
   try {
-    const res = await api(`/api/split/${splitId}/decide`,
-                          { uri: tr.uri, action: "keep", to_id: homeId });
-    applyDecision(tr.uri, res.decision);
-    // decide() reports `changed: false` for a no-op (e.g. re-keeping an
-    // already-kept track, or losing a race to another click) — that must
-    // read as "already handled", never as a fresh success.
-    toast(res.changed
-      ? `kept → ${homeNameFor(homeId)} (${res.remaining} left in the split)`
-      : `already decided — ${describeStanding(res.decision)}`);
-    renderNow();
-  } catch (e) { toast(e.message); }
+    fetched = await api(spUrl("/reread", pid), {});
+  } catch (e) {
+    if (pid !== spPid || gen !== spDraftGen) return;
+    toast(e.message);
+    return;
+  }
+  if (pid !== spPid || gen !== spDraftGen) return;
+  spDraft = fetched;
+  spDraftGen++;   // reconcile() is a fresh load, same as a landed Suggest
+  renderSpParts();
+  toast("re-read — new songs are marked ?");
 }
 
-async function decideReject() {
-  if (!nowState?.sitting) return;
-  const splitId = nowState.sitting.split_id;
-  const tr = nowState.track;
-  try {
-    const res = await api(`/api/split/${splitId}/decide`,
-                          { uri: tr.uri, action: "reject" });
-    applyDecision(tr.uri, res.decision);
-    toast(res.changed
-      ? `rejected — free (${res.remaining} left in the split)`
-      : `already decided — ${describeStanding(res.decision)}`);
-    renderNow();
-  } catch (e) { toast(e.message); }
+function spPart(key) { return spDraft.parts.find((p) => p.key === key) || null; }
+function spSongLabel(uri) {
+  const s = spDraft.songs[uri] || { name: uri, artists: "" };
+  return s.artists ? `${s.name} — ${s.artists}` : s.name;
 }
 
-async function decideUndecide() {
-  if (!nowState?.sitting) return;
-  const splitId = nowState.sitting.split_id;
-  const tr = nowState.track;
-  try {
-    const res = await api(`/api/split/${splitId}/decide`,
-                          { uri: tr.uri, action: "undecide" });
-    applyDecision(tr.uri, res.decision);  // null on success — clears it
-    toast(res.changed
-      ? `un-rejected — free (${res.remaining} left in the split)`
-      : res.decision ? `already decided — ${describeStanding(res.decision)}` : "nothing to undo");
-    renderNow();
-  } catch (e) { toast(e.message); }
+function renderSpParts() {
+  spPanel("sp-parts");
+  if (!spPart(spShown)) spShown = spDraft.parts[0]?.key || null;
+  renderSpChips();
+  // A button under the chips, not grouped with Remove/Start over below the
+  // song list — Done is the one action that matters regardless of which
+  // part is showing.
+  $("sp-done-row").innerHTML = '<button id="sp-open-done" class="primary">Done…</button>';
+  $("sp-open-done").onclick = spOpenDone;
+  renderSpList();
+  const hint = spDraft.hint;
+  $("sp-hint").hidden = !hint;
+  if (hint) {
+    $("sp-hint").innerHTML = `This splits more cleanly into ${hint} — <button id="sp-hint-go">try ${hint}</button>`;
+    $("sp-hint-go").onclick = () => spResuggest(hint);
+  }
+  const canRemove = spDraft.parts.length > SP_MIN;
+  $("sp-actions").innerHTML =
+    (canRemove ? '<button id="sp-remove-part">Remove this part</button>' : "") +
+    '<button id="sp-start-over">Start over</button>' +
+    '<button id="sp-discard">Discard this split</button>';
+  if (canRemove) $("sp-remove-part").onclick = () => spRemovePart(spShown);
+  $("sp-start-over").onclick = spStartOver;
+  $("sp-discard").onclick = spDiscard;
+}
+
+function renderSpChips() {
+  const add = spDraft.parts.length < SP_MAX
+    ? '<button id="sp-add" class="sp-chip sp-add" aria-label="Add a part">+</button>' : "";
+  $("sp-chips").innerHTML = spDraft.parts.map((p) =>
+    `<button class="sp-chip${p.key === spShown ? " on" : ""}${p.key === spDropKey ? " drop" : ""}" data-key="${esc(p.key)}">
+       <span class="sp-chip-name">${esc(p.name)}</span> <span class="sp-chip-n">${p.uris.length}</span>
+     </button>`).join("") + add;
+  $("sp-chips").querySelectorAll("button").forEach((b, i) => {
+    const part = spDraft.parts[i];
+    if (part) b.onclick = () => spShowPart(part.key);
+  });
+  if (add) $("sp-add").onclick = () => spAddPart();
+}
+
+function spShowPart(key) {
+  spShown = key;
+  renderSpChips();
+  renderSpList();
+}
+
+function renderSpList() {
+  const part = spPart(spShown);
+  const unknown = new Set(spDraft.unknown || []);
+  $("sp-list").innerHTML = part && part.uris.length
+    ? part.uris.map((u) => {
+        const s = spDraft.songs[u] || { name: u, artists: "" };
+        // Not merely "the row this uri belongs to" — spAudioUri is set
+        // before the fetch even starts, while spAudio itself (and so
+        // spAudioPending) doesn't exist yet, and a refused or still-
+        // buffering clip keeps both set without having taken audio focus.
+        // None of those earn the highlight until there's a real spAudio
+        // with spAudioPending cleared (see spPreview).
+        return `<div class="sp-song${spAudio && u === spAudioUri && !spAudioPending ? " playing" : ""}" data-uri="${esc(u)}">
+          <span class="sp-song-name">${esc(s.name)}${unknown.has(u) ? ' <span class="sp-unknown" title="no Last.fm data — check where it landed">?</span>' : ""}</span>
+          <span class="sp-song-artist">${esc(s.artists)}</span>
+        </div>`;
+      }).join("")
+    : '<p class="hint">no songs in this part yet — drag some onto its chip</p>';
+  $("sp-list").onpointerdown = spListPointerDown;
 }
 
 // ---- keyboard --------------------------------------------------------------
@@ -4931,20 +4795,9 @@ document.addEventListener("keydown", (e) => {
   // `nowProblem` and not just `nowState?.playing`: a failed poll leaves
   // nowState untouched on purpose, so after e.g. a 500 from /api/now the
   // screen shows an error card while `playing` still reads true — and `1`
-  // would fire a keep, which is final and costs a call. The card has to be
-  // showing the track a keystroke is about to decide on.
+  // would file, or `r` would remove, the track that error card no longer
+  // shows. The card has to be showing the track a keystroke is about to act on.
   if (!$("view-now").hidden && !nowProblem && nowState?.playing) {
-    if (nowState.sitting) {
-      const dec = nowState.sitting.decided[nowState.track.uri];
-      if (dec?.action === "keep") return;  // final — nothing left to press
-      if (dec?.action === "reject") { if (e.key === "u") decideUndecide(); return; }
-      const s = suggFor(e.key, nowState.suggestions);
-      if (s) decideKeep(s.playlist_id);
-      else if (SUGG_KEYS.includes(e.key)) return;
-      else if (e.key === "m" && nowState.track.sortable) openPicker(nowState.homes, decideKeep);
-      else if (e.key === "r") decideReject();
-      return;
-    }
     // Before the filed-guard below: once this track is filed or removed the
     // strip shows its Undo, and `u` must reach it — the guard used to eat
     // the key first, so the "(u)" the button advertised never worked.
@@ -4969,6 +4822,10 @@ document.addEventListener("visibilitychange", () => {
   // cut, not a fade — a hidden tab's timers are clamped, so a fade would go
   // on sounding over the music the close's resume just brought back.
   if (document.hidden) previewHold.stop(true);
+  // Same reasoning as previewHold's own stop: a locked phone has no visible
+  // player either, and a split-tab clip left running would keep Spotify
+  // paused with nothing on screen to say why.
+  if (document.hidden) spStopPreview();
   // Manual mode means almost exactly that — the refocus poll doesn't fire,
   // with one exception: a song that played out while the tab was hidden.
   // Coming back to the tool is "having it open", which is what the user

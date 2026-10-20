@@ -128,8 +128,9 @@ part, the set of "?" uris, and a cleanliness score per tried N.
 
 The existing preview player walks a whole playlist and cannot play one
 given track. New: `GET /api/track_preview?uri=…` resolves one track to a
-Deezer 30 s clip with the existing Deezer resolver and its cache
-(`deezer.json`) and the rejected-recordings list; it returns
+Deezer 30 s clip with the existing Deezer resolver
+(`_deezer_client().fetch_preview`; nothing is cached) and the
+rejected-recordings list; it returns
 `{url}` or 404 "no preview". The client plays it with the same audio and
 Spotify-resume handling as the existing player (`POST /api/preview_resume`,
 once, when previewing ends). Zero Spotify calls.

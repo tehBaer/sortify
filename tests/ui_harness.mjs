@@ -5,7 +5,7 @@
 //
 // NOT a pytest module (it is JavaScript, and the project deliberately has no
 // JS toolchain — no dependencies, no build step). It is a hand-run
-// diagnostic in the same spirit as fuzz_sittings.py:
+// diagnostic, run the same way against any copy of app.js:
 //
 //     node tests/ui_harness.mjs                     # the working tree
 //     node tests/ui_harness.mjs /tmp/app-before.js  # any other copy
@@ -13,23 +13,14 @@
 // Exits non-zero if any check fails. What it pins, and why each matters —
 // all were measured failing against the commit before the fix:
 //
-//   C1  a reservation with playlist_id:null must still show the sitting bar,
-//       disable every Start button, and leave Finish clickable. Otherwise
-//       the split is locked with its only escape outside the UI entirely.
-//   C2  three clicks on "Split it" must issue exactly one paid POST.
-//   I1  finishing with nowState===null must not throw on either exit.
-//   I2  no keep/reject may fire from the keyboard while an error card is up.
-//   I3  two Finish clicks must spend exactly one unfollow, and cleared:false
-//       must report what the resync actually found.
-//   I4  a failed startSitting must re-sync instead of hiding a live sitting.
+//   I1  renderNow() with nowState===null must not throw.
 //
 // The stub DOM models only what these paths touch, but the three details it
 // does model are load-bearing: assigning `innerHTML` replaces the subtree (so
-// renderPiles' row clearing is real, not additive), ids inside assigned
-// markup become addressable afterwards, and responses are deep-cloned —
-// app.js keeps `nowState.sitting` by reference and mutates its `decided` map
-// in place, so a shared fixture would leak one scenario's decision into the
-// next scenario's "server" answer and mask the very bug under test.
+// a re-render's row clearing is real, not additive), ids inside assigned
+// markup become addressable afterwards, and responses are deep-cloned, so a
+// shared fixture object can never leak one scenario's mutation into the next
+// scenario's "server" answer and mask the very bug under test.
 //
 // ---- two hazards that have each cost a debugging session ------------------
 //
@@ -118,7 +109,20 @@ class El {
     this._qs ||= {};
     return (this._qs[sel] ||= new El("_anon"));
   }
-  appendChild(c) { this.children.push(c); }
+  // `_siblings` is the array `c` actually landed in, captured at append time
+  // — not re-read off the parent later, so a caller that temporarily swaps
+  // in a different `children` (SP3's HTMLCollection-has-no-indexOf proxy)
+  // cannot make a later `remove()` see the swapped-in stand-in.
+  appendChild(c) { c._siblings = this.children; this.children.push(c); }
+  // A real DOM element's own `remove()`, not a parent lookup by the app: a
+  // real `HTMLCollection` has no `indexOf`, so the app may only ever call
+  // `el.remove()` on itself, never search `parent.children` for it.
+  remove() {
+    if (!this._siblings) return;
+    const i = this._siblings.indexOf(this);
+    if (i >= 0) this._siblings.splice(i, 1);
+    this._siblings = null;
+  }
   setAttribute(k, v) { this[k] = String(v); }
   scrollIntoView() {} focus() {}
   // Recorded, not run: a check that needs one fires it itself (fireClick).
@@ -146,6 +150,8 @@ const document = {
   createElement: () => new El("_created"),
   addEventListener: (t, f) => ((handlers[t] ||= []).push(f)),
   body: new El("_body"),   // blind mode toggles a class here
+  // The Split tab's drop target is found geometrically; checks script it.
+  elementFromPoint: () => null,
 };
 
 // ---- scripted fetch --------------------------------------------------------
@@ -170,10 +176,9 @@ async function fetchStub(path, opts) {
   if (r.status === undefined) r = { status: 200, body: r };
   return {
     status: r.status, ok: r.status >= 200 && r.status < 300,
-    // Deep-cloned: app.js keeps `nowState.sitting` by reference and mutates
-    // its `decided` map in place (applyDecision). Handing out the fixture
-    // itself would let one scenario's decision leak into the next poll's
-    // "server" answer.
+    // Deep-cloned: app.js holds onto parts of what it's given and can mutate
+    // them in place. Handing out the fixture object itself would let one
+    // scenario's mutation leak into the next poll's "server" answer.
     json: async () => structuredClone(r.body),
   };
 }
@@ -184,6 +189,10 @@ async function fetchStub(path, opts) {
 class AudioStub {
   constructor(src) {
     this.src = src; this.currentTime = 0; this.duration = 30; this.paused = false;
+    // Counts play() calls on THIS object — the iOS retry fix calls play()
+    // again on the same instance rather than making a new one, and "no new
+    // Audio, but play() ran twice" is what tells that apart from a no-op.
+    this.playCalls = 0;
     AudioStub.made.push(this);
   }
   // Setting src runs the media element's load algorithm, and an empty src
@@ -196,7 +205,19 @@ class AudioStub {
     if (v === "") setTimeout(() => { if (this.onerror) this.onerror(); }, 0);
   }
   get src() { return this.__src; }
-  play() { this.paused = false; return AudioStub.refuse ? Promise.reject(new Error("blocked")) : Promise.resolve(); }
+  // `refuse` can be `true` (the iOS gesture refusal, NotAllowedError — kept
+  // as the default meaning so every existing check still passes unchanged)
+  // or a specific DOMException name string ("NotSupportedError" for a dead
+  // clip, "AbortError" for a play() pre-empted by a stop) so a check can
+  // tell apart WHICH failure app.js is handling.
+  play() {
+    this.playCalls++; this.paused = false;
+    if (!AudioStub.refuse) return Promise.resolve();
+    const name = AudioStub.refuse === true ? "NotAllowedError" : AudioStub.refuse;
+    const err = new Error(name);
+    err.name = name;
+    return Promise.reject(err);
+  }
   pause() { this.paused = true; }
 }
 AudioStub.made = [];
@@ -215,6 +236,8 @@ const ctx = vm.createContext({
   })(),
   // The public gate sends the page to /gate/start by assigning this.
   location: { href: "" },
+  // The Split tab asks before discarding work; checks script the answer.
+  confirm: () => true,
 });
 Object.defineProperty(ctx, "globalThis", { value: ctx });
 
@@ -233,21 +256,6 @@ function check(name, pass, detail) {
   results.push({ name, pass, detail });
   console.log(`${pass ? "PASS" : "FAIL"}  ${name}${detail ? "  — " + detail : ""}`);
 }
-
-// Shaped like what _pile_progress actually sends, materialise fields
-// included: the client never computes a call cost, so a pile row without
-// `materialise_calls` renders its Save button disabled — which would make the
-// "no disabled buttons" assertions below pass or fail for the wrong reason.
-const PILES = [
-  { id: "p1", name: "one", tags: ["a"], uris: ["u1", "u2"], decided: 0, total: 2,
-    materialise_calls: 3, materialised: null },
-  { id: "p2", name: "two", tags: ["b"], uris: ["u3"], decided: 0, total: 1,
-    materialise_calls: 2, materialised: null },
-];
-const splitBody = (active) => ({
-  piles: PILES, decided: {}, active_sitting: active,
-  params: { resolution: 1, min_pile: 15 },
-});
 
 function resetLog() { log.length = 0; }
 
@@ -290,521 +298,63 @@ $$("picker").hidden = true;
 run("stopNowPolling()");
 
 // ============================================================================
-// C1 — a reservation with playlist_id:null must be visible and finishable
-// ============================================================================
-{
-  resetLog();
-  routes["GET /api/split/PL1"] = {
-    status: 200,
-    body: splitBody({ playlist_id: null, pile_id: "p1", uris: [], claim: "c1" }),
-  };
-  run(`openSplit("PL1", "PL1")`);
-  await tick();
-
-  const barShown = $$("split-sitting-bar").hidden === false;
-  check("C1 split-view sitting bar is shown for a playlist_id:null reservation",
-        barShown, `hidden=${$$("split-sitting-bar").hidden}`);
-  check("C1 bar text explains the stuck reservation",
-        /never created|reserved/i.test($$("split-sitting-status").textContent),
-        JSON.stringify($$("split-sitting-status").textContent.slice(0, 80)));
-
-  const rows = $$("piles").children.map((c) => c.innerHTML);
-  const allDisabled = rows.length === 2 && rows.every((h) => /<button[^>]*disabled/.test(h));
-  check("C1 every pile's Start button is disabled (backend would 409 them)",
-        allDisabled, `${rows.length} rows`);
-
-  const sittingGlobal = run("sitting && sitting.splitId");
-  check("C1 the `sitting` global is populated (Now-view bar has something to show)",
-        sittingGlobal === "PL1", `sitting.splitId=${sittingGlobal}`);
-
-  // The escape has to be reachable by a click.
-  routes["POST /api/split/PL1/sitting/finish"] = { status: 200, body: { cleared: true } };
-  resetLog();
-  run(`$("btn-split-finish-sitting").onclick()`);
-  await tick();
-  check("C1 clicking Finish reaches the server-side escape",
-        posts("/api/split/PL1/sitting/finish") === 1,
-        `${posts("/api/split/PL1/sitting/finish")} POST(s)`);
-  check("C1 after finishing, the split is usable again (bar hidden, Starts enabled)",
-        $$("split-sitting-bar").hidden === true &&
-        $$("piles").children.every((c) => !/<button[^>]*disabled/.test(c.innerHTML)),
-        `bar hidden=${$$("split-sitting-bar").hidden}`);
-}
-
-// ============================================================================
-// C2 — "Split it" must not multiply the paid read
-// ============================================================================
-{
-  routes["GET /api/split/PL2"] = { status: 404, body: { detail: "no split for that playlist" } };
-  let release;
-  const pending = new Promise((r) => (release = r));
-  routes["POST /api/split/PL2"] = () => pending;
-
-  run(`openSplit("PL2", "PL2")`);
-  await tick();
-  resetLog();
-
-  const btn = $$("btn-do-split");
-  check("C2 the paid offer rendered a Split button", !!btn.id, btn.id);
-
-  btn.onclick(); btn.onclick(); btn.onclick();   // three clicks in one tick
-  await tick();
-
-  check("C2 three clicks issue exactly one paid POST",
-        posts("/api/split/PL2") === 1, `${posts("/api/split/PL2")} POST(s)`);
-  check("C2 the button is disabled and relabelled for the duration",
-        btn.disabled === true && /splitting/i.test(btn.textContent),
-        `disabled=${btn.disabled} label=${JSON.stringify(btn.textContent)}`);
-
-  release({ status: 200, body: { piles: PILES, tagged: 3, untagged: 0 } });
-  routes["GET /api/split/PL2"] = { status: 200, body: splitBody(null) };
-  await tick();
-  check("C2 the offer is cleared once the split lands",
-        $$("split-empty").innerHTML === "", JSON.stringify($$("split-empty").innerHTML.slice(0, 40)));
-}
-
-// ============================================================================
-// C2b — a FAILED split must re-offer the button (re-enabled, original label)
-// ============================================================================
-{
-  routes["GET /api/split/PL3"] = { status: 404, body: { detail: "no split for that playlist" } };
-  routes["POST /api/split/PL3"] = { status: 502, body: { detail: "Last.fm exploded" } };
-  run(`openSplit("PL3", "PL3")`);
-  await tick();
-  const btn = $$("btn-do-split");
-  const label = btn.textContent;
-  btn.onclick();
-  await tick();
-  check("C2b after a failure the Split button is usable again with its price label",
-        btn.disabled === false && btn.textContent === label,
-        `disabled=${btn.disabled} label=${JSON.stringify(btn.textContent)}`);
-
-  // …and a 404 from the POST explains the Refresh, not "unknown playlist".
-  routes["POST /api/split/PL3"] = { status: 404, body: { detail: "unknown playlist" } };
-  btn.onclick();
-  await tick();
-  check("deferred-note: a 404 from create_split points at Refresh",
-        /refresh/i.test($$("toast").textContent),
-        JSON.stringify($$("toast").textContent.slice(0, 90)));
-}
-
-// ============================================================================
 // I1 — renderNow() with nowState === null must not throw
 // ============================================================================
 {
-  routes["GET /api/split/PL4"] = {
-    status: 200,
-    body: splitBody({ playlist_id: "SP4", pile_id: "p1", uris: ["u1"], claim: "c4" }),
-  };
-  run(`openSplit("PL4", "PL4")`);
-  await tick();
-  run(`nowState = null; show("now");`);          // Finish before any successful poll
-  routes["POST /api/split/PL4/sitting/finish"] = { status: 200, body: { cleared: true } };
-
+  run(`nowState = null; show("now");`);
   let threw = null;
   process.once("unhandledRejection", (e) => (threw = e));
   try {
-    run(`$("btn-now-finish-sitting").onclick()`);
+    run(`renderNow()`);
     await tick();
   } catch (e) { threw = e; }
-  check("I1 finish with nowState===null does not throw",
+  check("I1 renderNow() with nowState===null does not throw",
         threw === null, threw ? String(threw) : "");
-  check("I1 the success toast survives",
-        /finished/i.test($$("toast").textContent),
-        JSON.stringify($$("toast").textContent.slice(0, 60)));
-
-  // …and the 404 exit too.
-  run(`sitting = {splitId:"PL4", pileName:"one", uris:["u1"], decided:{}}; nowState = null;`);
-  routes["POST /api/split/PL4/sitting/finish"] = { status: 404, body: { detail: "no active sitting" } };
-  threw = null;
-  try {
-    run(`$("btn-now-finish-sitting").onclick()`);
-    await tick();
-  } catch (e) { threw = e; }
-  check("I1 the 404 finish exit does not throw either",
-        threw === null && /clearing it here/i.test($$("toast").textContent),
-        threw ? String(threw) : JSON.stringify($$("toast").textContent.slice(0, 60)));
 }
 
 // ============================================================================
-// I2 — no irreversible keep from the error screen
+// I2 — no keep (and no reject) fires from the keyboard while an error card
+// is up. A failed poll leaves `nowState` untouched on purpose (so the last
+// known truth stays on screen), which means `nowState.playing` can still
+// read true while the card itself shows an error — the `!nowProblem` guard
+// in the keydown handler is what stops a stray digit or `r` from filing or
+// removing the track the screen no longer shows.
 // ============================================================================
 {
-  run(`show("now");`);
-  // A good poll first: a live sitting card with a suggestion under key "1".
   setNow({
     status: 200,
     body: {
-      playing: true, poll_after_ms: 999999,
-      track: { uri: "spotify:track:u1", name: "T", artists: [{ name: "A" }], sortable: true, image: null },
-      context: { id: "SP5", name: "s" },
-      sitting: { split_id: "PL5", pile_id: "p1", pile_name: "one", uris: ["spotify:track:u1"], decided: {} },
+      playing: true, is_playing: true, poll_after_ms: 999999,
+      track: { uri: "spotify:track:i2", name: "Song", artists: [{ name: "A" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
       suggestions: [{ playlist_id: "H1", pct: 90, reasons: [], already: false }],
       homes: [{ id: "H1", name: "Home", folder: "" }],
-      inputs: [],
+      inputs: [{ id: "IN1", name: "[Hazy]", has_track: true }],
     },
   });
-  run(`pollNow(true)`);
+  run(`show("now"); filedUris = {}; nowActions = 0; nowActionLog = []; pollNow(true)`);
   await tick();
   run("stopNowPolling()");
-  routes["POST /api/split/PL5/decide"] = { status: 200, body: { changed: true, decision: { action: "keep", to_id: "H1" }, remaining: 0 } };
 
-  resetLog();
-  fireKey("1");
-  await tick();
-  check("I2 baseline: `1` keeps while the live card is on screen",
-        posts("/api/split/PL5/decide") === 1, `${posts("/api/split/PL5/decide")} POST(s)`);
-  check("I2 the kept card celebrates with the same big drawn check",
-        $$("now-card").innerHTML.includes('class="done-mark"') &&
-        /kept to/.test($$("now-card").innerHTML),
-        `mark=${$$("now-card").innerHTML.includes('class="done-mark"')}`);
-
-  // Re-poll first: the keep above wrote `decided` into nowState.sitting, and
-  // a decided track short-circuits the keyboard for a legitimate reason
-  // ("final — nothing left to press"), which would mask the bug under test.
-  run(`pollNow(true)`);
-  await tick();
-  run("stopNowPolling()");
-  check("I2 the track is undecided again after a fresh poll",
-        run(`Object.keys(nowState.sitting.decided).length`) === 0, "");
-
-  // Now a failed poll: nowState is deliberately left intact, card replaced.
   routes["GET /api/now?light=1"] = { status: 500, body: { detail: "boom" } };
-  run(`pollNow()`);
+  routes["GET /api/now?light=1&force=1"] = { status: 500, body: { detail: "boom" } };
+  run(`pollNow(true)`);
   await tick();
   run("stopNowPolling()");
+  check("I2 the error card is up while nowState.playing still reads true",
+        run(`nowProblem`) === true && run(`nowState.playing`) === true, "");
+
   resetLog();
   fireKey("1");
   fireKey("r");
   await tick();
-  check("I2 no keep (and no reject) fires from the error screen",
-        posts("/api/split/PL5/decide") === 0, `${posts("/api/split/PL5/decide")} POST(s)`);
-}
-
-// ============================================================================
-// I3 — Finish must not spend twice, and must not misdirect on cleared:false
-// ============================================================================
-{
-  routes["GET /api/split/PL6"] = {
-    status: 200,
-    body: splitBody({ playlist_id: "SP6", pile_id: "p1", uris: ["u1"], claim: "c6" }),
-  };
-  run(`openSplit("PL6", "PL6")`);
-  await tick();
-
-  let release;
-  const pending = new Promise((r) => (release = r));
-  routes["POST /api/split/PL6/sitting/finish"] = () => pending;
-  resetLog();
-  run(`$("btn-split-finish-sitting").onclick()`);
-  run(`$("btn-split-finish-sitting").onclick()`);   // second click, first in flight
-  await tick();
-  check("I3 two Finish clicks spend exactly one unfollow",
-        posts("/api/split/PL6/sitting/finish") === 1,
-        `${posts("/api/split/PL6/sitting/finish")} POST(s)`);
-  check("I3 both Finish buttons are disabled while in flight",
-        $$("btn-split-finish-sitting").disabled === true &&
-        $$("btn-now-finish-sitting").disabled === true, "");
-
-  // cleared:false with nothing actually active any more -> honest wording.
-  routes["GET /api/split/PL6"] = { status: 200, body: splitBody(null) };
-  release({ status: 200, body: { cleared: false } });
-  await tick();
-  check("I3 cleared:false + nothing active says so instead of 'finish it again'",
-        /already finished/i.test($$("toast").textContent) &&
-        !/finish it again/i.test($$("toast").textContent),
-        JSON.stringify($$("toast").textContent.slice(0, 90)));
-  check("I3 buttons re-enabled afterwards",
-        $$("btn-split-finish-sitting").disabled === false &&
-        $$("btn-split-finish-sitting").textContent === "Finish sitting", "");
-}
-
-// ============================================================================
-// I4 — a failed startSitting must re-sync, not hide a live reservation
-// ============================================================================
-{
-  routes["GET /api/split/PL7"] = { status: 200, body: splitBody(null) };
-  run(`openSplit("PL7", "PL7")`);
-  await tick();
-  check("I4 precondition: no sitting, Start buttons enabled",
-        $$("split-sitting-bar").hidden === true &&
-        $$("piles").children.every((c) => !/<button[^>]*disabled/.test(c.innerHTML)), "");
-
-  routes["POST /api/split/PL7/sitting"] = { status: 429, body: { detail: "rate limited" } };
-  // The server holds a reservation WITH a playlist id — a real ▶ playlist exists.
-  routes["GET /api/split/PL7"] = {
-    status: 200,
-    body: splitBody({ playlist_id: "SP7", pile_id: "p1", uris: ["u1", "u2"], claim: "c7" }),
-  };
-  resetLog();
-  run(`startSitting("p1", "one")`);
-  await tick();
-  check("I4 the failure triggers a free re-read of the split",
-        gets("/api/split/PL7") === 1, `${gets("/api/split/PL7")} GET(s)`);
-  check("I4 the live sitting is now visible with its Finish button",
-        $$("split-sitting-bar").hidden === false &&
-        $$("piles").children.every((c) => /<button[^>]*disabled/.test(c.innerHTML)),
-        JSON.stringify($$("split-sitting-status").textContent.slice(0, 70)));
-}
-
-// ============================================================================
-// O1 — the ownership guard: a non-owned playlist must never offer a live
-// split button. (The playlist-row DOM itself is out of reach here — the
-// stub's querySelectorAll() always returns [], by design, since it only
-// models the ids the sitting/piles paths touch — so this pins the pure
-// gating function renderLists() calls per row rather than the wired-up
-// button. The zero-Spotify-calls guarantee itself is pinned server-side, in
-// tests/test_split_api.py; this only pins that the UI won't let a click
-// through in the first place.)
-// ============================================================================
-{
-  const notOwned = run(`splitDisabledReason({ editable: false })`);
-  check("O1 a non-owned playlist gets a disabled reason",
-        typeof notOwned === "string" && notOwned.length > 0, JSON.stringify(notOwned));
-  check("O1 the reason says what to do about it",
-        /copy/i.test(notOwned), JSON.stringify(notOwned));
-
-  const owned = run(`splitDisabledReason({ editable: true })`);
-  check("O1 an owned playlist gets no disabled reason",
-        owned === null, JSON.stringify(owned));
-}
-
-// ============================================================================
-// M — saving piles into permanent playlists via the queue. The price must be
-// on the button before the click, it must be the server's number echoed
-// back unchanged — that echo is the only thing standing between a misclick
-// on the 309-track pile and 310 silent Spotify calls — and every price is a
-// FLOOR (finding I2), not a promise of the final total.
-// ============================================================================
-{
-  routes["GET /api/split/PL8"] = {
-    status: 200,
-    body: {
-      ...splitBody(null),
-      piles: [
-        { id: "p1", name: "fresh", tags: [], uris: ["u1", "u2"], decided: 0, total: 2,
-          materialise_calls: 3, materialised: null },
-        { id: "p2", name: "half done", tags: [], uris: ["u3", "u4", "u5"], decided: 0, total: 3,
-          materialise_calls: 2, materialised: { playlist_id: "SAVED2", added: 1, name: "half done", stale: false } },
-        { id: "p3", name: "complete", tags: [], uris: ["u6"], decided: 0, total: 1,
-          materialise_calls: 0, materialised: { playlist_id: "SAVED3", added: 1, name: "complete", stale: false } },
-        { id: "p4", name: "changed", tags: [], uris: ["u7"], decided: 0, total: 1,
-          materialise_calls: 2, materialised: { playlist_id: "SAVED4", added: 1, name: "old", stale: true } },
-      ],
-    },
-  };
-  run(`openSplit("PL8", "PL8")`);
-  await tick();
-  const rows = $$("piles").children.map((c) => c.innerHTML);
-
-  check("M the price is on the button before the click, as a floor",
-        /Save as playlist \(≥ 3 calls\)/.test(rows[0]), rows[0].slice(-120));
-  check("M a partly-saved pile offers to resume at the price of what's left",
-        /Resume saving \(≥ 2 calls\)/.test(rows[1]) && /1 of 3 saved so far/.test(rows[1]),
-        rows[1].slice(-160));
-  check("M a finished pile is not clickable and says so",
-        /Saved as a playlist/.test(rows[2]) && /<button[^>]*disabled[^>]*>Saved as a playlist/.test(rows[2]),
-        rows[2].slice(-140));
-  check("M a re-clustered pile is offered as a NEW playlist, at full price",
-        /Save as a new playlist \(≥ 2 calls\)/.test(rows[3]) && /pile has changed/.test(rows[3]),
-        rows[3].slice(-180));
-  check("M the tooltip states the honest server-side pace range and the floor disclosure, not just the price",
-        /one per track/.test(rows[0]) && /server-side worker/.test(rows[0]) &&
-        /at least/.test(rows[0]) && !/Leave this tab open/.test(rows[0]) &&
-        /runs on the server/.test(rows[0]) && /closing it/.test(rows[0]), rows[0]);
-
-  // A double-click on the SAME pile (identical queue signature) must not
-  // double-queue — the same misclick guard materialisePile had, now scoped
-  // per (split, pile-set) so it doesn't block an unrelated save-all/other-pile
-  // click (see the next block).
-  {
-    let release;
-    const pending = new Promise((r) => (release = r));
-    routes["POST /api/split/PL8/queue"] = () => pending;
-    resetLog();
-    run(`queuePiles(["p1"], 3)`);
-    run(`queuePiles(["p1"], 3)`);   // second click, first in flight
-    await tick();
-    check("M two clicks on the same pile issue exactly one paid POST",
-          posts("/api/split/PL8/queue") === 1,
-          `${posts("/api/split/PL8/queue")} POST(s)`);
-    release({ status: 200, body: { ok: true, queued: ["p1"], total_calls: 3 } });
-    await tick();
-  }
-
-  // A refusal (the cost guard, or a queue already running) must re-read too
-  // — the row that produced the stale number is exactly what needs
-  // replacing.
-  routes["POST /api/split/PL8/queue"] = {
-    status: 409, body: { detail: "cost has changed: saving these piles now spends 2 Spotify calls" } };
-  resetLog();
-  run(`queuePiles(["p1"], 3)`);
-  await tick();
-  check("M a refused enqueue says why and re-reads the split for free",
-        /cost has changed/.test($$("toast").textContent) && gets("/api/split/PL8") === 1,
-        `${gets("/api/split/PL8")} GET(s)`);
-
-  // The queue replaces the one-shot save. Same misclick contract: the number
-  // POSTed is the number the button displayed, now summed across piles.
-  resetLog();
-  routes["POST /api/split/PL8/queue"] = { ok: true, queued: ["p2", "p1"], total_calls: 5 };
-  run(`queuePiles(null, 5)`);          // "Save all" — null means every pile
-  check("save-all posts the summed price it displayed",
-        bodies("/api/split/PL8/queue")[0]?.expected_calls === 5,
-        JSON.stringify(bodies("/api/split/PL8/queue")[0]));
-  // The check above is deliberately synchronous (pins that the body is
-  // logged before any await, per the misclick contract) — but queuePiles'
-  // own trailing re-read + queue-poll are still pending after it. Drain
-  // them here so they can't land, unattributed, inside a later test's tick().
-  await tick();
-
-  resetLog();
-  run(`queuePiles(["p1"], 3)`);        // single pile goes through the same gate
-  check("single-pile save is a one-pile queue",
-        JSON.stringify(bodies("/api/split/PL8/queue")[0]?.pile_ids) === '["p1"]');
-  await tick();
-
-  // Finding I2: every displayed price is a floor, not a ceiling — request()
-  // retries a transient 429 up to 3x and each attempt is charged.
-  const saveAllLabel5 = run(`renderSaveAllLabel(5)`);
-  check("the price label discloses it is a floor",
-        /at least|minst|floor/i.test(saveAllLabel5), saveAllLabel5);
-
-  // Pause is one click and free; the button reflects the effective state.
-  resetLog();
-  routes["POST /api/split/PL8/queue/pause"] = { ok: true };
-  run(`pauseQueue()`);
-  check("pause posts exactly once and nowhere else",
-        posts("/api/split/PL8/queue/pause") === 1 && log.length === 1);
-  await tick();
-
-  // Review fix (Important 1): a 409 here means the on-screen state was
-  // already stale — a poll must reconcile it immediately rather than
-  // leaving a dead Pause button until the next scheduled tick (or none, if
-  // polling had already stopped).
-  routes["POST /api/split/PL8/queue/pause"] = {
-    status: 409, body: { detail: "queue is stopped, not running — nothing to pause" } };
-  resetLog();
-  run(`pauseQueue()`);
-  await tick();
-  check("a refused pause polls the queue so the UI reconciles immediately",
-        gets("/api/split/PL8/queue") === 1, `${gets("/api/split/PL8/queue")} GET(s)`);
-
-  // Review fix (Minor 2): the same in-flight guard the spend buttons use,
-  // now covering Pause/Resume/Cancel too.
-  {
-    let release;
-    const pending = new Promise((r) => (release = r));
-    routes["POST /api/split/PL8/queue/pause"] = () => pending;
-    resetLog();
-    run(`pauseQueue()`);
-    run(`pauseQueue()`);   // second click, first still in flight
-    await tick();
-    check("two clicks on Pause post exactly once",
-          posts("/api/split/PL8/queue/pause") === 1,
-          `${posts("/api/split/PL8/queue/pause")} POST(s)`);
-    release({ status: 200, body: { ok: true } });
-    await tick();
-  }
-
-  const restartPanel = run(`renderQueuePanel({ queue: { state: "paused", stop_reason: null,
-    pending: ["p2", "p3"], current: null,
-    progress: { pile_index: 1, pile_count: 8, track: 40, track_total: 309 } },
-    pacing: { rate_per_min: 2.5, ceiling: 7.0, max_clean_rate: 2.1 } })`);
-  check("a restart's leftover running state renders as paused with Resume",
-        restartPanel.includes("Resume"));
-
-  // Review fix (Important 2): Resume must not render enabled when there's
-  // nothing left to resume — cancel leaves exactly this shape (stopped,
-  // pending: [], current: null) and resume() 409s "nothing queued" against
-  // it, so a state-only gate left Resume a permanent dead end after Cancel.
-  const resumeTag = (html) => (html.match(/<button id="btn-queue-resume"[^>]*>/) || [""])[0];
-  const cancelledPanel = run(`renderQueuePanel({ queue: { state: "stopped", stop_reason: "cancelled",
-    pending: [], current: null, progress: {} }, pacing: {} })`);
-  check("a cancelled, empty queue renders Resume disabled",
-        /disabled/.test(resumeTag(cancelledPanel)), cancelledPanel);
-  const pausedWithWorkPanel = run(`renderQueuePanel({ queue: { state: "paused", stop_reason: null,
-    pending: ["p2"], current: null,
-    progress: { pile_index: 1, pile_count: 8, track: 40, track_total: 309 } },
-    pacing: { rate_per_min: 2.5, ceiling: 7.0, max_clean_rate: 2.1 } })`);
-  check("a paused queue with pending work renders Resume enabled",
-        !/disabled/.test(resumeTag(pausedWithWorkPanel)), pausedWithWorkPanel);
-
-  // Review fix (Minor 1): a quota trip is the severe case (Development
-  // Mode's daily allowance, gone until the window resets — see CLAUDE.md)
-  // and must not look like a routine 429 note.
-  const quotaPanel = run(`renderQueuePanel({ queue: { state: "stopped", stop_reason: "quota",
-    pending: [], current: null, progress: {} }, pacing: {} })`);
-  check("a quota trip renders its own distinct, prominent marker",
-        /queue-stop-quota/.test(quotaPanel) && /quota tripped/i.test(quotaPanel) &&
-        /resume is manual/i.test(quotaPanel),
-        quotaPanel);
-  const rateLimitPanel = run(`renderQueuePanel({ queue: { state: "sleeping", stop_reason: "rate limited",
-    pending: ["p2"], current: "p1", progress: {} }, pacing: {} })`);
-  check("an ordinary rate-limit note does NOT get the quota marker",
-        !/queue-stop-quota/.test(rateLimitPanel), rateLimitPanel);
-
-  // M-3: spend vs. cap+reserve, and the pacing side's last 429 — both already
-  // ride along in the GET's progress/pacing objects (free, local reads).
-  const spendPanel = run(`renderQueuePanel({ queue: { state: "running", stop_reason: null,
-    pending: ["p2"], current: "p1",
-    progress: { pile_index: 1, pile_count: 2, track: 1, track_total: 3,
-                spent_today: 210, bulk_today: 40, daily_cap: 600, reserve: 150 } },
-    pacing: { rate_per_min: 3.4, ceiling: 7.0,
-              history_429: [{ kind: "rate", rate: 1.8, when: 1755500000 },
-                             { kind: "quota", rate: 3.4, when: 1755500600 }] } })`);
-  check("M the queue panel shows spend vs. cap and reserve",
-        /210\/600/.test(spendPanel) && /bulk 40/.test(spendPanel) && /reserve 150/.test(spendPanel),
-        spendPanel);
-  check("M the queue panel shows the LAST of pacing's history_429, not an earlier one",
-        /last 429/.test(spendPanel) && /quota/.test(spendPanel) && /3\.4\/min/.test(spendPanel) &&
-        !spendPanel.includes(">last 429: rate at"),
-        spendPanel);
-  const noHistoryPanel = run(`renderQueuePanel({ queue: { state: "running", stop_reason: null,
-    pending: [], current: "p1", progress: { pile_count: 1 } },
-    pacing: { rate_per_min: 1.8, ceiling: 7.0, history_429: [] } })`);
-  check("M no last-429 line when pacing has no history yet",
-        !/last 429/.test(noHistoryPanel), noHistoryPanel);
-
-  // Review fix (Minor 3): pins the disclosed-but-untested claim — a
-  // single-pile save in flight must not block save-all's guard key, and
-  // vice versa, since the two are different (split, pile-set) signatures.
-  {
-    let release;
-    const pending = new Promise((r) => (release = r));
-    routes["POST /api/split/PL8/queue"] = () => pending;
-    resetLog();
-    run(`queuePiles(["p1"], 3)`);
-    run(`queuePiles(null, 5)`);
-    await tick();
-    check("a single-pile save in flight doesn't block save-all's guard key (and vice versa)",
-          posts("/api/split/PL8/queue") === 2,
-          `${posts("/api/split/PL8/queue")} POST(s)`);
-    release({ status: 200, body: { ok: true, queued: ["p1", "p2"], total_calls: 5 } });
-    await tick();
-  }
-
-  // A server that sends no cost must not be guessed at.
-  routes["GET /api/split/PL9"] = {
-    status: 200,
-    body: { ...splitBody(null), piles: [{ id: "p1", name: "n", tags: [], uris: ["u1"], decided: 0, total: 1 }] },
-  };
-  run(`openSplit("PL9", "PL9")`);
-  await tick();
-  resetLog();
-  const row = $$("piles").children[0].innerHTML;
-  check("M an unpriced pile is offered as un-clickable rather than guessed at",
-        /<button[^>]*disabled[^>]*>Save as playlist</.test(row), row.slice(-120));
-  run(`queuePiles(["p1"], null)`);
-  await tick();
-  check("M and calling it with no price spends nothing",
-        posts("/api/split/PL9/queue") === 0,
-        `${posts("/api/split/PL9/queue")} POST(s)`);
+  check("I2 no keep (and no reject) fires from the keyboard while an error card is up",
+        posts("/api/act") === 0, `${posts("/api/act")} POST(s)`);
 }
 
 // ============================================================================
 // V — Now-tab presentation pins (2026-08 visual refresh): cooldown countdown
-// card, hidden-until-useful Undo, sitting banner de-dupe, nav active state.
+// card, hidden-until-useful Undo, nav active state.
 // ============================================================================
 {
   // V5 — the nav marks which view you're in; triage/split count as the
@@ -926,39 +476,11 @@ run("stopNowPolling()");
         `hidden=${$$("btn-undo-now").hidden} disabled=${$$("btn-undo-now").disabled}`);
 }
 
-{
-  // V4 — in a sitting, the banner owns the pile name; the context line must
-  // not repeat it one line below.
-  setNow({
-    status: 200,
-    body: {
-      playing: true, poll_after_ms: 999999,
-      track: { uri: "spotify:track:u9", name: "T", artists: [{ name: "A" }], sortable: true, image: null },
-      context: { id: "SP9", name: "sit" },
-      sitting: { split_id: "PL9", pile_id: "p1", pile_name: "dreamy pile",
-                 uris: ["spotify:track:u9", "u2"], decided: { u2: { action: "keep", to_id: "H1" } } },
-      suggestions: [], homes: [], inputs: [],
-    },
-  });
-  run(`pollNow(true)`);
-  await tick();
-  run("stopNowPolling()");
-  const status = $$("now-sitting-status").innerHTML;
-  check("V4 the sitting banner names the pile and the progress",
-        $$("now-sitting-bar").hidden === false && /dreamy pile/.test(status) && /1 of 2 left/.test(status),
-        JSON.stringify(status.slice(0, 100)));
-  // The old #now-context line is gone; the input-switch trigger inherited
-  // the "what's playing from" role, and it must not echo the pile either.
-  check("V4 nothing above the banner repeats the pile name",
-        !/dreamy pile/.test($$("input-switch-label").textContent),
-        JSON.stringify($$("input-switch-label").textContent));
-}
-
 // ============================================================================
 // W — weak guesses: sub-threshold suggestions render as labeled guesses,
-// visually distinct from confident ones, in both the ordinary now card and
-// the sitting decide list. The server only ever sends weak entries when
-// NOTHING was confident, so the lead-in hint keys off suggestions[0].
+// visually distinct from confident ones, in the now card. The server only
+// ever sends weak entries when NOTHING was confident, so the lead-in hint
+// keys off suggestions[0].
 // ============================================================================
 {
   setNow({
@@ -998,309 +520,6 @@ run("stopNowPolling()");
   check("W1 confident suggestions keep today's rendering",
         !/closest guesses/.test($$("now-card").innerHTML) &&
         !/class="sugg weak"/.test($$("now-card").innerHTML), "");
-
-  // And the sitting decide list gets the same treatment.
-  routes["GET /api/now?light=1"].body.sitting =
-    { split_id: "PLW", pile_id: "p1", pile_name: "pile", uris: ["spotify:track:w1"], decided: {} };
-  routes["GET /api/now/suggest?force=1"].body.suggestions = [
-    { playlist_id: "H1", pct: 3, reasons: ["artist tags: cumbia"], already: false, weak: true },
-  ];
-  run(`pollNow(true)`);
-  await tick();
-  run("stopNowPolling()");
-  const decide = $$("now-card").innerHTML;
-  check("W2 the decide list leads weak entries with the guesses hint",
-        /No confident match — closest guesses:/.test(decide) &&
-        (decide.match(/class="sugg weak"/g) || []).length === 1,
-        JSON.stringify(decide.slice(0, 200)));
-}
-
-// ============================================================================
-// P — split progress: a bar that moves, a poll that stops, and failures that
-// say what to do next.
-//
-// The poll is the sensitive part. GET /api/split/{id}/progress reads one
-// module dict and cannot reach Spotify (pinned server-side by
-// test_split_progress_spends_no_api_calls), which is the only reason a
-// once-a-second poll is allowed here at all. What this harness pins is the
-// other half: that the poll STOPS. An interval left running after the split
-// ends is the shape of the bug that once cost ~600 Spotify calls an hour.
-// ============================================================================
-{
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const PROG = "/api/split/PL-P/progress";
-
-  routes["GET /api/split/PL-P"] = { status: 404, body: { detail: "no split for that playlist" } };
-  let release;
-  routes["POST /api/split/PL-P"] = () => new Promise((r) => (release = r));
-  // A fast poll_after_ms so the harness doesn't sit for seconds — the client
-  // takes its interval from the server, so this also pins that it obeys it
-  // rather than hard-coding one of its own.
-  routes[`GET ${PROG}`] = { status: 200, body: {
-    state: "running", phase: "tagging", done: 120, total: 700, detail: null, poll_after_ms: 5 } };
-
-  run(`openSplit("PL-P", "PL-P")`);
-  await tick();
-  resetLog();
-  // The stub DOM creates elements on demand with hidden=false, so without
-  // this the "is it showing?" check below would pass against an app.js that
-  // never touches the bar at all. Seed it the way index.html ships it.
-  $$("split-progress").hidden = true;
-  $$("btn-do-split").onclick();
-  await sleep(40);
-
-  check("P1 the progress bar is showing while the split runs",
-        $$("split-progress").hidden === false,
-        `hidden=${$$("split-progress").hidden}`);
-  check("P1 it reports artists done against the total",
-        /120/.test($$("split-progress").innerHTML) && /700/.test($$("split-progress").innerHTML),
-        JSON.stringify($$("split-progress").innerHTML.slice(0, 120)));
-  check("P1 it estimates the time left rather than only a count",
-        /min|sec/i.test($$("split-progress").innerHTML),
-        JSON.stringify($$("split-progress").innerHTML.slice(0, 120)));
-
-  const polled = gets(PROG);
-  check("P1 it polls on the interval the server handed it",
-        polled >= 2, `${polled} poll(s) in 40ms at poll_after_ms=5`);
-
-  routes[`GET ${PROG}`] = { status: 200, body: {
-    state: "done", phase: "complete", done: 700, total: 700, detail: null, poll_after_ms: 0 } };
-  routes["GET /api/split/PL-P"] = { status: 200, body: splitBody(null) };
-  release({ status: 200, body: { piles: PILES, tagged: 3, untagged: 0 } });
-  await tick();
-
-  const settled = gets(PROG);
-  await sleep(60);
-  check("P2 polling stops when the split finishes (no orphaned timer)",
-        gets(PROG) === settled,
-        `${gets(PROG) - settled} extra poll(s) in the 60ms after it finished`);
-  check("P2 the bar is hidden once the split is done",
-        $$("split-progress").hidden === true, `hidden=${$$("split-progress").hidden}`);
-}
-
-// ============================================================================
-// P3 — a partial Last.fm failure must say that retrying RESUMES.
-//
-// The server already saves the partial and says so in its 502 detail, but the
-// client dropped that into a 2600ms toast. A user who reads "stopped after
-// 431 of 712 artists" three seconds before it vanishes has no way to know
-// that pressing Split again resumes instead of starting over, and that the
-// several hundred answers already paid for are not lost.
-// ============================================================================
-{
-  routes["GET /api/split/PL-R"] = { status: 404, body: { detail: "no split for that playlist" } };
-  routes[`GET /api/split/PL-R/progress`] = { status: 200, body: {
-    state: "failed", phase: "tagging", done: 431, total: 712, poll_after_ms: 0,
-    detail: "Last.fm tagging stopped after 431 of 712 artists in this playlist" } };
-  routes["POST /api/split/PL-R"] = { status: 502, body: {
-    detail: "Last.fm tagging stopped after 431 of 712 artists in this playlist " +
-            "(Last.fm error 29: rate limited); progress was saved — re-running " +
-            "the split will resume instead of starting over." } };
-
-  run(`openSplit("PL-R", "PL-R")`);
-  await tick();
-  $$("btn-do-split").onclick();
-  await tick();
-
-  const card = $$("split-empty").innerHTML;
-  check("P3 the partial failure is a persistent card, not a vanishing toast",
-        /431/.test(card) && /712/.test(card), JSON.stringify(card.slice(0, 140)));
-  check("P3 it says plainly that trying again resumes",
-        /resume/i.test(card), JSON.stringify(card.slice(0, 200)));
-  check("P3 it offers a button to do exactly that",
-        /id="btn-resume-split"/.test(card), JSON.stringify(card.slice(0, 200)));
-
-  resetLog();
-  // Guarded: an unwired button is a failed check, not an exception that ends
-  // the run before P4 gets to say anything.
-  if (typeof $$("btn-resume-split").onclick === "function") $$("btn-resume-split").onclick();
-  await tick();
-  check("P3 pressing it re-runs the split",
-        posts("/api/split/PL-R") === 1, `${posts("/api/split/PL-R")} POST(s)`);
-}
-
-// ============================================================================
-// P4 — a playlist that isn't ours can never succeed, so it must NOT be
-// re-offered as a retry. The 403 is deliberately a different status from the
-// two 502s for exactly this reason; the client has to honour that.
-// ============================================================================
-{
-  routes["GET /api/split/PL-F"] = { status: 404, body: { detail: "no split for that playlist" } };
-  routes["POST /api/split/PL-F"] = { status: 403, body: {
-    detail: '"the bomb" belongs to rightkillthaz, not you. The Feb-2026 dev-mode API ' +
-            "won't let sortify read another user's playlist tracks at all, so splitting " +
-            'it can never succeed here. Make your own copy first' } };
-
-  run(`openSplit("PL-F", "the bomb")`);
-  await tick();
-  $$("split-progress").hidden = false;   // see P1 — prove app.js hides it
-  $$("btn-do-split").onclick();
-  await tick();
-
-  const card = $$("split-empty").innerHTML;
-  check("P4 the ownership refusal is explained persistently",
-        /belongs to rightkillthaz/.test(card), JSON.stringify(card.slice(0, 140)));
-  check("P4 it does not offer a retry of something that can never work",
-        !/btn-resume-split/.test(card) && !/btn-do-split/.test(card),
-        JSON.stringify(card.slice(0, 200)));
-  check("P4 the progress bar is not left up after an instant refusal",
-        $$("split-progress").hidden === true, `hidden=${$$("split-progress").hidden}`);
-}
-
-// ============================================================================
-// R1 — leftover sitting playlists are surfaced, priced, and removable
-// ============================================================================
-{
-  resetLog();
-  routes["GET /api/playlists"] = { status: 200, body: {
-    playlists: [], fetched_at: 0,
-    sitting_orphans: [{ id: "S1", name: "\u25b6 one" }, { id: "S2", name: "\u25b6 two" }] } };
-
-  await run("loadLists()");
-  await tick();
-  check("R1 the orphan bar is shown when the server reports leftovers",
-        $$("pl-orphan-bar").hidden === false, `hidden=${$$("pl-orphan-bar").hidden}`);
-  check("R1 it says how many and names them",
-        /2 leftover sitting playlists/.test($$("pl-orphan-status").textContent),
-        JSON.stringify($$("pl-orphan-status").textContent));
-  // Every spending control in this app states its price before it is pressed.
-  check("R1 the button prices the removal in Spotify calls",
-        /Remove \(2 calls\)/.test($$("btn-clean-sittings").textContent),
-        JSON.stringify($$("btn-clean-sittings").textContent));
-
-  routes["POST /api/sittings/cleanup"] = { status: 200, body: {
-    ok: true, removed: ["S1", "S2"], remaining: 0, deferred: false } };
-  routes["GET /api/playlists"] = { status: 200, body: {
-    playlists: [], fetched_at: 0, sitting_orphans: [] } };
-  resetLog();
-  await run(`$("btn-clean-sittings").onclick()`);
-  await tick();
-  check("R1 pressing Remove reaches the cleanup endpoint exactly once",
-        posts("/api/sittings/cleanup") === 1, `${posts("/api/sittings/cleanup")} POST(s)`);
-  check("R1 the bar disappears once the account is clean",
-        $$("pl-orphan-bar").hidden === true, `hidden=${$$("pl-orphan-bar").hidden}`);
-
-  // Nothing to remove must not leave a bar advertising an action that would
-  // spend a call and find nothing.
-  routes["GET /api/playlists"] = { status: 200, body: {
-    playlists: [], fetched_at: 0, sitting_orphans: [] } };
-  await run("loadLists()");
-  await tick();
-  check("R1 no bar at all when there are no leftovers",
-        $$("pl-orphan-bar").hidden === true, `hidden=${$$("pl-orphan-bar").hidden}`);
-
-  // A start in flight defers the sweep; the user is told to retry, not that
-  // nothing was wrong.
-  routes["GET /api/playlists"] = { status: 200, body: {
-    playlists: [], fetched_at: 0, sitting_orphans: [{ id: "S3", name: "\u25b6 three" }] } };
-  routes["POST /api/sittings/cleanup"] = { status: 200, body: {
-    ok: true, removed: [], remaining: null, deferred: true } };
-  await run("loadLists()");
-  await tick();
-  await run(`$("btn-clean-sittings").onclick()`);
-  await tick();
-  check("R1 a deferred sweep says a sitting is starting rather than failing silently",
-        /starting right now/.test($$("toast").textContent),
-        JSON.stringify($$("toast").textContent));
-}
-
-// ============================================================================
-// C-tab — the Split tab: picker lists eligible playlists, Back returns here
-// ============================================================================
-{
-  resetLog();
-  routes["GET /api/playlists"] = { playlists: [
-    { id: "liked", name: "Liked Songs", total: 900, editable: false, role: null },
-    { id: "PB", name: "big", total: 250, editable: true, role: null },
-    { id: "PS", name: "small", total: 30, editable: true, role: null },
-    { id: "PB2", name: "bigger", total: 400, editable: true, role: null },
-  ], fetched_at: 0 };
-  // GET queue is deliberately global regardless of the path id (M4).
-  routes["GET /api/split/_/queue"] = {
-    queue: { state: "paused", playlist_id: "PB2", pending: ["p2"], current: null },
-    pacing: {} };
-  run("showSplitPicker()");
-  await tick();
-  const rows = $$("splitpick-list").children;
-  check("C-tab picker shows only 100+-track, non-Liked playlists",
-        rows.length === 2, `${rows.length} rows`);
-  check("C-tab the in-progress split is pinned first",
-        /bigger/.test(rows[0]?.innerHTML || ""),
-        (rows[0]?.innerHTML || "").slice(0, 60));
-  check("C-tab the picker view is the visible one",
-        $$("view-splitpick").hidden === false);
-  check("C-tab opening the picker costs zero Spotify-priced POSTs",
-        log.every((c) => c.method === "GET"), JSON.stringify(log));
-
-  routes["GET /api/split/PB2"] = { status: 200, body: splitBody(null) };
-  routes["GET /api/split/PB2/queue"] = { queue: { state: "done", playlist_id: "PB2",
-    pending: [], current: null }, pacing: {} };
-  rows[0].onclick();
-  await tick();
-  check("C-tab clicking a row opens the split view",
-        $$("view-split").hidden === false);
-  run(`$("btn-split-back").onclick()`);
-  await tick();
-  check("C-tab Back returns to the picker, not Playlists",
-        $$("view-splitpick").hidden === false && $$("view-lists").hidden === true);
-}
-
-// ============================================================================
-// RN — the rename offer: the only price this branch computes client-side
-// ============================================================================
-// The server re-derives this number and 409s if it disagrees, so the two
-// computations have to walk the same collection. Nothing covered the offer at
-// all until review finding I2 — which was exactly a mismatch between them —
-// so the count, the quoted price, and the number the POST carries are all
-// pinned here.
-{
-  const matPiles = (names) => names.map((n, i) => ({
-    id: `p${i}`, name: n.replace(/^\{src\} · /, ""), tags: ["a"], uris: ["u1"],
-    decided: 0, total: 1, materialise_calls: 2,
-    materialised: { playlist_id: `SP${i}`, name: n, pile_id: `p${i}` },
-  }));
-  const renameBody = (names) => ({
-    piles: matPiles(names), decided: {}, active_sitting: null,
-    params: { resolution: 1, min_pile: 15 },
-  });
-
-  resetLog();
-  routes["GET /api/split/PRN"] = { status: 200, body: renameBody(
-    ["jazz · funk", "{src} · already done", "dub · techno"]) };
-  await run(`openSplit("PRN", "{src}")`);
-  await tick();
-  const btn = $$("btn-rename-outputs");
-  check("RN the offer appears when outputs still carry bare pile names",
-        btn.hidden === false, `hidden=${btn.hidden}`);
-  check("RN it counts only the ones missing the prefix, and prices them 1:1",
-        /Rename 2 saved playlists/.test(btn.textContent)
-        && /\(2 calls\)/.test(btn.textContent),
-        JSON.stringify(btn.textContent));
-
-  routes["POST /api/split/PRN/rename_outputs"] = { ok: true, renamed: [] };
-  resetLog();
-  await run(`$("btn-rename-outputs").onclick()`);
-  await tick();
-  check("RN pressing it POSTs exactly once",
-        posts("/api/split/PRN/rename_outputs") === 1,
-        `${posts("/api/split/PRN/rename_outputs")} POST(s)`);
-  // The echo the server validates against. If the button ever displays one
-  // number and sends another, the action 409s and nothing is renamed.
-  check("RN the POST echoes the same number the button displayed",
-        bodies("/api/split/PRN/rename_outputs")[0]?.expected_calls === 2,
-        JSON.stringify(bodies("/api/split/PRN/rename_outputs")[0]));
-  check("RN the offer is withdrawn once it succeeds",
-        $$("btn-rename-outputs").hidden === true,
-        `hidden=${$$("btn-rename-outputs").hidden}`);
-
-  // Nothing to do must not advertise a paid action that would rename nothing.
-  routes["GET /api/split/PRN2"] = { status: 200, body: renameBody(
-    ["{src} · jazz · funk", "{src} · dub · techno"]) };
-  await run(`openSplit("PRN2", "{src}")`);
-  await tick();
-  check("RN no offer when every output already carries the prefix",
-        $$("btn-rename-outputs").hidden === true,
-        `hidden=${$$("btn-rename-outputs").hidden}`);
 }
 
 // ============================================================================
@@ -3429,13 +2648,6 @@ run("stopNowPolling()");
   check("RG phase 1 (no inputs payload yet) stays live rather than flashing grey",
         live1 === true, `live=${live1}`);
 
-  // A sitting renders the strip too, and an input context never occurs there,
-  // so an always-drawn button could only ever be dead weight.
-  await paint({ isInput: false, sitting: { split_id: "S1", pile_id: "p1", pile_name: "x",
-                                           uris: ["spotify:track:rg1"], decided: {} } });
-  check("RG a sitting keeps the slot empty — the verb can never apply there",
-        !html().includes('id="btn-now-remove"'), `html=${html().slice(0, 200)}`);
-
   // Pressing the dead button explains itself instead of doing nothing.
   await paint({ isInput: false });
   resetLog();
@@ -4173,14 +3385,6 @@ run("stopNowPolling()");
           `both=${has('id="btn-now-both"')} trio=${has("np-trio")} ` +
           `undo=${has('id="btn-now-undo-remove"')}`);
 
-    // A sitting never has an input context, so it gets neither circle nor
-    // trio — the old empty-slot layout, unchanged.
-    await paint({ isInput: false, uri: "spotify:track:nc6",
-                  sitting: { split_id: "S1", pile_id: "p1", pile_name: "x",
-                             uris: ["spotify:track:nc6"], decided: {} } });
-    check("NC a sitting draws neither circle nor trio",
-          !has('id="btn-now-both"') && !has("np-trio") && has("np-remove-slot"),
-          `both=${has('id="btn-now-both"')} trio=${has("np-trio")}`);
   } finally {
     routes["POST /api/act"] = { status: 200, body: {} };
     run("stopNowPolling()");
@@ -5388,6 +4592,1631 @@ run("stopNowPolling()");
   check("GT ...and does not show the Spotify setup view",
         $$("view-setup").hidden === true, `setup hidden=${$$("view-setup").hidden}`);
   delete routes["GET /api/status"];
+}
+
+// ============================================================================
+// SP — split a home into parts: the picker, the counter, Suggest, the parts.
+// Spec: docs/superpowers/specs/2026-10-20-split-into-parts-design.md.
+// ============================================================================
+{
+  resetLog();
+  const HOMES = { homes: [
+    { id: "H1", name: "Big Home", total: 24, folder: "ROOT / Mix", splittable: true, reason: null, draft: false },
+    { id: "H2", name: "Tiny", total: 5, folder: null, splittable: false, reason: "too small to split — fewer than 10 songs", draft: false },
+  ] };
+  const DRAFT = {
+    playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2,
+    parts: [{ key: "p1", name: "rock", uris: ["u1", "u2", "u3"] },
+            { key: "p2", name: "jazz", uris: ["u4", "u5"] }],
+    unknown: ["u3"], hint: null, scores: { "2": 0.3 },
+    songs: { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+             u3: { name: "Three", artists: "C", local: false }, u4: { name: "Four", artists: "D", local: false },
+             u5: { name: "Five", artists: "E", local: false } },
+    tracks: [], done: null,
+  };
+  routes["GET /api/splitparts/homes"] = { status: 200, body: HOMES };
+  routes["GET /api/splitparts/H1"] = { status: 404, body: { detail: "no split in progress for this playlist" } };
+  await run(`showSplit()`);
+  await tick();
+  const homesHtml = () => $$("sp-homes").innerHTML;
+  check("SP the Split tab lists homes",
+        /Big Home/.test(homesHtml()) && /Tiny/.test(homesHtml()), homesHtml().slice(0, 300));
+  check("SP ...a too-small home is listed but disabled, with why",
+        /<button[^>]*data-id="H2"[^>]*disabled/.test(homesHtml()) && /fewer than 10/.test(homesHtml()),
+        homesHtml());
+  $$("sp-filter").value = "tin";
+  run(`renderSpHomes()`);
+  check("SP the filter narrows the list", !/Big Home/.test(homesHtml()) && /Tiny/.test(homesHtml()), homesHtml());
+  $$("sp-filter").value = "";
+  run(`renderSpHomes()`);
+
+  await run(`openSpHome(spHomes[0])`);
+  await tick();
+  check("SP a home without a draft opens on the counter, at 2",
+        $$("sp-setup").hidden === false && $$("sp-parts").hidden === true && $$("sp-n").textContent === "2",
+        `setup=${$$("sp-setup").hidden} n=${$$("sp-n").textContent}`);
+  run(`$("sp-minus").onclick()`);
+  check("SP ...the counter does not go below 2", $$("sp-n").textContent === "2", $$("sp-n").textContent);
+  for (let i = 0; i < 6; i++) run(`$("sp-plus").onclick()`);
+  check("SP ...nor above 6", $$("sp-n").textContent === "6", $$("sp-n").textContent);
+  // Lands on 3 — not the 2 the counter defaults to — so the POST below can
+  // tell "the chosen number" apart from "whatever the default happens to be".
+  run(`$("sp-minus").onclick(); $("sp-minus").onclick(); $("sp-minus").onclick()`);
+  check("SP ...the counter now reads the chosen 3", $$("sp-n").textContent === "3", $$("sp-n").textContent);
+
+  routes["POST /api/splitparts/H1/suggest"] = { status: 200, body: { started: true } };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "done", phase: "done", done: 0, total: 0, message: null, summary: null } };
+  routes["GET /api/splitparts/H1"] = { status: 200, body: DRAFT };
+  await run(`$("sp-suggest").onclick()`);
+  await tick(); await tick();
+  const sent = log.find((l) => l.method === "POST" && l.path === "/api/splitparts/H1/suggest");
+  check("SP Suggest posts the chosen number", sent && JSON.parse(sent.body).n === 3, JSON.stringify(sent));
+  check("SP ...and lands on the parts, one chip per part with its count",
+        $$("sp-parts").hidden === false &&
+        /data-key="p1"[^>]*>[\s\S]*rock[\s\S]*3/.test($$("sp-chips").innerHTML) &&
+        /data-key="p2"[\s\S]*jazz[\s\S]*2/.test($$("sp-chips").innerHTML),
+        $$("sp-chips").innerHTML);
+  check("SP ...the first part's songs are listed, title and artist",
+        /One[\s\S]*A/.test($$("sp-list").innerHTML) && !/Four/.test($$("sp-list").innerHTML),
+        $$("sp-list").innerHTML);
+  check("SP ...a song without Last.fm data carries the ? mark",
+        /data-uri="u3"[\s\S]*sp-unknown/.test($$("sp-list").innerHTML), $$("sp-list").innerHTML);
+  run(`spShowPart("p2")`);
+  check("SP tapping another chip lists that part",
+        /Four/.test($$("sp-list").innerHTML) && !/One/.test($$("sp-list").innerHTML), $$("sp-list").innerHTML);
+
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "error", phase: "", done: 0, total: 0, message: "not enough Last.fm data on these songs to suggest a split", summary: null } };
+  await run(`spSuggest(2)`);
+  await tick(); await tick();
+  check("SP a failed suggestion shows its reason on the counter screen",
+        $$("sp-setup").hidden === false && /not enough Last\.fm data/.test($$("sp-setup-msg").textContent),
+        $$("sp-setup-msg").textContent);
+
+  routes["GET /api/splitparts/H1"] = { status: 200, body: DRAFT };
+  await run(`openSpHome(spHomes[0])`);
+  await tick();
+  check("SP a home with a draft opens straight on its parts", $$("sp-parts").hidden === false, "");
+
+  // Fix round 1, finding 2: a Suggest started on one home must not keep
+  // polling — or clobber the screen — once a different home is opened.
+  // H1's progress never resolves ("running" forever), so the only way its
+  // poll stops is if opening another home stops it.
+  routes["POST /api/splitparts/H1/suggest"] = { status: 200, body: { started: true } };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "running", phase: "tagging", done: 1, total: 5, message: null, summary: null } };
+  resetLog();
+  await run(`spSuggest(2)`);
+  check("SP starting Suggest polls the open home's progress once",
+        gets("/api/splitparts/H1/progress") === 1, `${gets("/api/splitparts/H1/progress")} GET(s)`);
+
+  const DRAFT_H3 = {
+    playlist_id: "H3", name: "Third Home", snapshot_id: "s3", n: 2,
+    parts: [{ key: "q1", name: "folk", uris: ["v1"] }, { key: "q2", name: "ambient", uris: ["v2"] }],
+    unknown: [], hint: null, scores: { "2": 0.4 },
+    songs: { v1: { name: "Six", artists: "F", local: false }, v2: { name: "Seven", artists: "G", local: false } },
+    tracks: [], done: null,
+  };
+  routes["GET /api/splitparts/H3"] = { status: 200, body: DRAFT_H3 };
+  resetLog();
+  await run(`openSpHome({ id: "H3", name: "Third Home" })`);
+  await tick();
+  check("SP opening another home shows its own parts, not the old one's",
+        /folk/.test($$("sp-chips").innerHTML) && !/rock/.test($$("sp-chips").innerHTML),
+        $$("sp-chips").innerHTML);
+  run(`spShowPart("q2")`);
+  check("SP ...and the new home's chip tap sticks",
+        run(`spShown`) === "q2", run(`spShown`));
+
+  resetLog();
+  // H1's poll was scheduled 1000ms out while it was "running"; a real wait
+  // (not just a tick) is what gives a surviving timer the chance to fire.
+  await new Promise((r) => setTimeout(r, 1100));
+  check("SP the old home's abandoned poll makes no further request",
+        gets("/api/splitparts/H1/progress") === 0 && gets("/api/splitparts/H3/progress") === 0,
+        `H1=${gets("/api/splitparts/H1/progress")} H3=${gets("/api/splitparts/H3/progress")}`);
+  check("SP ...and does not snap the new home's screen back to its first part",
+        run(`spShown`) === "q2", run(`spShown`));
+
+  run(`spStopPolling(); show("lists")`);
+}
+
+// ============================================================================
+// SP2 — the parts screen: a touch that moves drags, a touch that does not is
+// a preview; songs drop on chips; parts come and go.
+// ============================================================================
+{
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = false;
+  const songs = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                  u3: { name: "Three", artists: "C", local: false }, u4: { name: "Four", artists: "D", local: false } };
+  const D = (parts, extra = {}) => ({ playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2, parts,
+    unknown: [], hint: null, scores: {}, songs, tracks: [], done: null, ...extra });
+  const two = () => [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3", "u4"] }];
+  run(`show("split")`);
+  // spDraft & co are `let` bindings in app.js, not properties of the vm's
+  // global object: assign them inside run(), never through ctx.
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spPid = "H1"; spShown = "p1"; spSection("sp-work"); renderSpParts(); nowState = { is_playing: true }`);
+
+  // tap = preview
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP2 a tap plays the song's preview",
+        AudioStub.made.length === 1 && AudioStub.made[0].src === "https://cdn/u1.mp3" && !AudioStub.made[0].paused &&
+        run("spAudioUri") === "u1", `made=${AudioStub.made.length}`);
+  check("SP2 ...and moves nothing", !log.some((l) => l.path.endsWith("/move")), "");
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(11, 12)`);
+  await tick();
+  check("SP2 a tap on the playing song stops it, and Spotify is resumed once",
+        AudioStub.made[0].paused && run("spAudioUri") === null &&
+        log.filter((l) => l.path === "/api/preview_resume").length === 1, "");
+
+  // no preview available
+  routes["GET /api/track_preview?pid=H1&uri=u2"] = { status: 404, body: { detail: "no preview" } };
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP2 a song with no preview says so", /no preview/.test($$("toast").textContent), $$("toast").textContent);
+
+  // drag onto another part's chip
+  routes["POST /api/splitparts/H1/move"] = { status: 200,
+    body: D([{ key: "p1", name: "rock", uris: ["u2"] }, { key: "p2", name: "jazz", uris: ["u3", "u4", "u1"] }]) };
+  document.elementFromPoint = () => ({ closest: () => ({ dataset: { key: "p2" } }) });
+  run(`spPointerDown("u1", 10, 10)`);
+  run(`spPointerMove(10, 40)`);
+  check("SP2 moving the finger lifts the song at once and lights the chip under it",
+        run("spDropKey") === "p2" && document.body.children.some((c) => c.className === "sp-ghost"),
+        `drop=${run("spDropKey")}`);
+  await run(`spPointerUp(10, 40)`);
+  await tick();
+  const mv = log.find((l) => l.path === "/api/splitparts/H1/move");
+  check("SP2 releasing over a chip moves the song to that part",
+        mv && JSON.parse(mv.body).uri === "u1" && JSON.parse(mv.body).to === "p2", JSON.stringify(mv));
+  check("SP2 ...and the list redraws without it", !/data-uri="u1"/.test($$("sp-list").innerHTML) &&
+        run("spDropKey") === null, $$("sp-list").innerHTML);
+
+  resetLog();
+  document.elementFromPoint = () => null;
+  run(`spPointerDown("u2", 10, 10); spPointerMove(10, 40)`);
+  await run(`spPointerUp(10, 40)`);
+  check("SP2 releasing away from every chip moves nothing", !log.some((l) => l.path.endsWith("/move")), "");
+  document.elementFromPoint = () => ({ closest: () => ({ dataset: { key: "p1" } }) });
+  run(`spPointerDown("u2", 10, 10); spPointerMove(10, 40)`);
+  await run(`spPointerUp(10, 40)`);
+  check("SP2 ...and so does releasing over its own part", !log.some((l) => l.path.endsWith("/move")), "");
+  document.elementFromPoint = () => null;
+
+  // add a part
+  routes["POST /api/splitparts/H1/parts"] = { status: 200,
+    body: D([...two(), { key: "p3", name: "New part", uris: [] }]) };
+  check("SP2 the chip row ends with an add chip", /id="sp-add"/.test($$("sp-chips").innerHTML), $$("sp-chips").innerHTML);
+  await run(`spAddPart()`);
+  check("SP2 adding a part shows the new, empty part",
+        run("spShown") === "p3" && /no songs in this part yet/.test($$("sp-list").innerHTML), "");
+
+  // remove the shown part: asks with destinations, then shows another part
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p2"; renderSpParts()`);
+  routes["POST /api/splitparts/H1/parts/p2/remove"] = (() => {
+    let n = 0;
+    return () => (n++ === 0
+      ? { status: 200, body: { moves: { p1: 2 } } }
+      : { status: 200, body: D([{ key: "p1", name: "rock", uris: ["u1", "u2", "u3", "u4"] }, { key: "p9", name: "x", uris: [] }]) });
+  })();
+  let asked = "";
+  ctx.confirm = (m) => { asked = m; return false; };
+  await run(`spRemovePart("p2")`);
+  check("SP2 removing a part asks first, naming where its songs go",
+        /jazz/.test(asked) && /2 songs/.test(asked) && /rock: 2/.test(asked), asked);
+  check("SP2 ...and a no changes nothing",
+        log.filter((l) => l.path.endsWith("/remove")).length === 1 && run("spShown") === "p2", "");
+  ctx.confirm = () => true;
+  await run(`spRemovePart("p2")`);
+  check("SP removing the shown part shows another one",
+        run("spShown") === "p1" && /data-uri="u3"/.test($$("sp-list").innerHTML), `shown=${run("spShown")}`);
+
+  // the hint and Start over
+  run(`spDraft = ${JSON.stringify(D(two(), { hint: 3 }))}`);
+  run(`renderSpParts()`);
+  check("SP2 a cleaner count is offered", $$("sp-hint").hidden === false && /3/.test($$("sp-hint").innerHTML),
+        $$("sp-hint").innerHTML);
+  routes["POST /api/splitparts/H1/suggest"] = { status: 200, body: { started: true } };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "running", phase: "grouping", done: 0, total: 0, message: null, summary: null } };
+  ctx.confirm = (m) => { asked = m; return true; };
+  run(`spDraft.edited = true`);   // asking is for a draft holding manual edits (SPF)
+  await run(`spResuggest(3)`);
+  const sg = log.find((l) => l.path === "/api/splitparts/H1/suggest");
+  check("SP2 trying it on an edited draft asks first, then re-suggests with that count",
+        /moves/.test(asked) && sg && JSON.parse(sg.body).n === 3, asked);
+  run(`spStopPolling()`);
+
+  // leaving the view stops a preview
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`renderSpParts()`);
+  routes["GET /api/track_preview?pid=H1&uri=u3"] = { status: 200, body: { url: "https://cdn/u3.mp3", uri: "u3", deezer_id: 3 } };
+  run(`spShowPart("p2"); spPointerDown("u3", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  const clip = AudioStub.made[AudioStub.made.length - 1];
+  run(`show("now")`);
+  check("SP2 leaving the Split tab stops the preview", clip.paused && run("spAudioUri") === null, "");
+  ctx.confirm = () => true;
+  run(`show("lists")`);
+}
+
+// ============================================================================
+// SP3 — fix round 1: the drop survives a real HTMLCollection, a resume is
+// armed only after a real play, backgrounding and re-entry stop a clip, the
+// iOS retry, multi-touch safety, and a failed resume says so.
+// ============================================================================
+{
+  const songs = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                  u3: { name: "Three", artists: "C", local: false } };
+  const D = (parts, extra = {}) => ({ playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2, parts,
+    unknown: [], hint: null, scores: {}, songs, tracks: [], done: null, ...extra });
+  const two = () => [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3"] }];
+  run(`show("split")`);
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spPid = "H1"; spShown = "p1"; spSection("sp-work"); renderSpParts(); nowState = { is_playing: true }`);
+
+  // fix 1 — dropping a lifted song must never call .indexOf() on
+  // document.body.children: a real HTMLCollection has none, and the old
+  // branch that did threw before spHighlight(null) or the move ever ran.
+  resetLog();
+  routes["POST /api/splitparts/H1/move"] = { status: 200,
+    body: D([{ key: "p1", name: "rock", uris: ["u2"] }, { key: "p2", name: "jazz", uris: ["u3", "u1"] }]) };
+  document.elementFromPoint = () => ({ closest: () => ({ dataset: { key: "p2" } }) });
+  run(`spPointerDown("u1", 10, 10)`);
+  run(`spPointerMove(10, 40)`);
+  // Stand in for a real HTMLCollection for the span of this one drop: it has
+  // no indexOf, so app code reaching for one throws exactly as it would in
+  // a real browser. Swapped back right after — later checks' `.some()` call
+  // is the stub's own bookkeeping, not something app code depends on.
+  const realChildren = document.body.children;
+  document.body.children = new Proxy(realChildren, {
+    get(t, p) { if (p === "indexOf") throw new Error("a real HTMLCollection has no indexOf"); return t[p]; },
+  });
+  let dropErr = null;
+  try { await run(`spPointerUp(10, 40)`); } catch (e) { dropErr = e; }
+  document.body.children = realChildren;
+  check("SP3 dropping a lifted song never reaches for document.body.children.indexOf",
+        dropErr === null, String(dropErr));
+  check("SP3 ...the ghost is actually gone (the stub's own remove(), not app code)",
+        !document.body.children.some((c) => c.className === "sp-ghost"), "");
+  check("SP3 ...the chip highlight clears instead of staying lit", run("spDropKey") === null, run("spDropKey"));
+  const mv1 = log.find((l) => l.path === "/api/splitparts/H1/move");
+  check("SP3 ...and the song actually moved, instead of the drop silently doing nothing",
+        mv1 && JSON.parse(mv1.body).uri === "u1" && JSON.parse(mv1.body).to === "p2", JSON.stringify(mv1));
+  document.elementFromPoint = () => null;
+
+  // fix 5 — two fingers: a second touch must end the first finger's drag
+  // (and its ghost), and the first finger's later release must do nothing.
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p1"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0;
+  run(`spPointerDown("u1", 10, 10, 1)`);
+  run(`spPointerMove(10, 40, 1)`);
+  check("SP3 the first finger's drag lifts", document.body.children.some((c) => c.className === "sp-ghost"), "");
+  run(`spPointerDown("u3", 10, 10, 2)`);
+  check("SP3 a second finger touching down ends the first finger's drag and its ghost",
+        !document.body.children.some((c) => c.className === "sp-ghost") && run("spDropKey") === null, "");
+  await run(`spPointerUp(10, 40, 1)`);
+  check("SP3 the first finger's now-stale release does nothing",
+        !log.some((l) => l.path.endsWith("/move")) && AudioStub.made.length === 0, `made=${AudioStub.made.length}`);
+  run(`spPointerCancel(2)`);   // tidy up the second finger too
+
+  // fix 2 — spResumeOwed must arm only once a clip actually plays, never on
+  // a 404 or a refused play, so leaving the tab never wrongly resumes.
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p1"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = false;
+  routes["GET /api/track_preview?pid=H1&uri=u2"] = { status: 404, body: { detail: "no preview" } };
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  run(`show("now")`);
+  check("SP3 a 404 preview leaves nothing to resume when the tab is left",
+        log.filter((l) => l.path === "/api/preview_resume").length === 0, "");
+  run(`show("split")`);
+
+  resetLog();
+  AudioStub.refuse = true;
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  run(`show("now")`);
+  check("SP3 a refused play never sends a resume either",
+        log.filter((l) => l.path === "/api/preview_resume").length === 0, "");
+  run(`show("split")`);
+  AudioStub.refuse = false;
+
+  resetLog();
+  routes["GET /api/track_preview?pid=H1&uri=u2"] = { status: 200, body: { url: "https://cdn/u2.mp3", uri: "u2", deezer_id: 2 } };
+  routes["POST /api/preview_resume"] = { status: 200, body: { ok: true } };
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(11, 12)`);
+  await tick();
+  check("SP3 a played clip, stopped, sends exactly one resume",
+        log.filter((l) => l.path === "/api/preview_resume").length === 1, "");
+
+  // fix 4 — a refused play (iOS) keeps the clip; the same row's next tap
+  // retries play() on that SAME Audio object, no refetch, no new Audio.
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p1"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = true;
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP4 a refused play says to tap again and keeps the clip pending",
+        AudioStub.made.length === 1 && /tap the song again/.test($$("toast").textContent) &&
+        run("spAudioUri") === "u1", $$("toast").textContent);
+  AudioStub.refuse = false;
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP4 tapping the same row again retries play() on the same Audio object",
+        AudioStub.made.length === 1 && AudioStub.made[0].playCalls === 2,
+        `made=${AudioStub.made.length} calls=${AudioStub.made[0]?.playCalls}`);
+  check("SP4 ...with no second fetch for the same uri",
+        gets("/api/track_preview?pid=H1&uri=u1") === 1, `${gets("/api/track_preview?pid=H1&uri=u1")} GET(s)`);
+  routes["POST /api/preview_resume"] = { status: 200, body: { ok: true } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(11, 12)`);
+  await tick();
+  check("SP4 once the retry succeeds, stopping it still resumes exactly once",
+        log.filter((l) => l.path === "/api/preview_resume").length === 1, "");
+
+  // fix 3 — backgrounding the tab (visibilitychange) must stop a live split
+  // preview, the same way it already stops the house player's.
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p2"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0;
+  routes["GET /api/track_preview?pid=H1&uri=u3"] = { status: 200, body: { url: "https://cdn/u3.mp3", uri: "u3", deezer_id: 3 } };
+  run(`spPointerDown("u3", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  const bgClip = AudioStub.made[AudioStub.made.length - 1];
+  document.hidden = true;
+  for (const h of handlers.visibilitychange || []) h();
+  check("SP3 backgrounding the tab stops a live split preview",
+        bgClip.paused && run("spAudioUri") === null, "");
+  document.hidden = false;
+
+  // fix 6a — a resume that fails (ok:false, or the call itself rejecting)
+  // says so, like the house player.
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p1"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0;
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  routes["POST /api/preview_resume"] = { status: 200, body: { ok: false, error: "no active device" } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(11, 12)`);
+  await tick();
+  check("SP6 a resume that comes back ok:false says to press play in Spotify",
+        /press play in Spotify/.test($$("toast").textContent), $$("toast").textContent);
+
+  resetLog();
+  routes["POST /api/preview_resume"] = () => Promise.reject(new Error("network down"));
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(11, 12)`);
+  await tick();
+  check("SP6 a resume call that rejects outright says the same",
+        /press play in Spotify/.test($$("toast").textContent), $$("toast").textContent);
+
+  // fix 6b — starting a fresh Suggest run, or re-opening the home picker,
+  // must stop a live preview rather than let it play on underneath.
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p1"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0;
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  const suggestClip = AudioStub.made[AudioStub.made.length - 1];
+  routes["POST /api/splitparts/H1/suggest"] = { status: 200, body: { started: true } };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "running", phase: "grouping", done: 0, total: 0, message: null, summary: null } };
+  await run(`spSuggest(2)`);
+  check("SP6 starting a fresh Suggest run stops a live preview",
+        suggestClip.paused && run("spAudioUri") === null, "");
+  run(`spStopPolling()`);
+
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p1"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0;
+  routes["GET /api/track_preview?pid=H1&uri=u2"] = { status: 200, body: { url: "https://cdn/u2.mp3", uri: "u2", deezer_id: 2 } };
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  const pickerClip = AudioStub.made[AudioStub.made.length - 1];
+  routes["GET /api/splitparts/homes"] = { status: 200, body: { homes: [] } };
+  await run(`showSplit()`);
+  check("SP6 re-entering the Split tab's home picker stops a live preview",
+        pickerClip.paused && run("spAudioUri") === null, "");
+
+  run(`show("lists")`);
+}
+
+// ============================================================================
+// SP7 — fix round 2: a dead clip refetches instead of retrying forever, an
+// aborted play shows no false toast, a buffering tap still stops the clip,
+// and a refused/pending clip is never drawn as playing.
+// ============================================================================
+{
+  const songs = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                  u3: { name: "Three", artists: "C", local: false } };
+  const D = (parts, extra = {}) => ({ playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2, parts,
+    unknown: [], hint: null, scores: {}, songs, tracks: [], done: null, ...extra });
+  const two = () => [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3"] }];
+  run(`show("split")`);
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spPid = "H1"; spShown = "p1"; spSection("sp-work"); renderSpParts(); nowState = { is_playing: true }`);
+
+  // fix 1 — a dead clip (NotSupportedError, or any non-permission rejection)
+  // must refetch on the next tap, not retry the same dead element forever.
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = "NotSupportedError";
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP7 a dead clip says to try again, not 'tap the song again'",
+        /this preview failed/.test($$("toast").textContent) && run("spAudioUri") === null,
+        $$("toast").textContent);
+  AudioStub.refuse = false;
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP7 ...and the next tap fetches a fresh URL instead of retrying the dead element",
+        AudioStub.made.length === 2, `made=${AudioStub.made.length}`);
+
+  // ...and a clip that dies MID-PLAYBACK (onerror, an expired CDN token)
+  // fails the exact same way. This clip actually played, so round 3's fix
+  // means spClipFailed also resumes Spotify now — give that call somewhere
+  // benign to land (a stale route from an earlier block would otherwise
+  // overwrite this toast with its own, independent of the failure path
+  // under test here).
+  const liveClip = AudioStub.made[AudioStub.made.length - 1];
+  routes["POST /api/preview_resume"] = { status: 200, body: { ok: true } };
+  check("SP7 the clip got an onerror handler wired to the same failure path",
+        typeof liveClip.onerror === "function", "");
+  if (liveClip.onerror) liveClip.onerror();
+  await tick();
+  check("SP7 ...and firing it fails the preview the same way play() rejecting does",
+        /this preview failed/.test($$("toast").textContent) && run("spAudioUri") === null,
+        $$("toast").textContent);
+
+  // fix 2 — an aborted play (stopped while play() was still pending) must
+  // never show a false "tap again" toast, in EITHER catch.
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = "AbortError";
+  routes["GET /api/track_preview?pid=H1&uri=u2"] = { status: 200, body: { url: "https://cdn/u2.mp3", uri: "u2", deezer_id: 2 } };
+  $$("toast").textContent = "untouched";
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP7 an aborted play on the main path shows no toast at all",
+        $$("toast").textContent === "untouched", $$("toast").textContent);
+  run(`spStopPreview(false)`);
+  AudioStub.refuse = false;
+
+  // the SAME check against the retry path's own catch: get refused first
+  // (NotAllowedError), then abort the retry attempt itself.
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = true;
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  AudioStub.refuse = "AbortError";
+  $$("toast").textContent = "untouched";
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP7 an aborted RETRY shows no toast either",
+        $$("toast").textContent === "untouched", $$("toast").textContent);
+  run(`spStopPreview(false)`);
+  AudioStub.refuse = false;
+
+  // fix 3 — tapping a clip that is still buffering (pending, not yet
+  // refused) stops it, rather than calling play() again on it.
+  resetLog();
+  AudioStub.made.length = 0;
+  const origPlay = AudioStub.prototype.play;
+  let bufferPlayCalls = 0;
+  AudioStub.prototype.play = function () {
+    bufferPlayCalls++;
+    this.paused = false;
+    return new Promise(() => {});   // never settles — still buffering
+  };
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  run(`spPointerDown("u1", 10, 10)`);
+  run(`spPointerUp(10, 10)`);          // fire-and-forget: the fetch resolves, play() never does
+  await tick();
+  check("SP7 a buffering clip is pending but never marked refused",
+        run("spAudioPending") === true && run("spAudioRefused") === false, "");
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  check("SP7 tapping it again stops it instead of retrying play() on it",
+        run("spAudioUri") === null && bufferPlayCalls === 1, `calls=${bufferPlayCalls}`);
+  AudioStub.prototype.play = origPlay;
+
+  // fix 4 — a refused (or still-buffering) clip's row is never drawn as
+  // playing — only an actually-playing clip earns the highlight.
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p1"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = true;
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  run(`renderSpList()`);
+  check("SP7 a refused clip's row is not drawn as playing",
+        !/sp-song playing" data-uri="u1"/.test($$("sp-list").innerHTML), $$("sp-list").innerHTML);
+  AudioStub.refuse = false;
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP7 ...but once it actually plays, the row IS drawn as playing",
+        /sp-song playing" data-uri="u1"/.test($$("sp-list").innerHTML), $$("sp-list").innerHTML);
+
+  run(`spStopPreview(false)`);
+  run(`show("lists")`);
+}
+
+// ============================================================================
+// SP8 — fix round 3: the retry branch's own refused flag must clear while
+// IT buffers too, a clip that dies after real playback still resumes
+// Spotify, and the playing highlight needs spAudio to actually exist.
+// ============================================================================
+{
+  const songs = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                  u3: { name: "Three", artists: "C", local: false } };
+  const D = (parts, extra = {}) => ({ playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2, parts,
+    unknown: [], hint: null, scores: {}, songs, tracks: [], done: null, ...extra });
+  const two = () => [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3"] }];
+  run(`show("split")`);
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spPid = "H1"; spShown = "p1"; spSection("sp-work"); renderSpParts(); nowState = { is_playing: true }`);
+
+  // fix 1 — the retry branch must clear spAudioRefused BEFORE awaiting its
+  // own play(), so a third tap landing while that retry still buffers
+  // stops the clip instead of matching the refused branch again.
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = true;
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP8 the first tap is refused", run("spAudioRefused") === true, "");
+
+  const origPlay2 = AudioStub.prototype.play;
+  let retryPlayCalls = 0;
+  AudioStub.prototype.play = function () {
+    retryPlayCalls++;
+    this.paused = false;
+    return new Promise(() => {});   // the retry itself buffers forever
+  };
+  run(`spPointerDown("u1", 10, 10)`);
+  run(`spPointerUp(10, 10)`);        // fire-and-forget: this retry's play() never settles
+  await tick();
+  check("SP8 the retry clears spAudioRefused while IT buffers",
+        run("spAudioPending") === true && run("spAudioRefused") === false, "");
+  run(`spPointerDown("u1", 10, 10)`);
+  run(`spPointerUp(10, 10)`);        // fire-and-forget too: must not re-enter the retry branch and hang the same way
+  await tick();
+  check("SP8 a third tap mid-retry stops the clip instead of calling play() again",
+        run("spAudioUri") === null && retryPlayCalls === 1, `calls=${retryPlayCalls}`);
+  AudioStub.prototype.play = origPlay2;
+  run(`spStopPreview(false)`);
+
+  // fix 2 — a clip that dies via onerror AFTER actually playing (resume
+  // owed) must still give Spotify back once, not leave it silently paused.
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = false;
+  routes["GET /api/track_preview?pid=H1&uri=u2"] = { status: 200, body: { url: "https://cdn/u2.mp3", uri: "u2", deezer_id: 2 } };
+  routes["POST /api/preview_resume"] = { status: 200, body: { ok: true } };
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP8 the clip actually played, so a resume is owed", run("spResumeOwed") === true, "");
+  const clip2 = AudioStub.made[AudioStub.made.length - 1];
+  clip2.onerror();
+  await tick();
+  check("SP8 a clip that dies after real playback resumes Spotify exactly once",
+        log.filter((l) => l.path === "/api/preview_resume").length === 1, "");
+
+  // fix 3 — the playing highlight needs an actual spAudio, not just a
+  // pending fetch (spAudioUri set, spAudioPending still false until the
+  // Audio object exists).
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p1"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0;
+  let resolveFetch;
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = () => new Promise((resolve) => { resolveFetch = resolve; });
+  run(`spPointerDown("u1", 10, 10)`);
+  run(`spPointerUp(10, 10)`);        // fire-and-forget: the fetch itself never resolves until we say so
+  await tick();
+  check("SP8 while the fetch is in flight, spAudio does not exist yet",
+        run("spAudio") === null && run("spAudioUri") === "u1" && run("spAudioPending") === false, "");
+  run(`renderSpList()`);
+  check("SP8 ...and that in-flight window is not drawn as playing",
+        !/sp-song playing" data-uri="u1"/.test($$("sp-list").innerHTML), $$("sp-list").innerHTML);
+  resolveFetch({ status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } });
+  await tick();
+  run(`spStopPreview(false)`);
+
+  run(`show("lists")`);
+}
+
+// ============================================================================
+// SPD — Done: name, folder, what happens to the original, the price; then
+// progress, and a summary or a way back. Fix round 1: a started Done is
+// never invisible to the screen, a stale /plan answer never wins, an
+// emptied name never falls back to a bad typed one, and Back → parts →
+// Done… keeps what was typed. (Named SPD, not SD — SD already names an
+// unrelated block above — and not SP3, which Task 9's own fix round uses.)
+// ============================================================================
+{
+  resetLog();
+  const songs = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                  u3: { name: "Three", artists: "C", local: false } };
+  const DRAFT = { playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2,
+    parts: [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3"] }],
+    unknown: [], hint: null, scores: {}, songs, tracks: [], done: null };
+  run(`show("split"); spPid = "H1"; spDoneChoicePid = null; spPlan = null;
+       spDraft = ${JSON.stringify(DRAFT)}; spShown = "p1"; spSection("sp-work"); renderSpParts()`);
+  check("SPD the Done button sits under the chips, not grouped with Remove/Start over",
+        /id="sp-open-done"/.test($$("sp-done-row").innerHTML) && !/id="sp-open-done"/.test($$("sp-actions").innerHTML),
+        `row=${$$("sp-done-row").innerHTML} actions=${$$("sp-actions").innerHTML}`);
+
+  // adjustment 1 — opening Done must not leave a clip playing over it.
+  AudioStub.made.length = 0; AudioStub.refuse = false;
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  routes["POST /api/preview_resume"] = { status: 200, body: { ok: true } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SPD a clip is playing before Done opens", run("spAudio") !== null, "");
+
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 6, creates: 2, empty: [], local: ["Home demo"], removals: 0,
+    folders: [{ path: "ROOT / Mix", blocked: null }, { path: "ROOT / Deep", blocked: "file this one by hand" }],
+    folder: "ROOT / Mix" } };
+  await run(`spOpenDone()`);
+  check("SPD opening Done stops a live preview", run("spAudio") === null, "");
+  resetLog();   // drop the preview_resume POST and the plan GET — not part of the price check below
+  const doneHtml = () => $$("sp-done").innerHTML;
+  check("SPD the Done screen names each part by its KEY (not position), prefilled, placeholder holds the suggested name",
+        /id="sp-name-p1"[^>]*value="rock"[^>]*placeholder="rock"/.test(doneHtml()) &&
+        /id="sp-name-p2"[^>]*value="jazz"[^>]*placeholder="jazz"/.test(doneHtml()), doneHtml().slice(0, 400));
+  check("SPD ...defaults to the original's folder, and a folder the mover can't reach is disabled",
+        $$("sp-folder").value === "ROOT / Mix" && /value="ROOT \/ Deep" disabled/.test(doneHtml()), doneHtml());
+  check("SPD ...keeps the original as a subset by default, renamed with the subset mark",
+        /id="sp-orig-subset"[^>]*checked/.test(doneHtml()) && /renamed with the subset mark/.test(doneHtml()), doneHtml());
+  check("SPD ...warns about local files that stay behind", /Home demo/.test(doneHtml()) && /local file/.test(doneHtml()), "");
+  check("SPD ...and shows the price before anything happens, the subset wording in the cost line too",
+        /2 new playlists/.test(doneHtml()) && /about 6 calls/.test(doneHtml()) &&
+        /renames the original with the subset mark/.test(doneHtml()) &&
+        !log.some((l) => l.method === "POST"), doneHtml());
+
+  routes["GET /api/splitparts/H1/plan?original=part&part=p1"] = { status: 200, body: {
+    calls: 4, creates: 1, empty: [], local: [], removals: 1,
+    folders: [{ path: "ROOT / Mix", blocked: null }], folder: "ROOT / Mix" } };
+  run(`spDoneChoice.original = "part"; spDoneChoice.part = "p1"`);
+  await run(`spRefreshPlan()`);
+  check("SPD choosing 'becomes a part' re-prices it, with the removals",
+        /1 new playlist\b/.test(doneHtml()) && /removes 1 song/.test(doneHtml()) && /about 4 calls/.test(doneHtml()), doneHtml());
+  check("SPD ...and that part's name field says it keeps the original's name",
+        /keeps the name/.test(doneHtml()) && /Big Home/.test(doneHtml()), doneHtml());
+
+  // fix round 1, item 3 — an emptied name falls back to the SUGGESTED name,
+  // never to a bad name that was typed and then cleared; Confirm sends the
+  // typed names/folder/choice and ends on a summary.
+  run(`spDoneChoice.original = "subset"; spDoneChoice.part = null`);
+  await run(`spRefreshPlan()`);
+  $$("sp-name-p1").value = "[bad]";
+  $$("sp-name-p2").value = "Jazzy";
+  routes["POST /api/splitparts/H1/done"] = { status: 400, body: { detail: "'[bad]': looks like an input, not a home" } };
+  resetLog();
+  await run(`spConfirmDone()`);
+  await tick();
+  check("SPD a bad typed name is refused with a toast, the form stays up and Confirm works again",
+        /looks like an input/.test($$("toast").textContent) && $$("sp-done").hidden === false &&
+        $$("sp-confirm").disabled === false, $$("toast").textContent);
+
+  $$("sp-name-p1").value = "";   // cleared, not retyped — must NOT send "[bad]"
+  routes["POST /api/splitparts/H1/done"] = { status: 200, body: { started: true } };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "done", phase: "done", done: 2, total: 2, message: null,
+    summary: { created: [{ id: "N1", name: "rock", count: 2 }, { id: "N2", name: "Jazzy", count: 1 }],
+               original: "subset", empty: [], local: ["Home demo"] } } };
+  resetLog();
+  await run(`spConfirmDone()`);
+  await tick();
+  const done = log.find((l) => l.method === "POST" && l.path === "/api/splitparts/H1/done");
+  const body = done && JSON.parse(done.body);
+  check("SPD Confirm sends the SUGGESTED name for a cleared field (never the cleared bad one), the typed one, the folder and the choice",
+        body && body.names.p1 === "rock" && body.names.p2 === "Jazzy" && body.folder === "ROOT / Mix" &&
+        body.original === "subset" && body.part === null, JSON.stringify(body));
+  check("SPD ...and ends on a summary of what was made",
+        /rock/.test(doneHtml()) && /Jazzy/.test(doneHtml()) && /2 songs/.test(doneHtml()) && /id="sp-finish"/.test(doneHtml()) &&
+        run("spDraft") === null, doneHtml());
+
+  // the playlist changed: a way to re-read
+  run(`spDraft = ${JSON.stringify(DRAFT)}`);
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "changed", phase: "", done: 0, total: 2,
+    message: "the playlist changed in Spotify since the suggestion — re-read it to continue", summary: null } };
+  await run(`spConfirmDone()`);
+  check("SPD a changed playlist offers Re-read", /id="sp-reread"/.test(doneHtml()) && /changed in Spotify/.test(doneHtml()), doneHtml());
+  routes["POST /api/splitparts/H1/reread"] = { status: 200, body: { ...DRAFT, unknown: ["u3"] } };
+  await run(`spReread()`);
+  check("SPD ...which lands back on the parts", $$("sp-parts").hidden === false && run("spDraft.unknown.length") === 1, "");
+
+  // an error that never wrote anything (draft.done still null): the plain
+  // "Back / Done again" form, not the locked finish screen.
+  routes["GET /api/splitparts/H1"] = { status: 200, body: { ...DRAFT, unknown: ["u3"] } };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "error", phase: "", done: 1, total: 2,
+    message: "Spotify API 429: rate limited — your split is saved; press Done again to continue", summary: null } };
+  resetLog();
+  await run(`spConfirmDone()`);
+  check("SPD a failed Done that never started writing says why and offers Done again",
+        /press Done again/.test(doneHtml()) && /id="sp-retry"/.test(doneHtml()) && !/id="sp-finish-done"/.test(doneHtml()), doneHtml());
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "running", phase: "creating", done: 1, total: 2, message: null, summary: null } };
+  await run(`$("sp-retry").onclick()`);
+  check("SPD ...and Done again posts again",
+        log.filter((l) => l.method === "POST" && l.path === "/api/splitparts/H1/done").length === 2, "");
+  run(`spStopPolling()`);
+
+  // adjustment 3 — the Confirm button posts only once for a double tap; the
+  // guard is a plain flag, not the disabled attribute, since calling the
+  // function directly (as this check does) bypasses a disabled button.
+  resetLog();
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "running", phase: "creating", done: 0, total: 2, message: null, summary: null } };
+  run(`spConfirmDone(); spConfirmDone();`);
+  await tick();
+  check("SPD two quick taps on Confirm post once",
+        log.filter((l) => l.method === "POST" && l.path === "/api/splitparts/H1/done").length === 1, "");
+  run(`spStopPolling()`);
+
+  // ---- fix round 1, item 1: a started Done is never invisible ------------
+
+  const STARTED_DRAFT = { playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2,
+    parts: [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3"] }],
+    unknown: [], hint: null, scores: {}, songs, tracks: [],
+    done: { opts: { original: "part", part: "p1", names: {}, folder: null }, created: {}, filled: [], original_done: false } };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null } };
+  routes["GET /api/splitparts/H1"] = { status: 200, body: STARTED_DRAFT };
+  run(`spPid = null; spDoneChoicePid = null; spDraft = null`);
+  resetLog();
+  await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+  check("SPD reopening a started Done lands on the locked finish screen, not an editable form",
+        /id="sp-finish-done"/.test(doneHtml()) && !/id="sp-confirm"/.test(doneHtml()) &&
+        /removed from it/.test(doneHtml()), doneHtml());
+  check("SPD ...naming the folder as top level when none was chosen",
+        /— top level —/.test(doneHtml()), doneHtml());
+  routes["POST /api/splitparts/H1/done"] = { status: 200, body: { started: true } };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "running", phase: "creating", done: 0, total: 1, message: null, summary: null } };
+  resetLog();
+  run(`$("sp-finish-done").onclick()`);
+  await tick();
+  const finishBody = JSON.parse(log.find((l) => l.path === "/api/splitparts/H1/done").body);
+  check("SPD its button posts exactly the stored opts",
+        JSON.stringify(finishBody) === JSON.stringify(STARTED_DRAFT.done.opts), JSON.stringify(finishBody));
+  run(`spStopPolling()`);
+
+  // reopening a home whose Done is actively RUNNING right now must show the
+  // progress panel (never the parts, and never the finish screen either —
+  // there is nothing to click until it's done), using the kind the server
+  // recorded so the finish is dispatched to spDoneFinished, not treated as
+  // a fresh Suggest.
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "running", phase: "creating", done: 1, total: 2, message: null, summary: null, kind: "done" } };
+  run(`spPid = null; spDoneChoicePid = null; spDraft = null`);
+  resetLog();
+  await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+  check("SPD reopening a home with Done running shows the progress panel, not the parts or finish screen",
+        $$("sp-progress").hidden === false && $$("sp-parts").hidden === true && $$("sp-done").hidden === true,
+        `progress.hidden=${$$("sp-progress").hidden} parts.hidden=${$$("sp-parts").hidden} done.hidden=${$$("sp-done").hidden}`);
+  check("SPD ...and never even asked for the draft while it was running",
+        !log.some((l) => l.method === "GET" && l.path === "/api/splitparts/H1"), "");
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "done", phase: "done", done: 2, total: 2, message: null,
+    summary: { created: [{ id: "N3", name: "rock", count: 2 }], original: "part", empty: [], local: [] } } };
+  await run(`spPoll("done")`);
+  check("SPD ...and ends in the summary once the running Done completes",
+        /id="sp-finish"/.test(doneHtml()) && $$("sp-done").hidden === false, doneHtml());
+  run(`spStopPolling()`);
+
+  // an error on a Done that already wrote something lands on the locked
+  // finish screen (with the error on top), not the editable "Done again"
+  // form, which could now disagree with the stored choice.
+  run(`spPid = "H1"; spDoneChoicePid = "H1"; spDraft = ${JSON.stringify(STARTED_DRAFT)}`);
+  routes["GET /api/splitparts/H1"] = { status: 200, body: STARTED_DRAFT };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "error", phase: "", done: 0, total: 1,
+    message: "Spotify API 429: rate limited — your split is saved; press Done again to continue", summary: null } };
+  resetLog();
+  await run(`spPoll("done")`);
+  check("SPD an error on a started Done lands on the locked finish screen, with the error on top",
+        /id="sp-finish-done"/.test(doneHtml()) && /rate limited/.test(doneHtml()) && !/id="sp-retry"/.test(doneHtml()),
+        doneHtml());
+
+  // the draft can vanish (Done finished and dropped it) while the job's own
+  // last progress record for this pid still holds the summary; reopening
+  // the home must show that summary, not a blank "pick a count" screen as
+  // if nothing had ever been split here.
+  routes["GET /api/splitparts/H1"] = { status: 404, body: { detail: "no split in progress for this playlist" } };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "done", phase: "done", done: 1, total: 1, message: null,
+    summary: { created: [{ id: "N9", name: "rock", count: 2 }], original: "subset", empty: [], local: [] } } };
+  run(`spPid = null; spDoneChoicePid = null; spDraft = null`);
+  resetLog();
+  await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+  check("SPD a vanished draft with a held summary shows the summary on reopen, not the setup screen",
+        $$("sp-done").hidden === false && /id="sp-finish"/.test(doneHtml()) && $$("sp-setup").hidden === true,
+        doneHtml());
+
+  // ---- fix round 1, item 2: a stale /plan answer never wins --------------
+
+  run(`spPid = "H1"; spDoneChoicePid = "H1"; spDraft = ${JSON.stringify(DRAFT)}; spPlan = null`);
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 6, creates: 2, empty: [], local: [], removals: 0,
+    folders: [{ path: "ROOT / Mix", blocked: null }], folder: "ROOT / Mix" } };
+  await run(`spRefreshPlan()`);   // a normal first load, so the next ones are "pending", not spinner-replaced
+  let resolvePart, resolveSubset;
+  routes["GET /api/splitparts/H1/plan?original=part&part=p1"] = () => new Promise((resolve) => { resolvePart = resolve; });
+  run(`spDoneChoice.original = "part"; spDoneChoice.part = "p1"`);
+  run(`spRefreshPlan()`);   // request 1, in flight
+  await tick();
+  check("SPD Confirm is disabled and the cost line says 'pricing…' while a plan is pending",
+        $$("sp-confirm").disabled === true && /pricing…/.test(doneHtml()), doneHtml());
+  routes["GET /api/splitparts/H1/plan?original=subset"] = () => new Promise((resolve) => { resolveSubset = resolve; });
+  run(`spDoneChoice.original = "subset"; spDoneChoice.part = null`);
+  run(`spRefreshPlan()`);   // request 2 (the latest), in flight too
+  await tick();
+  // resolve the STALE one (request 1, "part") first — out of order — then
+  // the fresh one (request 2, "subset").
+  resolvePart({ status: 200, body: { calls: 4, creates: 1, empty: [], local: [], removals: 1,
+    folders: [{ path: "ROOT / Mix", blocked: null }], folder: "ROOT / Mix" } });
+  await tick();
+  resolveSubset({ status: 200, body: { calls: 6, creates: 2, empty: [], local: [], removals: 0,
+    folders: [{ path: "ROOT / Mix", blocked: null }], folder: "ROOT / Mix" } });
+  await tick();
+  check("SPD out-of-order plan answers leave the cost line matching the LAST choice, not the stale one",
+        /2 new playlists/.test(doneHtml()) && /about 6 calls/.test(doneHtml()) &&
+        /renames the original with the subset mark/.test(doneHtml()) &&
+        $$("sp-confirm").disabled === false, doneHtml());
+
+  // ---- fix round 1, item 4a: Back → parts → Done… keeps what was typed ---
+
+  run(`spPid = "H1"; spDoneChoicePid = "H1"; spDraft = ${JSON.stringify(DRAFT)}; spPlan = null`);
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 6, creates: 2, empty: [], local: [], removals: 0,
+    folders: [{ path: "ROOT / Mix", blocked: null }], folder: "ROOT / Mix" } };
+  await run(`spOpenDone()`);
+  $$("sp-name-p1").value = "Rocky";
+  run(`spDoneChoice.folder = "ROOT / Mix"`);
+  run(`$("sp-done-back").onclick()`);   // Back → parts, reading the typed name first
+  check("SPD Back reads the typed name before leaving",
+        run("spDoneChoice.names.p1") === "Rocky", run("spDoneChoice.names.p1"));
+  await run(`spOpenDone()`);   // Done… again, same pid
+  check("SPD reopening Done for the SAME pid keeps the typed name and choice",
+        /value="Rocky"/.test(doneHtml()) && $$("sp-folder").value === "ROOT / Mix", doneHtml());
+
+  const DRAFT_H3 = { playlist_id: "H3", name: "Third Home", snapshot_id: "s3", n: 2,
+    parts: [{ key: "q1", name: "folk", uris: ["v1"] }, { key: "q2", name: "ambient", uris: ["v2"] }],
+    unknown: [], hint: null, scores: {}, songs: { v1: { name: "Six", artists: "F", local: false },
+    v2: { name: "Seven", artists: "G", local: false } }, tracks: [], done: null };
+  routes["GET /api/splitparts/H3/plan?original=subset"] = { status: 200, body: {
+    calls: 3, creates: 2, empty: [], local: [], removals: 0, folders: [], folder: "" } };
+  run(`spPid = "H3"; spDraft = ${JSON.stringify(DRAFT_H3)}`);
+  // spRefreshPlan() now only ever reads names from a form that is genuinely
+  // the one on screen (`hadPlan`) — opening Done for this different pid
+  // resets `spPlan` to null first, so the stale "Rocky" sitting in the
+  // stub's sticky "sp-name-p1" element (there is no "sp-name-p1" in THIS
+  // draft anyway; it would have been "sp-name-q1") is never read at all,
+  // matching a real DOM where that node would already be gone.
+  await run(`spOpenDone()`);
+  check("SPD opening Done for a DIFFERENT pid resets the choice, not the other split's typed name",
+        !/value="Rocky"/.test(doneHtml()) && /value="folk"/.test(doneHtml()), doneHtml());
+  run(`spStopPolling()`);
+
+  // ---- fix round 1, item 4d: a refused /plan keeps the form up -----------
+
+  run(`spPid = "H1"; spDoneChoicePid = "H1"; spDraft = ${JSON.stringify(DRAFT)}; spPlan = null`);
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 6, creates: 2, empty: [], local: [], removals: 0,
+    folders: [{ path: "ROOT / Mix", blocked: null }], folder: "ROOT / Mix" } };
+  await run(`spOpenDone()`);
+  routes["GET /api/splitparts/H1/plan?original=part&part=p2"] = { status: 400, body: { detail: "at least 2 parts need songs in them" } };
+  run(`spDoneChoice.original = "part"; spDoneChoice.part = "p2"`);
+  await run(`spRefreshPlan()`);
+  check("SPD a refused plan keeps the form up, the message in the cost line, Confirm disabled",
+        /at least 2 parts need songs/.test(doneHtml()) && $$("sp-confirm").disabled === true &&
+        /id="sp-orig-part-key"/.test(doneHtml()) && /id="sp-folder"/.test(doneHtml()), doneHtml());
+  run(`$("sp-orig-subset").onchange()`);
+  await tick();
+  check("SPD ...and the user can switch the choice back to one that prices fine",
+        /2 new playlists/.test(doneHtml()) && $$("sp-confirm").disabled === false, doneHtml());
+
+  run(`spStopPolling(); show("lists")`);
+}
+
+// ============================================================================
+// SPD2 — Done fix round 2: the typed choice invalidates when the part SET
+// changes shape, a held summary never blocks re-splitting, the locked
+// finish screen matches what the server will actually do, and smaller
+// robustness fixes (a stale plan answer, a draft re-fetch failure, a race
+// between two openSpHome calls).
+// ============================================================================
+{
+  resetLog();
+  const doneHtml2 = () => $$("sp-done").innerHTML;
+  const songs3 = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                   u3: { name: "Three", artists: "C", local: true } };
+  const DRAFT3 = { playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 3,
+    parts: [{ key: "p1", name: "rock", uris: ["u1"] }, { key: "p2", name: "jazz", uris: ["u2"] },
+            { key: "p3", name: "blues", uris: ["u3"] }],
+    unknown: [], hint: null, scores: {}, songs: songs3, tracks: [], done: null };
+  run(`show("split"); spPid = "H1"; spDoneChoicePid = null; spPlan = null;
+       spDraft = ${JSON.stringify(DRAFT3)}; spShown = "p1"; spSection("sp-work"); renderSpParts()`);
+
+  // ---- item 1: a structural change invalidates the typed choice ---------
+
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 7, creates: 3, empty: [], local: [], removals: 0, folders: [], folder: "" } };
+  await run(`spOpenDone()`);
+  $$("sp-name-p2").value = "JazzyX";
+  $$("sp-name-p1").value = "RockyKeep";
+  run(`spReadNames()`);
+  check("SPD2 the typed name lands on p2 (by key) before any structural change",
+        run("spDoneChoice.names.p2") === "JazzyX", run("spDoneChoice.names.p2"));
+
+  let removeCall = 0;
+  const REMOVED_DRAFT = { ...DRAFT3, parts: [{ key: "p1", name: "rock", uris: ["u1", "u2"] },
+                                              { key: "p3", name: "blues", uris: ["u3"] }] };
+  routes["POST /api/splitparts/H1/parts/p2/remove"] = () => {
+    removeCall++;
+    // The dry run (moves preview) and the real removal share this one
+    // route in the stub (keyed on method+path, not body) — the dry run
+    // comes first, in source order.
+    return removeCall === 1 ? { status: 200, body: { moves: { p1: 1 } } } : { status: 200, body: REMOVED_DRAFT };
+  };
+  await run(`spRemovePart("p2")`);
+  // The parts screen wiped #sp-done, so in a real DOM the old name fields
+  // are gone and getElementById answers null for them. The stub keeps every
+  // id it ever saw and makes up a blank one for any other, either of which
+  // spReadNames would read back as if a field were on screen — so, for
+  // these checks only, a name field exists only while markup holds it.
+  const realGetById = document.getElementById;
+  document.getElementById = (id) => (id.startsWith("sp-name-") ? (reg[id] || null) : realGetById(id));
+  const dropNameFields = () => { for (const k of Object.keys(reg)) if (k.startsWith("sp-name-")) delete reg[k]; };
+  dropNameFields();
+  check("SPD2 removing p2 leaves p3 with its OWN key, not renumbered to p2",
+        run(`spDraft.parts.map((p) => p.key).join(",")`) === "p1,p3",
+        run(`spDraft.parts.map((p) => p.key).join(",")`));
+
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 5, creates: 2, empty: [], local: [], removals: 0, folders: [], folder: "" } };
+  await run(`spOpenDone()`);
+  check("SPD2 a remove invalidates the choice — p3 gets its OWN suggested name, never p2's leaked one",
+        /id="sp-name-p3"[^>]*value="blues"/.test(doneHtml2()) && !/JazzyX/.test(doneHtml2()), doneHtml2());
+  // Surgical, not a reset: the untouched part keeps what was typed for it,
+  // and only the removed part's typed name is gone.
+  check("SPD2 ...while p1's typed name survives the removal, and p2's typed name is gone",
+        /id="sp-name-p1"[^>]*value="RockyKeep"/.test(doneHtml2()) && run("spDoneChoice.names.p2") === undefined,
+        doneHtml2());
+  routes["POST /api/splitparts/H1/parts"] = { status: 200, body: { ...REMOVED_DRAFT,
+    parts: [...REMOVED_DRAFT.parts, { key: "p4", name: "New part", uris: [] }] } };
+  run(`renderSpParts()`);
+  dropNameFields();
+  await run(`spAddPart()`);
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 5, creates: 2, empty: ["New part"], local: [], removals: 0, folders: [], folder: "" } };
+  await run(`spOpenDone()`);
+  check("SPD2 ...and survives adding a part, the new part showing its own suggested name",
+        /id="sp-name-p1"[^>]*value="RockyKeep"/.test(doneHtml2()) &&
+        /id="sp-name-p4"[^>]*value="New part"/.test(doneHtml2()) && !/JazzyX/.test(doneHtml2()), doneHtml2());
+  document.getElementById = realGetById;
+  run(`spStopPolling()`);
+
+  // Start over (same key scheme, entirely different songs) invalidates too.
+  run(`spDoneChoice.names = { p1: "OldStaleName" }; spDoneChoicePid = spPid;
+       spPlan = { folders: [], local: [], empty: [], calls: 1, creates: 1, folder: "" };`);
+  routes["POST /api/splitparts/H1/suggest"] = { status: 200, body: { started: true } };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "done", phase: "done", done: 0, total: 0, message: null, summary: null } };
+  const RESUGGESTED = { playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2,
+    parts: [{ key: "p1", name: "metal", uris: ["u5"] }, { key: "p2", name: "folk", uris: ["u6"] }],
+    unknown: [], hint: null, scores: {}, songs: { u5: { name: "Five", artists: "E", local: false },
+    u6: { name: "Six", artists: "F", local: false } }, tracks: [], done: null };
+  routes["GET /api/splitparts/H1"] = { status: 200, body: RESUGGESTED };
+  await run(`spResuggest(2)`);
+  check("SPD2 Start over bumps the draft generation, so the stale choice no longer matches",
+        run("spDoneChoiceGen !== spDraftGen") === true,
+        `gen=${run("spDraftGen")} choiceGen=${run("spDoneChoiceGen")}`);
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 3, creates: 2, empty: [], local: [], removals: 0, folders: [], folder: "" } };
+  await run(`spOpenDone()`);
+  check("SPD2 ...so Done… shows fresh defaults for the NEW parts, not the old typed name",
+        /id="sp-name-p1"[^>]*value="metal"/.test(doneHtml2()) && !/OldStaleName/.test(doneHtml2()), doneHtml2());
+  run(`spStopPolling()`);
+
+  // A stale part key (the choice pointed at a part that no longer exists)
+  // falls back to the first part instead of leaving a dead key behind.
+  routes["GET /api/splitparts/H1/plan?original=part&part=p1"] = { status: 200, body: {
+    calls: 2, creates: 1, empty: [], local: [], removals: 1, folders: [], folder: "" } };
+  run(`spDoneChoice = { original: "part", part: "DEAD", folder: "", names: {} }; spDoneChoicePid = spPid;
+       spPlan = { folders: [], local: [], empty: [], calls: 1, creates: 1, folder: "" };`);
+  await run(`spRefreshPlan()`);
+  check("SPD2 a stale part key is replaced with the first part",
+        run("spDoneChoice.part") === "p1", run("spDoneChoice.part"));
+  run(`spStopPolling()`);
+
+  // ---- item 2: a held summary never blocks re-splitting ------------------
+
+  const SUMMARY = { created: [{ id: "N1", name: "metal", count: 1 }], original: "subset", empty: [], local: [] };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "done", phase: "done", done: 1, total: 1, message: null, summary: SUMMARY } };
+  routes["GET /api/splitparts/H1"] = { status: 404, body: { detail: "no split in progress for this playlist" } };
+  run(`spPid = null; spDoneChoicePid = null; spDraft = null; spShownSummaryKey = null;`);
+  resetLog();
+  await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+  check("SPD2 the first reopen after Done shows the held summary",
+        /id="sp-finish"/.test(doneHtml2()) && $$("sp-done").hidden === false, doneHtml2());
+  check("SPD2 ...and offers no Split this home again in SUBSET mode — the original is no longer a home",
+        !/id="sp-split-again"/.test(doneHtml2()), doneHtml2());
+
+  run(`spPid = null`);   // left, then reopened — the job record for H1 is unchanged
+  resetLog();
+  await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+  check("SPD2 reopening AGAIN after the summary was shown goes to the counter, not the same summary",
+        $$("sp-setup").hidden === false && $$("sp-done").hidden === true, "");
+
+  const SUMMARY2 = { created: [{ id: "N2", name: "folk", count: 1 }], original: "part", empty: [], local: [] };
+  run(`spPid = "H1"; renderSpSummary(${JSON.stringify(SUMMARY2)})`);
+  check("SPD2 the summary offers Split this home again in PART mode — the original stayed a home",
+        /id="sp-split-again"/.test(doneHtml2()), doneHtml2());
+  run(`$("sp-split-again").onclick()`);
+  check("SPD2 ...and it goes straight to the counter",
+        $$("sp-setup").hidden === false, "");
+
+  // ---- item 4: the locked finish screen matches the server ---------------
+
+  const STARTED3 = { playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 3,
+    parts: [{ key: "p1", name: "rock", uris: ["u1"] }, { key: "p2", name: "jazz", uris: ["u2"] },
+            { key: "p3", name: "blues", uris: ["u3"] }],
+    unknown: [], hint: null, scores: {}, songs: songs3, tracks: [],
+    done: { opts: { original: "part", part: "p1", names: {}, folder: "ROOT / Mix" },
+            created: {}, filled: [], original_done: false } };
+  routes["GET /api/splitparts/H1/plan?original=part&part=p1"] = { status: 200, body: {
+    calls: 3, creates: 1, empty: ["blues"], local: ["Three"], removals: 1, folders: [], folder: "" } };
+  routes["GET /api/splitparts/H1"] = { status: 200, body: STARTED3 };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null } };
+  run(`spPid = null; spDoneChoicePid = null; spDraft = null`);
+  resetLog();
+  await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+  check("SPD2 the finish screen lists only the part the server will actually create (blues is empty/local-only)",
+        /jazz/.test(doneHtml2()) && !/blues/.test(doneHtml2()), doneHtml2());
+  check("SPD2 ...names which part the original becomes, and that the rest is removed from it",
+        /becomes the part “rock”/.test(doneHtml2()) && /removed from it/.test(doneHtml2()), doneHtml2());
+  check("SPD2 ...and shows the folder, the local-file note and the price, straight from a real /plan",
+        /ROOT \/ Mix/.test(doneHtml2()) && /Three/.test(doneHtml2()) && /local file/.test(doneHtml2()) &&
+        /1 new playlist/.test(doneHtml2()) && /about 3 calls/.test(doneHtml2()), doneHtml2());
+
+  const STARTED_SUBSET = { playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2,
+    parts: [{ key: "p1", name: "rock", uris: ["u1"] }, { key: "p2", name: "jazz", uris: ["u2"] }],
+    unknown: [], hint: null, scores: {}, songs: songs3, tracks: [],
+    done: { opts: { original: "subset", part: null, names: {}, folder: null },
+            created: {}, filled: [], original_done: false } };
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 5, creates: 2, empty: [], local: [], removals: 0, folders: [], folder: "" } };
+  routes["GET /api/splitparts/H1"] = { status: 200, body: STARTED_SUBSET };
+  run(`spPid = null; spDoneChoicePid = null; spDraft = null`);
+  resetLog();
+  await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+  check("SPD2 subset mode's finish screen also says it stops being a home",
+        /renamed with the subset mark/.test(doneHtml2()) && /stops being a home/.test(doneHtml2()), doneHtml2());
+
+  // ---- item 5: a draft re-fetch failure offers Try again, not a guess ----
+
+  routes["GET /api/splitparts/H1"] = { status: 500, body: { detail: "boom" } };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "error", phase: "", done: 0, total: 1,
+    message: "Spotify API 429: rate limited — your split is saved; press Done again to continue", summary: null } };
+  run(`spPid = "H1"; spDraft = ${JSON.stringify(STARTED_SUBSET)}`);
+  resetLog();
+  await run(`spPoll("done")`);
+  check("SPD2 a draft re-fetch failure shows the message with Try again, not the stale editable form",
+        /rate limited/.test(doneHtml2()) && /id="sp-try-again"/.test(doneHtml2()) &&
+        !/id="sp-retry"/.test(doneHtml2()) && !/id="sp-finish-done"/.test(doneHtml2()), doneHtml2());
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null } };
+  routes["GET /api/splitparts/H1"] = { status: 200, body: STARTED_SUBSET };
+  await run(`$("sp-try-again").onclick()`);
+  check("SPD2 ...and Try again reopens the home, landing on the (now working) finish screen",
+        /id="sp-finish-done"/.test(doneHtml2()), doneHtml2());
+
+  // ---- item 6: typed-while-pending survives; a stale warning never carries over; null-guards ----
+
+  run(`spPid = "H1"; spDoneChoicePid = "H1"; spDraft = ${JSON.stringify(DRAFT3)};
+       spPlan = { folders: [], local: [], empty: [], calls: 1, creates: 1, folder: "" };`);
+  let resolvePending;
+  routes["GET /api/splitparts/H1/plan?original=part&part=p1"] = () => new Promise((resolve) => { resolvePending = resolve; });
+  run(`spDoneChoice.original = "part"; spDoneChoice.part = "p1"`);
+  run(`spRefreshPlan()`);   // in flight ("pricing…")
+  await tick();
+  $$("sp-name-p2").value = "TypedDuringPending";
+  resolvePending({ status: 200, body: { calls: 2, creates: 2, empty: [], local: [], removals: 1, folders: [], folder: "" } });
+  await tick();
+  check("SPD2 a name typed WHILE a plan was pending survives into the final render",
+        run("spDoneChoice.names.p2") === "TypedDuringPending", run("spDoneChoice.names.p2"));
+  run(`spStopPolling()`);
+
+  run(`spDoneChoice.original = "subset"; spDoneChoice.part = null; spPlan = null;`);
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 7, creates: 3, empty: [], local: ["StaleLocalFile"], removals: 0, folders: [], folder: "" } };
+  await run(`spRefreshPlan()`);   // seed a plan WITH a local warning
+  check("SPD2 the good plan shows its own local warning", /StaleLocalFile/.test(doneHtml2()), doneHtml2());
+  routes["GET /api/splitparts/H1/plan?original=part&part=p1"] = { status: 400, body: { detail: "at least 2 parts need songs in them" } };
+  run(`spDoneChoice.original = "part"; spDoneChoice.part = "p1"`);
+  await run(`spRefreshPlan()`);
+  check("SPD2 the error render does not carry over the PREVIOUS plan's local warning",
+        !/StaleLocalFile/.test(doneHtml2()) && /at least 2 parts need songs/.test(doneHtml2()), doneHtml2());
+  run(`spDoneChoice.original = "subset"; spDoneChoice.part = null; spStopPolling();`);
+
+  let threw = null;
+  run(`spDraft = null`);
+  try { run(`renderSpDone()`); } catch (e) { threw = e; }
+  check("SPD2 renderSpDone with spDraft === null does not throw", threw === null, threw ? String(threw) : "");
+
+  run(`spDraft = ${JSON.stringify(DRAFT3)}; $("sp-work").hidden = true;`);
+  threw = null;
+  try { run(`renderSpDone()`); } catch (e) { threw = e; }
+  check("SPD2 renderSpDone while #sp-work is hidden does not throw", threw === null, threw ? String(threw) : "");
+  run(`$("sp-work").hidden = false;`);
+
+  // ---- item 7: a second openSpHome call wins over a slow first one -------
+
+  let resolveH1Progress;
+  routes["GET /api/splitparts/H1/progress"] = () => new Promise((resolve) => { resolveH1Progress = resolve; });
+  run(`spPid = null; spDraft = null`);
+  run(`openSpHome({ id: "H1", name: "Big Home" })`);   // fire-and-forget: in flight on its own /progress
+  await tick();
+  routes["GET /api/splitparts/H4/progress"] = { status: 200, body: { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null } };
+  const DRAFT4 = { playlist_id: "H4", name: "Fourth Home", snapshot_id: "s4", n: 2,
+    parts: [{ key: "r1", name: "chill", uris: ["w1"] }, { key: "r2", name: "dance", uris: ["w2"] }],
+    unknown: [], hint: null, scores: {}, songs: { w1: { name: "W1", artists: "X", local: false },
+    w2: { name: "W2", artists: "Y", local: false } }, tracks: [], done: null };
+  routes["GET /api/splitparts/H4"] = { status: 200, body: DRAFT4 };
+  await run(`openSpHome({ id: "H4", name: "Fourth Home" })`);
+  check("SPD2 opening a second home while the first's /progress is in flight shows the second",
+        /chill/.test($$("sp-chips").innerHTML), $$("sp-chips").innerHTML);
+  resolveH1Progress({ status: 200, body: { state: "running", phase: "x", done: 0, total: 1, message: null, summary: null, kind: "suggest" } });
+  await tick();
+  check("SPD2 ...and H1's stale /progress answer landing late does not clobber it",
+        $$("sp-progress").hidden === true && /chill/.test($$("sp-chips").innerHTML), "");
+
+  run(`spStopPolling(); show("lists")`);
+}
+
+// ============================================================================
+// SPD3 — Done fix round 3: stale state made structurally impossible.
+// #sp-done is wiped the moment it is not the panel on screen; a draft
+// generation (spDraftGen) lets every awaited answer tell a fresh load
+// from a stale one; add/remove edit spDoneChoice surgically instead of a
+// blunt reset.
+// ============================================================================
+{
+  resetLog();
+  const doneHtml3 = () => $$("sp-done").innerHTML;
+
+  // ---- the structural fix itself ------------------------------------------
+  run(`show("split"); spPid = "H1"; spSection("sp-work"); $("sp-done").innerHTML = "<p>stale</p>"; spPanel("sp-parts");`);
+  check("SPD3 spPanel wipes a stale #sp-done form when switching to another panel",
+        doneHtml3() === "", doneHtml3());
+
+  // ---- scenario A: type, Back, Start over, leave via header Back while it
+  // runs, the suggestion lands, reopen → Done… shows the NEW defaults ------
+
+  const songsA = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false } };
+  const DRAFT_A = { playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2,
+    parts: [{ key: "p1", name: "rock", uris: ["u1"] }, { key: "p2", name: "jazz", uris: ["u2"] }],
+    unknown: [], hint: null, scores: {}, songs: songsA, tracks: [], done: null };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null } };
+  routes["GET /api/splitparts/H1"] = { status: 200, body: DRAFT_A };
+  run(`spPid = null; spDraft = null;`);
+  await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 4, creates: 2, empty: [], local: [], removals: 0, folders: [], folder: "" } };
+  await run(`spOpenDone()`);
+  $$("sp-name-p1").value = "RockyTyped";
+  run(`$("sp-done-back").onclick()`);   // Back → parts, reading the typed name
+  check("SPD3 the typed name is captured before Start over",
+        run("spDoneChoice.names.p1") === "RockyTyped", run("spDoneChoice.names.p1"));
+
+  let resolveProgressA;
+  routes["POST /api/splitparts/H1/suggest"] = { status: 200, body: { started: true } };
+  routes["GET /api/splitparts/H1/progress"] = () => new Promise((resolve) => { resolveProgressA = resolve; });
+  run(`spResuggest(2)`);   // fire-and-forget: confirm() always answers yes
+  await tick();
+
+  // leave via the HEADER Back while the suggestion is still running — this
+  // never touches spPid, only the view.
+  routes["GET /api/splitparts/homes"] = { status: 200, body: { homes: [] } };
+  await run(`$("sp-back").onclick()`);
+  check("SPD3 leaving via header Back does not touch spPid",
+        run("spPid") === "H1", run("spPid"));
+
+  // the suggestion lands while we're away
+  const RESUGGESTED_A = { playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2,
+    parts: [{ key: "p1", name: "folk", uris: ["u3"] }, { key: "p2", name: "blues", uris: ["u4"] }],
+    unknown: [], hint: null, scores: {}, songs: { u3: { name: "Three", artists: "C", local: false },
+    u4: { name: "Four", artists: "D", local: false } }, tracks: [], done: null };
+  routes["GET /api/splitparts/H1"] = { status: 200, body: RESUGGESTED_A };
+  resolveProgressA({ status: 200, body: { state: "done", phase: "done", done: 0, total: 0, message: null, summary: null } });
+  await tick();
+
+  // reopen the home and open Done… again
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null } };
+  await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 4, creates: 2, empty: [], local: [], removals: 0, folders: [], folder: "" } };
+  await run(`spOpenDone()`);
+  check("SPD3 reopening Done… after the suggestion landed shows the NEW draft's suggested names",
+        /id="sp-name-p1"[^>]*value="folk"/.test(doneHtml3()) && !/RockyTyped/.test(doneHtml3()), doneHtml3());
+  run(`spStopPolling()`);
+
+  // ---- scenario B1: a pending EDITABLE /plan answer must not replace the
+  // locked finish screen once it is drawn ----------------------------------
+
+  const STARTED_B = { ...DRAFT_A, done: { opts: { original: "subset", part: null, names: {}, folder: null },
+                                           created: {}, filled: [], original_done: false } };
+  run(`spPid = "H1"; spDraft = ${JSON.stringify(STARTED_B)};`);   // draft.done already set; generation unchanged
+  let resolveEditablePlanB;
+  routes["GET /api/splitparts/H1/plan?original=subset"] = () => new Promise((resolve) => { resolveEditablePlanB = resolve; });
+  run(`spDoneChoice = { original: "subset", part: null, folder: "", names: {} }; spPlan = null;`);
+  run(`spRefreshPlan()`);   // a lingering editable request, fire-and-forget
+  await tick();
+
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 4, creates: 2, empty: [], local: [], removals: 0, folders: [], folder: "" } };
+  await run(`renderSpFinish()`);   // the screen moves to the locked view, same generation
+  check("SPD3 the locked finish screen is up",
+        /id="sp-finish-done"/.test(doneHtml3()), doneHtml3());
+  resolveEditablePlanB({ status: 200, body: { calls: 9, creates: 9, empty: [], local: [], removals: 0, folders: [], folder: "" } });
+  await tick();
+  check("SPD3 ...and the lingering editable /plan answer landing after it does not redraw over it",
+        /id="sp-finish-done"/.test(doneHtml3()) && !/about 9 calls/.test(doneHtml3()), doneHtml3());
+
+  // ---- scenario B2: a /plan answer for H1 landing while H2 is open draws
+  // nothing on H2 ------------------------------------------------------------
+
+  run(`spPid = "H1"; spDraft = ${JSON.stringify(DRAFT_A)}; spDoneChoicePid = null; spPlan = null;`);
+  let resolveH1Plan;
+  routes["GET /api/splitparts/H1/plan?original=subset"] = () => new Promise((resolve) => { resolveH1Plan = resolve; });
+  run(`spOpenDone()`);   // fire-and-forget: in flight on its own /plan
+  await tick();
+
+  const DRAFT_H2 = { playlist_id: "H2", name: "Second Home", snapshot_id: "s2", n: 2,
+    parts: [{ key: "p1", name: "pop", uris: ["w1"] }, { key: "p2", name: "soul", uris: ["w2"] }],
+    unknown: [], hint: null, scores: {}, songs: { w1: { name: "W1", artists: "X", local: false },
+    w2: { name: "W2", artists: "Y", local: false } }, tracks: [], done: null };
+  routes["GET /api/splitparts/H2/progress"] = { status: 200, body: { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null } };
+  routes["GET /api/splitparts/H2"] = { status: 200, body: DRAFT_H2 };
+  await run(`openSpHome({ id: "H2", name: "Second Home" })`);
+  check("SPD3 H2 is open on its own parts screen",
+        /pop/.test($$("sp-chips").innerHTML) && $$("sp-parts").hidden === false, $$("sp-chips").innerHTML);
+
+  resolveH1Plan({ status: 200, body: { calls: 4, creates: 2, empty: [], local: [], removals: 0, folders: [], folder: "" } });
+  await tick();
+  check("SPD3 H1's stale /plan answer landing while H2 is open draws nothing on H2",
+        $$("sp-parts").hidden === false && /pop/.test($$("sp-chips").innerHTML) && doneHtml3() === "",
+        `parts.hidden=${$$("sp-parts").hidden} done=${doneHtml3()}`);
+  run(`spStopPolling()`);
+
+  // ---- scenario C: H1's draft landing late while H2 opens changes nothing
+
+  let resolveH1Draft;
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null } };
+  routes["GET /api/splitparts/H1"] = () => new Promise((resolve) => { resolveH1Draft = resolve; });
+  run(`spPid = null; spDraft = null;`);
+  run(`openSpHome({ id: "H1", name: "Big Home" })`);   // fire-and-forget: in flight on its own draft fetch
+  await tick();
+
+  await run(`openSpHome({ id: "H2", name: "Second Home" })`);
+  check("SPD3 opening H2 while H1's draft fetch is still in flight shows H2",
+        /pop/.test($$("sp-chips").innerHTML), $$("sp-chips").innerHTML);
+
+  const draftBefore = run(`JSON.stringify(spDraft)`);
+  resolveH1Draft({ status: 200, body: DRAFT_A });
+  await tick();
+  check("SPD3 H1's late draft does not change spDraft or the screen",
+        run(`JSON.stringify(spDraft)`) === draftBefore && /pop/.test($$("sp-chips").innerHTML),
+        run(`JSON.stringify(spDraft)`));
+  run(`spStopPolling()`);
+
+  // ---- item D: "which parts get created" is decided by key/content, never
+  // by matching a possibly-renamed display name against /plan's own
+  // suggested-name-based `empty` list ---------------------------------------
+
+  const songsD = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: true } };
+  const DRAFT_D = { playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2,
+    parts: [{ key: "p1", name: "rock", uris: ["u1"] }, { key: "p2", name: "jazz", uris: ["u2"] }],
+    unknown: [], hint: null, scores: {}, songs: songsD, tracks: [], done: null };
+  run(`spPid = "H1"; spDraft = ${JSON.stringify(DRAFT_D)}; spDoneChoicePid = null; spPlan = null;`);
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 2, creates: 1, empty: ["jazz"], local: ["Two"], removals: 0, folders: [], folder: "" } };
+  await run(`spOpenDone()`);
+  run(`spDoneChoice.names.p2 = "RenamedJazz"`);   // a custom name for the local-only (never-created) part
+  run(`renderSpDone()`);
+  check("SPD3 the editable screen's 'Not created' line matches by key/content, surviving a rename",
+        /Not created, no songs: RenamedJazz/.test(doneHtml3()), doneHtml3());
+  run(`spStopPolling()`);
+
+  const STARTED_D = { ...DRAFT_D, done: { opts: { original: "subset", part: null, names: { p2: "RenamedJazz" }, folder: null },
+                                           created: {}, filled: [], original_done: false } };
+  routes["GET /api/splitparts/H1"] = { status: 200, body: STARTED_D };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null } };
+  run(`spPid = null; spDraft = null;`);
+  resetLog();
+  await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+  check("SPD3 the locked finish screen excludes the renamed local-only part too, by key",
+        !/RenamedJazz/.test(doneHtml3()) && /rock/.test(doneHtml3()), doneHtml3());
+
+  // ---- item F: a non-404 draft-fetch failure in openSpHome offers Try
+  // again, not a silent fall-through to the counter screen -----------------
+
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null } };
+  routes["GET /api/splitparts/H1"] = { status: 500, body: { detail: "boom" } };
+  run(`spPid = null; spDraft = null;`);
+  resetLog();
+  await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+  check("SPD3 a non-404 draft-fetch failure shows the message with Try again, not the counter",
+        /boom/.test(doneHtml3()) && /id="sp-try-again"/.test(doneHtml3()) && $$("sp-setup").hidden === true,
+        doneHtml3());
+  routes["GET /api/splitparts/H1"] = { status: 200, body: DRAFT_A };
+  await run(`$("sp-try-again").onclick()`);
+  check("SPD3 ...and Try again reopens the home successfully",
+        $$("sp-parts").hidden === false, "");
+
+  run(`spStopPolling(); show("lists")`);
+}
+
+// ============================================================================
+// SPF — final review fixes. Start over opens the counter (asking only when
+// the draft holds manual edits), Discard, folder filing shown per part in
+// the summary, a poll token that a left view's in-flight answer cannot get
+// past, the last finished Done found on entering the tab, Abandon on the
+// locked finish screen, an unknown nowState counted as playing, and the
+// "becomes the part" picker naming the parts as typed.
+// ============================================================================
+{
+  resetLog();
+  const savedConfirm = ctx.confirm;
+  const savedNow = run("JSON.stringify(nowState)");
+  const doneF = () => $$("sp-done").innerHTML;
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const IDLE = { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null };
+  const songsF = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                   u3: { name: "Three", artists: "C", local: false } };
+  const DRAFT_F = { playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 3,
+    parts: [{ key: "p1", name: "rock", uris: ["u1"] }, { key: "p2", name: "jazz", uris: ["u2"] },
+            { key: "p3", name: "blues", uris: ["u3"] }],
+    unknown: [], hint: 2, scores: {}, songs: songsF, done: null, edited: false };
+  let asked = null;
+  try {
+    routes["GET /api/splitparts/progress"] = { pid: null, kind: null, state: "idle", summary: null };
+    routes["GET /api/splitparts/homes"] = { homes: [] };
+    routes["GET /api/splitparts/H1/progress"] = IDLE;
+    routes["GET /api/splitparts/H1"] = DRAFT_F;
+    run(`show("split"); spPid = null; spDraft = null;`);
+    await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+
+    // ---- 1: Start over opens the counter at the current count ------------
+    ctx.confirm = (m) => { asked = m; return true; };
+    resetLog();
+    run(`$("sp-start-over").onclick()`);
+    check("SPF Start over opens the counter, prefilled with the draft's count",
+          $$("sp-setup").hidden === false && $$("sp-n").textContent === "3" && posts("/api/splitparts/H1/suggest") === 0,
+          `setup=${$$("sp-setup").hidden} n=${$$("sp-n").textContent}`);
+    check("SPF ...with a way back to the parts it came from",
+          $$("sp-setup-keep").hidden === false, "");
+    run(`$("sp-setup-keep").onclick()`);
+    check("SPF ...which lands on the same draft's parts",
+          $$("sp-parts").hidden === false && /blues/.test($$("sp-chips").innerHTML), "");
+
+    routes["POST /api/splitparts/H1/suggest"] = { started: true };
+    routes["GET /api/splitparts/H1/progress"] = { ...IDLE, state: "done", kind: "suggest" };
+    run(`$("sp-start-over").onclick(); $("sp-minus").onclick()`);
+    asked = null;
+    await run(`$("sp-suggest").onclick()`);
+    await tick();
+    const sentF = bodies("/api/splitparts/H1/suggest").filter(Boolean);
+    check("SPF Suggest from there, on an unedited draft, re-suggests with the new count and asks nothing",
+          asked === null && sentF.length === 1 && sentF[0].n === 2, `asked=${asked} ${JSON.stringify(sentF)}`);
+
+    routes["GET /api/splitparts/H1"] = { ...DRAFT_F, edited: true };
+    await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+    resetLog();
+    ctx.confirm = (m) => { asked = m; return false; };
+    run(`$("sp-start-over").onclick()`);
+    await run(`$("sp-suggest").onclick()`);
+    check("SPF ...on an edited draft Suggest asks first, and a no posts nothing",
+          /lost/.test(asked || "") && posts("/api/splitparts/H1/suggest") === 0, asked);
+    run(`$("sp-setup-keep").onclick()`);
+
+    // the hint keeps re-suggesting directly — asking only when edited
+    asked = null;
+    await run(`$("sp-hint-go").onclick()`);
+    check("SPF the hint on an edited draft asks first too",
+          /2 parts/.test(asked || "") && posts("/api/splitparts/H1/suggest") === 0, asked);
+    run(`spDraft.edited = false; renderSpParts()`);
+    asked = null;
+    ctx.confirm = (m) => { asked = m; return true; };
+    await run(`$("sp-hint-go").onclick()`);
+    await tick();
+    check("SPF ...and on an unedited one re-suggests with N straight away",
+          asked === null && bodies("/api/splitparts/H1/suggest").filter(Boolean).pop()?.n === 2, `asked=${asked}`);
+    run(`spStopPolling()`);
+
+    // ---- 1: Discard ----------------------------------------------------------
+    routes["GET /api/splitparts/H1"] = { ...DRAFT_F, edited: true };
+    routes["GET /api/splitparts/H1/progress"] = IDLE;
+    await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+    resetLog();
+    ctx.confirm = (m) => { asked = m; return false; };
+    check("SPF the parts screen offers Discard this split", /id="sp-discard"/.test($$("sp-actions").innerHTML),
+          $$("sp-actions").innerHTML);
+    await run(`$("sp-discard").onclick()`);
+    check("SPF ...which asks first on an edited draft, and a no deletes nothing",
+          /Discard/.test(asked || "") && log.filter((l) => l.method === "DELETE").length === 0, asked);
+    routes["DELETE /api/splitparts/H1"] = { ok: true };
+    run(`spDraft.edited = false`);
+    asked = null;
+    await run(`$("sp-discard").onclick()`);
+    await tick();
+    check("SPF ...an unedited one is deleted without a question, back on the homes list",
+          asked === null && log.filter((l) => l.method === "DELETE" && l.path === "/api/splitparts/H1").length === 1 &&
+          $$("sp-pick").hidden === false && $$("sp-work").hidden === true && run("spDraft") === null,
+          `asked=${asked} pick=${$$("sp-pick").hidden}`);
+    ctx.confirm = () => true;
+
+    // ---- 2: filing is watched per part in the summary --------------------
+    run(`SP_FILING_POLL_MS = 5`);
+    let n1 = "filing";
+    routes["GET /api/playlists/filing/N1"] = () => ({ state: n1, folder: n1 === "filed" ? "ROOT / Mix" : "ROOT / Mix", error: null });
+    routes["GET /api/playlists/filing/N2"] = { state: "failed", folder: null, error: "another playlist is also called 'Jazzy'" };
+    routes["GET /api/playlists/filing/N3"] = { state: "filing", folder: "ROOT / Mix", error: null };
+    const SUM_F = { created: [{ id: "N1", name: "Rocky", count: 1 }, { id: "N2", name: "Jazzy", count: 1 },
+                              { id: "N3", name: "Bluesy", count: 1 }],
+                    original: "part", empty: [], local: [], folder: "ROOT / Mix", name: "Big Home" };
+    resetLog();
+    run(`spPid = "H1"; spSection("sp-work"); renderSpSummary(${JSON.stringify(SUM_F)})`);
+    await tick();
+    const line = (id) => $$(`sp-filing-${id}`).textContent;
+    check("SPF the summary shows each part filing…",
+          /filing…/.test(line("N1")) && /filing…/.test(line("N3")), `${line("N1")} | ${line("N3")}`);
+    check("SPF ...and a refused one as left at the top level, with why",
+          /left at the top level — another playlist is also called 'Jazzy'/.test(line("N2")), line("N2"));
+    n1 = "filed";
+    await wait(30); await tick();
+    check("SPF a landed move reads filed in its folder",
+          /filed in ROOT \/ Mix/.test(line("N1")), line("N1"));
+    check("SPF ...and a final part is not asked about again",
+          gets("/api/playlists/filing/N2") === 1, `${gets("/api/playlists/filing/N2")} GETs`);
+    run(`show("lists")`);
+    const n3Before = gets("/api/playlists/filing/N3");
+    await wait(30); await tick();
+    check("SPF leaving the view stops the filing watch",
+          gets("/api/playlists/filing/N3") === n3Before, `${n3Before} -> ${gets("/api/playlists/filing/N3")}`);
+
+    routes["GET /api/playlists/filing/N4"] = { state: "idle" };
+    run(`show("split"); spPid = "H1"; spSection("sp-work"); renderSpSummary(${JSON.stringify({ ...SUM_F, created: [{ id: "N4", name: "Stuck", count: 1 }] })})`);
+    await wait(40); await tick();
+    check("SPF a filing job that never starts ends as left at the top level, not watched forever",
+          /left at the top level — the move never started/.test(line("N4")), line("N4"));
+    resetLog();
+    run(`renderSpSummary(${JSON.stringify({ ...SUM_F, folder: null })})`);
+    await tick();
+    check("SPF with no folder chosen nothing is watched",
+          log.filter((l) => l.path.startsWith("/api/playlists/filing/")).length === 0, "");
+    run(`spStopPolling()`);
+
+    // ---- 3: a poll in flight when the view is left draws nothing ----------
+    let resolveDone;
+    const SUM_SUBSET = { ...SUM_F, original: "subset", folder: null,
+                         created: [{ id: "N7", name: "Seven", count: 1 }, { id: "N8", name: "Eight", count: 1 }] };
+    routes["GET /api/splitparts/H1/progress"] = () => new Promise((r) => { resolveDone = r; });
+    run(`spPid = "H1"; spSection("sp-work"); spPanel("sp-progress"); spShownSummaryKey = null;`);
+    run(`spPoll("done")`);
+    await tick();
+    routes["GET /api/splitparts/progress"] = { pid: "H1", kind: "done", state: "running", summary: null };
+    await run(`$("sp-back").onclick()`);
+    await tick();
+    resetLog();
+    resolveDone({ status: 200, body: { state: "done", phase: "done", done: 2, total: 2, message: null, summary: SUM_SUBSET, kind: "done" } });
+    await tick();
+    check("SPF an in-flight poll that lands after leaving draws nothing and marks nothing shown",
+          run("spShownSummaryKey") === null && $$("sp-pick").hidden === false && !/Seven/.test(doneF()),
+          `key=${run("spShownSummaryKey")}`);
+    await wait(1100); await tick();
+    check("SPF ...and does not re-arm itself",
+          gets("/api/splitparts/H1/progress") === 0, `${gets("/api/splitparts/H1/progress")} GETs`);
+
+    // ...so entering the tab finds the finished Done and shows its summary
+    routes["GET /api/splitparts/progress"] = { pid: "H1", kind: "done", state: "done", summary: SUM_SUBSET };
+    run(`spPid = null`);
+    await run(`showSplit()`);
+    await tick();
+    check("SPF entering the Split tab shows a finished Done's unseen summary (subset mode: no home to reopen)",
+          $$("sp-work").hidden === false && /Seven/.test(doneF()) && $$("sp-title").textContent === "Big Home" &&
+          run("spPid") === "H1", `title=${$$("sp-title").textContent}`);
+    await run(`showSplit()`);
+    await tick();
+    check("SPF ...once only: the next entry lands on the homes list",
+          $$("sp-pick").hidden === false && $$("sp-work").hidden === true, "");
+
+    // ---- 4: Abandon on the locked finish screen -------------------------
+    const STARTED_F = { ...DRAFT_F, done: { opts: { original: "subset", part: null, names: { p1: "Rocky" }, folder: null },
+                                            created: { p1: "N1" }, filled: ["p1"], original_done: false } };
+    routes["GET /api/splitparts/H1/progress"] = IDLE;
+    routes["GET /api/splitparts/H1"] = STARTED_F;
+    routes["GET /api/splitparts/H1/plan?original=subset"] = { calls: 5, creates: 3, empty: [], local: [], removals: 0, folders: [], folder: "" };
+    await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+    check("SPF the locked finish screen offers Abandon — keep what was made",
+          /id="sp-finish-done"/.test(doneF()) && /id="sp-abandon"[^>]*>Abandon — keep what was made/.test(doneF()), doneF());
+    resetLog();
+    ctx.confirm = (m) => { asked = m; return false; };
+    await run(`$("sp-abandon").onclick()`);
+    check("SPF ...it asks first, saying what stays, and a no posts nothing",
+          /stay/.test(asked || "") && /original/.test(asked || "") && posts("/api/splitparts/H1/abandon") === 0, asked);
+    ctx.confirm = () => true;
+    routes["POST /api/splitparts/H1/abandon"] = { created: [{ id: "N1", name: "Rocky" }], original_done: false };
+    await run(`$("sp-abandon").onclick()`);
+    check("SPF ...a yes abandons and lists what was already made",
+          posts("/api/splitparts/H1/abandon") === 1 && /Rocky/.test(doneF()) && /id="sp-abandon-back"/.test(doneF()) &&
+          run("spDraft") === null, doneF());
+    await run(`$("sp-abandon-back").onclick()`);
+    check("SPF ...and returns to the homes list", $$("sp-pick").hidden === false, "");
+
+    // ---- minors -------------------------------------------------------------
+    routes["GET /api/splitparts/H1"] = DRAFT_F;
+    await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+    routes["GET /api/track_preview?pid=H1&uri=u1"] = { url: "https://cdn/spf-u1.mp3", uri: "u1", deezer_id: 1 };
+    run(`spStopPreview(false); nowState = null`);
+    await run(`spPreview("u1")`);
+    check("SPF an unknown nowState is taken as Spotify playing, as the house player does",
+          run("spSessionPlaying") === true, String(run("spSessionPlaying")));
+    run(`spResumeOwed = false; spStopPreview(false)`);
+
+    run(`spDoneChoicePid = null; spPlan = null;`);
+    routes["GET /api/splitparts/H1/plan?original=part&part=p1"] = { calls: 4, creates: 2, empty: [], local: [], removals: 2, folders: [], folder: "" };
+    await run(`spOpenDone()`);
+    $$("sp-name-p2").value = "Jazz Typed";
+    run(`$("sp-name-p2").oninput()`);
+    check("SPF the becomes-the-part picker names the parts as typed above",
+          /Jazz Typed/.test($$("sp-orig-part-key").innerHTML) && /rock/.test($$("sp-orig-part-key").innerHTML),
+          $$("sp-orig-part-key").innerHTML);
+    run(`$("sp-orig-part").onchange()`);
+    await tick();
+    check("SPF ...and still does after a re-render",
+          /Jazz Typed/.test($$("sp-orig-part-key").innerHTML), $$("sp-orig-part-key").innerHTML);
+  } finally {
+    ctx.confirm = savedConfirm;
+    run(`spStopPolling(); spStopPreview(false); nowState = ${savedNow}; show("lists")`);
+  }
 }
 
 // ---- summary ---------------------------------------------------------------

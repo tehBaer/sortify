@@ -579,7 +579,7 @@ def enrich(artist_names: dict[str, str], cached: dict, fm: LastFm, now: str,
     (`Store.tag_artists()`), not the versioned envelope — passing the envelope
     would match no artist ids and silently re-fetch the whole library.
 
-    Tags are stored raw and unfiltered; `split.split_tracks` applies
+    Tags are stored raw and unfiltered; the splitting code applies
     `clean_tags`. Misses are recorded as `miss: true` so they are never asked
     about again — at ~3% of artists, re-asking every split would be pure waste.
 

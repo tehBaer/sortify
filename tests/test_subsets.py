@@ -155,7 +155,6 @@ def test_playlists_view_marks_role_archived_and_eligibility(client, monkeypatch)
                                 _pl("arch_theirs", "\U0001F5C4\uFE0F theirs", editable=False)]
     appmod.store.save_config(_cfg(home_ids=["h1"]))
     monkeypatch.setattr(appmod.sp, "my_playlists", lambda refresh=False: listing)
-    monkeypatch.setattr(appmod, "_split_summary", lambda pid, splits: None)
     rows = {p["id"]: p for p in client.get("/api/playlists").json()["playlists"]}
     assert (rows["s1"]["role"], rows["s1"]["subset_eligible"]) == ("subset", True)
     assert (rows["arch"]["role"], rows["arch"]["archived"]) == (None, True)

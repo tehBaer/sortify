@@ -15,8 +15,8 @@ Deliberately NOT cached (see Store.CACHED_READS):
   object would let one thread mutate what another is iterating.
 - usage.json / the ledger paths: the Spotify budget must never act on a
   stale read (CLAUDE.md's budget section) — and they're tiny anyway.
-- config.json, queue.json, pacing.json, splits.json, …: sub-millisecond
-  parses; caching buys nothing and widens the sharing contract for free.
+- config.json, …: sub-millisecond parses; caching buys nothing and widens
+  the sharing contract for free.
 
 The sharing contract for the cached files: callers get THE SAME parsed
 object until the file changes, so they must never mutate it — which the

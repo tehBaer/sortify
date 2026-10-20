@@ -1166,63 +1166,14 @@ body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { t
 
 /* Now-view playback controls: the switcher takes the space, Next stays snug. */
 
-/* splitting */
-.pl-split { font-size: 1.1rem; padding: .3rem .6rem; }
-#split-params label { display: flex; align-items: center; gap: .35rem; font-size: .85rem; color: var(--muted); }
-#split-params input { width: 4.5rem; }
-#split-params button { margin-left: auto; }
-.pile-row {
-  display: flex; align-items: center; gap: .65rem;
-  padding: .5rem .6rem; border: 1px solid var(--border); border-radius: 10px;
-  background: var(--card); margin-bottom: .5rem;
-  /* Two buttons per row now (save the pile, start a sitting) and both labels
-     carry a call count, so on a phone they wrap under the pile name rather
-     than squeezing it to nothing. */
-  flex-wrap: wrap;
-}
-.pile-row .pl-meta { flex: 1 1 12rem; min-width: 0; }
-.pile-row .name { font-weight: 600; }
-.pile-row .sub { color: var(--muted); font-size: .8rem; }
-.pile-row button { flex-shrink: 0; }
-#split-loading p { text-align: center; color: var(--muted); }
-#split-sitting-bar, #now-sitting-bar { align-items: center; }
-#split-save-all { align-items: center; }
-#btn-save-all { margin-left: auto; }
-
-/* the queued materialiser's status panel */
-#queue-panel {
-  border: 1px solid var(--border); border-radius: 10px; background: var(--card);
-  padding: .6rem .7rem; margin-bottom: .6rem; font-size: .85rem;
-}
-.queue-summary { display: flex; flex-wrap: wrap; gap: .5rem .9rem; align-items: center; margin-bottom: .4rem; }
-.queue-state {
-  font-weight: 600; text-transform: uppercase; font-size: .75rem;
-  padding: .1rem .5rem; border-radius: 999px; border: 1px solid var(--border);
-}
-.queue-controls { display: flex; gap: .5rem; }
-.queue-controls button { flex-shrink: 0; }
-/* A quota trip is the severe case — Development Mode's daily allowance is
-   gone until the window resets and resuming is a human decision, not a
-   routine 429 that clears itself. Must not blend in with .hint. */
-.queue-stop-quota {
-  color: var(--danger); font-weight: 600; border: 1px solid var(--danger);
-  border-radius: 8px; padding: .3rem .5rem;
-}
-#split-sitting-status, #now-sitting-status { flex: 1; }
-
-/* A sitting is a mode, not a footnote: an accent-tinted banner that owns the
-   pile name, the progress, and the Finish escape. */
+/* A shared row style for a status banner that deserves more weight than a
+   plain .hint — currently the Playlists view's naming-violations bar. */
 .sitting-banner {
   background: color-mix(in srgb, var(--accent) 9%, var(--card));
   border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
   border-radius: 12px; padding: .55rem .8rem;
 }
 .sitting-banner b { color: var(--fg); }
-.sitting-banner .sb-bar {
-  display: block; height: 4px; margin-top: .4rem; border-radius: 999px;
-  background: color-mix(in srgb, var(--accent) 22%, transparent); overflow: hidden;
-}
-.sitting-banner .sb-fill { display: block; height: 100%; background: var(--accent); }
 
 /* Cooldown countdown card — amber, not red: a temporary hold that self-heals,
    not an error. Same palette in both themes. Display-only: the ticker never
@@ -1248,13 +1199,6 @@ body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { t
 }
 .cooldown-card .cb-fill { height: 100%; width: 0; background: #3a2402; transition: width 1s linear; }
 
-/* Split progress. The Last.fm phase is ~700 artists at 4/s — about three
-   minutes in which the only feedback used to be a spinner that never moved. */
-.progress-track { background: var(--card); border: 1px solid var(--border); border-radius: 999px;
-                  height: .5rem; overflow: hidden; margin: .35rem 0; }
-.progress-fill { background: var(--accent); height: 100%; border-radius: 999px;
-                 transition: width .3s ease; }
-
 /* Input sets in the Playlists view. The buffer set carries day-to-day work
    and stays open; "other" and "the bomb" fold, so 26 inputs cannot bury the
    playlists below them. A filter match force-opens its set (see renderLists)
@@ -1276,3 +1220,53 @@ body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { t
 .picker-folders .chip.on { outline: 2px solid currentColor; }
 .picker-folders .chip:disabled { opacity: .45; }
 .picker-folders .picker-folders-why { flex-basis: 100%; color: var(--muted); font-size: .78rem; line-height: 1.35; }
+
+/* ---- split a home into parts ---- */
+.sp-counter { display: flex; align-items: center; gap: .6rem; margin: .4rem 0 1rem; font-size: 1.1rem; }
+#sp-n { min-width: 1.5rem; text-align: center; font-weight: 700; }
+#sp-homes .sp-home { display: block; width: 100%; text-align: left; }
+/* The chips stay pinned while the songs scroll under them: they are the drop
+   targets, so they must be on screen whenever a song is lifted. */
+/* `top` is the sticky header's height (44.8px measured on the Split view,
+   2.8rem at the 16px root size), so no gap opens under it; opaque, so the
+   rows scrolling beneath never show through. */
+#sp-chips {
+  position: sticky; top: 2.8rem; z-index: 3; display: flex; flex-wrap: wrap; gap: .4rem;
+  padding: .4rem 0; background: var(--bg);
+}
+.sp-chip { border-radius: 999px; padding: .4rem .8rem; }
+.sp-chip.on { border-color: var(--accent); color: var(--accent); }
+.sp-chip.drop { background: var(--accent); color: var(--bg); }
+.sp-chip-n { color: var(--muted); font-size: .85rem; }
+.sp-chip.drop .sp-chip-n { color: inherit; }
+/* Song rows stop short of the right edge: a swipe in that free strip
+   scrolls the list, a touch on a song drags it. */
+#sp-list { padding-right: 20%; }
+.sp-song {
+  touch-action: none; user-select: none; -webkit-user-select: none;
+  padding: .55rem .7rem; margin: .3rem 0; border-radius: 10px; background: var(--card);
+  cursor: grab;
+}
+.sp-song-name, .sp-song-artist { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sp-song-artist { color: var(--muted); font-size: .85rem; }
+.sp-unknown { color: var(--muted); font-weight: 700; }
+.sp-song.playing { outline: 2px solid var(--accent); }
+.sp-ghost {
+  position: fixed; z-index: 30; pointer-events: none; transform: translate(-50%, -120%);
+  max-width: 70vw; padding: .45rem .8rem; border-radius: 10px;
+  background: var(--fg); color: var(--bg); font-size: .9rem;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  box-shadow: var(--shadow-card);
+}
+.sp-chip.sp-add { font-weight: 700; min-width: 2.6rem; }
+#sp-hint { margin: .4rem 0; color: var(--muted); }
+#sp-actions { margin-top: 1rem; gap: .5rem; }
+#sp-done-row { margin: .5rem 0; }
+
+#sp-done h3 { font-size: 1rem; margin: 1.1rem 0 .4rem; }
+.sp-name-row { display: block; margin: .4rem 0; }
+.sp-name-row input { width: 100%; }
+.sp-orig { display: block; margin: .35rem 0; }
+.sp-warn { color: var(--muted); }
+.sp-cost { margin-top: 1rem; font-weight: 600; }
+.sp-summary { padding-left: 1.2rem; }

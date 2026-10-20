@@ -210,17 +210,15 @@ def test_the_settle_window_expires_so_a_replayed_track_is_not_suspect_forever(
 #
 # Every test above drives `_currently_playing_shared()` directly, so all of
 # them pin the helper and none of them pin GET /api/now — the thing an open
-# tab actually calls, and the thing this branch grew a `_sitting_for_context`
-# read in. Inserting a second `sp.currently_playing()` into `now_playing()`
-# doubled the cost of every poll with the whole suite still green. That is the
-# shape of the original ~600-calls/hour bug, so it gets a test at the level
-# where it happens.
+# tab actually calls. Inserting a second `sp.currently_playing()` into
+# `now_playing()` doubled the cost of every poll with the whole suite still
+# green. That is the shape of the original ~600-calls/hour bug, so it gets a
+# test at the level where it happens.
 #
 # Counted at `Spotify.request()` — the single chokepoint currently_playing,
 # my_playlists, playlist_tracks and everything else funnels through — rather
 # than at the methods this endpoint happens to call today, so ANY call the
 # handler grows shows up here rather than being absorbed by a stand-in fake.
-# Same reasoning as test_get_split_spends_no_api_calls in test_split_api.py.
 
 RAW_CURRENTLY_PLAYING = {
     "item": {
@@ -242,10 +240,10 @@ NOW_LISTING = [{"id": "CTX1", "name": "Some playlist", "owner": "me", "editable"
 def route_client(monkeypatch):
     """GET /api/now with every Spotify call trapped and counted.
 
-    cache.json / config.json / splits.json are one set of files for the whole
-    test session (see conftest.py), so this captures and restores them —
-    otherwise the injected playlist listing would follow other test files
-    around depending on run order.
+    cache.json / config.json are one set of files for the whole test session
+    (see conftest.py), so this captures and restores them — otherwise the
+    injected playlist listing would follow other test files around
+    depending on run order.
 
     The listing it primes is deliberately non-editable and not input-named, so
     `_ensure_profiles` resolves zero homes and zero inputs: the route's own
@@ -253,7 +251,7 @@ def route_client(monkeypatch):
     a regression behind.
     """
     s = Store()
-    original_cache, original_config, original_splits = s.cache(), s.config(), s.splits()
+    original_cache, original_config = s.cache(), s.config()
     original_tags = s.tags()
 
     cache = s.cache()
@@ -282,8 +280,7 @@ def route_client(monkeypatch):
     # singleton: monkeypatch.setattr(sp, "currently_playing", ...) in an
     # earlier test leaves a real instance attribute behind even after undo
     # (undo re-sets the bound method it read off the class). Strip anything
-    # shadowing the real methods so the trap is genuinely reachable — the
-    # same reason test_split_api.py delattrs before trapping request().
+    # shadowing the real methods so the trap is genuinely reachable.
     for name in ("currently_playing", "my_playlists", "playlist_tracks"):
         if name in vars(appmod.sp):
             monkeypatch.delattr(appmod.sp, name)
@@ -297,7 +294,6 @@ def route_client(monkeypatch):
         s = Store()
         s.save_cache(original_cache)
         s.save_config(original_config)
-        s.save_splits(original_splits)
         s.save_tags(original_tags)
         appmod._profile_state.clear()
         appmod._profile_state["built_at"] = 0.0
@@ -382,34 +378,12 @@ def test_player_next_marks_the_preskip_uri_suspect_and_drops_the_cache(route_cli
     assert appmod._now_cache["at"] == 0.0
 
 
-def test_the_sitting_lookup_on_the_poll_path_is_free(route_client):
-    """`_sitting_for_context` is this branch's addition to the hottest path in
-    the app. It answers from splits.json on purpose; resolving the context
-    playlist against Spotify instead would put a call on every poll of every
-    open tab."""
-    Store().save_splits({"version": 1, "splits": {"PL_NOW": {
-        "created_at": "2026-08-17T10:00:00Z", "snapshot_id": None, "params": {},
-        "piles": [{"id": "p1", "name": "dream pop", "tags": [], "uris": ["spotify:track:x"]}],
-        "decided": {"spotify:track:x": {"action": "keep", "to_id": "H1", "at": "t"}},
-        "active_sitting": {"playlist_id": "CTX1", "pile_id": "p1",
-                           "uris": ["spotify:track:x"],
-                           "started_at": "2026-08-17T10:05:00Z", "claim": "c1"},
-    }}})
-
-    body = route_client.get("/api/now").json()
-
-    assert body["sitting"]["split_id"] == "PL_NOW"
-    assert body["sitting"]["decided"] == {
-        "spotify:track:x": {"action": "keep", "to_id": "H1", "at": "t"}}
-    assert route_client.spotify_calls == [("GET", "/me/player/currently-playing")]
-
-
 # ---- the two-phase card: light poll + /api/now/suggest ----------------------
 #
 # Presenting a track used to block on the whole suggestion pipeline — a
 # possible profile rebuild, up to ~8 sequential Last.fm requests, and ~10MB of
 # JSON re-parsing — before the client could even show the track's name. The
-# split: `?light=1` returns just the card (track, context, sitting) as fast as
+# split: `?light=1` returns just the card (track, context) as fast as
 # the now-cache allows, and /api/now/suggest computes the suggestion side for
 # the already-cached track afterwards, spending no currently-playing call of
 # its own.
@@ -449,20 +423,6 @@ def test_light_poll_resolves_context_from_the_cached_listing(route_client):
     must never be able to trigger a profile build."""
     body = route_client.get("/api/now?light=1").json()
     assert body["context"] == {"id": "CTX1", "name": "Some playlist", "is_input": False}
-
-
-def test_light_poll_carries_the_sitting(route_client):
-    """The sitting card renders in phase 1, so the light payload includes the
-    same free splits.json lookup the full endpoint does."""
-    Store().save_splits({"version": 1, "splits": {"PL_NOW": {
-        "created_at": "t", "snapshot_id": None, "params": {},
-        "piles": [{"id": "p1", "name": "dream pop", "tags": [], "uris": ["spotify:track:x"]}],
-        "decided": {},
-        "active_sitting": {"playlist_id": "CTX1", "pile_id": "p1",
-                           "uris": ["spotify:track:x"], "started_at": "t", "claim": "c1"},
-    }}})
-    body = route_client.get("/api/now?light=1").json()
-    assert body["sitting"]["split_id"] == "PL_NOW"
 
 
 def test_a_forced_light_poll_does_not_reach_lastfm(route_client, monkeypatch):
