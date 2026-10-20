@@ -54,6 +54,7 @@ from .spotify import (
     AuthNeeded,
     Spotify,
     SpotifyError,
+    _LIST_LOCK,
     build_auth_url,
     pkce_pair,
 )
@@ -669,6 +670,15 @@ def splitparts_homes():
     return {"homes": out}
 
 
+# A split sits "running" (409-ing every other Suggest) for as long as this
+# fill takes; on a genuine Last.fm outage each call pays its own 15s timeout,
+# so without a breaker a single bad patch of network turns one Suggest into
+# hours. One counter spans the track and artist-similar phases below — a
+# success anywhere resets it — so a string of failures straddling the two
+# phases still trips it exactly once, not twice as long.
+FILL_FAILURE_LIMIT = 10
+
+
 def _splitparts_fill(tracks: list[dict], progress) -> None:
     """Fetch Last.fm data for never-seen songs; never raises. A missing key
     or a Last.fm failure just leaves those songs without data ("?")."""
@@ -688,26 +698,81 @@ def _splitparts_fill(tracks: list[dict], progress) -> None:
         except LastFmError as exc:
             log.warning("split: tag fetch stopped early: %s", exc)
             merged = exc.partial if exc.partial is not None else cached
+            if len(merged) > len(cached):
+                _merge_save_tag_artists(merged)
+            # The tag fetch itself failed — Last.fm is failing outright, not
+            # just missing this one artist, so the track and artist-similar
+            # phases would just pay the same timeout per song for nothing.
+            skipped = len(need_tracks) + len(need_similar)
+            if skipped:
+                log.warning("split: Last.fm is failing — skipping %d further lookups", skipped)
+            progress(done=total)
+            return
         if len(merged) > len(cached):
             _merge_save_tag_artists(merged)
         done = len(need_tags)
+    failures = 0
     for artist, title in need_tracks:
+        if failures >= FILL_FAILURE_LIMIT:
+            log.warning("split: stopping after %d consecutive Last.fm failures, "
+                        "%d lookups left undone", FILL_FAILURE_LIMIT, total - done)
+            progress(done=total)
+            return
         try:
             record = fetch_track(fm, artist, title, time.time())
             _merge_save_lastfm_tracks({track_key(artist, title): record})
+            failures = 0
         except Exception:
             log.warning("split: track record failed for %r — %r", artist, title, exc_info=True)
+            failures += 1
         done += 1
         progress(done=done)
     for aid, name in need_similar:
+        if failures >= FILL_FAILURE_LIMIT:
+            log.warning("split: stopping after %d consecutive Last.fm failures, "
+                        "%d lookups left undone", FILL_FAILURE_LIMIT, total - done)
+            progress(done=total)
+            return
         try:
             similar = fm.artist_similar(name)
             _merge_save_lastfm_artists({aid: {"name": name, "similar": similar or [],
                                               "fetched_at": _now_iso(), "miss": similar is None}})
+            failures = 0
         except Exception:
             log.warning("split: artist-similar failed for %r", name, exc_info=True)
+            failures += 1
         done += 1
         progress(done=done)
+
+
+def _sync_listing_snapshot(pid: str, snapshot_id: str | None, total: int | None = None) -> None:
+    """Patch the cached playlist LISTING's own snapshot_id (and total, when
+    given) to match a fresher read taken elsewhere — e.g. Suggest's own
+    `sp.snapshot` call. The profile rebuild's staleness check keys off the
+    listing (`cache["playlist_list"]`), not the per-playlist track cache
+    `_cached_tracks` updates — leaving the listing behind made every later
+    read see a mismatch and re-fetch, and the next Suggest would mismatch
+    again the same way. Same lock as `Spotify.rename_playlist`; a refresh
+    landing in between still wins, and correctly so. No-op when there is no
+    snapshot_id to record, or the playlist is not (yet) in the listing.
+    """
+    if snapshot_id is None:
+        return
+    with _LIST_LOCK:
+        cache = store.cache()
+        entry = cache.get("playlist_list")
+        if not entry or entry.get("items") is None:
+            return
+        found = False
+        for p in entry["items"]:
+            if p.get("id") == pid:
+                p["snapshot_id"] = snapshot_id
+                if total is not None:
+                    p["total"] = total
+                found = True
+                break
+        if found:
+            store.save_cache(cache)
 
 
 def _splitparts_run_suggest(playlist: dict, n: int) -> None:
@@ -721,6 +786,7 @@ def _splitparts_run_suggest(playlist: dict, n: int) -> None:
         progress(phase="reading the playlist", done=0, total=0)
         snap = sp.snapshot(pid)
         tracks = _cached_tracks(pid, snap)
+        _sync_listing_snapshot(pid, snap, total=len(tracks))
         _splitparts_fill(tracks, progress)
         progress(phase="grouping", done=0, total=0)
         sugg = spp.suggest(tracks, n, store.tag_artists(), store.lastfm_track_map(),
@@ -741,6 +807,10 @@ def splitparts_suggest(pid: str, body: SplitSuggestIn):
     if not spp.MIN_PARTS <= body.n <= spp.MAX_PARTS:
         raise HTTPException(400, f"choose between {spp.MIN_PARTS} and {spp.MAX_PARTS} parts")
     playlist = _splitparts_home(pid)
+    existing = spa.get_draft(store, pid)
+    if existing is not None and existing.get("done") is not None:
+        raise HTTPException(
+            409, "Done has already started for this split — press Done again to finish it")
     with _splitparts_job_lock:
         if _splitparts_job.get("state") == "running":
             raise HTTPException(409, "already running")

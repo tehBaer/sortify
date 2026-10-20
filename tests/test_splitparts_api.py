@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from sortify import app as appmod
 from sortify import splitparts_api as spa
+from sortify.tags import LastFmError
 
 from liveguard import assert_not_live_data
 
@@ -131,6 +132,126 @@ def test_discarding_a_draft(client):
 
     assert client.delete("/api/splitparts/H1").json() == {"ok": True}
     assert client.get("/api/splitparts/H1").status_code == 404
+
+
+# ---- fix round 1 ------------------------------------------------------
+
+
+def test_suggest_syncs_the_listing_snapshot(client, monkeypatch):
+    """The profile rebuild keys off playlist_list's own snapshot_id, not the
+    per-playlist track cache — Suggest's fresher `sp.snapshot` read must land
+    there too, or the next read mismatches and re-fetches for no reason."""
+    monkeypatch.setattr(appmod.sp, "snapshot",
+                        lambda pid: client.calls.append(("snapshot", pid)) or "snap-9")
+
+    client.post("/api/splitparts/H1/suggest", json={"n": 2})
+
+    listing = appmod.store.cache()["playlist_list"]["items"]
+    home = next(p for p in listing if p["id"] == "H1")
+    assert home["snapshot_id"] == "snap-9"
+    assert home["total"] == 24
+
+    client.calls.clear()
+    appmod._cached_tracks("H1", home["snapshot_id"])
+    assert client.calls == []
+
+
+def test_fill_circuit_breaker_stops_after_consecutive_failures(client, monkeypatch):
+    """Every track-record call fails (a Last.fm outage): after
+    FILL_FAILURE_LIMIT consecutive failures the fill gives up rather than
+    paying a timeout per remaining song, and never reaches artist-similar."""
+
+    class FailingTrackFm:
+        def __init__(self):
+            self.top_tags_calls = 0
+            self.track_calls = 0
+            self.track_tags_calls = 0
+            self.similar_calls = 0
+
+        def top_tags(self, name):
+            self.top_tags_calls += 1
+            return None
+
+        def track_similar(self, artist, title):
+            self.track_calls += 1
+            raise LastFmError("Last.fm is down")
+
+        def track_top_tags(self, artist, title):
+            self.track_tags_calls += 1
+            return None
+
+        def artist_similar(self, name):
+            self.similar_calls += 1
+            return []
+
+    fake = FailingTrackFm()
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: fake)
+
+    res = client.post("/api/splitparts/H1/suggest", json={"n": 2})
+    assert res.status_code == 200
+
+    prog = client.get("/api/splitparts/H1/progress").json()
+    assert prog["state"] == "done"
+    assert fake.track_calls == appmod.FILL_FAILURE_LIMIT
+    assert fake.track_tags_calls == 0        # track_similar raised first every time
+    assert fake.similar_calls == 0           # the breaker tripped before this phase
+    assert fake.top_tags_calls == 0          # tags were already fully cached
+
+
+def test_fill_skips_remaining_phases_when_tags_fail(client, monkeypatch):
+    """When the tag fetch itself raises LastFmError, Last.fm is failing
+    outright — the track and artist-similar phases are skipped entirely
+    rather than paying for 47 more doomed round trips."""
+    partial_tags = dict(TAGS)
+    del partial_tags["a0"]   # one artist still needs tags; the rest already have them
+    appmod.store.save_tag_artists(partial_tags)
+
+    class FailingTagsFm:
+        def __init__(self):
+            self.top_tags_calls = 0
+            self.track_calls = 0
+            self.similar_calls = 0
+
+        def top_tags(self, name):
+            self.top_tags_calls += 1
+            raise LastFmError("Last.fm tag service is down")
+
+        def track_similar(self, artist, title):
+            self.track_calls += 1
+            return []
+
+        def track_top_tags(self, artist, title):
+            return []
+
+        def artist_similar(self, name):
+            self.similar_calls += 1
+            return []
+
+    fake = FailingTagsFm()
+    monkeypatch.setattr(appmod, "_lastfm_client", lambda: fake)
+
+    res = client.post("/api/splitparts/H1/suggest", json={"n": 2})
+    assert res.status_code == 200
+
+    prog = client.get("/api/splitparts/H1/progress").json()
+    assert prog["state"] == "done"
+    assert fake.top_tags_calls == 1
+    assert fake.track_calls == 0
+    assert fake.similar_calls == 0
+
+
+def test_suggest_refuses_when_done_has_already_started(client):
+    draft = {"playlist_id": "H1", "name": "Big Home", "snapshot_id": "snap-1", "n": 2,
+             "parts": [{"key": "p1", "name": "N1", "uris": []}],
+             "unknown": [], "hint": None, "scores": {}, "songs": {}, "tracks": [],
+             "done": {"created": {"p1": "N1"}}}
+    spa.put_draft(appmod.store, draft)
+
+    res = client.post("/api/splitparts/H1/suggest", json={"n": 2})
+
+    assert res.status_code == 409
+    assert "Done has already started" in res.json()["detail"]
+    assert appmod.store.splitparts()["drafts"]["H1"] == draft
 
 
 def test_missing_lastfm_lists_what_to_fetch():
