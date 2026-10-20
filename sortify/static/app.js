@@ -2855,6 +2855,11 @@ let coverUri = null;
 // The expand animation plays on the render that opens the panel, not on
 // every poll's re-render after it.
 let coverFresh = false;
+// A pull from the button (wireCoverPull): how far open, 0..1, while one is
+// in hand, else null; and whether the press became a pull, so its click
+// is not taken for a tap.
+let coverPull = null;
+let coverDragged = false;
 
 function setCoverBtn(on) {
   $("btn-cover").classList.toggle("on", on);
@@ -2874,14 +2879,103 @@ function openCover() {
 function closeCover(rerender = true) {
   coverOpen = false;
   coverUri = null;
+  coverPull = null;
   setCoverBtn(false);
   if (rerender) renderNow();
 }
-$("btn-cover").onclick = () => (coverOpen ? closeCover() : openCover());
+$("btn-cover").onclick = () => {
+  // The click a drag ends with is not a tap.
+  if (coverDragged) { coverDragged = false; return; }
+  coverOpen ? closeCover() : openCover();
+};
+
+// The button can also be pulled downward: the cover opens under the finger,
+// as far as it has travelled, and lets go into open past COVER_PULL_OPEN (or
+// on a downward flick) and back into closed short of it. `coverPull` is how
+// far open (0..1) while a pull is in hand, null otherwise; renderNow draws the
+// panel at that size, so a poll landing mid-pull does not snap it. The moves
+// themselves restyle the panel in place rather than re-render the card.
+const COVER_PULL_START = 6;     // px before a press becomes a pull
+const COVER_PULL_OPEN = 0.3;    // fraction past which a release opens
+const COVER_FLICK = 0.5;        // px/ms downward that opens regardless
+function paintCoverPull(f) {
+  const panel = $("cover-panel");
+  if (!panel) return;
+  panel.style.gridTemplateRows = `${f}fr`;
+  const img = panel.querySelector("img");
+  if (img) { img.style.transform = `scale(${0.6 + 0.4 * f})`; img.style.opacity = String(f); }
+}
+
+// Let go: settle the panel the rest of the way, open or closed.
+function settleCoverPull(open) {
+  if (coverPull === null) return;
+  const panel = $("cover-panel");
+  if (panel) panel.classList.add("cover-settle");
+  if (open) {
+    coverPull = null;
+    setCoverBtn(true);
+    paintCoverPull(1);
+    return;
+  }
+  coverPull = 0;
+  paintCoverPull(0);
+  const uri = coverUri;
+  // Closed for real once the collapse has played; a track change in between
+  // has already closed it (renderNow).
+  setTimeout(() => { if (coverOpen && coverPull === 0 && coverUri === uri) closeCover(); }, 200);
+}
+
+(function wireCoverPull() {
+  const btn = $("btn-cover");
+  let y0 = null, x0 = 0, full = 0, lastY = 0, lastT = 0, speed = 0;
+  btn.onpointerdown = (e) => {
+    coverDragged = false;
+    // Only a closed cover can be pulled open; an open one closes on a tap.
+    if (coverOpen) { y0 = null; return; }
+    y0 = e.clientY; x0 = e.clientX; lastY = e.clientY; lastT = e.timeStamp; speed = 0;
+    btn.setPointerCapture?.(e.pointerId);
+  };
+  btn.onpointermove = (e) => {
+    if (y0 === null) return;
+    const dy = e.clientY - y0;
+    if (!coverDragged) {
+      if (dy < COVER_PULL_START || Math.abs(e.clientX - x0) > dy) return;
+      const t = nowState?.track;
+      if (!t?.image) { y0 = null; return; }   // the tap's toast says why
+      coverDragged = true;
+      coverOpen = true;
+      coverUri = t.uri || null;
+      coverFresh = false;
+      coverPull = 0;
+      renderNow();
+      const inner = $("cover-panel")?.querySelector(".cover-panel-inner");
+      full = inner?.scrollHeight || 360;
+    }
+    if (coverPull === null) { y0 = null; return; }   // the track changed under it
+    if (e.timeStamp > lastT) speed = (e.clientY - lastY) / (e.timeStamp - lastT);
+    lastY = e.clientY; lastT = e.timeStamp;
+    coverPull = Math.max(0, Math.min(1, dy / full));
+    paintCoverPull(coverPull);
+  };
+  btn.onpointerup = () => {
+    if (y0 === null) return;
+    y0 = null;
+    if (coverDragged) settleCoverPull(coverPull >= COVER_PULL_OPEN || speed > COVER_FLICK);
+  };
+  btn.onpointercancel = () => {
+    if (y0 === null) return;
+    y0 = null;
+    if (coverDragged) settleCoverPull(false);
+  };
+})();
 
 function coverPanel(tr) {
   const fresh = coverFresh ? " cover-in" : "";
   coverFresh = false;
+  // Mid-pull the panel is drawn at the pull's size (see wireCoverPull).
+  const f = coverPull;
+  const pull = f === null ? "" : ` style="grid-template-rows:${f}fr"`;
+  const imgPull = f === null ? "" : ` style="transform:scale(${0.6 + 0.4 * f});opacity:${f}"`;
   const artists = tr.artists.map((a) => a.name).join(", ");
   // Share needs a real track; local files and episodes have no
   // spotify:track: uri and the tablet flow can't find them by title anyway.
@@ -2890,8 +2984,8 @@ function coverPanel(tr) {
         <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>
       </button>`
     : "";
-  return `<div id="cover-panel" class="cover-panel${fresh}"><div class="cover-panel-inner">
-      <img src="${esc(tr.image_large || tr.image)}" alt="">
+  return `<div id="cover-panel" class="cover-panel${fresh}"${pull}><div class="cover-panel-inner">
+      <img src="${esc(tr.image_large || tr.image)}" alt=""${imgPull}>
       <div class="cover-info">
         <div class="cover-text">
           <div class="cover-title">${esc(tr.name)}</div>

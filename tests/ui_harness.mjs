@@ -1789,6 +1789,84 @@ run("stopNowPolling()");
   check("CV no cover, no panel — a toast says so",
         !panelOpen() && /no cover/.test($$("toast").textContent),
         `toast=${JSON.stringify($$("toast").textContent)}`);
+
+  // The button can be pulled downward too: the cover opens under the finger,
+  // and a release decides open or closed. The stub panel has no layout, so
+  // its full height falls back to 360px.
+  routes["GET /api/now?light=1"].body.track =
+    { uri: "spotify:track:br5", name: "Pull Song", artists: [{ name: "Pull Artist" }],
+      sortable: true, image: "http://img/300" };
+  routes["GET /api/now/suggest?force=1"].body.track_uri = "spotify:track:br5";
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  const btn = $$("btn-cover");
+  const pt = (y, t, x = 100) => ({ clientX: x, clientY: y, timeStamp: t, pointerId: 1 });
+  // The click a real browser fires after every pointerup.
+  const click = () => btn.onclick();
+  btn.onpointerdown(pt(10, 0));
+  btn.onpointermove(pt(13, 50));
+  check("PULL a few pixels is still a tap, not a pull",
+        !panelOpen() && run("coverPull") === null, `pull=${run("coverPull")}`);
+  btn.onpointermove(pt(100, 400));
+  check("PULL dragging down draws the panel at the finger's size",
+        panelOpen() && Math.abs(run("coverPull") - 0.25) < 1e-9 &&
+        $$("cover-panel").style.gridTemplateRows === "0.25fr" && !card().includes("cover-panel cover-in"),
+        `pull=${run("coverPull")} rows=${$$("cover-panel").style.gridTemplateRows}`);
+  run(`renderNow()`);
+  check("PULL a re-render mid-pull keeps the pulled size",
+        card().includes('style="grid-template-rows:0.25fr"'), card().slice(0, 200));
+  btn.onpointermove(pt(160, 1000));
+  btn.onpointerup(pt(160, 1000));
+  click();
+  check("PULL released past the line, it opens and the click is not a tap",
+        panelOpen() && run("coverOpen") && run("coverPull") === null &&
+        btn.classList.contains("on"), `open=${run("coverOpen")} pull=${run("coverPull")}`);
+  btn.onpointerdown(pt(10, 0));
+  btn.onpointermove(pt(100, 400));
+  check("PULL an open cover is not pulled again", run("coverPull") === null, "");
+  btn.onpointerup(pt(100, 400));
+  click();
+  check("PULL ...a tap still closes it", !panelOpen() && !run("coverOpen"), "");
+
+  btn.onpointerdown(pt(10, 0));
+  btn.onpointermove(pt(40, 400));
+  btn.onpointermove(pt(60, 800));
+  btn.onpointerup(pt(60, 800));
+  click();
+  check("PULL released short of the line, it collapses...",
+        run("coverPull") === 0 && $$("cover-panel").style.gridTemplateRows === "0fr", "");
+  await new Promise((r) => setTimeout(r, 260));
+  check("PULL ...and then closes", !panelOpen() && !run("coverOpen") &&
+        !btn.classList.contains("on"), `open=${run("coverOpen")}`);
+
+  btn.onpointerdown(pt(10, 0));
+  btn.onpointermove(pt(30, 10));
+  btn.onpointermove(pt(50, 20));
+  btn.onpointerup(pt(50, 20));
+  click();
+  check("PULL a quick flick opens it even when short",
+        run("coverOpen") && run("coverPull") === null, `pull=${run("coverPull")}`);
+  run(`closeCover()`);
+
+  btn.onpointerdown(pt(10, 0));
+  btn.onpointermove(pt(100, 400));
+  btn.onpointercancel();
+  await new Promise((r) => setTimeout(r, 260));
+  check("PULL a cancelled pull closes", !panelOpen() && !run("coverOpen"), "");
+
+  routes["GET /api/now?light=1"].body.track.image = null;
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  $$("toast").textContent = "";
+  btn.onpointerdown(pt(10, 0));
+  btn.onpointermove(pt(100, 400));
+  btn.onpointerup(pt(100, 400));
+  btn.onclick();
+  check("PULL no cover: no pull, and the click's toast says why",
+        !panelOpen() && !run("coverOpen") && /no cover/.test($$("toast").textContent),
+        `toast=${JSON.stringify($$("toast").textContent)}`);
 }
 
 // ============================================================================

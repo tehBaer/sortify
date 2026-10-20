@@ -1075,8 +1075,14 @@ body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
 .cover-title { font-weight: 700; font-size: 1.05rem; }
 .cover-artist { color: var(--muted); font-size: .92rem; }
 .cover-share { flex: 0 0 auto; color: var(--muted); }
+/* Pulled open from the button: the finger sets the size, so the button
+   must not scroll the page under it. On release the rest plays out. */
+#btn-cover { touch-action: none; user-select: none; -webkit-user-select: none; }
+.cover-panel.cover-settle { transition: grid-template-rows .2s cubic-bezier(.2, .8, .2, 1); }
+.cover-panel.cover-settle img { transition: transform .2s cubic-bezier(.2, .8, .2, 1), opacity .2s; }
 @media (prefers-reduced-motion: reduce) {
   .cover-panel.cover-in, .cover-panel.cover-in img { animation: none; }
+  .cover-panel.cover-settle, .cover-panel.cover-settle img { transition: none; }
 }
 
 #toast {
