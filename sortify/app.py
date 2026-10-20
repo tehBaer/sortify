@@ -683,6 +683,20 @@ def splitparts_homes():
     return {"homes": out}
 
 
+@app.get("/api/splitparts/progress")
+def splitparts_last_job():
+    """The job slot without knowing its pid: which home it was for, what
+    kind of job, and how it ended. Registered before the `{pid}` routes so
+    "progress" is never read as a playlist id. The Split tab asks this on
+    entry, because a finished subset-mode Done's original is no longer a
+    home — this is the only way back to its summary."""
+    with _splitparts_job_lock:
+        job = dict(_splitparts_job)
+    if not job:
+        return {"pid": None, "kind": None, "state": "idle", "summary": None}
+    return {k: job.get(k) for k in ("pid", "kind", "state", "summary")}
+
+
 # A split sits "running" (409-ing every other Suggest) for as long as this
 # fill takes; on a genuine Last.fm outage each call pays its own 15s timeout,
 # so without a breaker a single bad patch of network turns one Suggest into
@@ -853,7 +867,7 @@ def splitparts_get(pid: str):
     draft = spa.get_draft(store, pid)
     if draft is None:
         raise HTTPException(404, "no split in progress for this playlist")
-    return draft
+    return spa.without_tracks(draft)
 
 
 @app.delete("/api/splitparts/{pid}")
@@ -863,6 +877,27 @@ def splitparts_discard(pid: str):
         raise HTTPException(409, _SPLITPARTS_DONE_STARTED_MSG)
     spa.drop_draft(store, pid)
     return {"ok": True}
+
+
+@app.post("/api/splitparts/{pid}/abandon")
+def splitparts_abandon(pid: str):
+    """The way out of a started Done that keeps failing (a created part
+    deleted in Spotify, the original unfollowed, a refused batch): every
+    other action 409s once Done has started. Zero Spotify calls — the draft
+    goes, and what was already made stays as it is and is reported back."""
+    with _splitparts_job_lock:
+        running = _splitparts_job.get("state") == "running" and _splitparts_job.get("pid") == pid
+    with spa._lock:
+        draft = spa.get_draft(store, pid)
+        if draft is None:
+            raise HTTPException(404, "no split in progress for this playlist")
+        if draft.get("done") is None:
+            raise HTTPException(409, "Done has not started for this split — discard it instead")
+        if running:
+            raise HTTPException(409, "Done is running for this split — wait for it to stop")
+        report = spa.abandon_report(draft)
+        spa.drop_draft(store, pid)
+    return report
 
 
 def _splitparts_draft(pid: str) -> dict:
@@ -883,7 +918,7 @@ def splitparts_move(pid: str, body: SplitMoveIn):
         except KeyError as exc:
             raise HTTPException(400, exc.args[0])
         spa.put_draft(store, draft)
-    return draft
+    return spa.without_tracks(draft)
 
 
 @app.post("/api/splitparts/{pid}/parts")
@@ -897,7 +932,7 @@ def splitparts_add_part(pid: str):
         except ValueError as exc:
             raise HTTPException(409, str(exc))
         spa.put_draft(store, draft)
-    return draft
+    return spa.without_tracks(draft)
 
 
 @app.post("/api/splitparts/{pid}/parts/{key}/remove")
@@ -920,7 +955,7 @@ def splitparts_remove_part(pid: str, key: str, body: SplitRemoveIn):
             return {"moves": counts}
         spa.remove_part(draft, key, moves)
         spa.put_draft(store, draft)
-    return draft
+    return spa.without_tracks(draft)
 
 
 class SplitDoneIn(BaseModel):
@@ -1048,7 +1083,10 @@ def _splitparts_run_done(pid: str, opts: dict) -> None:
                 return
         plan = spa.done_plan(draft, opts["original"], opts.get("part"),
                              names=opts.get("names"), remove_batch=REMOVE_BATCH)
-        save()
+        # Not saved yet on a first attempt: `done` locks the split, and
+        # nothing is worth locking it for until the first write has landed
+        # (a quota trip on create #1 must leave moves and Suggest open).
+        # The first save is the one recording the first created id.
         full = {t["uri"]: t for t in
                 (store.cache()["playlists"].get(pid) or {}).get("tracks") or []}
         for t in draft["tracks"]:
@@ -1134,7 +1172,10 @@ def _splitparts_run_done(pid: str, opts: dict) -> None:
                  summary={"created": created, "original": opts["original"],
                           "empty": plan["empty"], "local": plan["local"]})
     except SpotifyError as exc:
-        progress(state="error", message=f"{exc} — your split is saved; press Done again to continue")
+        # Retrying into a 429 is what extends it: say to wait, not "again".
+        tail = ("press Done again after the cooldown" if exc.status == 429
+                else "press Done again to continue")
+        progress(state="error", message=f"{exc} — your split is saved; {tail}")
     except Exception as exc:
         log.exception("split: done failed")
         progress(state="error", message=f"done failed: {exc} — your split is saved; press Done again to continue")
@@ -1159,6 +1200,16 @@ def splitparts_done(pid: str, body: SplitDoneIn):
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     problem = _splitparts_name_problem([p["name"] for p in plan["new_parts"]])
+    if not problem and started is None:
+        # First attempt only: on a resume the parts already created are in
+        # the listing under these very names.
+        listing = (store.cache().get("playlist_list") or {}).get("items") or []
+        # Kept as a subset, the original is renamed with the subset mark
+        # before anything is filed, so its current name is no twin.
+        renamed = (check["original"] == "subset"
+                   and roles.mark_subset_name(draft["name"]) != draft["name"])
+        problem = spa.twin_name_problem([p["name"] for p in plan["new_parts"]], listing,
+                                        skip_id=pid if renamed else None)
     if problem:
         raise HTTPException(400, problem)
     # The folder check is for a FIRST attempt only. On a resume it would
@@ -1209,7 +1260,7 @@ def splitparts_reread(pid: str):
         spa.reconcile(draft, tracks, snap, store.tag_artists(),
                       store.lastfm_track_map(), store.lastfm_artist_map())
         spa.put_draft(store, draft)
-    return draft
+    return spa.without_tracks(draft)
 
 
 @app.post("/api/config")

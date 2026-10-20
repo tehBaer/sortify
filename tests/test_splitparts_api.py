@@ -909,3 +909,174 @@ def test_ordinary_names_and_folders_still_pass_with_input_sets(sets_env):
 
     assert res.status_code == 200
     assert progress(sets_env)["state"] == "done"
+
+
+# finding 1: the draft says whether it holds manual edits
+
+
+def test_a_fresh_suggestion_is_not_edited(drafted):
+    assert drafted.get("/api/splitparts/H1").json()["edited"] is False
+
+
+def test_moves_and_part_changes_mark_the_draft_edited(drafted):
+    d = drafted.get("/api/splitparts/H1").json()
+    uri = d["parts"][0]["uris"][0]
+
+    assert drafted.post("/api/splitparts/H1/move", json={"uri": uri, "to": "p2"}).json()["edited"] is True
+    drafted.post("/api/splitparts/H1/suggest", json={"n": 2})
+    assert drafted.get("/api/splitparts/H1").json()["edited"] is False
+
+    assert drafted.post("/api/splitparts/H1/parts").json()["edited"] is True
+    drafted.post("/api/splitparts/H1/suggest", json={"n": 3})
+    dry = drafted.post("/api/splitparts/H1/parts/p3/remove", json={"dry": True})
+    assert dry.status_code == 200
+    assert drafted.get("/api/splitparts/H1").json()["edited"] is False   # a dry run edits nothing
+    assert drafted.post("/api/splitparts/H1/parts/p3/remove", json={"dry": False}).json()["edited"] is True
+
+
+# finding 2: names filing would refuse are refused at Done
+
+
+@pytest.mark.parametrize("names", [{"p1": "Same", "p2": " same "}, {"p1": "tiny "}, {"p2": "[INBOX]"}])
+def test_twin_part_names_are_refused_before_any_call(env, names):
+    res = env.post("/api/splitparts/H1/done", json={"names": names, "folder": None, "original": "subset"})
+
+    assert res.status_code == 400
+    assert "called" in res.json()["detail"] or "input" in res.json()["detail"]
+    assert env.log == [] and env.calls == []
+
+
+def test_a_part_named_like_the_original_is_a_twin_only_when_the_original_keeps_its_name(env):
+    res = env.post("/api/splitparts/H1/done", json={
+        "names": {"p2": "big home"}, "folder": None, "original": "part", "part": "p1"})
+    assert res.status_code == 400 and env.log == []
+
+    # Kept as a subset, the original is renamed with the subset mark first.
+    res = env.post("/api/splitparts/H1/done", json={
+        "names": {"p2": "big home"}, "folder": None, "original": "subset"})
+    assert res.status_code == 200 and progress(env)["state"] == "done"
+
+
+# finding 3: which job the slot holds, without knowing its pid
+
+
+def test_pidless_progress_is_idle_with_an_empty_slot(client):
+    assert client.get("/api/splitparts/progress").json() == {
+        "pid": None, "kind": None, "state": "idle", "summary": None}
+
+
+def test_pidless_progress_names_the_last_job(env):
+    p = env.get("/api/splitparts/progress").json()
+    assert p["pid"] == "H1" and p["kind"] == "suggest"      # the fixture's own Suggest
+
+    env.post("/api/splitparts/H1/done", json={"names": {"p1": "Rocky", "p2": "Jazzy"},
+                                               "folder": None, "original": "subset"})
+
+    p = env.get("/api/splitparts/progress").json()
+    assert p["pid"] == "H1" and p["kind"] == "done" and p["state"] == "done"
+    assert [c["name"] for c in p["summary"]["created"]] == ["Rocky", "Jazzy"]
+
+
+# finding 4: a started Done can be abandoned, keeping what was made
+
+
+def fail_second_create(monkeypatch, env):
+    real = appmod.sp.create_playlist_full
+    n = {"i": 0}
+
+    def flaky(name, **kw):
+        n["i"] += 1
+        if n["i"] == 2:
+            raise SpotifyError(404, "gone")
+        return real(name, **kw)
+
+    monkeypatch.setattr(appmod.sp, "create_playlist_full", flaky)
+
+
+def test_abandon_drops_a_started_done_and_says_what_exists(env, monkeypatch):
+    fail_second_create(monkeypatch, env)
+    env.post("/api/splitparts/H1/done", json={"names": {"p1": "Rocky"}, "folder": None,
+                                               "original": "subset"})
+    assert progress(env)["state"] == "error"
+    env.log.clear()
+    env.calls.clear()
+
+    res = env.post("/api/splitparts/H1/abandon")
+
+    assert res.status_code == 200
+    assert res.json() == {"created": [{"id": "N1", "name": "Rocky"}], "original_done": False}
+    assert env.get("/api/splitparts/H1").status_code == 404
+    assert env.log == [] and env.calls == []          # zero Spotify calls
+    assert "N1" in appmod.store.config()["home_ids"]   # what was made stays a home
+
+
+def test_abandon_refuses_a_draft_whose_done_never_started(drafted):
+    res = drafted.post("/api/splitparts/H1/abandon")
+
+    assert res.status_code == 409
+    assert drafted.get("/api/splitparts/H1").status_code == 200
+
+
+def test_abandon_refuses_while_a_job_runs_for_it(env, monkeypatch):
+    fail_second_create(monkeypatch, env)
+    env.post("/api/splitparts/H1/done", json={"names": {}, "folder": None, "original": "subset"})
+    appmod._splitparts_job.update({"pid": "H1", "state": "running"})
+
+    assert env.post("/api/splitparts/H1/abandon").status_code == 409
+    assert env.get("/api/splitparts/H1").status_code == 200
+
+
+def test_abandon_of_a_missing_draft_is_404(client):
+    assert client.post("/api/splitparts/H1/abandon").status_code == 404
+
+
+# minors
+
+
+def test_a_failed_first_create_leaves_the_split_unlocked(env, monkeypatch):
+    def boom(name, **kw):
+        raise SpotifyError(429, "rate limited")
+    monkeypatch.setattr(appmod.sp, "create_playlist_full", boom)
+
+    env.post("/api/splitparts/H1/done", json={"names": {}, "folder": None, "original": "subset"})
+
+    assert progress(env)["state"] == "error"
+    assert appmod.store.splitparts()["drafts"]["H1"]["done"] is None
+    d = env.get("/api/splitparts/H1").json()
+    uri = d["parts"][0]["uris"][0]
+    assert env.post("/api/splitparts/H1/move", json={"uri": uri, "to": "p2"}).status_code == 200
+
+
+def test_a_cooldown_says_to_wait_before_pressing_done_again(env, monkeypatch):
+    def boom(name, **kw):
+        raise SpotifyError(429, "rate limited")
+    monkeypatch.setattr(appmod.sp, "create_playlist_full", boom)
+
+    env.post("/api/splitparts/H1/done", json={"names": {}, "folder": None, "original": "subset"})
+
+    assert progress(env)["message"].endswith("your split is saved; press Done again after the cooldown")
+
+
+def test_an_ordinary_failure_still_says_press_done_again_to_continue(env, monkeypatch):
+    def boom(name, **kw):
+        raise SpotifyError(500, "server error")
+    monkeypatch.setattr(appmod.sp, "create_playlist_full", boom)
+
+    env.post("/api/splitparts/H1/done", json={"names": {}, "folder": None, "original": "subset"})
+
+    assert progress(env)["message"].endswith("press Done again to continue")
+
+
+def test_draft_answers_carry_no_track_list(env, monkeypatch):
+    d = env.get("/api/splitparts/H1").json()
+    uri = d["parts"][0]["uris"][0]
+    monkeypatch.setattr(appmod.sp, "snapshot", lambda pid: "snap-1")
+
+    answers = [d,
+               env.post("/api/splitparts/H1/move", json={"uri": uri, "to": "p2"}).json(),
+               env.post("/api/splitparts/H1/parts").json(),
+               env.post("/api/splitparts/H1/parts/p3/remove", json={"dry": False}).json(),
+               env.post("/api/splitparts/H1/reread").json()]
+
+    assert all("tracks" not in a and "parts" in a and "songs" in a for a in answers)
+    assert appmod.store.splitparts()["drafts"]["H1"]["tracks"]   # still stored for the engine

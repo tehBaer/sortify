@@ -56,8 +56,17 @@ def draft_from(playlist: dict, snapshot_id: str | None, tracks: list[dict],
         "scores": {str(k): v for k, v in sugg.scores.items()},
         "songs": _songs(tracks),
         "tracks": slim_tracks(tracks),
+        # Manual edits (a move, an added or removed part) since the
+        # suggestion: what the UI asks about before replacing the draft.
+        "edited": False,
         "done": None,
     }
+
+
+def without_tracks(draft: dict) -> dict:
+    """The draft as the client gets it: `tracks` is the engine's input
+    (~250 KB on a 1000-song home) and the client never reads it."""
+    return {k: v for k, v in draft.items() if k != "tracks"}
 
 
 def get_draft(store, pid: str) -> dict | None:
@@ -126,6 +135,7 @@ def move(draft: dict, uri: str, to_key: str) -> dict:
     if source is not target:
         source["uris"].remove(uri)
         target["uris"].append(uri)
+        draft["edited"] = True
     return draft
 
 
@@ -136,6 +146,7 @@ def add_part(draft: dict) -> dict:
     nums = [int(p["key"][1:]) for p in draft["parts"] if p["key"][1:].isdigit()]
     draft["parts"].append({"key": f"p{max(nums, default=0) + 1}",
                            "name": NEW_PART_NAME, "uris": []})
+    draft["edited"] = True
     return draft
 
 
@@ -157,6 +168,7 @@ def remove_part(draft: dict, key: str, moves: dict[str, str]) -> dict:
     draft["parts"] = [p for p in draft["parts"] if p["key"] != key]
     for u in leaving["uris"]:
         _part(draft, moves[u])["uris"].append(u)
+    draft["edited"] = True
     return draft
 
 
@@ -202,6 +214,39 @@ def done_plan(draft: dict, original: str, part_key: str | None,
     return {"new_parts": new_parts, "empty": empty,
             "local": [songs[u]["name"] for u in songs if local(u)],
             "removals": removals, "calls": calls, "creates": len(new_parts)}
+
+
+def twin_name_problem(names: list[str], listing: list[dict],
+                      skip_id: str | None = None) -> str | None:
+    """Filing finds a playlist's row in the client by its NAME and refuses
+    when two share one, so a part named like another part, or like a
+    playlist already in the listing, could never be filed. Case-insensitive
+    and trimmed, the same comparison `filing.file_playlist` makes."""
+    seen: set[str] = set()
+    for name in names:
+        k = name.strip().lower()
+        if k in seen:
+            return f"two parts are called {name.strip()!r} — give each part its own name"
+        seen.add(k)
+    taken = {(p.get("name") or "").strip().lower() for p in listing if p.get("id") != skip_id}
+    for name in names:
+        if name.strip().lower() in taken:
+            return (f"a playlist called {name.strip()!r} already exists — filing finds "
+                    "playlists by name, so give this part another one")
+    return None
+
+
+def abandon_report(draft: dict) -> dict:
+    """What a started Done already made, for the user to know what exists."""
+    done = draft.get("done") or {}
+    names = (done.get("opts") or {}).get("names") or {}
+    by_key = {p["key"]: p for p in draft["parts"]}
+    created = []
+    for key, pid in (done.get("created") or {}).items():
+        part = by_key.get(key) or {"name": key}
+        name = (names.get(key) or part["name"]).strip() or part["name"]
+        created.append({"id": pid, "name": name})
+    return {"created": created, "original_done": bool(done.get("original_done"))}
 
 
 def reconcile(draft: dict, tracks: list[dict], snapshot_id: str | None,
