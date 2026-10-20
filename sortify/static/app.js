@@ -3631,13 +3631,15 @@ const SP_MIN = 2, SP_MAX = 6;
 let spAudio = null;
 let spAudioUri = null;
 let spAudioPending = false;   // spAudio exists but play() has not yet succeeded
+let spAudioRefused = false;   // play() was refused PERMISSION (iOS) — tap again to retry
 let spResumeOwed = false;
 let spSessionPlaying = false; // was Spotify playing when this preview session began
 
 function spStopPreview(resume = true) {
-  if (spAudio) { spAudio.onended = null; spAudio.pause(); spAudio.src = ""; }
+  if (spAudio) { spAudio.onended = null; spAudio.onerror = null; spAudio.pause(); spAudio.src = ""; }
   spAudio = null;
   spAudioPending = false;
+  spAudioRefused = false;
   const was = spAudioUri;
   spAudioUri = null;
   if (resume && spResumeOwed) {
@@ -3653,24 +3655,47 @@ function spStopPreview(resume = true) {
   if (was && spDraft && !$("sp-parts").hidden) renderSpList();
 }
 
+// A clip that failed to LOAD or DECODE — an expired CDN token, a 403/404, a
+// network hiccup — is never a permission refusal: retrying play() on the
+// same dead element only rejects the same way forever. Fetch a fresh URL on
+// the next tap instead. Shared by a rejected play() and a later onerror (a
+// clip that dies mid-playback, not just at the start).
+function spClipFailed() {
+  if (!spAudio) return;
+  spStopPreview(false);
+  toast("this preview failed — tap to try again");
+}
+
 async function spPreview(uri) {
-  // iOS: a previous tap's play() on this exact row was refused. Retry it
-  // SYNCHRONOUSLY, before any await, on the same Audio object — no new
-  // fetch, no new Audio — since iOS only grants playback inside the very
-  // gesture handler that asks for it, never one that resumes after an
-  // awaited fetch has already returned.
-  if (spAudio && spAudioUri === uri && spAudioPending) {
+  // iOS: a previous tap's play() on this exact row was refused PERMISSION
+  // (NotAllowedError). Retry it SYNCHRONOUSLY, before any await, on the
+  // same Audio object — no new fetch, no new Audio — since iOS only grants
+  // playback inside the very gesture handler that asks for it, never one
+  // that resumes after an awaited fetch has already returned.
+  if (spAudio && spAudioUri === uri && spAudioRefused) {
+    const a = spAudio;
     try {
-      await spAudio.play();
-    } catch (_) {
-      toast("tap the song again to play its preview");
+      await a.play();
+    } catch (e) {
+      // Quiet when this exact attempt was superseded (spAudio !== a) or
+      // simply aborted by a stop that raced it — neither is a failure.
+      if (spAudio !== a || (e && e.name === "AbortError")) return;
+      if (e && e.name === "NotAllowedError") {
+        toast("tap the song again to play its preview");
+        return;
+      }
+      spClipFailed();
       return;
     }
+    if (spAudio !== a) return;
+    spAudioRefused = false;
     spAudioPending = false;
     if (spSessionPlaying) spResumeOwed = true;
     renderSpList();
     return;
   }
+  // Same row, not refused: either genuinely playing, or merely still
+  // buffering — either way a second tap means "stop", never "try again".
   if (spAudioUri === uri) { spStopPreview(); return; }
   // A session starts when nothing is playing or pending yet — captured once,
   // so switching between songs mid-session never re-asks "was it playing".
@@ -3687,17 +3712,25 @@ async function spPreview(uri) {
     return;
   }
   if (spAudioUri !== uri) return;        // another tap won the race
-  spAudio = new Audio(r.url);
+  const a = spAudio = new Audio(r.url);
   spAudioPending = true;
-  spAudio.onended = () => spStopPreview();
+  a.onended = () => { if (spAudio === a) spStopPreview(); };
+  a.onerror = () => { if (spAudio === a) spClipFailed(); };
   try {
-    await spAudio.play();
-  } catch (_) {
-    // Keep spAudio/spAudioUri/spAudioPending: the next tap on this same row
-    // retries play() on this object instead of refetching and failing again.
-    toast("tap the song again to play its preview");
+    await a.play();
+  } catch (e) {
+    if (spAudio !== a || (e && e.name === "AbortError")) return;
+    if (e && e.name === "NotAllowedError") {
+      // Keep spAudio/spAudioUri/spAudioPending: the next tap on this same
+      // row retries play() on this object instead of refetching.
+      spAudioRefused = true;
+      toast("tap the song again to play its preview");
+      return;
+    }
+    spClipFailed();
     return;
   }
+  if (spAudio !== a) return;
   spAudioPending = false;
   if (spSessionPlaying) spResumeOwed = true;
   renderSpList();
@@ -4016,7 +4049,11 @@ function renderSpList() {
   $("sp-list").innerHTML = part && part.uris.length
     ? part.uris.map((u) => {
         const s = spDraft.songs[u] || { name: u, artists: "" };
-        return `<div class="sp-song${u === spAudioUri ? " playing" : ""}" data-uri="${esc(u)}">
+        // Not merely "the row this uri belongs to" — a refused or still-
+        // buffering clip keeps spAudioUri so the next tap can retry or stop
+        // it, but has never actually taken audio focus, so it earns no
+        // highlight until spAudioPending clears (see spPreview).
+        return `<div class="sp-song${u === spAudioUri && !spAudioPending ? " playing" : ""}" data-uri="${esc(u)}">
           <span class="sp-song-name">${esc(s.name)}${unknown.has(u) ? ' <span class="sp-unknown" title="no Last.fm data — check where it landed">?</span>' : ""}</span>
           <span class="sp-song-artist">${esc(s.artists)}</span>
         </div>`;

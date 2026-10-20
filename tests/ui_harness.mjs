@@ -202,7 +202,19 @@ class AudioStub {
     if (v === "") setTimeout(() => { if (this.onerror) this.onerror(); }, 0);
   }
   get src() { return this.__src; }
-  play() { this.playCalls++; this.paused = false; return AudioStub.refuse ? Promise.reject(new Error("blocked")) : Promise.resolve(); }
+  // `refuse` can be `true` (the iOS gesture refusal, NotAllowedError — kept
+  // as the default meaning so every existing check still passes unchanged)
+  // or a specific DOMException name string ("NotSupportedError" for a dead
+  // clip, "AbortError" for a play() pre-empted by a stop) so a check can
+  // tell apart WHICH failure app.js is handling.
+  play() {
+    this.playCalls++; this.paused = false;
+    if (!AudioStub.refuse) return Promise.resolve();
+    const name = AudioStub.refuse === true ? "NotAllowedError" : AudioStub.refuse;
+    const err = new Error(name);
+    err.name = name;
+    return Promise.reject(err);
+  }
   pause() { this.paused = true; }
 }
 AudioStub.made = [];
@@ -4941,6 +4953,128 @@ run("stopNowPolling()");
   check("SP6 re-entering the Split tab's home picker stops a live preview",
         pickerClip.paused && run("spAudioUri") === null, "");
 
+  run(`show("lists")`);
+}
+
+// ============================================================================
+// SP7 — fix round 2: a dead clip refetches instead of retrying forever, an
+// aborted play shows no false toast, a buffering tap still stops the clip,
+// and a refused/pending clip is never drawn as playing.
+// ============================================================================
+{
+  const songs = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                  u3: { name: "Three", artists: "C", local: false } };
+  const D = (parts, extra = {}) => ({ playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2, parts,
+    unknown: [], hint: null, scores: {}, songs, tracks: [], done: null, ...extra });
+  const two = () => [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3"] }];
+  run(`show("split")`);
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spPid = "H1"; spShown = "p1"; spSection("sp-work"); renderSpParts(); nowState = { is_playing: true }`);
+
+  // fix 1 — a dead clip (NotSupportedError, or any non-permission rejection)
+  // must refetch on the next tap, not retry the same dead element forever.
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = "NotSupportedError";
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP7 a dead clip says to try again, not 'tap the song again'",
+        /this preview failed/.test($$("toast").textContent) && run("spAudioUri") === null,
+        $$("toast").textContent);
+  AudioStub.refuse = false;
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP7 ...and the next tap fetches a fresh URL instead of retrying the dead element",
+        AudioStub.made.length === 2, `made=${AudioStub.made.length}`);
+
+  // ...and a clip that dies MID-PLAYBACK (onerror, an expired CDN token)
+  // fails the exact same way.
+  const liveClip = AudioStub.made[AudioStub.made.length - 1];
+  check("SP7 the clip got an onerror handler wired to the same failure path",
+        typeof liveClip.onerror === "function", "");
+  if (liveClip.onerror) liveClip.onerror();
+  await tick();
+  check("SP7 ...and firing it fails the preview the same way play() rejecting does",
+        /this preview failed/.test($$("toast").textContent) && run("spAudioUri") === null,
+        $$("toast").textContent);
+
+  // fix 2 — an aborted play (stopped while play() was still pending) must
+  // never show a false "tap again" toast, in EITHER catch.
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = "AbortError";
+  routes["GET /api/track_preview?pid=H1&uri=u2"] = { status: 200, body: { url: "https://cdn/u2.mp3", uri: "u2", deezer_id: 2 } };
+  $$("toast").textContent = "untouched";
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP7 an aborted play on the main path shows no toast at all",
+        $$("toast").textContent === "untouched", $$("toast").textContent);
+  run(`spStopPreview(false)`);
+  AudioStub.refuse = false;
+
+  // the SAME check against the retry path's own catch: get refused first
+  // (NotAllowedError), then abort the retry attempt itself.
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = true;
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  AudioStub.refuse = "AbortError";
+  $$("toast").textContent = "untouched";
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP7 an aborted RETRY shows no toast either",
+        $$("toast").textContent === "untouched", $$("toast").textContent);
+  run(`spStopPreview(false)`);
+  AudioStub.refuse = false;
+
+  // fix 3 — tapping a clip that is still buffering (pending, not yet
+  // refused) stops it, rather than calling play() again on it.
+  resetLog();
+  AudioStub.made.length = 0;
+  const origPlay = AudioStub.prototype.play;
+  let bufferPlayCalls = 0;
+  AudioStub.prototype.play = function () {
+    bufferPlayCalls++;
+    this.paused = false;
+    return new Promise(() => {});   // never settles — still buffering
+  };
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  run(`spPointerDown("u1", 10, 10)`);
+  run(`spPointerUp(10, 10)`);          // fire-and-forget: the fetch resolves, play() never does
+  await tick();
+  check("SP7 a buffering clip is pending but never marked refused",
+        run("spAudioPending") === true && run("spAudioRefused") === false, "");
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  check("SP7 tapping it again stops it instead of retrying play() on it",
+        run("spAudioUri") === null && bufferPlayCalls === 1, `calls=${bufferPlayCalls}`);
+  AudioStub.prototype.play = origPlay;
+
+  // fix 4 — a refused (or still-buffering) clip's row is never drawn as
+  // playing — only an actually-playing clip earns the highlight.
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p1"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = true;
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  run(`renderSpList()`);
+  check("SP7 a refused clip's row is not drawn as playing",
+        !/sp-song playing" data-uri="u1"/.test($$("sp-list").innerHTML), $$("sp-list").innerHTML);
+  AudioStub.refuse = false;
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP7 ...but once it actually plays, the row IS drawn as playing",
+        /sp-song playing" data-uri="u1"/.test($$("sp-list").innerHTML), $$("sp-list").innerHTML);
+
+  run(`spStopPreview(false)`);
   run(`show("lists")`);
 }
 
