@@ -731,7 +731,9 @@ def test_filing_uses_the_cached_listing_not_my_playlists(env, monkeypatch):
 def test_created_id_is_saved_before_home_ids_are_updated(env, monkeypatch):
     """A crash right after creating a part's playlist must not leave it an
     unrecorded orphan: the draft needs to know about it before the
-    config write that marks it a home, not after."""
+    config write that marks it a home, not after. And the resumed run must
+    still end up marking it a home — the id being pre-recorded must not
+    make the home-marking write get skipped for good."""
     real_update_config = appmod.store.update_config
     calls = {"n": 0}
 
@@ -753,3 +755,6 @@ def test_created_id_is_saved_before_home_ids_are_updated(env, monkeypatch):
     env.post("/api/splitparts/H1/done", json=body)
     assert progress(env)["state"] == "done"
     assert [e[0] for e in env.log].count("create") == 2   # p1 was not created twice
+    cfg = appmod.store.config()
+    assert {"N1", "N2"} <= set(cfg["home_ids"])
+    assert {"N1", "N2"} <= set(cfg["sticky_home_ids"])

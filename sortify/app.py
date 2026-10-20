@@ -1035,16 +1035,26 @@ def _splitparts_run_done(pid: str, opts: dict) -> None:
             new_id = state["created"].get(key)
             if not new_id:
                 new_id, _ = sp.create_playlist_full(name)
-                # Record it before the config write below: a crash between
+                # Record it before marking it a home below: a crash between
                 # the two must not leave this id unrecorded — that would
                 # make resume create a second playlist for the same part
                 # and orphan the first, forever untracked.
                 state["created"][key] = new_id
                 save()
-                cfg = store.config()
+            # Idempotent, and run on every pass — not only when the id was
+            # just created above — so a crash in the config write on a
+            # prior attempt (new_id already in state["created"]) still
+            # gets the id marked a home on the next attempt, instead of
+            # skipping this forever because `if not new_id:` was already
+            # false. Skip the write once both sets already have it, so a
+            # fully-resolved resume doesn't pay a needless config save.
+            cfg = store.config()
+            home_ids = set(cfg.get("home_ids") or [])
+            sticky_home_ids = set(cfg.get("sticky_home_ids") or [])
+            if new_id not in home_ids or new_id not in sticky_home_ids:
                 store.update_config(
-                    home_ids=sorted(set(cfg.get("home_ids") or []) | {new_id}),
-                    sticky_home_ids=sorted(set(cfg.get("sticky_home_ids") or []) | {new_id}))
+                    home_ids=sorted(home_ids | {new_id}),
+                    sticky_home_ids=sorted(sticky_home_ids | {new_id}))
             if key not in state["filled"]:
                 uris = part["uris"]
                 added = state.setdefault("added", {})
