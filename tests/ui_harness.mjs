@@ -281,6 +281,46 @@ run("stopNowPolling()");
 }
 
 // ============================================================================
+// I2 — no keep (and no reject) fires from the keyboard while an error card
+// is up. A failed poll leaves `nowState` untouched on purpose (so the last
+// known truth stays on screen), which means `nowState.playing` can still
+// read true while the card itself shows an error — the `!nowProblem` guard
+// in the keydown handler is what stops a stray digit or `r` from filing or
+// removing the track the screen no longer shows.
+// ============================================================================
+{
+  setNow({
+    status: 200,
+    body: {
+      playing: true, is_playing: true, poll_after_ms: 999999,
+      track: { uri: "spotify:track:i2", name: "Song", artists: [{ name: "A" }], sortable: true, image: null },
+      context: { id: "IN1", name: "[Hazy]", is_input: true }, sitting: null,
+      suggestions: [{ playlist_id: "H1", pct: 90, reasons: [], already: false }],
+      homes: [{ id: "H1", name: "Home", folder: "" }],
+      inputs: [{ id: "IN1", name: "[Hazy]", has_track: true }],
+    },
+  });
+  run(`show("now"); filedUris = {}; nowActions = 0; nowActionLog = []; pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+
+  routes["GET /api/now?light=1"] = { status: 500, body: { detail: "boom" } };
+  routes["GET /api/now?light=1&force=1"] = { status: 500, body: { detail: "boom" } };
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  check("I2 the error card is up while nowState.playing still reads true",
+        run(`nowProblem`) === true && run(`nowState.playing`) === true, "");
+
+  resetLog();
+  fireKey("1");
+  fireKey("r");
+  await tick();
+  check("I2 no keep (and no reject) fires from the keyboard while an error card is up",
+        posts("/api/act") === 0, `${posts("/api/act")} POST(s)`);
+}
+
+// ============================================================================
 // V — Now-tab presentation pins (2026-08 visual refresh): cooldown countdown
 // card, hidden-until-useful Undo, nav active state.
 // ============================================================================
@@ -4472,7 +4512,10 @@ run("stopNowPolling()");
   check("SP ...the counter does not go below 2", $$("sp-n").textContent === "2", $$("sp-n").textContent);
   for (let i = 0; i < 6; i++) run(`$("sp-plus").onclick()`);
   check("SP ...nor above 6", $$("sp-n").textContent === "6", $$("sp-n").textContent);
-  run(`$("sp-minus").onclick(); $("sp-minus").onclick(); $("sp-minus").onclick(); $("sp-minus").onclick()`);
+  // Lands on 3 — not the 2 the counter defaults to — so the POST below can
+  // tell "the chosen number" apart from "whatever the default happens to be".
+  run(`$("sp-minus").onclick(); $("sp-minus").onclick(); $("sp-minus").onclick()`);
+  check("SP ...the counter now reads the chosen 3", $$("sp-n").textContent === "3", $$("sp-n").textContent);
 
   routes["POST /api/splitparts/H1/suggest"] = { status: 200, body: { started: true } };
   routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "done", phase: "done", done: 0, total: 0, message: null, summary: null } };
@@ -4480,7 +4523,7 @@ run("stopNowPolling()");
   await run(`$("sp-suggest").onclick()`);
   await tick(); await tick();
   const sent = log.find((l) => l.method === "POST" && l.path === "/api/splitparts/H1/suggest");
-  check("SP Suggest posts the chosen number", sent && JSON.parse(sent.body).n === 2, JSON.stringify(sent));
+  check("SP Suggest posts the chosen number", sent && JSON.parse(sent.body).n === 3, JSON.stringify(sent));
   check("SP ...and lands on the parts, one chip per part with its count",
         $$("sp-parts").hidden === false &&
         /data-key="p1"[^>]*>[\s\S]*rock[\s\S]*3/.test($$("sp-chips").innerHTML) &&
@@ -4506,6 +4549,46 @@ run("stopNowPolling()");
   await run(`openSpHome(spHomes[0])`);
   await tick();
   check("SP a home with a draft opens straight on its parts", $$("sp-parts").hidden === false, "");
+
+  // Fix round 1, finding 2: a Suggest started on one home must not keep
+  // polling — or clobber the screen — once a different home is opened.
+  // H1's progress never resolves ("running" forever), so the only way its
+  // poll stops is if opening another home stops it.
+  routes["POST /api/splitparts/H1/suggest"] = { status: 200, body: { started: true } };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "running", phase: "tagging", done: 1, total: 5, message: null, summary: null } };
+  resetLog();
+  await run(`spSuggest(2)`);
+  check("SP starting Suggest polls the open home's progress once",
+        gets("/api/splitparts/H1/progress") === 1, `${gets("/api/splitparts/H1/progress")} GET(s)`);
+
+  const DRAFT_H3 = {
+    playlist_id: "H3", name: "Third Home", snapshot_id: "s3", n: 2,
+    parts: [{ key: "q1", name: "folk", uris: ["v1"] }, { key: "q2", name: "ambient", uris: ["v2"] }],
+    unknown: [], hint: null, scores: { "2": 0.4 },
+    songs: { v1: { name: "Six", artists: "F", local: false }, v2: { name: "Seven", artists: "G", local: false } },
+    tracks: [], done: null,
+  };
+  routes["GET /api/splitparts/H3"] = { status: 200, body: DRAFT_H3 };
+  resetLog();
+  await run(`openSpHome({ id: "H3", name: "Third Home" })`);
+  await tick();
+  check("SP opening another home shows its own parts, not the old one's",
+        /folk/.test($$("sp-chips").innerHTML) && !/rock/.test($$("sp-chips").innerHTML),
+        $$("sp-chips").innerHTML);
+  run(`spShowPart("q2")`);
+  check("SP ...and the new home's chip tap sticks",
+        run(`spShown`) === "q2", run(`spShown`));
+
+  resetLog();
+  // H1's poll was scheduled 1000ms out while it was "running"; a real wait
+  // (not just a tick) is what gives a surviving timer the chance to fire.
+  await new Promise((r) => setTimeout(r, 1100));
+  check("SP the old home's abandoned poll makes no further request",
+        gets("/api/splitparts/H1/progress") === 0 && gets("/api/splitparts/H3/progress") === 0,
+        `H1=${gets("/api/splitparts/H1/progress")} H3=${gets("/api/splitparts/H3/progress")}`);
+  check("SP ...and does not snap the new home's screen back to its first part",
+        run(`spShown`) === "q2", run(`spShown`));
+
   run(`spStopPolling(); show("lists")`);
 }
 

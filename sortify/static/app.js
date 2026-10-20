@@ -762,9 +762,10 @@ let nowState = null;   // last /api/now payload + client flags
 // than a live track. `nowState` is deliberately NOT cleared on a failed poll
 // (the toasts still want the last known truth), so it alone cannot answer
 // "is what the user is looking at current?" — and the keyboard must not fire
-// an irreversible keep against a track the screen stopped showing. A keep
-// spends a call and removes the track from every future suggestion; unlike
-// /api/act there is no undo.
+// a stray filing or removal against a track the screen stopped showing and no
+// longer names. Both go through /api/act and can be undone, but the undo
+// stack only knows about the track actually on screen — a keypress aimed at
+// a track the error card has hidden would act on the wrong one blind.
 let nowProblem = false;
 let nowTimer = null;
 let nowActions = 0;    // enables Undo
@@ -1777,10 +1778,9 @@ function bothButton(d) {
 
 function renderNow() {
   const d = nowState;
-  // Callers that are not the poll can reach this before any poll has ever
-  // succeeded, because nowState starts null. Dereferencing d below then threw
-  // a TypeError that ate a success toast on one path and escaped as an
-  // unhandled rejection on another.
+  // Defensive: `nowState` starts null and only a successful poll sets it, so
+  // a re-render triggered before the first poll has landed must not
+  // dereference `d` blindly.
   if (!d) { return; }
   // A reveal lasts exactly one track: it falls away the moment the playing
   // uri is no longer the one it was opened for.
@@ -3632,9 +3632,10 @@ function spPanel(id) {
   for (const s of ["sp-setup", "sp-progress", "sp-parts", "sp-done"]) $(s).hidden = s !== id;
 }
 function spStopPolling() { clearTimeout(spPollTimer); spPollTimer = null; }
-const spUrl = (tail = "") => `/api/splitparts/${encodeURIComponent(spPid)}${tail}`;
+const spUrl = (tail = "", pid = spPid) => `/api/splitparts/${encodeURIComponent(pid)}${tail}`;
 
 async function showSplit() {
+  spStopPolling();
   show("split");
   spSection("sp-pick");
   $("sp-homes").innerHTML = '<p class="hint">loading…</p>';
@@ -3664,6 +3665,7 @@ function renderSpHomes() {
 $("sp-filter").oninput = renderSpHomes;
 
 async function openSpHome(home) {
+  spStopPolling();
   spPid = home.id;
   spDraft = null;
   $("sp-title").textContent = home.name;
@@ -3702,30 +3704,42 @@ async function spSuggest(n) {
 
 // One poll; schedules the next while the server job runs. `kind` says what
 // a finished job means: a fresh draft ("suggest") or a finished Done ("done",
-// handled in Task 10's spDoneFinished).
-async function spPoll(kind) {
+// handled in Task 10's spDoneFinished). `pid` is captured at the moment this
+// poll chain started (default: whatever home was open then) and carried
+// through every re-schedule — opening a different home moves `spPid` out
+// from under it, and without a pid of its own this kept building URLs from
+// the live global and, worse, kept re-arming itself against whatever home
+// happened to be open when it next fired. `spStopPolling()` at the top of
+// `showSplit`/`openSpHome` cancels the still-pending timer outright; the
+// `pid !== spPid` checks below are the fallback for a request already in
+// flight at the moment of the switch, which a cleared timeout cannot recall.
+async function spPoll(kind, pid = spPid) {
   spStopPolling();
   let p;
   try {
-    p = await api(spUrl("/progress"));
+    p = await api(spUrl("/progress", pid));
   } catch (e) {
-    spPollTimer = setTimeout(() => spPoll(kind), 2000);
+    if (pid !== spPid) return;
+    spPollTimer = setTimeout(() => spPoll(kind, pid), 2000);
     return;
   }
+  if (pid !== spPid) return;   // a different home opened while this was in flight
   if (p.state === "running") {
     const count = p.total ? ` — ${p.done} of ${p.total}` : "";
     $("sp-progress").innerHTML = `<div class="spinner"></div><p class="hint">${esc(p.phase || "working")}${count}</p>`;
-    spPollTimer = setTimeout(() => spPoll(kind), 1000);
+    spPollTimer = setTimeout(() => spPoll(kind, pid), 1000);
     return;
   }
   if (kind === "done") { spDoneFinished(p); return; }
   if (p.state === "error") { renderSpSetup(p.message || "the suggestion failed"); return; }
   try {
-    spDraft = await api(spUrl());
+    spDraft = await api(spUrl("", pid));
   } catch (e) {
+    if (pid !== spPid) return;
     renderSpSetup(e.message);
     return;
   }
+  if (pid !== spPid) return;
   spShown = spDraft.parts[0]?.key || null;
   renderSpParts();
 }
@@ -3811,8 +3825,8 @@ document.addEventListener("keydown", (e) => {
   // `nowProblem` and not just `nowState?.playing`: a failed poll leaves
   // nowState untouched on purpose, so after e.g. a 500 from /api/now the
   // screen shows an error card while `playing` still reads true — and `1`
-  // would fire a keep, which is final and costs a call. The card has to be
-  // showing the track a keystroke is about to decide on.
+  // would file, or `r` would remove, the track that error card no longer
+  // shows. The card has to be showing the track a keystroke is about to act on.
   if (!$("view-now").hidden && !nowProblem && nowState?.playing) {
     // Before the filed-guard below: once this track is filed or removed the
     // strip shows its Undo, and `u` must reach it — the guard used to eat
