@@ -17,13 +17,8 @@ escalating penalties. Therefore:
   evidence, not optimism. The 2026-08-13 ban came from 678 calls in ~70 minutes.
   (`DAILY_CAP` was raised 600 → 1000 on 2026-08-20 on the strength of
   autoqueuer's clean 1208-call day — the rate protections are unchanged.)
-  The queued materialiser adds two more: `BULK_RESERVE` 150 means it never
-  spends the day's last 150 calls and sleeps to local midnight instead — unless
-  the run was enqueued with `spend_reserve: true` (per-run checkbox/API flag,
-  recorded in queue.json), which moves that line to `DAILY_CAP` itself; its
-  governor holds a 7.0/min ceiling and only escalates after 15 clean minutes.
-  `data/pacing.json` carries the measured `max_clean_rate` — the number that
-  replaces the guess band once the rate has actually been observed clean.
+  `BULK_RESERVE` 150 is a fourth layer: a bulk call never spends the day's
+  last 150 calls, sleeping to local midnight instead.
 - **It is the rate, not the day's total.** spotify-autoqueuer ran 1208 calls on
   2026-08-14 (~1.8/min) with no penalty, against sortify's 678 at ~9.7/min that
   earned ~23h. So `WINDOW_CAP` and the pacing are the real protection; the daily
@@ -98,7 +93,7 @@ escalating penalties. Therefore:
   line: signed in it redirects to `/`, signed out to `/gate/start`.
 - Tests: `.venv/bin/pytest -q` — keep them green; they cost zero API calls.
   Frontend: `node tests/ui_harness.mjs` (no framework, no build step — a
-  hand-run harness of 189 checks against a stub DOM, also zero API calls).
+  hand-run harness against a stub DOM, also zero API calls).
   Both must be green before any commit touching their surface.
 
 ## Conventions (encoded in data/config.json — don't re-derive)
@@ -213,3 +208,33 @@ escalating penalties. Therefore:
   contains the leaf, or the target having subfolders. On this account that
   leaves 52 of 88 folders targetable; the rest have to be moved by hand.
   Don't narrow the guard without a mover that can identify the row it clicks.
+
+## Split a home into parts
+
+- The Split tab (since 2026-10): pick a home, choose 2–6 parts, get a
+  suggestion, drag songs between parts on the phone, tap a song for its
+  30 s Deezer preview, then Done. Spec:
+  `docs/superpowers/specs/2026-10-20-split-into-parts-design.md`.
+- **Nothing is written to Spotify before Done.** Suggest reads the snapshot
+  (1 call) and the track list only when it moved (~1 per 100).
+- The grouping (`sortify/splitparts.py`) is pure and offline: artist tags,
+  Last.fm getSimilar and artist-similar, average-linkage clustering cut at
+  exactly N with slivers folded in. Weights are constants in that file.
+  The Last.fm fill-in that feeds it stops after 10 consecutive failures and
+  groups with whatever is already stored.
+- Drafts live in `data/splitparts.json`, one per home; every move is saved
+  at once. Once Done has started for a draft, Suggest, moves, part changes,
+  Re-read and Discard are all refused (409) until Done finishes; the UI
+  then shows a locked "Finish Done" screen with the stored choices, and a
+  resumed Done always uses the choices it started with.
+- Done creates and fills the new parts first and touches the original only
+  after that (🐾 rename and dropped from the home lists, or batched
+  removal). It is resumable per add batch (no duplicates), marks every
+  created part a home on every pass, and refuses a folder that wasn't
+  offered on a first attempt (a resume doesn't refuse one, since filing
+  fails without damage). Batch removal's upper limit is still unprobed;
+  `REMOVE_BATCH` stays 100 until the probe recorded in the plan (Task 1
+  Step 6) has actually been run.
+- Replaced the 2026-08 split (piles, sittings, the queued materialiser):
+  all of that code is gone; its data files were kept as
+  `*.bak-2026-10-20`.
