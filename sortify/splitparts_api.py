@@ -6,6 +6,7 @@ the Spotify client. Spec: docs/superpowers/specs/2026-10-20-split-into-parts-des
 
 from __future__ import annotations
 
+import math
 import threading
 
 from .splitparts import Suggestion
@@ -156,4 +157,72 @@ def remove_part(draft: dict, key: str, moves: dict[str, str]) -> dict:
     draft["parts"] = [p for p in draft["parts"] if p["key"] != key]
     for u in leaving["uris"]:
         _part(draft, moves[u])["uris"].append(u)
+    return draft
+
+
+ORIGINAL_CHOICES = ("subset", "part")
+
+
+def done_plan(draft: dict, original: str, part_key: str | None,
+              names: dict[str, str] | None = None, remove_batch: int = 100) -> dict:
+    """What Done will do, and what it costs, without doing any of it."""
+    if original not in ORIGINAL_CHOICES:
+        raise ValueError("choose what happens to the original")
+    keys = [p["key"] for p in draft["parts"]]
+    keep_key = part_key if original == "part" else None
+    if original == "part" and keep_key not in keys:
+        raise ValueError("pick the part the original becomes")
+    songs = draft.get("songs") or {}
+    names = names or {}
+
+    def local(u: str) -> bool:
+        return bool((songs.get(u) or {}).get("local"))
+
+    new_parts, empty = [], []
+    for p in draft["parts"]:
+        name = (names.get(p["key"]) or p["name"]).strip() or p["name"]
+        if p["key"] == keep_key:
+            continue
+        uris = list(dict.fromkeys(u for u in p["uris"] if not local(u)))
+        if uris:
+            new_parts.append({"key": p["key"], "name": name, "uris": uris})
+        else:
+            empty.append(name)
+    if len(new_parts) + (1 if keep_key else 0) < 2:
+        raise ValueError("at least 2 parts need songs in them")
+
+    removals: list[str] = []
+    if keep_key:
+        keep = set(_part(draft, keep_key)["uris"])
+        removals = list(dict.fromkeys(
+            u for p in draft["parts"] if p["key"] != keep_key
+            for u in p["uris"] if u not in keep and not local(u)))
+    calls = 1 + sum(1 + math.ceil(len(p["uris"]) / 100) for p in new_parts)
+    calls += 1 if original == "subset" else math.ceil(len(removals) / remove_batch)
+    return {"new_parts": new_parts, "empty": empty,
+            "local": [songs[u]["name"] for u in songs if local(u)],
+            "removals": removals, "calls": calls, "creates": len(new_parts)}
+
+
+def reconcile(draft: dict, tracks: list[dict], snapshot_id: str | None,
+              tag_artists: dict, track_map: dict, artist_map: dict) -> dict:
+    """The playlist changed in Spotify: keep the user's moves for songs
+    still there, drop songs that left, place new songs where they fit best
+    and mark them "?"."""
+    from .splitparts import place
+    slim = slim_tracks(tracks)
+    present = {t["uri"] for t in slim}
+    for p in draft["parts"]:
+        p["uris"] = [u for u in p["uris"] if u in present]
+    placed = {u for p in draft["parts"] for u in p["uris"]}
+    new = [t["uri"] for t in slim if t["uri"] not in placed]
+    picks = place(slim, [p["uris"] for p in draft["parts"]], new,
+                  tag_artists, track_map, artist_map)
+    for u in new:
+        draft["parts"][picks.get(u, 0)]["uris"].append(u)
+    draft["unknown"] = [u for u in draft["unknown"] if u in present] + \
+        [u for u in new if u not in draft["unknown"]]
+    draft["tracks"] = slim
+    draft["songs"] = _songs(tracks)
+    draft["snapshot_id"] = snapshot_id
     return draft

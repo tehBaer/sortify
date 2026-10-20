@@ -21,7 +21,7 @@ import uvicorn
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import filing
 from . import foldermove
@@ -50,6 +50,7 @@ from .spotify import (
     DAILY_CAP,
     LIKED_ID,
     REDIRECT_URI,
+    REMOVE_BATCH,
     AuthFlowError,
     AuthNeeded,
     Spotify,
@@ -842,8 +843,9 @@ def splitparts_progress(pid: str):
     with _splitparts_job_lock:
         job = dict(_splitparts_job)
     if job.get("pid") != pid:
-        return {"state": "idle", "phase": "", "done": 0, "total": 0, "message": None}
-    return {k: job.get(k) for k in ("state", "phase", "done", "total", "message")}
+        return {"state": "idle", "phase": "", "done": 0, "total": 0, "message": None,
+                "summary": None}
+    return {k: job.get(k) for k in ("state", "phase", "done", "total", "message", "summary")}
 
 
 @app.get("/api/splitparts/{pid}")
@@ -914,6 +916,211 @@ def splitparts_remove_part(pid: str, key: str, body: SplitRemoveIn):
                 counts[dest] = counts.get(dest, 0) + 1
             return {"moves": counts}
         spa.remove_part(draft, key, moves)
+        spa.put_draft(store, draft)
+    return draft
+
+
+class SplitDoneIn(BaseModel):
+    names: dict[str, str] = Field(default_factory=dict)
+    folder: str | None = None
+    original: str = "subset"
+    part: str | None = None
+
+
+def _splitparts_name_problem(names: list[str]) -> str | None:
+    cfg = store.config()
+    for name in names:
+        problem = creatable_home_name_problem(
+            name,
+            input_pattern=cfg.get("input_name_pattern"),
+            exclude_patterns=cfg.get("home_name_exclude_patterns") or [],
+            exclude_emoji=bool(cfg.get("home_exclude_emoji_names")),
+        )
+        if problem:
+            return f"{name!r}: {problem}"
+    return None
+
+
+@app.get("/api/splitparts/{pid}/plan")
+def splitparts_plan(pid: str, original: str = "subset", part: str | None = None):
+    draft = _splitparts_draft(pid)
+    try:
+        plan = spa.done_plan(draft, original, part, remove_batch=REMOVE_BATCH)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    choices, default = _home_folder_choices(store.config(), pid)
+    return {"calls": plan["calls"], "creates": plan["creates"], "empty": plan["empty"],
+            "local": plan["local"], "removals": len(plan["removals"]),
+            "folders": choices, "folder": default}
+
+
+def _splitparts_seed_tracks(pid: str, snapshot_id: str | None, uris: list[str],
+                            full: dict[str, dict]) -> None:
+    """Mirror a Done step in the local track cache (no call), so the new
+    homes take part in filing suggestions at once. `full` maps uri to the
+    richest track dict we hold (the original's cached tracks)."""
+    if not snapshot_id:
+        return
+    cache = store.cache()
+    entry = cache["playlists"].get(pid) or {}
+    entry.update({"snapshot_id": snapshot_id, "fetched_at": time.time(),
+                  "tracks": [full[u] for u in uris if u in full]})
+    cache["playlists"][pid] = entry
+    store.save_cache(cache)
+
+
+def _splitparts_file(created: list[dict], folder: str) -> None:
+    """File the new parts one after another: the mover drives one desktop
+    client, so the jobs must not overlap."""
+    def run():
+        for c in created:
+            filing.start(c["id"], c["name"], folder, items=sp.my_playlists(),
+                         on_success=lambda path, p=c["id"]: store.set_folder_path(p, path),
+                         threaded=False)
+    if _splitparts_threaded:
+        threading.Thread(target=run, daemon=True).start()
+    else:
+        run()
+
+
+def _splitparts_run_done(pid: str, opts: dict) -> None:
+    def progress(**fields):
+        with _splitparts_job_lock:
+            _splitparts_job.update(fields)
+
+    try:
+        draft = spa.get_draft(store, pid)
+        if draft is None:
+            progress(state="error", message="no split in progress for this playlist")
+            return
+        first_attempt = draft.get("done") is None
+        state = draft.get("done") or {"opts": opts, "created": {}, "filled": [],
+                                      "original_done": False}
+        opts = state["opts"]   # a resumed Done keeps the choices it started with
+        draft["done"] = state
+
+        def save():
+            spa.put_draft(store, draft)
+
+        if first_attempt:
+            # Only before anything was written: once parts exist, a resume
+            # must finish the job rather than stop on our own changes.
+            progress(phase="checking the playlist")
+            if sp.snapshot(pid) != draft["snapshot_id"]:
+                draft["done"] = None
+                progress(state="changed", message=(
+                    "the playlist changed in Spotify since the suggestion — "
+                    "re-read it to continue"))
+                return
+        plan = spa.done_plan(draft, opts["original"], opts.get("part"),
+                             names=opts.get("names"), remove_batch=REMOVE_BATCH)
+        save()
+        full = {t["uri"]: t for t in
+                (store.cache()["playlists"].get(pid) or {}).get("tracks") or []}
+        for t in draft["tracks"]:
+            full.setdefault(t["uri"], t)
+        me = (store.cache().get("me") or {}).get("id")
+        created = []
+        for i, part in enumerate(plan["new_parts"]):
+            key, name = part["key"], part["name"]
+            progress(phase=f"creating “{name}” ({i + 1} of {len(plan['new_parts'])})", done=i)
+            new_id = state["created"].get(key)
+            if not new_id:
+                new_id, _ = sp.create_playlist_full(name)
+                state["created"][key] = new_id
+                cfg = store.config()
+                store.update_config(
+                    home_ids=sorted(set(cfg.get("home_ids") or []) | {new_id}),
+                    sticky_home_ids=sorted(set(cfg.get("sticky_home_ids") or []) | {new_id}))
+                save()
+            if key not in state["filled"]:
+                snap = None
+                for b in range(0, len(part["uris"]), 100):
+                    snap = sp.add_to_playlist(new_id, part["uris"][b:b + 100]) or snap
+                snap = snap or f"created:{new_id}"
+                sp.remember_playlist({"id": new_id, "name": name, "owner": me,
+                                      "editable": True, "total": len(part["uris"]),
+                                      "snapshot_id": snap, "image": None, "description": ""})
+                _splitparts_seed_tracks(new_id, snap, part["uris"], full)
+                state["filled"].append(key)
+                save()
+            created.append({"id": new_id, "name": name, "count": len(part["uris"])})
+
+        if not state["original_done"]:
+            progress(phase="updating the original", done=len(plan["new_parts"]))
+            if opts["original"] == "subset":
+                new_name = roles.mark_subset_name(draft["name"])
+                if new_name != draft["name"]:
+                    sp.rename_playlist(pid, new_name)
+                cfg = store.config()
+                store.update_config(
+                    home_ids=[h for h in cfg.get("home_ids") or [] if h != pid],
+                    sticky_home_ids=[h for h in cfg.get("sticky_home_ids") or [] if h != pid])
+            else:
+                snap = sp.remove_many(pid, plan["removals"])
+                gone = set(plan["removals"])
+                kept = [t["uri"] for t in draft["tracks"] if t["uri"] not in gone]
+                _splitparts_seed_tracks(pid, snap, kept, full)
+                _sync_listing_snapshot(pid, snap, total=len(kept))
+            state["original_done"] = True
+            save()
+
+        _profile_state.clear()
+        _profile_state["built_at"] = 0.0
+        if opts.get("folder"):
+            _splitparts_file(created, opts["folder"])
+        spa.drop_draft(store, pid)
+        progress(state="done", phase="done", done=len(plan["new_parts"]), message=None,
+                 summary={"created": created, "original": opts["original"],
+                          "empty": plan["empty"], "local": plan["local"]})
+    except SpotifyError as exc:
+        progress(state="error", message=f"{exc} — your split is saved; press Done again to continue")
+    except Exception as exc:
+        log.exception("split: done failed")
+        progress(state="error", message=f"done failed: {exc} — your split is saved; press Done again to continue")
+
+
+@app.post("/api/splitparts/{pid}/done")
+def splitparts_done(pid: str, body: SplitDoneIn):
+    draft = _splitparts_draft(pid)
+    try:
+        plan = spa.done_plan(draft, body.original, body.part, names=body.names,
+                             remove_batch=REMOVE_BATCH)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    problem = _splitparts_name_problem([p["name"] for p in plan["new_parts"]])
+    if problem:
+        raise HTTPException(400, problem)
+    with _splitparts_job_lock:
+        if _splitparts_job.get("state") == "running":
+            raise HTTPException(409, "already running")
+        _splitparts_job.clear()
+        _splitparts_job.update({"pid": pid, "state": "running", "phase": "starting",
+                                "done": 0, "total": plan["creates"], "message": None,
+                                "summary": None})
+    opts = {"names": body.names, "folder": body.folder, "original": body.original,
+            "part": body.part}
+    if _splitparts_threaded:
+        threading.Thread(target=_splitparts_run_done, args=(pid, opts), daemon=True).start()
+    else:
+        _splitparts_run_done(pid, opts)
+    return {"started": True}
+
+
+@app.post("/api/splitparts/{pid}/reread")
+def splitparts_reread(pid: str):
+    draft0 = _splitparts_draft(pid)
+    if draft0.get("done") is not None:
+        raise HTTPException(409, _SPLITPARTS_DONE_STARTED_MSG)
+    snap = sp.snapshot(pid)               # network outside the draft lock
+    tracks = _cached_tracks(pid, snap)
+    _sync_listing_snapshot(pid, snap, total=len(tracks))
+    with spa._lock:
+        draft = _splitparts_draft(pid)
+        if draft.get("done") is not None:
+            raise HTTPException(409, _SPLITPARTS_DONE_STARTED_MSG)
+        spa.reconcile(draft, tracks, snap, store.tag_artists(),
+                      store.lastfm_track_map(), store.lastfm_artist_map())
         spa.put_draft(store, draft)
     return draft
 

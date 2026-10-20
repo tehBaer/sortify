@@ -409,3 +409,231 @@ def test_move_error_message_format(drafted):
 
     res2 = drafted.post("/api/splitparts/H1/move", json={"uri": uri, "to": "p9"})
     assert res2.json()["detail"] == "no part 'p9'"
+
+
+# ---- Done ------------------------------------------------------------------
+
+from sortify.spotify import SpotifyError
+
+
+@pytest.fixture
+def env(drafted, monkeypatch):
+    appmod.store.update_config(input_name_pattern=r"^\[.+\]$")
+    log = []
+    ids = iter(["N1", "N2", "N3", "N4", "N5"])
+
+    def create(name, description="", bulk=False, spend_reserve=False, public=False):
+        new = next(ids)
+        log.append(("create", name, new))
+        return new, f"snap-{new}"
+
+    def add(pid, uris, bulk=False, spend_reserve=False):
+        log.append(("add", pid, list(uris)))
+        return f"snap-add-{pid}"
+
+    def remove_many(pid, uris):
+        log.append(("remove", pid, list(uris)))
+        return "snap-removed"
+
+    def rename(pid, name):
+        log.append(("rename", pid, name))
+
+    monkeypatch.setattr(appmod.sp, "create_playlist_full", create)
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", add)
+    monkeypatch.setattr(appmod.sp, "remove_many", remove_many)
+    monkeypatch.setattr(appmod.sp, "rename_playlist", rename)
+    filed = []
+    monkeypatch.setattr(appmod.filing, "start",
+                        lambda pid, name, dest, **kw: filed.append((pid, name, dest)))
+    drafted.log = log
+    drafted.filed = filed
+    return drafted
+
+
+def progress(c):
+    return c.get("/api/splitparts/H1/progress").json()
+
+
+def edit_draft(fn):
+    env_ = appmod.store.splitparts()
+    fn(env_["drafts"]["H1"])
+    appmod.store.save_splitparts(env_)
+
+
+def test_plan_prices_keep_as_subset(env):
+    plan = env.get("/api/splitparts/H1/plan", params={"original": "subset"}).json()
+
+    # snapshot + (create + 1 add) x 2 + rename
+    assert plan["calls"] == 6
+    assert plan["creates"] == 2
+    assert plan["removals"] == 0 and plan["empty"] == [] and plan["local"] == []
+
+
+def test_plan_prices_original_becomes_a_part(env):
+    plan = env.get("/api/splitparts/H1/plan", params={"original": "part", "part": "p1"}).json()
+
+    # snapshot + (create + 1 add) + 1 removal batch
+    assert plan["calls"] == 4
+    assert plan["creates"] == 1
+    assert plan["removals"] == 10
+
+
+def test_done_keep_as_subset_creates_all_parts_then_renames_the_original(env):
+    res = env.post("/api/splitparts/H1/done", json={
+        "names": {"p1": "Rocky", "p2": "Jazzy"}, "folder": "ROOT / Mix", "original": "subset"})
+    assert res.status_code == 200
+
+    p = progress(env)
+    assert p["state"] == "done"
+    assert [e[0] for e in env.log] == ["create", "add", "create", "add", "rename"]
+    assert env.log[0][1] == "Rocky" and env.log[2][1] == "Jazzy"
+    assert env.log[-1] == ("rename", "H1", "🐾 Big Home")
+    cfg = appmod.store.config()
+    assert {"N1", "N2"} <= set(cfg["home_ids"]) and {"N1", "N2"} <= set(cfg["sticky_home_ids"])
+    assert "H1" not in cfg["home_ids"]
+    assert env.filed == [("N1", "Rocky", "ROOT / Mix"), ("N2", "Jazzy", "ROOT / Mix")]
+    assert p["summary"]["created"] == [{"id": "N1", "name": "Rocky", "count": 14},
+                                       {"id": "N2", "name": "Jazzy", "count": 10}]
+    assert env.get("/api/splitparts/H1").status_code == 404
+    assert env.calls == [("snapshot", "H1")]
+
+
+def test_done_original_becomes_a_part_removes_the_rest_from_it(env):
+    d = env.get("/api/splitparts/H1").json()
+    others = d["parts"][1]["uris"]
+
+    env.post("/api/splitparts/H1/done", json={"names": {}, "folder": None,
+                                               "original": "part", "part": "p1"})
+
+    assert progress(env)["state"] == "done"
+    assert [e[0] for e in env.log] == ["create", "add", "remove"]
+    assert env.log[-1] == ("remove", "H1", others)
+    assert "H1" in appmod.store.config()["home_ids"]
+    assert env.filed == []
+
+
+def test_done_part_syncs_the_listing_snapshot(env):
+    """After a "part" Done, the cached LISTING item for H1 must carry the
+    snapshot the removal actually produced — same reasoning as Suggest's
+    own _sync_listing_snapshot call: the profile rebuild keys off the
+    listing's snapshot_id, not the per-playlist track cache."""
+    env.post("/api/splitparts/H1/done", json={"names": {}, "folder": None,
+                                               "original": "part", "part": "p1"})
+
+    listing = appmod.store.cache()["playlist_list"]["items"]
+    home = next(p for p in listing if p["id"] == "H1")
+    assert home["snapshot_id"] == "snap-removed"
+
+
+def test_part_of_only_local_files_is_not_created(env):
+    env.post("/api/splitparts/H1/parts")
+    d = env.get("/api/splitparts/H1").json()
+    two = d["parts"][0]["uris"][:2]
+    for u in two:
+        env.post("/api/splitparts/H1/move", json={"uri": u, "to": "p3"})
+    edit_draft(lambda dr: [dr["songs"][u].update(local=True) for u in two])
+
+    plan = env.get("/api/splitparts/H1/plan", params={"original": "subset"}).json()
+    assert plan["creates"] == 2
+    assert plan["empty"] == ["New part"]
+    assert sorted(plan["local"]) == sorted(d["songs"][u]["name"] for u in two)
+
+    env.post("/api/splitparts/H1/done", json={"names": {}, "folder": None, "original": "subset"})
+    assert [e[0] for e in env.log].count("create") == 2
+
+
+def test_done_adds_each_song_once(env):
+    edit_draft(lambda dr: dr["parts"][0]["uris"].append(dr["parts"][0]["uris"][0]))
+
+    env.post("/api/splitparts/H1/done", json={"names": {}, "folder": None, "original": "subset"})
+
+    first_add = next(e for e in env.log if e[0] == "add")
+    assert len(first_add[2]) == len(set(first_add[2])) == 14
+
+
+def test_done_stops_when_the_playlist_changed(env, monkeypatch):
+    monkeypatch.setattr(appmod.sp, "snapshot", lambda pid: "snap-2")
+
+    env.post("/api/splitparts/H1/done", json={"names": {}, "folder": None, "original": "subset"})
+
+    p = progress(env)
+    assert p["state"] == "changed"
+    assert env.log == []
+
+
+def test_done_resumes_after_a_failure_without_duplicates(env, monkeypatch):
+    real_add = appmod.sp.add_to_playlist
+    failed = []
+
+    def flaky(pid, uris, bulk=False, spend_reserve=False):
+        if pid == "N2" and not failed:
+            failed.append(1)
+            raise SpotifyError(429, "rate limited")
+        return real_add(pid, uris)
+
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", flaky)
+    body = {"names": {}, "folder": None, "original": "subset"}
+
+    env.post("/api/splitparts/H1/done", json=body)
+    assert progress(env)["state"] == "error"
+    assert "press Done again" in progress(env)["message"]
+    assert not any(e[0] == "rename" for e in env.log)
+
+    env.post("/api/splitparts/H1/done", json=body)
+    assert progress(env)["state"] == "done"
+    assert [e[0] for e in env.log].count("create") == 2
+    assert [e[0] for e in env.log].count("rename") == 1
+
+
+def test_second_done_while_running_is_refused(env):
+    appmod._splitparts_job.update({"pid": "H1", "state": "running"})
+
+    res = env.post("/api/splitparts/H1/done", json={"names": {}, "folder": None, "original": "subset"})
+
+    assert res.status_code == 409
+    assert env.log == []
+
+
+def test_an_input_shaped_part_name_is_refused_before_any_call(env):
+    res = env.post("/api/splitparts/H1/done", json={
+        "names": {"p1": "[Oops]"}, "folder": None, "original": "subset"})
+
+    assert res.status_code == 400
+    assert env.log == []
+
+
+def test_a_bad_original_choice_is_refused(env):
+    assert env.post("/api/splitparts/H1/done", json={
+        "names": {}, "folder": None, "original": "part", "part": "p9"}).status_code == 400
+
+
+def test_reread_keeps_moves_and_places_new_songs(env, monkeypatch):
+    d = env.get("/api/splitparts/H1").json()
+    moved = d["parts"][0]["uris"][3]
+    env.post("/api/splitparts/H1/move", json={"uri": moved, "to": "p2"})
+    gone = d["parts"][0]["uris"][0]
+    new = {"uri": "spotify:track:new", "name": "Fresh", "is_local": False,
+           "artists": [{"id": "a0", "name": "Artist 0"}]}
+    changed = [t for t in TRACKS if t["uri"] != gone] + [new]
+    monkeypatch.setattr(appmod.sp, "snapshot", lambda pid: "snap-2")
+    monkeypatch.setattr(appmod.sp, "playlist_tracks", lambda pid: list(changed))
+
+    d2 = env.post("/api/splitparts/H1/reread").json()
+
+    assert d2["snapshot_id"] == "snap-2"
+    assert part_of(d2, moved) == "p2"
+    assert all(gone not in p["uris"] for p in d2["parts"])
+    assert part_of(d2, "spotify:track:new") == "p1"   # same artist as rock song 0
+    assert "spotify:track:new" in d2["unknown"]
+    assert d2["songs"]["spotify:track:new"]["name"] == "Fresh"
+
+
+def test_reread_refuses_when_done_has_already_started(env):
+    draft = spa.get_draft(appmod.store, "H1")
+    draft["done"] = {"created": {"p1": "N1"}}
+    spa.put_draft(appmod.store, draft)
+
+    res = env.post("/api/splitparts/H1/reread")
+
+    assert res.status_code == 409
+    assert "Done has already started" in res.json()["detail"]
