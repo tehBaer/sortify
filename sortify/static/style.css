@@ -670,7 +670,10 @@ body.on-now header h1 { visibility: hidden; }
      overscroll-behavior keeps a flick that hits the end from carrying on
      into the page behind it (#input-pop uses the same guard). */
   overflow-y: auto; overscroll-behavior: contain;
-  padding-right: 2px;
+  /* A phone's scrollbar is an overlay drawn over the box's right edge, so
+     with 2px it sat on the rows' borders and the reasons. The gutter is
+     the space it draws in instead. #picker-list keeps the same one. */
+  padding-right: 10px;
 }
 /* Inboxes go two to a row. A home suggestion is a ranked guess and its
    sub-line is the reason to trust it, so it earns the full width; an inbox
@@ -960,7 +963,7 @@ kbd {
   padding: 1rem; display: flex; flex-direction: column; gap: .6rem;
   box-shadow: var(--shadow-card);
 }
-#picker-list { overflow-y: auto; flex: 1; }
+#picker-list { overflow-y: auto; flex: 1; padding-right: 10px; }
 #picker-list button { display: block; width: 100%; text-align: left; margin-bottom: .4rem; }
 .picker-row { padding: .55rem .8rem; }
 /* Homeless heads the picker as a verdict rather than a destination, so it
