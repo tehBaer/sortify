@@ -1731,10 +1731,16 @@ run("stopNowPolling()");
   await tick();
   run("stopNowPolling()");
   const card = () => $$("now-card").innerHTML;
-  const panelOpen = () => card().includes('id="cover-panel"');
+  // Shut, the panel is still there as the strip; open means not shut.
+  const panelOpen = () => card().includes('id="cover-panel"') && !card().includes("cover-shut");
+  const strip = () => card().includes('class="cover-panel cover-shut') && card().includes('style="--f:0"');
   run(`if (coverOpen) closeCover()`);
-  run(`$("cover-peek").onclick()`);
-  check("CV the peek opens the large cover inside the card",
+  check("CV shut, the cover is a strip at the top of the card",
+        strip() && card().indexOf('id="cover-panel"') < card().indexOf("np-progress"), card().slice(0, 300));
+  check("CV ...that does not name the song, not even hidden",
+        !/Cover Song|Cover Artist|cover-info/.test(card()), card().slice(0, 400));
+  run(`$("cover-panel").onclick()`);
+  check("CV a tap on the strip opens the large cover inside the card",
         panelOpen() && /id="cover-panel"[\s\S]*src="http:\/\/img\/640"/.test(card()),
         `card=${card().slice(0, 300)}`);
   check("CV ...at the top of the card, above the playback strip",
@@ -1759,9 +1765,12 @@ run("stopNowPolling()");
         !panelOpen() && $$("share-pop").hidden === false,
         `panel=${panelOpen()} share hidden=${$$("share-pop").hidden}`);
   $$("share-pop").hidden = true;
-  run(`$("cover-peek").onclick()`);
   run(`$("cover-panel").onclick()`);
-  check("CV a tap on it closes it", !panelOpen(), "");
+  run(`$("cover-panel").onclick()`);
+  check("CV a tap on it shuts it back to the strip, folding up",
+        !panelOpen() && strip() && card().includes("cover-out"), card().slice(0, 200));
+  run(`renderNow()`);
+  check("CV ...and folds up only once", strip() && !card().includes("cover-out"), "");
   check("CV the cover button is gone from the bar",
         !/btn-cover/.test(fs.readFileSync(path.join(HERE, "..", "sortify", "static", "index.html"), "utf8")), "");
   run(`$("btn-reveal").onclick()`);
@@ -1769,7 +1778,7 @@ run("stopNowPolling()");
         document.body.classList.contains("peeked") && !panelOpen(), "");
   run(`setReveal(false)`);
 
-  run(`$("cover-peek").onclick()`);
+  run(`$("cover-panel").onclick()`);
   routes["GET /api/now?light=1"].body.track =
     { uri: "spotify:track:br4", name: "After Song", artists: [{ name: "After Artist" }],
       sortable: true, image: "http://img/x" };
@@ -1802,15 +1811,8 @@ run("stopNowPolling()");
   run("stopNowPolling()");
   const bar = $$("topbar");
   const pt = (y, t, x = 100) => ({ clientX: x, clientY: y, timeStamp: t, pointerId: 1 });
-  check("PEEK the cover's edge peeks out under the bar, from this song's art",
-        $$("cover-peek").hidden === false &&
-        $$("cover-peek-art").style.backgroundImage === 'url("http://img/300")',
-        `hidden=${$$("cover-peek").hidden} bg=${$$("cover-peek-art").style.backgroundImage}`);
-  $$("cover-peek").onclick();
-  check("PEEK a tap on it opens the cover, and it hides while the cover is open",
-        panelOpen() && $$("cover-peek").hidden === true, `hidden=${$$("cover-peek").hidden}`);
-  run(`closeCover()`);
-  check("PEEK ...and comes back when the cover shuts", $$("cover-peek").hidden === false, "");
+  check("PEEK the strip is this song's art", strip() && /src="http:\/\/img\/300"/.test(card()),
+        card().slice(0, 300));
   $$("nav-pop").hidden = false;
   bar.onpointerdown({ clientX: 100, clientY: 10, timeStamp: 0, pointerId: 1 });
   bar.onpointermove({ clientX: 100, clientY: 100, timeStamp: 400, pointerId: 1 });
@@ -1880,6 +1882,21 @@ run("stopNowPolling()");
   await new Promise((r) => setTimeout(r, 260));
   check("PULL a cancelled pull closes", !panelOpen() && !run("coverOpen"), "");
 
+  // The strip pulls too; the rest of the card does not (it scrolls).
+  const cardEl = $$("now-card");
+  const on = (hit) => ({ closest: (sel) => (sel === ".cover-panel" && hit ? {} : null) });
+  cardEl.onpointerdown({ ...pt(10, 0), target: on(false) });
+  cardEl.onpointermove({ ...pt(100, 400), target: on(false) });
+  cardEl.onpointerup(pt(100, 400));
+  check("PULL a drag elsewhere on the card does not pull", !panelOpen() && run("coverPull") === null, "");
+  cardEl.onpointerdown({ ...pt(10, 0), target: on(true) });
+  cardEl.onpointermove({ ...pt(160, 1000), target: on(true) });
+  check("PULL dragging the strip itself pulls the cover", panelOpen() && run("coverPull") > 0.4,
+        `pull=${run("coverPull")}`);
+  cardEl.onpointerup(pt(160, 1000));
+  check("PULL ...and letting go past the line opens it", run("coverOpen") && run("coverPull") === null, "");
+  run(`closeCover()`);
+
   routes["GET /api/now?light=1"].body.track.image = null;
   run(`pollNow(true)`);
   await tick();
@@ -1888,7 +1905,7 @@ run("stopNowPolling()");
   bar.onpointerdown(pt(10, 0));
   bar.onpointermove(pt(100, 400));
   bar.onpointerup(pt(100, 400));
-  check("PEEK no art, no peek", $$("cover-peek").hidden === true, "");
+  check("PEEK no art, no strip", !card().includes('id="cover-panel"'), "");
   check("PULL no cover: the bar does not pull", !panelOpen() && !run("coverOpen"), "");
 
   // A poll that never reaches the server ("Failed to fetch") says so with a
@@ -1902,7 +1919,7 @@ run("stopNowPolling()");
         /Failed to fetch/.test(card()) && /id="btn-now-retry"[^>]*>Try again</.test(card()),
         card().slice(0, 200));
   routes["GET /api/now?light=1&force=1"] = lightRoute;
-  check("PEEK a failed poll hides the peek with the track", $$("cover-peek").hidden === true, "");
+  check("PEEK a failed poll takes the strip with the track", !card().includes('id="cover-panel"'), "");
   resetLog();
   $$("btn-now-retry").onclick();
   check("RETRY ...pressing it disables it against a double tap",

@@ -1054,21 +1054,31 @@ body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
 }
 #btn-reveal.on { color: var(--accent); }
 
-/* The cover, pulled down from the bar into the card: full card width,
-   the title, artist and share under it; a tap on it closes it. It comes
-   down continuing the grey strip that peeked under the bar: the shade opens
-   from nothing with the image centred in it, so the middle of the cover
-   shows first and the top and bottom come in as it opens, while the image
-   goes from blurred grey to sharp colour. The
-   title and artist come in over the last stretch. Everything reads one
-   number, --f (0 shut, 1 open): a pull sets it inline, the tap's opening
-   animates it, a release transitions it. Registered so it can animate. */
+/* The cover, at the top of the card. Shut it is a strip: the middle of the
+   art, blurred and grey, with a grab pill, the hint that it is there
+   without naming the song. Open it is the full square, sharp and in colour,
+   with the title, artist and share under it; a tap on it shuts it again.
+   Everything between is the same element, drawn from one number, --f
+   (0 shut, 1 open): a pull sets it inline, a tap animates it, a release
+   transitions it. So the hint and the opening cannot part ways. Registered
+   so it can animate. */
 @property --f { syntax: "<number>"; inherits: true; initial-value: 1; }
-.cover-panel { margin-bottom: .9rem; cursor: pointer; }
+.cover-panel {
+  --strip: 12px;
+  cursor: pointer;
+  /* Shut, the strip tucks into the card's top padding and pushes what is
+     under it down only a little; open, it takes its full room. */
+  margin: calc((1 - var(--f)) * -.4rem) 0 calc(.45rem + var(--f) * .45rem);
+}
+/* The strip takes the pull itself, so it must not scroll the page. */
+.cover-panel.cover-shut { touch-action: none; }
 .cover-shade {
-  position: relative; overflow: hidden; border-radius: 12px;
-  /* Square, so its full height is its width: padding % reads the width. */
-  height: 0; padding-top: calc(var(--f) * 100%);
+  position: relative; overflow: hidden;
+  border-radius: calc(4px + var(--f) * 8px);
+  /* Square when open, so its full height is its width (padding % reads the
+     width); the strip's height when shut. The image sits centred in it, so
+     the middle shows first and the top and bottom come in as it opens. */
+  height: 0; padding-top: calc(var(--strip) + var(--f) * (100% - var(--strip)));
 }
 .track-card .cover-panel .cover-shade img {
   position: absolute; left: 0; top: 50%;
@@ -1080,8 +1090,18 @@ body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
      shade, which clips it. */
   transform: translateY(-50%) scale(calc(1 + (1 - var(--f)) * .08));
 }
+/* The grab pill: white with a thin dark ring, so it reads on a pale cover
+   and a dark one. Gone once the cover is a quarter open. */
+.cover-grip {
+  position: absolute; left: 50%; top: 4px; width: 36px; height: 4px; margin-left: -18px;
+  border-radius: 2px; background: rgba(255, 255, 255, .9);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .2);
+  opacity: clamp(0, calc(1 - var(--f) * 4), 1);
+}
 .cover-panel.cover-in { animation: cover-down .35s cubic-bezier(.2, .8, .2, 1); }
+.cover-panel.cover-out { animation: cover-up .25s cubic-bezier(.2, .8, .2, 1); }
 @keyframes cover-down { from { --f: 0; } }
+@keyframes cover-up { from { --f: 1; } }
 /* Takes its room only as it fades in, so a short pull does not open a gap
    between the strip of cover and the controls under it. */
 .cover-info {
@@ -1095,39 +1115,14 @@ body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
 .cover-title { font-weight: 700; font-size: 1.05rem; }
 .cover-artist { color: var(--muted); font-size: .92rem; }
 .cover-share { flex: 0 0 auto; color: var(--muted); }
-/* Pulled open from the top bar: the finger sets the size, so on the Now
-   view the bar must not scroll the page under it — except while the menu or
-   input list hangs from it, which scroll and take their own gestures. On
-   release the rest plays out. */
+/* Pulled open from the top bar too: on the Now view the bar must not scroll
+   the page under the finger — except while the menu or input list hangs
+   from it, which scroll and take their own gestures. */
 body.on-now header { touch-action: none; user-select: none; -webkit-user-select: none; }
 body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { touch-action: auto; }
-/* The cover behind the bar: its middle, blurred and grey, as a thin
-   lip under the bar, with a grab pill. Grey because it is still hidden:
-   the colour comes with the cover. Overlaid, so it moves no layout. Exactly
-   as wide as the cover it opens into, and lined up with it: main's 640px
-   cap, less main's 1rem sides, the card's 1px border and .85rem padding —
-   full-bleed, it stuck out past the card on both sides. */
-#cover-peek {
-  position: absolute; top: 100%; height: 10px; left: 50%;
-  width: calc(min(100%, 640px) - 3.7rem - 2px); transform: translateX(-50%);
-  overflow: hidden; cursor: pointer;
-  border-radius: 0 0 8px 8px;
-}
-body:not(.on-now) #cover-peek { display: none; }
-#cover-peek-art {
-  position: absolute; inset: -16px;
-  background: center / cover no-repeat;
-  filter: blur(8px) grayscale(1);
-}
-.peek-grip {
-  position: absolute; left: 50%; top: 3px; width: 36px; height: 4px; margin-left: -18px;
-  /* White with a thin dark ring, so it reads on a pale cover and a dark one. */
-  border-radius: 2px; background: rgba(255, 255, 255, .9);
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, .2);
-}
 .cover-panel.cover-settle { transition: --f .2s cubic-bezier(.2, .8, .2, 1); }
 @media (prefers-reduced-motion: reduce) {
-  .cover-panel.cover-in { animation: none; }
+  .cover-panel.cover-in, .cover-panel.cover-out { animation: none; }
   .cover-panel.cover-settle { transition: none; }
 }
 

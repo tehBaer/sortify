@@ -1071,7 +1071,6 @@ function fmtCountdown(ms) {
 
 function renderNowProblem(msg) {
   nowProblem = true;
-  paintCoverPeek(null);
   paintSittingBar();
   parkInputSwitch(/cooldown/.test(msg) ? "Spotify is cooling down" : "waiting for Spotify");
   stopCooldownTicker();
@@ -1918,7 +1917,6 @@ function renderNow() {
   // uri is no longer the one it was opened for.
   if (document.body.classList.contains("peeked") && d.track?.uri !== peekedUri) setReveal(false);
   if (coverOpen && (d.track?.uri || null) !== coverUri) closeCover(false);
-  paintCoverPeek(d);
   // Same expiry, same reason: the strip's undo offer belongs to one track.
   if (removedUri && d.track?.uri !== removedUri) removedUri = null;
   // Next's completion signal. What the press was FOR is a different track, so
@@ -1981,9 +1979,10 @@ function renderNow() {
   // a pause toggle, the suggestions arriving) is not an arrival.
   const cardFresh = enterOnce("card", tr.uri) ? " card-fresh" : "";
   // Before filing the card names the song in one place only: the cover
-  // panel, pulled down from the bar (openCover). Nothing else on it does.
+  // panel, shut to a grey strip until pulled down (openCover). Nothing else
+  // on it does.
   $("now-card").innerHTML = `<div class="track-card${cardFresh}${d.is_playing ? "" : " is-paused"}">
-    ${coverOpen && tr.image ? coverPanel(tr) : ""}
+    ${tr.image ? coverPanel(tr) : ""}
     ${playbackStrip(d, tr)}
     ${body}
   </div>`;
@@ -2842,9 +2841,9 @@ async function undoStripAction() {
 // The card never names what is playing: the ear decides, not the name. The
 // title, artist and album are not on the card at all. The eye in the bar
 // only unblurs the suggestion REASONS (they leak artist names), so pressing
-// it moves nothing on screen. The cover hides behind the top bar: pulling the
-// bar down (or tapping its peek) opens the art inside the card with the
-// title, artist and share. Both last one track:
+// it moves nothing on screen. The cover sits shut at the top of the card, a
+// grey strip: pulling it (or the bar) down, or tapping it, opens the art
+// with the title, artist and share. Both last one track:
 // renderNow drops them as soon as the playing uri is no longer the one they
 // were opened for.
 
@@ -2869,12 +2868,11 @@ $("btn-reveal").onclick = () => setReveal(!document.body.classList.contains("pee
 // coverUri null does not mean "closed"; coverOpen does.
 let coverOpen = false;
 let coverUri = null;
-// The expand animation plays on the render that opens the panel, not on
-// every poll's re-render after it.
-let coverFresh = false;
-// A pull from the top bar (wireCoverPull): how far open, 0..1, while one is
-// in hand, else null; and whether the press became a pull, so its click
-// is not taken for a tap.
+// The animation the next render plays: "in" on the render a tap opens with,
+// "out" on the one a tap closes with, null on every poll's re-render after.
+let coverAnim = null;
+// A pull (wireCoverPull): how far open, 0..1, while one is in hand, else
+// null; and whether the press became a pull, so its click is not a tap.
 let coverPull = null;
 let coverDragged = false;
 
@@ -2884,25 +2882,31 @@ function openCover() {
   if (!t.image) { toast("no cover for this one"); return; }
   coverOpen = true;
   coverUri = t.uri || null;
-  coverFresh = true;
+  coverAnim = "in";
   renderNow();
 }
 // `rerender` is false only from inside renderNow, which is already drawing.
-function closeCover(rerender = true) {
+// `animate` folds it back up into the strip; a pull that let go short has
+// already collapsed it, and a track change has nothing to animate.
+function closeCover(rerender = true, animate = false) {
   coverOpen = false;
   coverUri = null;
   coverPull = null;
+  coverAnim = animate ? "out" : null;
   if (rerender) renderNow();
 }
 
-// The whole top bar can be pulled downward: the cover opens under the finger,
-// as far as it has travelled, and lets go into open past COVER_PULL_OPEN (or
-// on a downward flick) and back into closed short of it. A press only becomes
-// a pull past COVER_PULL_START, so every button on the bar still takes its
-// tap. `coverPull` is how far open (0..1) while a pull is in hand, null
-// otherwise; renderNow draws the panel at that size, so a poll landing
-// mid-pull does not snap it. The moves themselves restyle the panel in place
-// rather than re-render the card.
+// The cover lives at the top of the card, shut: a thin strip of its middle,
+// blurred and grey, with a grab pill — the hint that it is there, without
+// naming the song. Opening is the same element growing (style.css draws it
+// all from --f, 0 shut to 1 open), so the hint and the animation cannot
+// part ways. It opens from a tap on the strip, or a pull downward on the
+// strip or anywhere on the top bar: the cover follows the finger, and lets
+// go into open past COVER_PULL_OPEN (or on a downward flick) and back to the
+// strip short of it. A press only becomes a pull past COVER_PULL_START, so
+// every button on the bar still takes its tap. renderNow draws the panel at
+// `coverPull`, so a poll landing mid-pull does not snap it; the moves
+// themselves restyle the panel in place rather than re-render the card.
 const COVER_PULL_START = 6;     // px before a press becomes a pull
 const COVER_PULL_OPEN = 0.3;    // fraction past which a release opens
 const COVER_FLICK = 0.5;        // px/ms downward that opens regardless
@@ -2910,7 +2914,7 @@ function paintCoverPull(f) {
   $("cover-panel")?.style.setProperty("--f", String(f));
 }
 
-// Let go: settle the panel the rest of the way, open or closed.
+// Let go: settle the panel the rest of the way, open or shut.
 function settleCoverPull(open) {
   if (coverPull === null) return;
   const panel = $("cover-panel");
@@ -2923,60 +2927,56 @@ function settleCoverPull(open) {
   coverPull = 0;
   paintCoverPull(0);
   const uri = coverUri;
-  // Closed for real once the collapse has played; a track change in between
-  // has already closed it (renderNow).
+  // Shut for real once the collapse has played (already at the strip, so
+  // the re-render is seamless); a track change in between has already shut
+  // it (renderNow).
   setTimeout(() => { if (coverOpen && coverPull === 0 && coverUri === uri) closeCover(); }, 200);
 }
 
-// What says the cover is up there: the middle of this song's art, peeking
-// out under the bar as a thin band with a grab pill on it. Blurred and grey,
-// so it hints without naming the song. Shown while a track with art
-// is on the card and the cover is shut; a tap on it opens the cover too.
-let coverPeekSrc = null;
-function paintCoverPeek(d) {
-  const t = d?.track;
-  const show = !!(d && d.playing && !d.cooldown && !d.needs_reauth && t?.image && !coverOpen);
-  $("cover-peek").hidden = !show;
-  if (show && t.image !== coverPeekSrc) {
-    coverPeekSrc = t.image;
-    $("cover-peek-art").style.backgroundImage = `url("${t.image}")`;
-  }
-}
-$("cover-peek").onclick = () => { if (!coverOpen) openCover(); };
-
 (function wireCoverPull() {
   const bar = $("topbar");
-  let y0 = null, x0 = 0, full = 0, lastY = 0, lastT = 0, speed = 0;
-  // A pull that started on a button must not end in that button's click.
-  // Capture phase, so it is swallowed before the button sees it.
-  bar.addEventListener("click", (e) => {
+  const card = $("now-card");
+  let y0 = null, x0 = 0, full = 0, lastY = 0, lastT = 0, speed = 0, from = null;
+  // A pull must not end in a click: not on the bar button it started on,
+  // and not on the strip, whose tap opens. Capture phase, so it is
+  // swallowed before either sees it.
+  const swallow = (e) => {
     if (coverDragged) { coverDragged = false; e.stopPropagation(); e.preventDefault(); }
-  }, true);
-  bar.onpointerdown = (e) => {
+  };
+  bar.addEventListener("click", swallow, true);
+  card.addEventListener("click", swallow, true);
+  const down = (el, e) => {
     coverDragged = false;
     y0 = null;
-    // Only a closed cover on the Now card can be pulled open; an open one
+    // Only a shut cover on the Now card can be pulled open; an open one
     // closes on a tap. An open menu or input list owns its own gestures.
     if (coverOpen || !document.body.classList.contains("on-now")) return;
     if (!$("nav-pop").hidden || !$("input-pop").hidden) return;
     y0 = e.clientY; x0 = e.clientX; lastY = e.clientY; lastT = e.timeStamp; speed = 0;
+    from = el;
   };
-  bar.onpointermove = (e) => {
+  bar.onpointerdown = (e) => down(bar, e);
+  // On the card only the strip pulls; everywhere else the card scrolls.
+  card.onpointerdown = (e) => {
+    if (e.target?.closest?.(".cover-panel")) down(card, e);
+    else { coverDragged = false; y0 = null; }
+  };
+  const move = (e) => {
     if (y0 === null) return;
     const dy = e.clientY - y0;
     if (!coverDragged) {
       if (dy < COVER_PULL_START || Math.abs(e.clientX - x0) > dy) return;
       const t = nowState?.track;
-      // The card must be showing a track with art; the tap's toast says why not.
+      // The card must be showing a track with art.
       if (!t?.image || nowProblem || !nowState.playing) { y0 = null; return; }
       coverDragged = true;
       // Captured only now, so a tap's click still lands on its own button.
-      bar.setPointerCapture?.(e.pointerId);
+      from.setPointerCapture?.(e.pointerId);
       // The panel opens at the top of the card: bring that into view.
       if (globalThis.scrollY > 0) globalThis.scrollTo?.(0, 0);
       coverOpen = true;
       coverUri = t.uri || null;
-      coverFresh = false;
+      coverAnim = null;
       coverPull = 0;
       renderNow();
       // The cover is square and card-wide: fully down at one width of travel.
@@ -2988,23 +2988,29 @@ $("cover-peek").onclick = () => { if (!coverOpen) openCover(); };
     coverPull = Math.max(0, Math.min(1, dy / full));
     paintCoverPull(coverPull);
   };
-  bar.onpointerup = () => {
+  const up = () => {
     if (y0 === null) return;
     y0 = null;
     if (coverDragged) settleCoverPull(coverPull >= COVER_PULL_OPEN || speed > COVER_FLICK);
   };
-  bar.onpointercancel = () => {
+  const cancel = () => {
     if (y0 === null) return;
     y0 = null;
     if (coverDragged) settleCoverPull(false);
   };
+  bar.onpointermove = card.onpointermove = move;
+  bar.onpointerup = card.onpointerup = up;
+  bar.onpointercancel = card.onpointercancel = cancel;
 })();
 
 function coverPanel(tr) {
-  const fresh = coverFresh ? " cover-in" : "";
-  coverFresh = false;
-  // Mid-pull the panel is drawn at the pull's size (see wireCoverPull).
-  const pull = coverPull === null ? "" : ` style="--f:${coverPull}"`;
+  const shut = !coverOpen;
+  const anim = coverAnim === "in" ? " cover-in" : coverAnim === "out" ? " cover-out" : "";
+  coverAnim = null;
+  // Mid-pull the panel is drawn at the pull's size (see wireCoverPull); shut
+  // it is the strip.
+  const f = coverPull !== null ? coverPull : shut ? 0 : null;
+  const style = f === null ? "" : ` style="--f:${f}"`;
   const artists = tr.artists.map((a) => a.name).join(", ");
   // Share needs a real track; local files and episodes have no
   // spotify:track: uri and the tablet flow can't find them by title anyway.
@@ -3013,27 +3019,29 @@ function coverPanel(tr) {
         <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>
       </button>`
     : "";
-  // The cover opens from its middle: the shade shows the centre slice
-  // first, the part that peeked out under the bar, then the top and bottom,
-  // and colour comes in as it opens. `--f` (0..1) is how far; style.css draws everything from it.
-  return `<div id="cover-panel" class="cover-panel${fresh}"${pull}>
-      <div class="cover-shade"><img src="${esc(tr.image_large || tr.image)}" alt=""></div>
+  // Shut, the strip carries no title or artist at all, not even hidden: the
+  // card does not name the song until asked. The one exception is the render
+  // that folds it up, so the text fades out with it instead of vanishing.
+  const info = shut && anim !== " cover-out" ? "" : `
       <div class="cover-info">
         <div class="cover-text">
           <div class="cover-title">${esc(tr.name)}</div>
           <div class="cover-artist">${esc(artists)}</div>
         </div>
         ${share}
-      </div>
+      </div>`;
+  return `<div id="cover-panel" class="cover-panel${shut ? " cover-shut" : ""}${anim}"${style}${
+      shut ? ' title="Pull down for the cover"' : ""}>
+      <div class="cover-shade"><img src="${esc(tr.image_large || tr.image)}" alt=""><span class="cover-grip"></span></div>${info}
     </div>`;
 }
 // Wired after each render that draws the panel (renderNow).
 function wireCoverPanel() {
   const panel = $("cover-panel");
   if (!panel) return;
-  // A tap anywhere on the panel closes it, except on share, which closes it
-  // and opens the share sheet instead.
-  panel.onclick = () => closeCover();
+  // Shut, a tap opens it. Open, a tap anywhere on it folds it back up,
+  // except on share, which closes it and opens the share sheet instead.
+  panel.onclick = () => (coverOpen ? closeCover(true, true) : openCover());
   const sh = $("btn-share");
   if (sh) sh.onclick = (e) => { e?.stopPropagation(); closeCover(); openSharePop(); };
 }
