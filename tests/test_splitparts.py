@@ -315,3 +315,40 @@ def test_artists_sharing_a_name_both_get_artist_similarity():
     # Both (aref, atwin1) and (aref, atwin2) pairs should be in asim
     assert sig.asim.get(("aref", "atwin1"), 0.0) == 0.9 or sig.asim.get(("atwin1", "aref"), 0.0) == 0.9
     assert sig.asim.get(("aref", "atwin2"), 0.0) == 0.9 or sig.asim.get(("atwin2", "aref"), 0.0) == 0.9
+
+
+def test_no_slivers_even_when_no_cut_level_has_exactly_n_big_clusters():
+    """The probe from the final review: two big groups plus 70 one-off songs
+    that have data but share no tag with anything. The one-offs are the last
+    merges of the dendrogram, so every level within the old 60-level window
+    held ONE big cluster plus singletons, and the plain 2-cut fallback
+    returned [869, 1]. The two big groups must be the parts, with everything
+    else folded into them."""
+    tracks, tags = make({"rock": 500, "jazz": 300})
+    solo_tracks, solo_tags = make({f"solo{i}": 1 for i in range(70)}, start=800)
+    tracks, tags = tracks + solo_tracks, {**tags, **solo_tags}
+    floor = max(3, -(-5 * len(tracks) // 100))
+
+    s = spp.suggest(tracks, 2, tags, {}, {})
+
+    assert len(s.parts) == 2
+    assert min(len(p) for p in s.parts) >= floor, [len(p) for p in s.parts]
+    assert sum(len(p) for p in s.parts) == 870
+    by_uri = {t["uri"]: t for t in tracks}
+    big = [{tags[by_uri[u]["artists"][0]["id"]]["tags"][0]["name"] for u in p} & {"rock", "jazz"}
+           for p in s.parts]
+    assert sorted(map(sorted, big)) == [["jazz"], ["rock"]]
+
+
+def test_when_no_level_reaches_the_floor_the_largest_clusters_still_make_k_parts():
+    """A floor no cut can meet (5 items, two parts, floor 4): the level with
+    the most big clusters is cut and its k largest clusters kept, the rest
+    folded in — exactly k parts, every item placed once."""
+    tracks, tags = make({"rock": 3, "jazz": 2})
+    sig = spp.build_signals(tracks, tags, {}, {})
+    S = spp._similarity(sig, list(range(5)))
+    parts = spp._parts_at(S, spp._dendrogram(S), 2, 4)
+
+    assert len(parts) == 2
+    assert sorted(x for p in parts for x in p) == [0, 1, 2, 3, 4]
+    assert sorted(map(sorted, parts)) == [[0, 1, 2], [3, 4]]

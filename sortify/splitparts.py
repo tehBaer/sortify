@@ -12,7 +12,7 @@ The three signals, all already on disk:
 
 Clustering is average-linkage agglomerative on 1 - score via the
 nearest-neighbour chain (O(n^2), pure Python), cut at exactly n parts with
-sliver parts folded into their closest neighbour.
+sliver parts folded into their closest neighbour (`_parts_at`).
 """
 
 from __future__ import annotations
@@ -35,8 +35,6 @@ HINT_MARGIN = 0.05
 MIN_PARTS, MAX_PARTS = 2, 6
 MIN_TRACKS, MAX_TRACKS = 10, 2000
 TAG_FLOOR, TAG_KEEP, NAME_TAGS = 10, 8, 2
-# How many extra cut levels to look through for a cut without slivers.
-SLIVER_LEVELS = 60
 
 
 class SplitError(ValueError):
@@ -301,22 +299,72 @@ def _mean_link(S: list[array], g: list[int], h: list[int]) -> float:
     return sum(S[x][y] for x in g for y in h) / (len(g) * len(h))
 
 
+def _fold(S: list[array], parts: list[list[int]], rest: list[list[int]]) -> list[list[int]]:
+    """Fold each cluster in `rest` into the part it has the highest mean
+    link to (ties to the earlier part)."""
+    k = len(parts)
+    for g in rest:
+        t = max(range(k), key=lambda t: (_mean_link(S, g, parts[t]), -t))
+        parts[t] = sorted(parts[t] + g)
+    return parts
+
+
+def _big_counts(n: int, merges, floor: int) -> dict[int, int]:
+    """For every cut level (number of clusters), how many clusters hold at
+    least `floor` items. One union-find pass over the merges in the order
+    `_cut` applies them, so every level costs O(1) instead of a fresh cut."""
+    parent = list(range(n))
+    size = [1] * n
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    big = n if floor <= 1 else 0
+    level = n
+    counts = {level: big}
+    for m in sorted(range(len(merges)), key=lambda m: (merges[m][0], m)):
+        _, a, b = merges[m]
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            continue
+        big -= (size[ra] >= floor) + (size[rb] >= floor)
+        lo, hi = min(ra, rb), max(ra, rb)
+        parent[hi] = lo
+        size[lo] += size[hi]
+        big += size[lo] >= floor
+        level -= 1
+        counts[level] = big
+    return counts
+
+
 def _parts_at(S: list[array], merges, k: int, floor: int) -> list[list[int]]:
-    """Exactly k clusters with no sliver: the first cut level with exactly k
-    clusters of at least `floor` items, slivers folded into the closest of
-    those; the plain k-cut when no level within SLIVER_LEVELS has one."""
+    """Exactly k parts with no sliver, whenever the data allows one.
+
+    The coarsest cut level with exactly k clusters of at least `floor` items
+    wins, its smaller clusters folded into the closest of those. Every level
+    is looked at, not just the first few past k: songs that resemble nothing
+    are the LAST merges of the dendrogram, so 70 of them keep every level
+    near k down to one real group plus singletons — which is how a fixed
+    window of levels returned [869, 1]. The big-cluster count moves by at
+    most one per merge and is 1 at the top, so when any level has k or more
+    big clusters, some level has exactly k. Only when none does (the floor
+    is out of reach) is a sliver unavoidable: the level with the most big
+    clusters is cut, its k largest clusters kept and the rest folded in.
+    """
     n = len(S)
-    for level in range(k, min(n, k + SLIVER_LEVELS) + 1):
-        groups = _cut(n, merges, level)
-        big = [g for g in groups if len(g) >= floor]
-        if len(big) == k:
-            for g in (g for g in groups if len(g) < floor):
-                t = max(range(k), key=lambda t: (_mean_link(S, g, big[t]), -t))
-                big[t] = sorted(big[t] + g)
-            return big
-        if len(big) > k:
-            break
-    return _cut(n, merges, k)
+    counts = _big_counts(n, merges, floor)
+    exact = [lv for lv, c in counts.items() if lv >= k and c == k]
+    if exact:
+        level = min(exact)
+    else:
+        level = min((lv for lv in counts if lv >= k), key=lambda lv: (-counts[lv], lv))
+    groups = _cut(n, merges, level)
+    ranked = sorted(range(len(groups)), key=lambda i: (-len(groups[i]), groups[i][0]))
+    keep = sorted(ranked[:k])      # cut order: by smallest index
+    return _fold(S, [groups[i] for i in keep], [groups[i] for i in sorted(ranked[k:])])
 
 
 def _cleanliness(S: list[array], groups: list[list[int]]) -> float:
