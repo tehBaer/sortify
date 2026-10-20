@@ -2036,6 +2036,27 @@ def playlist_preview(playlist_id: str, offset: int = 0) -> dict:
         return payload
 
 
+@app.get("/api/track_preview")
+def track_preview(pid: str, uri: str):
+    """One song's 30 s Deezer clip, for a tap in the Split tab. The song is
+    looked up in that playlist's split draft (no Spotify call); recordings
+    the user marked wrong are skipped, as in the medley player."""
+    draft = spa.get_draft(store, pid) or {}
+    track = next((t for t in draft.get("tracks") or [] if t.get("uri") == uri), None)
+    if track is None or not track.get("artists"):
+        raise HTTPException(404, "not in this split")
+    artist = track["artists"][0].get("name") or ""
+    skip = (store.preview_rejects().get(uri) or {}).get("rejected") or []
+    try:
+        rec = _deezer_client().fetch_preview(artist, track.get("name") or "", exclude=skip)
+    except Exception:
+        log.warning("deezer preview failed for %r", track.get("name"))
+        raise HTTPException(404, "no preview")
+    if rec.get("miss") or not rec.get("url"):
+        raise HTTPException(404, "no preview")
+    return {"url": rec["url"], "uri": uri, "deezer_id": rec.get("deezer_id")}
+
+
 class ExploreIn(BaseModel):
     uri: str
     # Sent by the client from the card it is already showing, the same way
