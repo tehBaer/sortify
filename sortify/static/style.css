@@ -164,12 +164,6 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 .pl-hints { flex-basis: 100%; font-size: .85rem; min-height: 38px; margin-top: .1rem; }
 .actionbar { position: sticky; bottom: 0; padding: .8rem 0; background: var(--bg); }
 .actionbar button { width: 100%; }
-/* The Claude button (boxdash's rc-button.js) is fixed 16px off the bottom
-   right and 38px tall, which put it over Save roles and the rows scrolling
-   past it. The sticky bar grows a band underneath for it to sit in. Keyed on
-   the script tag, so the public port — which strips that line — keeps the
-   plain bar. */
-body:has(script[src$="/rc-button.js"]) .actionbar { padding-bottom: calc(54px + .5rem); }
 
 /* triage */
 .triage-top {
