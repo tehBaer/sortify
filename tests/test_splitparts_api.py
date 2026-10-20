@@ -266,3 +266,78 @@ def test_missing_lastfm_lists_what_to_fetch():
     assert need_tags == {"a2": "B"}
     assert need_tracks == [("B", "Two")]
     assert need_similar == [("a1", "A")]
+
+
+# ---- moves and parts -------------------------------------------------------
+
+
+@pytest.fixture
+def drafted(client):
+    client.post("/api/splitparts/H1/suggest", json={"n": 2})
+    client.calls.clear()
+    return client
+
+
+def part_of(draft, uri):
+    return next(p["key"] for p in draft["parts"] if uri in p["uris"])
+
+
+def test_move_puts_the_song_at_the_end_of_its_new_part(drafted):
+    d = drafted.get("/api/splitparts/H1").json()
+    uri = d["parts"][0]["uris"][0]
+
+    d2 = drafted.post("/api/splitparts/H1/move", json={"uri": uri, "to": "p2"}).json()
+
+    assert part_of(d2, uri) == "p2"
+    assert d2["parts"][1]["uris"][-1] == uri
+    assert sum(len(p["uris"]) for p in d2["parts"]) == 24
+    assert appmod.store.splitparts()["drafts"]["H1"]["parts"] == d2["parts"]
+    assert drafted.calls == []
+
+
+def test_move_refuses_unknown_song_or_part(drafted):
+    d = drafted.get("/api/splitparts/H1").json()
+    uri = d["parts"][0]["uris"][0]
+
+    assert drafted.post("/api/splitparts/H1/move", json={"uri": "nope", "to": "p2"}).status_code == 400
+    assert drafted.post("/api/splitparts/H1/move", json={"uri": uri, "to": "p9"}).status_code == 400
+
+
+def test_add_part_makes_an_empty_new_part(drafted):
+    d = drafted.post("/api/splitparts/H1/parts").json()
+
+    assert d["parts"][-1] == {"key": "p3", "name": "New part", "uris": []}
+
+
+def test_add_part_stops_at_six(drafted):
+    for _ in range(4):
+        assert drafted.post("/api/splitparts/H1/parts").status_code == 200
+    assert drafted.post("/api/splitparts/H1/parts").status_code == 409
+
+
+def test_remove_part_dry_run_says_where_songs_go_and_saves_nothing(drafted):
+    drafted.post("/api/splitparts/H1/parts")
+    before = drafted.get("/api/splitparts/H1").json()
+
+    res = drafted.post("/api/splitparts/H1/parts/p2/remove", json={"dry": True}).json()
+
+    assert res == {"moves": {"p1": 10}}   # the empty p3 never wins
+    assert drafted.get("/api/splitparts/H1").json() == before
+
+
+def test_remove_part_moves_each_song_to_its_best_part(drafted):
+    drafted.post("/api/splitparts/H1/parts")
+    d = drafted.get("/api/splitparts/H1").json()
+    moved = list(d["parts"][1]["uris"])
+
+    d2 = drafted.post("/api/splitparts/H1/parts/p2/remove", json={"dry": False}).json()
+
+    assert [p["key"] for p in d2["parts"]] == ["p1", "p3"]
+    assert all(part_of(d2, u) == "p1" for u in moved)
+
+
+def test_at_least_two_parts_remain(drafted):
+    res = drafted.post("/api/splitparts/H1/parts/p2/remove", json={"dry": False})
+
+    assert res.status_code == 409
+    assert "at least 2" in res.json()["detail"]

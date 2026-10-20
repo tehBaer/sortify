@@ -638,6 +638,15 @@ class SplitSuggestIn(BaseModel):
     n: int
 
 
+class SplitMoveIn(BaseModel):
+    uri: str
+    to: str
+
+
+class SplitRemoveIn(BaseModel):
+    dry: bool = False
+
+
 def _splitparts_home(pid: str) -> dict:
     cfg = store.config()
     items = sp.my_playlists()
@@ -846,6 +855,58 @@ def splitparts_get(pid: str):
 def splitparts_discard(pid: str):
     spa.drop_draft(store, pid)
     return {"ok": True}
+
+
+def _splitparts_draft(pid: str) -> dict:
+    draft = spa.get_draft(store, pid)
+    if draft is None:
+        raise HTTPException(404, "no split in progress for this playlist")
+    return draft
+
+
+@app.post("/api/splitparts/{pid}/move")
+def splitparts_move(pid: str, body: SplitMoveIn):
+    with spa._lock:
+        draft = _splitparts_draft(pid)
+        try:
+            spa.move(draft, body.uri, body.to)
+        except KeyError as exc:
+            raise HTTPException(400, str(exc).strip("'\""))
+        spa.put_draft(store, draft)
+    return draft
+
+
+@app.post("/api/splitparts/{pid}/parts")
+def splitparts_add_part(pid: str):
+    with spa._lock:
+        draft = _splitparts_draft(pid)
+        try:
+            spa.add_part(draft)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+        spa.put_draft(store, draft)
+    return draft
+
+
+@app.post("/api/splitparts/{pid}/parts/{key}/remove")
+def splitparts_remove_part(pid: str, key: str, body: SplitRemoveIn):
+    with spa._lock:
+        draft = _splitparts_draft(pid)
+        if len(draft["parts"]) <= spp.MIN_PARTS:
+            raise HTTPException(409, f"at least {spp.MIN_PARTS} parts must remain")
+        try:
+            moves = spa.removal_moves(draft, key, store.tag_artists(),
+                                      store.lastfm_track_map(), store.lastfm_artist_map())
+        except KeyError as exc:
+            raise HTTPException(400, str(exc).strip("'\""))
+        if body.dry:
+            counts: dict[str, int] = {}
+            for dest in moves.values():
+                counts[dest] = counts.get(dest, 0) + 1
+            return {"moves": counts}
+        spa.remove_part(draft, key, moves)
+        spa.put_draft(store, draft)
+    return draft
 
 
 @app.post("/api/config")

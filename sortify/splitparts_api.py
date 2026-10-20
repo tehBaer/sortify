@@ -105,3 +105,55 @@ def missing_lastfm(tracks: list[dict], tag_artists: dict, track_map: dict,
             seen_similar.add(aid)
             need_similar.append((aid, first["name"]))
     return need_tags, need_tracks, need_similar
+
+
+NEW_PART_NAME = "New part"
+
+
+def _part(draft: dict, key: str) -> dict:
+    for p in draft["parts"]:
+        if p["key"] == key:
+            return p
+    raise KeyError(f"no part {key!r}")
+
+
+def move(draft: dict, uri: str, to_key: str) -> dict:
+    target = _part(draft, to_key)
+    source = next((p for p in draft["parts"] if uri in p["uris"]), None)
+    if source is None:
+        raise KeyError(f"song {uri!r} is not in this split")
+    if source is not target:
+        source["uris"].remove(uri)
+        target["uris"].append(uri)
+    return draft
+
+
+def add_part(draft: dict) -> dict:
+    from .splitparts import MAX_PARTS
+    if len(draft["parts"]) >= MAX_PARTS:
+        raise ValueError(f"at most {MAX_PARTS} parts")
+    nums = [int(p["key"][1:]) for p in draft["parts"] if p["key"][1:].isdigit()]
+    draft["parts"].append({"key": f"p{max(nums, default=0) + 1}",
+                           "name": NEW_PART_NAME, "uris": []})
+    return draft
+
+
+def removal_moves(draft: dict, key: str, tag_artists: dict, track_map: dict,
+                  artist_map: dict) -> dict[str, str]:
+    from .splitparts import place
+    leaving = _part(draft, key)["uris"]
+    others = [p for p in draft["parts"] if p["key"] != key]
+    picks = place(draft["tracks"], [p["uris"] for p in others], leaving,
+                  tag_artists, track_map, artist_map)
+    return {u: others[picks.get(u, 0)]["key"] for u in leaving}
+
+
+def remove_part(draft: dict, key: str, moves: dict[str, str]) -> dict:
+    from .splitparts import MIN_PARTS
+    if len(draft["parts"]) <= MIN_PARTS:
+        raise ValueError(f"at least {MIN_PARTS} parts must remain")
+    leaving = _part(draft, key)
+    draft["parts"] = [p for p in draft["parts"] if p["key"] != key]
+    for u in leaving["uris"]:
+        _part(draft, moves[u])["uris"].append(u)
+    return draft
