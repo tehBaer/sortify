@@ -647,6 +647,9 @@ class SplitRemoveIn(BaseModel):
     dry: bool = False
 
 
+_SPLITPARTS_DONE_STARTED_MSG = "Done has already started for this split — press Done again to finish it"
+
+
 def _splitparts_home(pid: str) -> dict:
     cfg = store.config()
     items = sp.my_playlists()
@@ -868,10 +871,12 @@ def _splitparts_draft(pid: str) -> dict:
 def splitparts_move(pid: str, body: SplitMoveIn):
     with spa._lock:
         draft = _splitparts_draft(pid)
+        if draft.get("done") is not None:
+            raise HTTPException(409, _SPLITPARTS_DONE_STARTED_MSG)
         try:
             spa.move(draft, body.uri, body.to)
         except KeyError as exc:
-            raise HTTPException(400, str(exc).strip("'\""))
+            raise HTTPException(400, exc.args[0])
         spa.put_draft(store, draft)
     return draft
 
@@ -880,6 +885,8 @@ def splitparts_move(pid: str, body: SplitMoveIn):
 def splitparts_add_part(pid: str):
     with spa._lock:
         draft = _splitparts_draft(pid)
+        if draft.get("done") is not None:
+            raise HTTPException(409, _SPLITPARTS_DONE_STARTED_MSG)
         try:
             spa.add_part(draft)
         except ValueError as exc:
@@ -892,13 +899,15 @@ def splitparts_add_part(pid: str):
 def splitparts_remove_part(pid: str, key: str, body: SplitRemoveIn):
     with spa._lock:
         draft = _splitparts_draft(pid)
+        if draft.get("done") is not None:
+            raise HTTPException(409, _SPLITPARTS_DONE_STARTED_MSG)
         if len(draft["parts"]) <= spp.MIN_PARTS:
             raise HTTPException(409, f"at least {spp.MIN_PARTS} parts must remain")
         try:
             moves = spa.removal_moves(draft, key, store.tag_artists(),
                                       store.lastfm_track_map(), store.lastfm_artist_map())
         except KeyError as exc:
-            raise HTTPException(400, str(exc).strip("'\""))
+            raise HTTPException(400, exc.args[0])
         if body.dry:
             counts: dict[str, int] = {}
             for dest in moves.values():

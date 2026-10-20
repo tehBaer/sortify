@@ -341,3 +341,71 @@ def test_at_least_two_parts_remain(drafted):
 
     assert res.status_code == 409
     assert "at least 2" in res.json()["detail"]
+
+
+# ---- fix round 1 -------------------------------------------------------
+
+
+def test_move_refuses_when_done_has_started(drafted):
+    d = drafted.get("/api/splitparts/H1").json()
+    uri = d["parts"][0]["uris"][0]
+    draft = spa.get_draft(appmod.store, "H1")
+    draft["done"] = {"created": {"p1": "N1"}}
+    spa.put_draft(appmod.store, draft)
+    before = drafted.get("/api/splitparts/H1").json()
+
+    res = drafted.post("/api/splitparts/H1/move", json={"uri": uri, "to": "p2"})
+
+    assert res.status_code == 409
+    assert "Done has already started" in res.json()["detail"]
+    assert drafted.get("/api/splitparts/H1").json() == before
+
+
+def test_add_part_refuses_when_done_has_started(drafted):
+    draft = spa.get_draft(appmod.store, "H1")
+    draft["done"] = {"created": {"p1": "N1"}}
+    spa.put_draft(appmod.store, draft)
+    before = drafted.get("/api/splitparts/H1").json()
+
+    res = drafted.post("/api/splitparts/H1/parts")
+
+    assert res.status_code == 409
+    assert "Done has already started" in res.json()["detail"]
+    assert drafted.get("/api/splitparts/H1").json() == before
+
+
+def test_remove_part_refuses_when_done_has_started(drafted):
+    draft = spa.get_draft(appmod.store, "H1")
+    draft["done"] = {"created": {"p1": "N1"}}
+    spa.put_draft(appmod.store, draft)
+    before = drafted.get("/api/splitparts/H1").json()
+
+    res = drafted.post("/api/splitparts/H1/parts/p2/remove", json={"dry": False})
+
+    assert res.status_code == 409
+    assert "Done has already started" in res.json()["detail"]
+    assert drafted.get("/api/splitparts/H1").json() == before
+
+
+def test_remove_part_dry_run_refuses_when_done_has_started(drafted):
+    draft = spa.get_draft(appmod.store, "H1")
+    draft["done"] = {"created": {"p1": "N1"}}
+    spa.put_draft(appmod.store, draft)
+    before = drafted.get("/api/splitparts/H1").json()
+
+    res = drafted.post("/api/splitparts/H1/parts/p2/remove", json={"dry": True})
+
+    assert res.status_code == 409
+    assert "Done has already started" in res.json()["detail"]
+    assert drafted.get("/api/splitparts/H1").json() == before
+
+
+def test_move_error_message_format(drafted):
+    d = drafted.get("/api/splitparts/H1").json()
+    uri = d["parts"][0]["uris"][0]
+
+    res1 = drafted.post("/api/splitparts/H1/move", json={"uri": "nope", "to": "p2"})
+    assert res1.json()["detail"] == "song 'nope' is not in this split"
+
+    res2 = drafted.post("/api/splitparts/H1/move", json={"uri": uri, "to": "p9"})
+    assert res2.json()["detail"] == "no part 'p9'"
