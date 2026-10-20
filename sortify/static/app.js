@@ -1149,8 +1149,18 @@ function parkInputSwitch(label) {
   b.classList.add("placeholder");
   b.classList.remove("adrift");
   $("input-switch-label").textContent = label;
+  paintSwitchCount(null);
   paintAdrift(null);
   closeInputPop();
+}
+
+// The count sits in its own span, beside the name rather than inside it: in
+// one string a long list name ellipsized the number off the end, and the
+// number is the part you check. The name gives way; the count never does.
+function paintSwitchCount(n) {
+  const c = $("input-switch-count");
+  c.hidden = n == null;
+  c.textContent = n == null ? "" : String(n);
 }
 
 function paintNowControls(d) {
@@ -1171,7 +1181,7 @@ function paintNowControls(d) {
   // rather than the name waiting for it.
   const playingRow = d.playing && ctx?.is_input
     ? playable.find((l) => l.id === ctx.id) : null;
-  const left = playingRow && playingRow.total != null ? ` · ${playingRow.total}` : "";
+  paintSwitchCount(playingRow ? playingRow.total : null);
   // The autoplay tail wears the switcher's own face: the list that ran out,
   // in the accent, where the name of the list you are filing out of sits.
   const drift = adrift(d);
@@ -1179,7 +1189,7 @@ function paintNowControls(d) {
     ? (drift
         ? (ranOutOf(d)?.name ? `${ranOutOf(d).name} ran out` : "autoplay")
         : ctx?.name
-        ? (ctx.is_input ? `${ctx.name}${left}` : `${ctx.name} (not an input)`)
+        ? (ctx.is_input ? ctx.name : `${ctx.name} (not an input)`)
         : "not playing from a playlist")
     : "start an input…";
   $("btn-input-switch").classList.toggle("placeholder", !(d.playing && ctx?.is_input) && !drift);

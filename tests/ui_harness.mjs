@@ -1367,9 +1367,11 @@ run("stopNowPolling()");
     // PLAYING input's row, not the first one that happens to match — a bar
     // that counted down someone else's inbox would be worse than no count.
     check("NB the trigger carries the playing input's own count",
-          /\[B\].*\b7\b/.test($$("input-switch-label").textContent)
-          && !/12/.test($$("input-switch-label").textContent),
-          JSON.stringify($$("input-switch-label").textContent));
+          $$("input-switch-count").textContent === "7" && $$("input-switch-count").hidden === false,
+          JSON.stringify($$("input-switch-count").textContent));
+    // In its own span, so a long name ellipsizes and the count stays.
+    check("NB ...beside the name, not inside it",
+          $$("input-switch-label").textContent === "[B]", JSON.stringify($$("input-switch-label").textContent));
 
     run(`openInputPop()`);
     const pop = $$("input-pop");
@@ -1434,8 +1436,8 @@ run("stopNowPolling()");
     run(`paintNowControls(${JSON.stringify(unknown)}); openInputPop()`);
     check("NB an unknown count draws no number at all, on the row or the face",
           !/ip-count/.test($$("input-pop").innerHTML)
-          && !/·/.test($$("input-switch-label").textContent),
-          `label=${JSON.stringify($$("input-switch-label").textContent)} ` +
+          && $$("input-switch-count").hidden === true && $$("input-switch-count").textContent === "",
+          `count=${JSON.stringify($$("input-switch-count").textContent)} ` +
           JSON.stringify($$("input-pop").innerHTML.slice(0, 200)));
     run(`closeInputPop(); paintNowControls(${JSON.stringify(d)})`);
 
@@ -1444,7 +1446,7 @@ run("stopNowPolling()");
     run(`paintNowControls(${JSON.stringify({ ...d,
       context: { id: "zz", name: "someone else's mix", is_input: false } })})`);
     check("NB a non-input context gets no count",
-          !/·/.test($$("input-switch-label").textContent)
+          $$("input-switch-count").hidden === true
           && /not an input/.test($$("input-switch-label").textContent),
           JSON.stringify($$("input-switch-label").textContent));
     run(`paintNowControls(${JSON.stringify(d)})`);

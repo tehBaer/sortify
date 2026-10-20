@@ -183,19 +183,26 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
      icons at the row's end. */
   /* Centred on the BAR, not in the space left over: auto margins split the
      free space, which lands the switcher off-centre by half the hamburger
-     whenever the two ends differ in width. Absolute centring is exact, and
-     it is why the width came down to 10.5rem — at 390px the title ends
-     around 120px and the centred face starts around 125px. */
+     whenever the two ends differ in width. Absolute centring is exact.
+     Its width is what the bar leaves free on the narrower side, the right:
+     eye and refresh (two 40px discs, a .4rem gap) plus the bar's .7rem
+     padding come to ~6.1rem, so 6.5rem each side keeps a hair of air. That
+     is ~182px at 390px; past 14rem a name has room enough. */
   /* top pinned: the bar can grow a second line (the autoplay strip), and
      an absolute box with no top would centre itself across both. */
   position: absolute; left: 50%; top: 0; transform: translateX(-50%);
-  flex: 0 1 auto; width: min(36vw, 10.5rem); min-width: 0; min-height: 40px;
+  flex: 0 1 auto; width: min(calc(100vw - 13rem), 14rem); min-width: 0; min-height: 40px;
   display: inline-flex; align-items: center; gap: .35rem;
   padding: .3rem .55rem .3rem .8rem; border-radius: 12px;
   background: var(--card); text-align: left;
 }
 .input-switch #input-switch-label {
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* The count never shrinks; the name ellipsizes first (paintSwitchCount). */
+.input-switch #input-switch-count {
+  flex-shrink: 0; color: var(--muted); font-size: .85rem;
+  font-variant-numeric: tabular-nums;
 }
 .input-switch.placeholder #input-switch-label { color: var(--muted); }
 /* The list ran out and Spotify carried on: the switcher says so in the
@@ -207,7 +214,12 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 .input-switch.adrift .ip-chev { color: inherit; }
 /* Parked (cooldown, reauth, no inputs, first paint): present but inert, so
    the top row never reflows when the state changes. */
-.input-switch:disabled { opacity: .7; cursor: default; }
+/* The transform is restated: the generic button:disabled resets it to none,
+   which dropped the centring and parked the face over the eye. */
+.input-switch:disabled { opacity: .7; cursor: default; transform: translateX(-50%); }
+/* Same for the press: button:active's scale replaced the centring and the
+   face jumped half its width under the finger. */
+.input-switch:active:not(:disabled) { transform: translateX(-50%) scale(.97); }
 .input-switch .ip-chev { flex-shrink: 0; color: var(--muted); transition: transform .15s ease; }
 .input-switch.open .ip-chev { transform: rotate(180deg); }
 #input-pop {
