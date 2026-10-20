@@ -3625,27 +3625,58 @@ const SP_MIN = 2, SP_MAX = 6;
 
 // ---- tap = preview ----------------------------------------------------------
 // One clip at a time. Spotify is paused by the phone when the clip takes the
-// audio, and given back once when previewing ends — only if it was playing.
+// audio, and given back once when previewing ends — only if it was playing
+// when THIS session's first tap landed, and only once a clip of ours has
+// actually taken that focus (a 404 or a refused play never took it).
 let spAudio = null;
 let spAudioUri = null;
+let spAudioPending = false;   // spAudio exists but play() has not yet succeeded
 let spResumeOwed = false;
+let spSessionPlaying = false; // was Spotify playing when this preview session began
 
 function spStopPreview(resume = true) {
   if (spAudio) { spAudio.onended = null; spAudio.pause(); spAudio.src = ""; }
   spAudio = null;
+  spAudioPending = false;
   const was = spAudioUri;
   spAudioUri = null;
   if (resume && spResumeOwed) {
     spResumeOwed = false;
-    api("/api/preview_resume", {}).catch(() => {});
+    spSessionPlaying = false;
+    // Like the house player's own resume (previewHold.resumeSpotify): a
+    // failure — ok:false, or the call itself rejecting — says so rather
+    // than leaving Spotify silently paused with no visible way back.
+    api("/api/preview_resume", {}).then((r) => {
+      if (!r || r.ok === false) toast("preview over — press play in Spotify");
+    }).catch(() => toast("preview over — press play in Spotify"));
   }
   if (was && spDraft && !$("sp-parts").hidden) renderSpList();
 }
 
 async function spPreview(uri) {
+  // iOS: a previous tap's play() on this exact row was refused. Retry it
+  // SYNCHRONOUSLY, before any await, on the same Audio object — no new
+  // fetch, no new Audio — since iOS only grants playback inside the very
+  // gesture handler that asks for it, never one that resumes after an
+  // awaited fetch has already returned.
+  if (spAudio && spAudioUri === uri && spAudioPending) {
+    try {
+      await spAudio.play();
+    } catch (_) {
+      toast("tap the song again to play its preview");
+      return;
+    }
+    spAudioPending = false;
+    if (spSessionPlaying) spResumeOwed = true;
+    renderSpList();
+    return;
+  }
   if (spAudioUri === uri) { spStopPreview(); return; }
+  // A session starts when nothing is playing or pending yet — captured once,
+  // so switching between songs mid-session never re-asks "was it playing".
+  const startingSession = !spAudio;
+  if (startingSession) spSessionPlaying = !!nowState?.is_playing;
   if (spAudio) spStopPreview(false);
-  if (!spResumeOwed && nowState?.is_playing) spResumeOwed = true;
   spAudioUri = uri;
   let r;
   try {
@@ -3657,14 +3688,24 @@ async function spPreview(uri) {
   }
   if (spAudioUri !== uri) return;        // another tap won the race
   spAudio = new Audio(r.url);
+  spAudioPending = true;
   spAudio.onended = () => spStopPreview();
-  try { await spAudio.play(); } catch (_) { toast("preview blocked — tap again"); spStopPreview(); return; }
+  try {
+    await spAudio.play();
+  } catch (_) {
+    // Keep spAudio/spAudioUri/spAudioPending: the next tap on this same row
+    // retries play() on this object instead of refetching and failing again.
+    toast("tap the song again to play its preview");
+    return;
+  }
+  spAudioPending = false;
+  if (spSessionPlaying) spResumeOwed = true;
   renderSpList();
 }
 
 // ---- touch that moves = drag -------------------------------------------------
 const SP_LIFT_PX = 8;
-let spDrag = null;      // {uri, x0, y0, lifted, ghost}
+let spDrag = null;      // {uri, x0, y0, lifted, ghost, pointerId}
 let spDropKey = null;   // the chip under a lifted song
 
 function spChipAt(x, y) {
@@ -3681,12 +3722,17 @@ function spHighlight(key) {
   });
 }
 
-function spPointerDown(uri, x, y) {
-  spDrag = { uri, x0: x, y0: y, lifted: false, ghost: null };
+function spPointerDown(uri, x, y, id) {
+  // A new touch always ends whatever drag is already in progress — without
+  // this a second finger silently overwrote spDrag, orphaning the first
+  // finger's ghost and leaving its eventual pointerup to act on someone
+  // else's drag.
+  spEndDrag();
+  spDrag = { uri, x0: x, y0: y, lifted: false, ghost: null, pointerId: id };
 }
 
-function spPointerMove(x, y) {
-  if (!spDrag) return;
+function spPointerMove(x, y, id) {
+  if (!spDrag || id !== spDrag.pointerId) return;
   if (!spDrag.lifted && Math.hypot(x - spDrag.x0, y - spDrag.y0) >= SP_LIFT_PX) {
     spDrag.lifted = true;
     const g = document.createElement("div");
@@ -3705,17 +3751,17 @@ function spPointerMove(x, y) {
 function spEndDrag() {
   const d = spDrag;
   spDrag = null;
-  if (d && d.ghost && d.ghost.remove) d.ghost.remove();
-  if (d && d.ghost && document.body.children) {   // the harness's stub body
-    const i = document.body.children.indexOf(d.ghost);
-    if (i >= 0) document.body.children.splice(i, 1);
-  }
+  // Only ever the element's own remove() — a real HTMLCollection (what
+  // document.body.children actually is) has no indexOf, so searching it by
+  // hand threw before this ever got as far as clearing the highlight or
+  // moving the song.
+  if (d && d.ghost) d.ghost.remove();
   spHighlight(null);
   return d;
 }
 
-async function spPointerUp(x, y) {
-  if (!spDrag) return;
+async function spPointerUp(x, y, id) {
+  if (!spDrag || id !== spDrag.pointerId) return;
   const lifted = spDrag.lifted;
   const key = lifted ? spChipAt(x, y) : null;
   const d = spEndDrag();
@@ -3723,21 +3769,24 @@ async function spPointerUp(x, y) {
   if (key && key !== spShown) await spMove(d.uri, key);
 }
 
-function spPointerCancel() { spEndDrag(); }
+function spPointerCancel(id) {
+  if (!spDrag || id !== spDrag.pointerId) return;
+  spEndDrag();
+}
 
 function spListPointerDown(e) {
   const row = e.target && e.target.closest ? e.target.closest(".sp-song") : null;
   if (!row || (e.button !== undefined && e.button > 0)) return;
   e.preventDefault();
-  spPointerDown(row.dataset.uri, e.clientX, e.clientY);
+  spPointerDown(row.dataset.uri, e.clientX, e.clientY, e.pointerId);
 }
 document.addEventListener("pointermove", (e) => {
   if (!spDrag) return;
   if (e.preventDefault) e.preventDefault();
-  spPointerMove(e.clientX, e.clientY);
+  spPointerMove(e.clientX, e.clientY, e.pointerId);
 }, { passive: false });
-document.addEventListener("pointerup", (e) => { if (spDrag) spPointerUp(e.clientX, e.clientY); });
-document.addEventListener("pointercancel", () => { if (spDrag) spPointerCancel(); });
+document.addEventListener("pointerup", (e) => { if (spDrag) spPointerUp(e.clientX, e.clientY, e.pointerId); });
+document.addEventListener("pointercancel", (e) => { if (spDrag) spPointerCancel(e.pointerId); });
 
 async function spMove(uri, key) {
   try {
@@ -3804,6 +3853,7 @@ const spUrl = (tail = "", pid = spPid) => `/api/splitparts/${encodeURIComponent(
 
 async function showSplit() {
   spStopPolling();
+  spStopPreview();
   show("split");
   spSection("sp-pick");
   $("sp-homes").innerHTML = '<p class="hint">loading…</p>';
@@ -3858,6 +3908,7 @@ $("sp-plus").onclick = () => { spN = Math.min(SP_MAX, spN + 1); $("sp-n").textCo
 $("sp-suggest").onclick = () => spSuggest(spN);
 
 async function spSuggest(n) {
+  spStopPreview();
   spN = n;
   try {
     await api(spUrl("/suggest"), { n });
@@ -4036,6 +4087,10 @@ document.addEventListener("visibilitychange", () => {
   // cut, not a fade — a hidden tab's timers are clamped, so a fade would go
   // on sounding over the music the close's resume just brought back.
   if (document.hidden) previewHold.stop(true);
+  // Same reasoning as previewHold's own stop: a locked phone has no visible
+  // player either, and a split-tab clip left running would keep Spotify
+  // paused with nothing on screen to say why.
+  if (document.hidden) spStopPreview();
   // Manual mode means almost exactly that — the refocus poll doesn't fire,
   // with one exception: a song that played out while the tab was hidden.
   // Coming back to the tool is "having it open", which is what the user

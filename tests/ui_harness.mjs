@@ -108,7 +108,20 @@ class El {
     this._qs ||= {};
     return (this._qs[sel] ||= new El("_anon"));
   }
-  appendChild(c) { this.children.push(c); }
+  // `_siblings` is the array `c` actually landed in, captured at append time
+  // — not re-read off the parent later, so a caller that temporarily swaps
+  // in a different `children` (SP3's HTMLCollection-has-no-indexOf proxy)
+  // cannot make a later `remove()` see the swapped-in stand-in.
+  appendChild(c) { c._siblings = this.children; this.children.push(c); }
+  // A real DOM element's own `remove()`, not a parent lookup by the app: a
+  // real `HTMLCollection` has no `indexOf`, so the app may only ever call
+  // `el.remove()` on itself, never search `parent.children` for it.
+  remove() {
+    if (!this._siblings) return;
+    const i = this._siblings.indexOf(this);
+    if (i >= 0) this._siblings.splice(i, 1);
+    this._siblings = null;
+  }
   setAttribute(k, v) { this[k] = String(v); }
   scrollIntoView() {} focus() {} addEventListener() {}
 }
@@ -173,6 +186,10 @@ async function fetchStub(path, opts) {
 class AudioStub {
   constructor(src) {
     this.src = src; this.currentTime = 0; this.duration = 30; this.paused = false;
+    // Counts play() calls on THIS object — the iOS retry fix calls play()
+    // again on the same instance rather than making a new one, and "no new
+    // Audio, but play() ran twice" is what tells that apart from a no-op.
+    this.playCalls = 0;
     AudioStub.made.push(this);
   }
   // Setting src runs the media element's load algorithm, and an empty src
@@ -185,7 +202,7 @@ class AudioStub {
     if (v === "") setTimeout(() => { if (this.onerror) this.onerror(); }, 0);
   }
   get src() { return this.__src; }
-  play() { this.paused = false; return AudioStub.refuse ? Promise.reject(new Error("blocked")) : Promise.resolve(); }
+  play() { this.playCalls++; this.paused = false; return AudioStub.refuse ? Promise.reject(new Error("blocked")) : Promise.resolve(); }
   pause() { this.paused = true; }
 }
 AudioStub.made = [];
@@ -4715,6 +4732,215 @@ run("stopNowPolling()");
   run(`show("now")`);
   check("SP2 leaving the Split tab stops the preview", clip.paused && run("spAudioUri") === null, "");
   ctx.confirm = () => true;
+  run(`show("lists")`);
+}
+
+// ============================================================================
+// SP3 — fix round 1: the drop survives a real HTMLCollection, a resume is
+// armed only after a real play, backgrounding and re-entry stop a clip, the
+// iOS retry, multi-touch safety, and a failed resume says so.
+// ============================================================================
+{
+  const songs = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                  u3: { name: "Three", artists: "C", local: false } };
+  const D = (parts, extra = {}) => ({ playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2, parts,
+    unknown: [], hint: null, scores: {}, songs, tracks: [], done: null, ...extra });
+  const two = () => [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3"] }];
+  run(`show("split")`);
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spPid = "H1"; spShown = "p1"; spSection("sp-work"); renderSpParts(); nowState = { is_playing: true }`);
+
+  // fix 1 — dropping a lifted song must never call .indexOf() on
+  // document.body.children: a real HTMLCollection has none, and the old
+  // branch that did threw before spHighlight(null) or the move ever ran.
+  resetLog();
+  routes["POST /api/splitparts/H1/move"] = { status: 200,
+    body: D([{ key: "p1", name: "rock", uris: ["u2"] }, { key: "p2", name: "jazz", uris: ["u3", "u1"] }]) };
+  document.elementFromPoint = () => ({ closest: () => ({ dataset: { key: "p2" } }) });
+  run(`spPointerDown("u1", 10, 10)`);
+  run(`spPointerMove(10, 40)`);
+  // Stand in for a real HTMLCollection for the span of this one drop: it has
+  // no indexOf, so app code reaching for one throws exactly as it would in
+  // a real browser. Swapped back right after — later checks' `.some()` call
+  // is the stub's own bookkeeping, not something app code depends on.
+  const realChildren = document.body.children;
+  document.body.children = new Proxy(realChildren, {
+    get(t, p) { if (p === "indexOf") throw new Error("a real HTMLCollection has no indexOf"); return t[p]; },
+  });
+  let dropErr = null;
+  try { await run(`spPointerUp(10, 40)`); } catch (e) { dropErr = e; }
+  document.body.children = realChildren;
+  check("SP3 dropping a lifted song never reaches for document.body.children.indexOf",
+        dropErr === null, String(dropErr));
+  check("SP3 ...the ghost is actually gone (the stub's own remove(), not app code)",
+        !document.body.children.some((c) => c.className === "sp-ghost"), "");
+  check("SP3 ...the chip highlight clears instead of staying lit", run("spDropKey") === null, run("spDropKey"));
+  const mv1 = log.find((l) => l.path === "/api/splitparts/H1/move");
+  check("SP3 ...and the song actually moved, instead of the drop silently doing nothing",
+        mv1 && JSON.parse(mv1.body).uri === "u1" && JSON.parse(mv1.body).to === "p2", JSON.stringify(mv1));
+  document.elementFromPoint = () => null;
+
+  // fix 5 — two fingers: a second touch must end the first finger's drag
+  // (and its ghost), and the first finger's later release must do nothing.
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p1"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0;
+  run(`spPointerDown("u1", 10, 10, 1)`);
+  run(`spPointerMove(10, 40, 1)`);
+  check("SP3 the first finger's drag lifts", document.body.children.some((c) => c.className === "sp-ghost"), "");
+  run(`spPointerDown("u3", 10, 10, 2)`);
+  check("SP3 a second finger touching down ends the first finger's drag and its ghost",
+        !document.body.children.some((c) => c.className === "sp-ghost") && run("spDropKey") === null, "");
+  await run(`spPointerUp(10, 40, 1)`);
+  check("SP3 the first finger's now-stale release does nothing",
+        !log.some((l) => l.path.endsWith("/move")) && AudioStub.made.length === 0, `made=${AudioStub.made.length}`);
+  run(`spPointerCancel(2)`);   // tidy up the second finger too
+
+  // fix 2 — spResumeOwed must arm only once a clip actually plays, never on
+  // a 404 or a refused play, so leaving the tab never wrongly resumes.
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p1"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = false;
+  routes["GET /api/track_preview?pid=H1&uri=u2"] = { status: 404, body: { detail: "no preview" } };
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  run(`show("now")`);
+  check("SP3 a 404 preview leaves nothing to resume when the tab is left",
+        log.filter((l) => l.path === "/api/preview_resume").length === 0, "");
+  run(`show("split")`);
+
+  resetLog();
+  AudioStub.refuse = true;
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  run(`show("now")`);
+  check("SP3 a refused play never sends a resume either",
+        log.filter((l) => l.path === "/api/preview_resume").length === 0, "");
+  run(`show("split")`);
+  AudioStub.refuse = false;
+
+  resetLog();
+  routes["GET /api/track_preview?pid=H1&uri=u2"] = { status: 200, body: { url: "https://cdn/u2.mp3", uri: "u2", deezer_id: 2 } };
+  routes["POST /api/preview_resume"] = { status: 200, body: { ok: true } };
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(11, 12)`);
+  await tick();
+  check("SP3 a played clip, stopped, sends exactly one resume",
+        log.filter((l) => l.path === "/api/preview_resume").length === 1, "");
+
+  // fix 4 — a refused play (iOS) keeps the clip; the same row's next tap
+  // retries play() on that SAME Audio object, no refetch, no new Audio.
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p1"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = true;
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP4 a refused play says to tap again and keeps the clip pending",
+        AudioStub.made.length === 1 && /tap the song again/.test($$("toast").textContent) &&
+        run("spAudioUri") === "u1", $$("toast").textContent);
+  AudioStub.refuse = false;
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP4 tapping the same row again retries play() on the same Audio object",
+        AudioStub.made.length === 1 && AudioStub.made[0].playCalls === 2,
+        `made=${AudioStub.made.length} calls=${AudioStub.made[0]?.playCalls}`);
+  check("SP4 ...with no second fetch for the same uri",
+        gets("/api/track_preview?pid=H1&uri=u1") === 1, `${gets("/api/track_preview?pid=H1&uri=u1")} GET(s)`);
+  routes["POST /api/preview_resume"] = { status: 200, body: { ok: true } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(11, 12)`);
+  await tick();
+  check("SP4 once the retry succeeds, stopping it still resumes exactly once",
+        log.filter((l) => l.path === "/api/preview_resume").length === 1, "");
+
+  // fix 3 — backgrounding the tab (visibilitychange) must stop a live split
+  // preview, the same way it already stops the house player's.
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p2"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0;
+  routes["GET /api/track_preview?pid=H1&uri=u3"] = { status: 200, body: { url: "https://cdn/u3.mp3", uri: "u3", deezer_id: 3 } };
+  run(`spPointerDown("u3", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  const bgClip = AudioStub.made[AudioStub.made.length - 1];
+  document.hidden = true;
+  for (const h of handlers.visibilitychange || []) h();
+  check("SP3 backgrounding the tab stops a live split preview",
+        bgClip.paused && run("spAudioUri") === null, "");
+  document.hidden = false;
+
+  // fix 6a — a resume that fails (ok:false, or the call itself rejecting)
+  // says so, like the house player.
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p1"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0;
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  routes["POST /api/preview_resume"] = { status: 200, body: { ok: false, error: "no active device" } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(11, 12)`);
+  await tick();
+  check("SP6 a resume that comes back ok:false says to press play in Spotify",
+        /press play in Spotify/.test($$("toast").textContent), $$("toast").textContent);
+
+  resetLog();
+  routes["POST /api/preview_resume"] = () => Promise.reject(new Error("network down"));
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(11, 12)`);
+  await tick();
+  check("SP6 a resume call that rejects outright says the same",
+        /press play in Spotify/.test($$("toast").textContent), $$("toast").textContent);
+
+  // fix 6b — starting a fresh Suggest run, or re-opening the home picker,
+  // must stop a live preview rather than let it play on underneath.
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p1"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0;
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  const suggestClip = AudioStub.made[AudioStub.made.length - 1];
+  routes["POST /api/splitparts/H1/suggest"] = { status: 200, body: { started: true } };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "running", phase: "grouping", done: 0, total: 0, message: null, summary: null } };
+  await run(`spSuggest(2)`);
+  check("SP6 starting a fresh Suggest run stops a live preview",
+        suggestClip.paused && run("spAudioUri") === null, "");
+  run(`spStopPolling()`);
+
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p1"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0;
+  routes["GET /api/track_preview?pid=H1&uri=u2"] = { status: 200, body: { url: "https://cdn/u2.mp3", uri: "u2", deezer_id: 2 } };
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  const pickerClip = AudioStub.made[AudioStub.made.length - 1];
+  routes["GET /api/splitparts/homes"] = { status: 200, body: { homes: [] } };
+  await run(`showSplit()`);
+  check("SP6 re-entering the Split tab's home picker stops a live preview",
+        pickerClip.paused && run("spAudioUri") === null, "");
+
   run(`show("lists")`);
 }
 
