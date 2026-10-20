@@ -161,6 +161,14 @@ escalating penalties. Therefore:
   through the desktop client. Creation still sends `public: false` unless a
   caller passes `public=True`; whether the CREATE honours it was never probed
   (the PUT-after-create path is the verified one).
+- **Playlist reads ask for playability** (since 2026-10-20): `market=from_token`
+  plus `is_playable,linked_from` in the fields, stored as each track's
+  `playable`. Unprobed in dev mode when written; a 400 drops that process
+  back to the old request. A market can return a relinked stand-in, so
+  `_slim_track` keeps `linked_from`'s uri — removals and membership need the
+  playlist's own. The input switcher's count leaves out `_unplayable` songs
+  (`playable` False, or no title: how the API returns a pulled song); they
+  stay members everywhere else.
 
 ## Playlist folders (how folder paths work — costs zero API calls)
 

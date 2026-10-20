@@ -114,6 +114,15 @@ ITEM_FIELDS = (
     "items(added_at,is_local,item(uri,id,type,name,duration_ms,"
     "artists(id,name),album(name,images,release_date))),next"
 )
+# The same, plus whether each song can still be played. `is_playable` only
+# comes back when the read names a market; from_token is the account's own
+# country, which is what the Spotify app greys songs out by. Never probed in
+# dev mode, so a 400 on it drops back to exactly the request above.
+ITEM_FIELDS_PLAYABLE = (
+    "items(added_at,is_local,item(uri,id,type,name,duration_ms,is_playable,"
+    "linked_from(uri,id),artists(id,name),album(name,images,release_date))),next"
+)
+ITEM_MARKET = "from_token"
 
 
 class AuthNeeded(Exception):
@@ -187,6 +196,9 @@ class Spotify:
         # poke the API again (that can extend the penalty).
         self.cooldown_until = float(store.tokens().get("cooldown_until", 0))
         self._last_call = 0.0
+        # Cleared by a 400 on a playlist read that asked for a market, so a
+        # rejection costs one retry per process rather than one per read.
+        self._items_market = True
         self._window: deque[float] = deque()  # timestamps of recent calls
         self._budget_lock = threading.Lock()
         # Several browser tabs poll concurrently; without a lock they race to
@@ -696,10 +708,18 @@ class Spotify:
         t = item.get("item") or item.get("track")
         if not t:
             return None
+        # A read with a market can hand back a relinked recording: a playable
+        # stand-in, with the one actually in the playlist under linked_from.
+        # The playlist's own uri is what every removal and membership check
+        # needs, so it wins.
+        orig = t.get("linked_from") or {}
         return {
-            "uri": t.get("uri"),
-            "id": t.get("id"),
+            "uri": orig.get("uri") or t.get("uri"),
+            "id": orig.get("id") or t.get("id"),
             "name": t.get("name"),
+            # False only when Spotify says so; None when the read carried no
+            # market (Liked Songs, a cache from before 2026-10-20).
+            "playable": t.get("is_playable"),
             "type": t.get("type", "track"),
             "is_local": item.get("is_local", False),
             "duration_ms": t.get("duration_ms"),
@@ -718,19 +738,26 @@ class Spotify:
         if playlist_id == LIKED_ID:
             items = list(self._paginate("/me/tracks", {"limit": 50}, **kw))
         else:
-            try:
-                items = list(
-                    self._paginate(
-                        f"/playlists/{playlist_id}/items",
-                        {"limit": 100, "fields": ITEM_FIELDS}, **kw,
-                    )
-                )
-            except SpotifyError as e:
-                # If the fields filter is rejected, refetch unfiltered.
-                if e.status != 400:
-                    raise
-                items = list(self._paginate(f"/playlists/{playlist_id}/items",
-                                            {"limit": 100}, **kw))
+            path = f"/playlists/{playlist_id}/items"
+            items = None
+            if self._items_market:
+                try:
+                    items = list(self._paginate(
+                        path, {"limit": 100, "fields": ITEM_FIELDS_PLAYABLE,
+                               "market": ITEM_MARKET}, **kw))
+                except SpotifyError as e:
+                    if e.status != 400:
+                        raise
+                    self._items_market = False
+            if items is None:
+                try:
+                    items = list(self._paginate(
+                        path, {"limit": 100, "fields": ITEM_FIELDS}, **kw))
+                except SpotifyError as e:
+                    # If the fields filter is rejected, refetch unfiltered.
+                    if e.status != 400:
+                        raise
+                    items = list(self._paginate(path, {"limit": 100}, **kw))
         return [t for t in (self._slim_track(i) for i in items) if t and t["uri"]]
 
     # ---- playback control -------------------------------------------------

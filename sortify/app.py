@@ -854,6 +854,14 @@ def _effective_subset_ids(cfg: dict, playlists: list[dict]) -> set[str]:
 # ---- cache helpers ---------------------------------------------------------
 
 
+def _unplayable(t: dict) -> bool:
+    """A song the Spotify app greys out: Spotify said so (`playable` False,
+    read with a market since 2026-10-20), or it came back with no title,
+    which is how the dev-mode API returns a song pulled from the catalogue.
+    The title test also covers caches read before the flag existed."""
+    return t.get("playable") is False or not t.get("name")
+
+
 def _cached_tracks(pid: str, snapshot_id: str | None) -> list[dict]:
     cache = store.cache()
     entry = cache["playlists"].get(pid)
@@ -1003,6 +1011,9 @@ def _build_profiles() -> dict:
         tracks = _cached_tracks(iid, by_id.get(iid, {}).get("snapshot_id"))
         inputs.append({
             "id": iid, "name": name, "uris": {t["uri"] for t in tracks},
+            # Kept out of the switcher's count only (see _now_payload); they
+            # are still members for every other purpose.
+            "unplayable": {t["uri"] for t in tracks if _unplayable(t)},
             "set": (inputsets.set_of(name, (store.folders().get(iid) or {}).get("path"),
                                      inputsets.resolve_sets(cfg))
                     or inputsets.DEFAULT_KEY),
@@ -4045,7 +4056,9 @@ def _idle_inputs_payload() -> list[dict]:
     upstream, and must never trade "nothing playing" for the >40-homes 400
     a profile build is allowed to raise. An empty cache just means no CTA.
     """
-    items = (store.cache().get("playlist_list") or {}).get("items") or []
+    cache = store.cache()
+    items = (cache.get("playlist_list") or {}).get("items") or []
+    cached = cache.get("playlists") or {}
     by_id = {p["id"]: p for p in items}
     out = []
     for iid in sorted(_effective_input_ids(store.config(), items)):
@@ -4057,9 +4070,16 @@ def _idle_inputs_payload() -> list[dict]:
         elif iid in by_id:
             # The listing's own total, NOT a membership set — there is none to
             # count here, and building one is exactly what this branch must
-            # never do. Same number in practice, staler by a refresh.
+            # never do. Same number in practice, staler by a refresh. Less the
+            # unplayable songs the cached track list already knows of (a disk
+            # read, no call), so it matches the playing switcher's count.
+            total = by_id[iid].get("total")
+            entry = cached.get(iid)
+            if isinstance(total, int) and isinstance(entry, dict):
+                total = max(0, total - len({t["uri"] for t in entry.get("tracks") or []
+                                            if _unplayable(t)}))
             out.append({"id": iid, "name": by_id[iid]["name"], "has_track": False,
-                        "total": by_id[iid].get("total")})
+                        "total": total})
     return out
 
 
@@ -4171,7 +4191,9 @@ def _suggestion_payload(np: dict) -> dict:
              # inbox empties instead of waiting out PROFILE_TTL. Deduped by
              # construction, which is why it can differ by a track or two from
              # the listing's `total` on a playlist holding the same song twice.
-             "total": len(l["uris"])}
+             # Songs that can no longer be played are left out: the count is
+             # what there is to work through, and the Spotify app hides them.
+             "total": len(l["uris"] - l.get("unplayable", set()))}
             for l in state["inputs"]
         ],
         "homeless_id": _homeless_id(state),
