@@ -896,6 +896,18 @@ $("btn-now-refresh").onclick = async () => {
   try { await pollNow(true); } finally { b.disabled = false; b.classList.remove("spinning"); }
 };
 
+// A failed fetch says so on the card with a Try again beside it, which is
+// exactly a press of refresh: same forced poll, same spinner, same lockout
+// against double taps. Without it a failure sat there until the next
+// scheduled poll (90s), or forever in manual mode.
+function retryButton(id) {
+  return `<button id="${id}" class="retry-btn">Try again</button>`;
+}
+function wireRetry(id) {
+  const b = $(id);
+  if (b) b.onclick = () => { b.disabled = true; $("btn-now-refresh").onclick(); };
+}
+
 function showNow() {
   show("now");
   stopNowPolling();
@@ -1066,7 +1078,8 @@ function renderNowProblem(msg) {
   const cd = msg.match(/cooldown — try again in ~(\d+) min/);
   if (!cd) {
     nowCooldownUntil = nowCooldownTotal = 0;
-    $("now-card").innerHTML = `<p class="done-msg">${esc(msg)}</p>`;
+    $("now-card").innerHTML = `<div class="done-msg"><p>${esc(msg)}</p>${retryButton("btn-now-retry")}</div>`;
+    wireRetry("btn-now-retry");
     return;
   }
   // One clock read for the whole first paint. Deriving `until` from Date.now()
@@ -1991,6 +2004,7 @@ function renderNow() {
   const undoRem = $("btn-now-undo-remove");
   if (undoRem) undoRem.onclick = undoStripAction;
   wireCoverPanel();
+  wireRetry("btn-sugg-retry");
   startNowTicker(d, tr);
   wireSeekBar(tr);
 
@@ -2256,7 +2270,7 @@ function ordinaryCardBody(d, tr, ctx) {
   // moment the answer landed, on a card the user was already aiming at.
   let lead = "";
   if (d.suggError) {
-    body += `<p class="hint">suggestions failed: ${esc(d.suggError)} — refresh to retry.</p>`;
+    body += `<p class="hint">suggestions failed: ${esc(d.suggError)} ${retryButton("btn-sugg-retry")}</p>`;
   } else if (provisional) {
     rows += captureRows(d, true);
   } else if (d.suggPending) {

@@ -867,6 +867,8 @@ body:not(.on-now) #adrift-strip { display: none; }
 .danger { color: var(--danger); }
 .done-msg { text-align: center; padding: 3rem 0; color: var(--muted); }
 .done-msg p { margin: 0; }
+.done-msg .retry-btn { margin-top: .8rem; }
+.hint .retry-btn { margin-left: .4rem; padding: .2rem .7rem; font-size: .85rem; }
 /* The filed card names the song: the choice is made, so blind mode is done
    with it. One line each, cut with an ellipsis like the rest of the card. */
 .done-msg .filed-song { margin-bottom: .5rem; max-width: 100%; }

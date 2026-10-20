@@ -1867,6 +1867,46 @@ run("stopNowPolling()");
   check("PULL no cover: no pull, and the click's toast says why",
         !panelOpen() && !run("coverOpen") && /no cover/.test($$("toast").textContent),
         `toast=${JSON.stringify($$("toast").textContent)}`);
+
+  // A poll that never reaches the server ("Failed to fetch") says so with a
+  // Try again, which polls again at once instead of waiting out the 90s.
+  const lightRoute = routes["GET /api/now?light=1&force=1"];
+  routes["GET /api/now?light=1&force=1"] = () => { throw new TypeError("Failed to fetch"); };
+  run(`pollNow(true)`);
+  await tick();
+  run("stopNowPolling()");
+  check("RETRY a failed poll shows the error with a Try again",
+        /Failed to fetch/.test(card()) && /id="btn-now-retry"[^>]*>Try again</.test(card()),
+        card().slice(0, 200));
+  routes["GET /api/now?light=1&force=1"] = lightRoute;
+  resetLog();
+  $$("btn-now-retry").onclick();
+  check("RETRY ...pressing it disables it against a double tap",
+        $$("btn-now-retry").disabled === true, "");
+  await tick();
+  run("stopNowPolling()");
+  check("RETRY ...and polls again at once, putting the card back",
+        gets("/api/now?light=1&force=1") === 1 && !/btn-now-retry|Failed to fetch/.test(card()) &&
+        !$$("btn-now-refresh").disabled,
+        `polls=${gets("/api/now?light=1&force=1")} card=${card().slice(0, 120)}`);
+
+  // Same for the suggestions half of the card.
+  const suggRoute = routes["GET /api/now/suggest?force=1"];
+  routes["GET /api/now/suggest?force=1"] = () => { throw new TypeError("Failed to fetch"); };
+  run(`pollNow(true)`);
+  await tick(); await tick();
+  run("stopNowPolling()");
+  check("RETRY failed suggestions carry a Try again too",
+        /suggestions failed: Failed to fetch/.test(card()) && /id="btn-sugg-retry"/.test(card()),
+        card().slice(0, 400));
+  routes["GET /api/now/suggest?force=1"] = suggRoute;
+  resetLog();
+  $$("btn-sugg-retry").onclick();
+  await tick(); await tick();
+  run("stopNowPolling()");
+  check("RETRY ...which refetches them and clears the failure",
+        gets("/api/now/suggest?force=1") === 1 && !/suggestions failed/.test(card()),
+        `sugg=${gets("/api/now/suggest?force=1")}`);
 }
 
 // ============================================================================
