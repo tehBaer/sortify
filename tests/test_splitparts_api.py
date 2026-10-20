@@ -758,3 +758,56 @@ def test_created_id_is_saved_before_home_ids_are_updated(env, monkeypatch):
     cfg = appmod.store.config()
     assert {"N1", "N2"} <= set(cfg["home_ids"])
     assert {"N1", "N2"} <= set(cfg["sticky_home_ids"])
+
+
+# ---- fix round 2 (Task 10 frontend review) ----------------------------
+
+
+def test_progress_carries_kind_for_a_suggest_job(client):
+    client.post("/api/splitparts/H1/suggest", json={"n": 2})
+
+    assert progress(client)["kind"] == "suggest"
+
+
+def test_progress_kind_is_none_when_idle(client):
+    assert progress(client)["kind"] is None
+
+
+def test_progress_carries_kind_for_a_done_job(env):
+    env.post("/api/splitparts/H1/done", json={"names": {}, "folder": None, "original": "subset"})
+
+    assert progress(env)["kind"] == "done"
+
+
+def test_a_resumed_done_validates_against_the_stored_opts_not_the_retry_body(env, monkeypatch):
+    """The first attempt chose "part"/"p1" with no folder and crashed mid-way
+    (one playlist created, its add not yet done). A retry's body says
+    "subset" and names the BLOCKED folder "ROOT / Deep" — a body like that
+    alone would be refused outright at the folder check. Validation must
+    check the stored opts (what `_splitparts_run_done` actually uses on a
+    resume — it already ignores the body), not the retry's body, or a
+    crash-and-retry could get stuck 400ing on a body the resumed run was
+    never going to honour anyway. And the run itself must still follow the
+    stored choice, not the retry body's "subset"."""
+    real_add = appmod.sp.add_to_playlist
+    failed = []
+
+    def flaky(pid, uris, bulk=False, spend_reserve=False):
+        if not failed:
+            failed.append(1)
+            raise SpotifyError(429, "rate limited")
+        return real_add(pid, uris)
+
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", flaky)
+    env.post("/api/splitparts/H1/done",
+             json={"names": {}, "folder": None, "original": "part", "part": "p1"})
+    assert progress(env)["state"] == "error"
+
+    res = env.post("/api/splitparts/H1/done",
+                   json={"names": {}, "folder": "ROOT / Deep", "original": "subset"})
+
+    assert res.status_code == 200
+    assert progress(env)["state"] == "done"
+    assert not any(e[0] == "rename" for e in env.log)      # the stored "part" choice ran
+    assert any(e[0] == "remove" for e in env.log)
+    assert env.filed == []                                  # the stored folder (None) ran, not "ROOT / Deep"

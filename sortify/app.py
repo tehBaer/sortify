@@ -828,7 +828,7 @@ def splitparts_suggest(pid: str, body: SplitSuggestIn):
         if _splitparts_job.get("state") == "running":
             raise HTTPException(409, "already running")
         _splitparts_job.clear()
-        _splitparts_job.update({"pid": pid, "state": "running", "phase": "starting",
+        _splitparts_job.update({"pid": pid, "state": "running", "phase": "starting", "kind": "suggest",
                                 "done": 0, "total": 0, "message": None})
     if _splitparts_threaded:
         threading.Thread(target=_splitparts_run_suggest, args=(playlist, body.n),
@@ -844,8 +844,8 @@ def splitparts_progress(pid: str):
         job = dict(_splitparts_job)
     if job.get("pid") != pid:
         return {"state": "idle", "phase": "", "done": 0, "total": 0, "message": None,
-                "summary": None}
-    return {k: job.get(k) for k in ("state", "phase", "done", "total", "message", "summary")}
+                "summary": None, "kind": None}
+    return {k: job.get(k) for k in ("state", "phase", "done", "total", "message", "summary", "kind")}
 
 
 @app.get("/api/splitparts/{pid}")
@@ -1117,25 +1117,38 @@ def _splitparts_run_done(pid: str, opts: dict) -> None:
 @app.post("/api/splitparts/{pid}/done")
 def splitparts_done(pid: str, body: SplitDoneIn):
     draft = _splitparts_draft(pid)
+    # A resumed Done (draft["done"] already set) ignores the request body —
+    # _splitparts_run_done keeps the choices it started with — so validation
+    # must check the SAME thing the runner will actually do, or a retry whose
+    # body disagrees with the stored opts (e.g. the screen reopened with
+    # fresh editable defaults instead of the locked finish screen) could pass
+    # here against "subset" while the runner goes on to remove songs for a
+    # stored "part" choice.
+    started = draft.get("done")
+    check = started["opts"] if started is not None else {
+        "names": body.names, "folder": body.folder, "original": body.original, "part": body.part}
     try:
-        plan = spa.done_plan(draft, body.original, body.part, names=body.names,
-                             remove_batch=REMOVE_BATCH)
+        plan = spa.done_plan(draft, check["original"], check.get("part"),
+                             names=check.get("names"), remove_batch=REMOVE_BATCH)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     problem = _splitparts_name_problem([p["name"] for p in plan["new_parts"]])
     if problem:
         raise HTTPException(400, problem)
-    if body.folder:
+    if check.get("folder"):
         choices, _ = _home_folder_choices(store.config(), pid)
-        if not any(c["path"] == body.folder and not c["blocked"] for c in choices):
-            raise HTTPException(400, f"{body.folder!r} is not an offered folder")
+        if not any(c["path"] == check["folder"] and not c["blocked"] for c in choices):
+            raise HTTPException(400, f"{check['folder']!r} is not an offered folder")
     with _splitparts_job_lock:
         if _splitparts_job.get("state") == "running":
             raise HTTPException(409, "already running")
         _splitparts_job.clear()
-        _splitparts_job.update({"pid": pid, "state": "running", "phase": "starting",
+        _splitparts_job.update({"pid": pid, "state": "running", "phase": "starting", "kind": "done",
                                 "done": 0, "total": plan["creates"], "message": None,
                                 "summary": None})
+    # The body's own opts still seed a FIRST attempt (the runner has nothing
+    # stored yet to prefer); a resume ignores them regardless, inside the
+    # runner itself.
     opts = {"names": body.names, "folder": body.folder, "original": body.original,
             "part": body.part}
     if _splitparts_threaded:
