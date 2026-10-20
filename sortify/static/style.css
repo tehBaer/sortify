@@ -1056,9 +1056,10 @@ body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
 
 /* The cover, pulled down from the bar into the card: full card width,
    the title, artist and share under it; a tap on it closes it. It comes
-   down like a blind, continuing the grey edge that peeked under the bar:
-   the shade opens from nothing, anchored so the image's BOTTOM edge leads,
-   and the image goes from blurred grey to sharp colour as it opens. The
+   down continuing the grey strip that peeked under the bar: the shade opens
+   from nothing with the image centred in it, so the middle of the cover
+   shows first and the top and bottom come in as it opens, while the image
+   goes from blurred grey to sharp colour. The
    title and artist come in over the last stretch. Everything reads one
    number, --f (0 shut, 1 open): a pull sets it inline, the tap's opening
    animates it, a release transitions it. Registered so it can animate. */
@@ -1070,13 +1071,14 @@ body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
   height: 0; padding-top: calc(var(--f) * 100%);
 }
 .track-card .cover-panel .cover-shade img {
-  position: absolute; left: 0; bottom: 0;
+  position: absolute; left: 0; top: 50%;
   display: block; width: 100%; height: auto; aspect-ratio: 1;
   object-fit: cover; box-shadow: none; border-radius: 0;
   filter: grayscale(calc(1 - var(--f))) blur(calc((1 - var(--f)) * 8px));
-  /* Blur pulls the background in at the edges; a little overscale while it
-     is blurred pushes that soft rim outside the shade, which clips it. */
-  transform: scale(calc(1 + (1 - var(--f)) * .08));
+  /* Centred in the shade. Blur pulls the background in at the edges; a
+     little overscale while it is blurred pushes that soft rim outside the
+     shade, which clips it. */
+  transform: translateY(-50%) scale(calc(1 + (1 - var(--f)) * .08));
 }
 .cover-panel.cover-in { animation: cover-down .35s cubic-bezier(.2, .8, .2, 1); }
 @keyframes cover-down { from { --f: 0; } }
@@ -1099,7 +1101,7 @@ body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
    release the rest plays out. */
 body.on-now header { touch-action: none; user-select: none; -webkit-user-select: none; }
 body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { touch-action: auto; }
-/* The cover behind the bar: its bottom edge, blurred and grey, as a thin
+/* The cover behind the bar: its middle, blurred and grey, as a thin
    lip under the bar, with a grab pill. Grey because it is still hidden:
    the colour comes with the cover. Overlaid, so it moves no layout. */
 #cover-peek {
@@ -1110,7 +1112,7 @@ body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { t
 body:not(.on-now) #cover-peek { display: none; }
 #cover-peek-art {
   position: absolute; inset: -16px;
-  background: center bottom / cover no-repeat;
+  background: center / cover no-repeat;
   filter: blur(8px) grayscale(1);
 }
 .peek-grip {

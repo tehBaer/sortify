@@ -2928,7 +2928,7 @@ function settleCoverPull(open) {
   setTimeout(() => { if (coverOpen && coverPull === 0 && coverUri === uri) closeCover(); }, 200);
 }
 
-// What says the cover is up there: the bottom edge of this song's art, peeking
+// What says the cover is up there: the middle of this song's art, peeking
 // out under the bar as a thin band with a grab pill on it. Blurred and grey,
 // so it hints without naming the song. Shown while a track with art
 // is on the card and the cover is shut; a tap on it opens the cover too.
@@ -3013,9 +3013,9 @@ function coverPanel(tr) {
         <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>
       </button>`
     : "";
-  // The cover comes down like a blind: the shade shows the image's bottom
-  // edge first, the part that peeked out under the bar, and colour comes in
-  // as it opens. `--f` (0..1) is how far; style.css draws everything from it.
+  // The cover opens from its middle: the shade shows the centre slice
+  // first, the part that peeked out under the bar, then the top and bottom,
+  // and colour comes in as it opens. `--f` (0..1) is how far; style.css draws everything from it.
   return `<div id="cover-panel" class="cover-panel${fresh}"${pull}>
       <div class="cover-shade"><img src="${esc(tr.image_large || tr.image)}" alt=""></div>
       <div class="cover-info">
