@@ -1199,3 +1199,11 @@ body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
 .sp-chip.sp-add { font-weight: 700; min-width: 2.6rem; }
 #sp-hint { margin: .4rem 0; color: var(--muted); }
 #sp-actions { margin-top: 1rem; gap: .5rem; }
+
+#sp-done h3 { font-size: 1rem; margin: 1.1rem 0 .4rem; }
+.sp-name-row { display: block; margin: .4rem 0; }
+.sp-name-row input { width: 100%; }
+.sp-orig { display: block; margin: .35rem 0; }
+.sp-warn { color: var(--muted); }
+.sp-cost { margin-top: 1rem; font-weight: 600; }
+.sp-summary { padding-left: 1.2rem; }

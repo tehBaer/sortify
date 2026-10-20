@@ -4004,7 +4004,164 @@ async function spPoll(kind, pid = spPid) {
   renderSpParts();
 }
 
-function spDoneFinished(p) { renderSpParts(); }
+// ---- Done ---------------------------------------------------------------------
+let spDoneChoice = { original: "subset", part: null, folder: null, names: {} };
+let spPlan = null;
+// A plain flag, not the Confirm button's `disabled` attribute: the guard
+// must stop a second CALL to spConfirmDone (the Done-again button reuses
+// it too), and a disabled attribute only stops a second real tap on a real
+// button — it would not catch a double call made directly.
+let spConfirmBusy = false;
+
+async function spOpenDone() {
+  spStopPreview();   // no clip plays on under the Done screen
+  spDoneChoice = { original: "subset", part: spDraft.parts[0]?.key || null,
+                   folder: undefined, names: {} };
+  spPanel("sp-done");
+  $("sp-done").innerHTML = '<div class="spinner"></div>';
+  await spRefreshPlan();
+}
+
+async function spRefreshPlan() {
+  spReadNames();
+  const q = spDoneChoice.original === "part"
+    ? `?original=part&part=${encodeURIComponent(spDoneChoice.part)}`
+    : "?original=subset";
+  try {
+    spPlan = await api(spUrl("/plan" + q));
+  } catch (e) {
+    $("sp-done").innerHTML = `<p class="hint">${esc(e.message)}</p>
+      <div class="row"><button id="sp-done-back">Back</button></div>`;
+    $("sp-done-back").onclick = renderSpParts;
+    return;
+  }
+  if (spDoneChoice.folder === undefined) spDoneChoice.folder = spPlan.folder || "";
+  renderSpDone();
+}
+
+// What the name fields hold now; an emptied field falls back to the
+// suggested name (the server does the same).
+function spReadNames() {
+  if (!spDraft) return;
+  spDraft.parts.forEach((p, i) => {
+    const el = $(`sp-name-${i}`);
+    const v = el && typeof el.value === "string" ? el.value.trim() : "";
+    if (el && !el.disabled) spDoneChoice.names[p.key] = v || spDoneChoice.names[p.key] || p.name;
+  });
+}
+
+function spCostLine(plan, isPart) {
+  const n = plan.creates;
+  const made = `${n} new playlist${n === 1 ? "" : "s"}`;
+  const orig = isPart
+    ? `removes ${plan.removals} song${plan.removals === 1 ? "" : "s"} from the original`
+    : "marks the original as a subset";
+  return `${made} · ${orig} · about ${plan.calls} calls`;
+}
+
+function renderSpDone() {
+  const isPart = spDoneChoice.original === "part";
+  const names = spDraft.parts.map((p, i) => {
+    const keeps = isPart && p.key === spDoneChoice.part;
+    const val = keeps ? spDraft.name : (spDoneChoice.names[p.key] || p.name);
+    return `<label class="sp-name-row">
+        <span class="hint">${p.uris.length} song${p.uris.length === 1 ? "" : "s"}${keeps ? ` · keeps the name “${esc(spDraft.name)}”` : ""}</span>
+        <input id="sp-name-${i}" value="${esc(val)}" autocomplete="off"${keeps ? " disabled" : ""}>
+      </label>`;
+  }).join("");
+  const folders = [`<option value="">${esc(FOLDER_TOP_LEVEL)}</option>`].concat(
+    (spPlan.folders || []).map((f) => `<option value="${esc(f.path)}"${f.blocked ? " disabled" : ""}>${esc(f.path)}${f.blocked ? " — file by hand" : ""}</option>`)).join("");
+  const parts = spDraft.parts.map((p) =>
+    `<option value="${esc(p.key)}"${p.key === spDoneChoice.part ? " selected" : ""}>${esc(p.name)}</option>`).join("");
+  const warn = [];
+  if (spPlan.local.length) {
+    warn.push(`${spPlan.local.length} local file${spPlan.local.length === 1 ? "" : "s"} cannot be added through Spotify's API and stay${spPlan.local.length === 1 ? "s" : ""} in the original only: ${spPlan.local.map(esc).join(", ")}`);
+  }
+  if (spPlan.empty.length) warn.push(`Not created, no songs: ${spPlan.empty.map(esc).join(", ")}`);
+  $("sp-done").innerHTML = `
+    <h3>Name the parts</h3>${names}
+    <h3>Folder</h3><select id="sp-folder">${folders}</select>
+    <h3>The original, “${esc(spDraft.name)}”</h3>
+    <label class="sp-orig"><input type="radio" name="sp-orig" id="sp-orig-subset"${isPart ? "" : " checked"}>
+      Keep it as a subset — it keeps every song and stops being a home</label>
+    <label class="sp-orig"><input type="radio" name="sp-orig" id="sp-orig-part"${isPart ? " checked" : ""}>
+      It becomes the part <select id="sp-orig-part-key"${isPart ? "" : " disabled"}>${parts}</select></label>
+    ${warn.map((w) => `<p class="hint sp-warn">${w}</p>`).join("")}
+    <p id="sp-cost" class="sp-cost">${spCostLine(spPlan, isPart)}</p>
+    <div class="row"><button id="sp-done-back">Back</button><button id="sp-confirm" class="primary">Confirm</button></div>`;
+  $("sp-folder").value = spDoneChoice.folder || "";
+  $("sp-folder").onchange = () => { spDoneChoice.folder = $("sp-folder").value; };
+  $("sp-orig-subset").onchange = () => { spDoneChoice.original = "subset"; spRefreshPlan(); };
+  $("sp-orig-part").onchange = () => { spDoneChoice.original = "part"; spRefreshPlan(); };
+  $("sp-orig-part-key").onchange = () => { spDoneChoice.part = $("sp-orig-part-key").value; spRefreshPlan(); };
+  $("sp-done-back").onclick = () => { spReadNames(); renderSpParts(); };
+  $("sp-confirm").onclick = spConfirmDone;
+}
+
+async function spConfirmDone() {
+  // A double tap (or a Done-again retry landing while a first POST is still
+  // in flight) must not post twice — the server would 409 the second one,
+  // but the screen must not flash "already running" over what the user
+  // just confirmed.
+  if (spConfirmBusy) return;
+  spConfirmBusy = true;
+  if ($("sp-confirm")) $("sp-confirm").disabled = true;
+  spReadNames();
+  const isPart = spDoneChoice.original === "part";
+  const body = { names: spDoneChoice.names, folder: spDoneChoice.folder || null,
+                 original: spDoneChoice.original, part: isPart ? spDoneChoice.part : null };
+  try {
+    await api(spUrl("/done"), body);
+  } catch (e) {
+    spConfirmBusy = false;
+    if ($("sp-confirm")) $("sp-confirm").disabled = false;
+    toast(e.message, 6000);
+    return;
+  }
+  spConfirmBusy = false;
+  spPanel("sp-progress");
+  $("sp-progress").innerHTML = '<div class="spinner"></div><p class="hint">starting…</p>';
+  await spPoll("done");
+}
+
+function spDoneFinished(p) {
+  if (p.state === "done" && p.summary) { renderSpSummary(p.summary); return; }
+  spPanel("sp-done");
+  if (p.state === "changed") {
+    $("sp-done").innerHTML = `<p>${esc(p.message)}</p>
+      <div class="row"><button id="sp-reread" class="primary">Re-read the playlist</button></div>`;
+    $("sp-reread").onclick = spReread;
+    return;
+  }
+  $("sp-done").innerHTML = `<p>${esc(p.message || "Done did not finish")}</p>
+    <div class="row"><button id="sp-done-back">Back</button><button id="sp-retry" class="primary">Done again</button></div>`;
+  $("sp-done-back").onclick = renderSpParts;
+  $("sp-retry").onclick = spConfirmDone;
+}
+
+function renderSpSummary(s) {
+  spDraft = null;
+  const rows = s.created.map((c) => `<li><b>${esc(c.name)}</b> — ${c.count} song${c.count === 1 ? "" : "s"}</li>`).join("");
+  const orig = s.original === "subset"
+    ? "The original is now a subset and keeps every song."
+    : "The original kept its name and now holds its part's songs.";
+  const local = s.local.length ? `<p class="hint">Local files left in the original: ${s.local.map(esc).join(", ")}</p>` : "";
+  spPanel("sp-done");
+  $("sp-done").innerHTML = `<h3>Done</h3><ul class="sp-summary">${rows}</ul><p class="hint">${orig}</p>${local}
+    <div class="row"><button id="sp-finish" class="primary">Back to homes</button></div>`;
+  $("sp-finish").onclick = showSplit;
+}
+
+async function spReread() {
+  try {
+    spDraft = await api(spUrl("/reread"), {});
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  renderSpParts();
+  toast("re-read — new songs are marked ?");
+}
 
 function spPart(key) { return spDraft.parts.find((p) => p.key === key) || null; }
 function spSongLabel(uri) {
@@ -4026,9 +4183,11 @@ function renderSpParts() {
   const canRemove = spDraft.parts.length > SP_MIN;
   $("sp-actions").innerHTML =
     (canRemove ? '<button id="sp-remove-part">Remove this part</button>' : "") +
-    '<button id="sp-start-over">Start over</button>';
+    '<button id="sp-start-over">Start over</button>' +
+    '<button id="sp-open-done" class="primary">Done…</button>';
   if (canRemove) $("sp-remove-part").onclick = () => spRemovePart(spShown);
   $("sp-start-over").onclick = () => spStartOver(spDraft.n);
+  $("sp-open-done").onclick = spOpenDone;
 }
 
 function renderSpChips() {

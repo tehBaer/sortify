@@ -5169,6 +5169,114 @@ run("stopNowPolling()");
   run(`show("lists")`);
 }
 
+// ============================================================================
+// SD — Done: name, folder, what happens to the original, the price; then
+// progress, and a summary or a way back. (Named SD, not SP3, because SP3
+// already names the Task 9 fix-round block above.)
+// ============================================================================
+{
+  resetLog();
+  const songs = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                  u3: { name: "Three", artists: "C", local: false } };
+  const DRAFT = { playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2,
+    parts: [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3"] }],
+    unknown: [], hint: null, scores: {}, songs, tracks: [], done: null };
+  run(`show("split"); spPid = "H1"; spDraft = ${JSON.stringify(DRAFT)}; spShown = "p1"; spSection("sp-work"); renderSpParts()`);
+  check("SD the parts screen offers Done", /id="sp-open-done"/.test($$("sp-actions").innerHTML), $$("sp-actions").innerHTML);
+
+  // adjustment 1 — opening Done must not leave a clip playing over it.
+  AudioStub.made.length = 0; AudioStub.refuse = false;
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  routes["POST /api/preview_resume"] = { status: 200, body: { ok: true } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SD a clip is playing before Done opens", run("spAudio") !== null, "");
+
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 6, creates: 2, empty: [], local: ["Home demo"], removals: 0,
+    folders: [{ path: "ROOT / Mix", blocked: null }, { path: "ROOT / Deep", blocked: "file this one by hand" }],
+    folder: "ROOT / Mix" } };
+  await run(`spOpenDone()`);
+  check("SD opening Done stops a live preview", run("spAudio") === null, "");
+  resetLog();   // drop the preview_resume POST and the plan GET — not part of the price check below
+  const doneHtml = () => $$("sp-done").innerHTML;
+  check("SD the Done screen names each part, prefilled",
+        /id="sp-name-0"[^>]*value="rock"/.test(doneHtml()) && /id="sp-name-1"[^>]*value="jazz"/.test(doneHtml()), doneHtml().slice(0, 400));
+  check("SD ...defaults to the original's folder, and a folder the mover can't reach is disabled",
+        $$("sp-folder").value === "ROOT / Mix" && /value="ROOT \/ Deep" disabled/.test(doneHtml()), doneHtml());
+  check("SD ...keeps the original as a subset by default",
+        /id="sp-orig-subset" checked/.test(doneHtml()) || /id="sp-orig-subset"[^>]*checked/.test(doneHtml()), "");
+  check("SD ...warns about local files that stay behind", /Home demo/.test(doneHtml()) && /local file/.test(doneHtml()), "");
+  check("SD ...and shows the price before anything happens",
+        /2 new playlists/.test(doneHtml()) && /about 6 calls/.test(doneHtml()) &&
+        !log.some((l) => l.method === "POST"), doneHtml());
+
+  routes["GET /api/splitparts/H1/plan?original=part&part=p1"] = { status: 200, body: {
+    calls: 4, creates: 1, empty: [], local: [], removals: 1,
+    folders: [{ path: "ROOT / Mix", blocked: null }], folder: "ROOT / Mix" } };
+  run(`spDoneChoice.original = "part"; spDoneChoice.part = "p1"`);
+  await run(`spRefreshPlan()`);
+  check("SD choosing 'becomes a part' re-prices it, with the removals",
+        /1 new playlist\b/.test(doneHtml()) && /removes 1 song/.test(doneHtml()) && /about 4 calls/.test(doneHtml()), doneHtml());
+  check("SD ...and that part's name field says it keeps the original's name",
+        /keeps the name/.test(doneHtml()) && /Big Home/.test(doneHtml()), doneHtml());
+
+  run(`spDoneChoice.original = "subset"; spDoneChoice.part = null`);
+  await run(`spRefreshPlan()`);
+  $$("sp-name-0").value = "Rocky";
+  $$("sp-name-1").value = "";
+  routes["POST /api/splitparts/H1/done"] = { status: 200, body: { started: true } };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "done", phase: "done", done: 2, total: 2, message: null,
+    summary: { created: [{ id: "N1", name: "Rocky", count: 2 }, { id: "N2", name: "jazz", count: 1 }],
+               original: "subset", empty: [], local: ["Home demo"] } } };
+  await run(`spConfirmDone()`);
+  await tick();
+  const done = log.find((l) => l.method === "POST" && l.path === "/api/splitparts/H1/done");
+  const body = done && JSON.parse(done.body);
+  check("SD Confirm sends the typed names, the folder and the choice",
+        body && body.names.p1 === "Rocky" && body.names.p2 === "jazz" && body.folder === "ROOT / Mix" &&
+        body.original === "subset" && body.part === null, JSON.stringify(body));
+  check("SD ...and ends on a summary of what was made",
+        /Rocky/.test(doneHtml()) && /2 songs/.test(doneHtml()) && /id="sp-finish"/.test(doneHtml()) &&
+        run("spDraft") === null, doneHtml());
+
+  // the playlist changed: a way to re-read
+  run(`spDraft = ${JSON.stringify(DRAFT)}`);
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "changed", phase: "", done: 0, total: 2,
+    message: "the playlist changed in Spotify since the suggestion — re-read it to continue", summary: null } };
+  await run(`spConfirmDone()`);
+  check("SD a changed playlist offers Re-read", /id="sp-reread"/.test(doneHtml()) && /changed in Spotify/.test(doneHtml()), doneHtml());
+  routes["POST /api/splitparts/H1/reread"] = { status: 200, body: { ...DRAFT, unknown: ["u3"] } };
+  await run(`spReread()`);
+  check("SD ...which lands back on the parts", $$("sp-parts").hidden === false && run("spDraft.unknown.length") === 1, "");
+
+  // an error: Done again
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "error", phase: "", done: 1, total: 2,
+    message: "Spotify API 429: rate limited — your split is saved; press Done again to continue", summary: null } };
+  resetLog();
+  await run(`spConfirmDone()`);
+  check("SD a failed Done says why and offers Done again",
+        /press Done again/.test(doneHtml()) && /id="sp-retry"/.test(doneHtml()), doneHtml());
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "running", phase: "creating", done: 1, total: 2, message: null, summary: null } };
+  await run(`$("sp-retry").onclick()`);
+  check("SD ...and Done again posts again",
+        log.filter((l) => l.method === "POST" && l.path === "/api/splitparts/H1/done").length === 2, "");
+  run(`spStopPolling()`);
+
+  // adjustment 3 — the Confirm button posts only once for a double tap; the
+  // guard is a plain flag, not the disabled attribute, since calling the
+  // function directly (as this check does) bypasses a disabled button.
+  resetLog();
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "running", phase: "creating", done: 0, total: 2, message: null, summary: null } };
+  run(`spConfirmDone(); spConfirmDone();`);
+  await tick();
+  check("SD two quick taps on Confirm post once",
+        log.filter((l) => l.method === "POST" && l.path === "/api/splitparts/H1/done").length === 1, "");
+
+  run(`spStopPolling(); show("lists")`);
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
