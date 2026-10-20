@@ -6,6 +6,12 @@ tune the constants in sortify/splitparts.py once, with the user, before
 they are frozen.
 
     .venv/bin/python scripts/eval_splitparts.py [--n 2 3] [--limit 5] [--id PID ...]
+
+Store() reads SORTIFY_DATA_DIR (default: this tree's data/) and CREATES the
+directory when it is missing — so from a worktree, point it at the live
+data, or it silently evaluates an empty new data/ instead:
+
+    SORTIFY_DATA_DIR=<live data dir> .venv/bin/python scripts/eval_splitparts.py
 """
 
 from __future__ import annotations

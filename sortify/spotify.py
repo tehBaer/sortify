@@ -95,12 +95,13 @@ WINDOW_CAP = 12       # calls per rolling 60s
 # more than a few dozen calls a day.
 BACKGROUND_DAILY_CAP = 40
 
-# The queued materialiser's spend class: user-initiated but unattended. It
+# The bulk spend class (`bulk=True`): user-approved but unattended work. It
 # counts toward DAILY_CAP, but the day's LAST 150 calls are reserved for the
-# user's own interactive clicks — the bulk job sleeps to local midnight
-# instead of spending them. (Spec 2026-08-18, decision 3.) A run enqueued
-# with spend_reserve=True opts out per run (2026-08-20): the reserve line
-# moves to DAILY_CAP itself, trading interactive headroom for finishing.
+# user's own interactive clicks — a bulk call is refused rather than spend
+# them. (Spec 2026-08-18, decision 3; the queued materialiser it was built
+# for is gone since 2026-10-20.) spend_reserve=True opts a caller out: the
+# reserve line moves to DAILY_CAP itself, trading interactive headroom for
+# finishing.
 BULK_RESERVE = 150
 
 # Background work also yields once the day is half spent: at that point the
@@ -266,16 +267,18 @@ class Spotify:
         return usage.get("bulk", 0)
 
     def bulk_block_reason(self, spend_reserve: bool = False) -> tuple[str, float] | None:
-        """Why the bulk worker must not call right now — None means go.
+        """Why an unattended bulk job must not call right now — None means go.
 
         Returns (reason, resume_at). QUIET_AFTER_COOLDOWN applies here on
         purpose: this rail survived the enricher's deletion named for "the
-        next proactive job", and the queued materialiser is that job.
+        next proactive job". The queued materialiser that used it is gone
+        (2026-10-20); no production caller remains, and the rail is kept for the next
+        unattended job rather than rebuilt from memory.
 
-        spend_reserve is the per-run opt-out (queue.json's flag): the reserve
-        line moves to DAILY_CAP itself, so the run finishes instead of
-        sleeping at DAILY_CAP - BULK_RESERVE. The cooldown/quiet rails are
-        not the reserve's business and always apply.
+        spend_reserve is the caller's opt-out: the reserve line moves to
+        DAILY_CAP itself, so a job finishes instead of stopping at
+        DAILY_CAP - BULK_RESERVE. The cooldown/quiet rails are not the
+        reserve's business and always apply.
         """
         floor = DAILY_CAP if spend_reserve else DAILY_CAP - BULK_RESERVE
         now = time.time()

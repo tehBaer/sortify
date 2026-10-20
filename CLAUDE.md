@@ -226,7 +226,10 @@ escalating penalties. Therefore:
   at once. Once Done has started for a draft, Suggest, moves, part changes,
   Re-read and Discard are all refused (409) until Done finishes; the UI
   then shows a locked "Finish Done" screen with the stored choices, and a
-  resumed Done always uses the choices it started with.
+  resumed Done always uses the choices it started with. That screen's
+  "Abandon" (`POST /api/splitparts/{pid}/abandon`, zero calls) is the way
+  out of a failure that repeats: it drops the draft and keeps whatever was
+  already created.
 - Done creates and fills the new parts first and touches the original only
   after that (🐾 rename and dropped from the home lists, or batched
   removal). It is resumable per add batch (no duplicates), marks every
@@ -236,5 +239,5 @@ escalating penalties. Therefore:
   `REMOVE_BATCH` stays 100 until the probe recorded in the plan (Task 1
   Step 6) has actually been run.
 - Replaced the 2026-08 split (piles, sittings, the queued materialiser):
-  all of that code is gone; its data files were kept as
-  `*.bak-2026-10-20`.
+  all of that code is gone; its data files are moved aside as
+  `*.bak-2026-10-20` at rollout.
