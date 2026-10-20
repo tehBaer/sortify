@@ -1080,3 +1080,11 @@ def test_draft_answers_carry_no_track_list(env, monkeypatch):
 
     assert all("tracks" not in a and "parts" in a and "songs" in a for a in answers)
     assert appmod.store.splitparts()["drafts"]["H1"]["tracks"]   # still stored for the engine
+
+
+def test_the_summary_names_the_folder_and_the_original(env):
+    env.post("/api/splitparts/H1/done", json={"names": {"p1": "Rocky", "p2": "Jazzy"},
+                                               "folder": "ROOT / Mix", "original": "subset"})
+
+    s = progress(env)["summary"]
+    assert s["folder"] == "ROOT / Mix" and s["name"] == "Big Home"

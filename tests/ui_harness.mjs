@@ -4727,9 +4727,10 @@ run("stopNowPolling()");
   routes["POST /api/splitparts/H1/suggest"] = { status: 200, body: { started: true } };
   routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "running", phase: "grouping", done: 0, total: 0, message: null, summary: null } };
   ctx.confirm = (m) => { asked = m; return true; };
-  await run(`spStartOver(3)`);
+  run(`spDraft.edited = true`);   // asking is for a draft holding manual edits (SPF)
+  await run(`spResuggest(3)`);
   const sg = log.find((l) => l.path === "/api/splitparts/H1/suggest");
-  check("SP2 trying it asks first, then re-suggests with that count",
+  check("SP2 trying it on an edited draft asks first, then re-suggests with that count",
         /moves/.test(asked) && sg && JSON.parse(sg.body).n === 3, asked);
   run(`spStopPolling()`);
 
@@ -5483,6 +5484,7 @@ run("stopNowPolling()");
     calls: 7, creates: 3, empty: [], local: [], removals: 0, folders: [], folder: "" } };
   await run(`spOpenDone()`);
   $$("sp-name-p2").value = "JazzyX";
+  $$("sp-name-p1").value = "RockyKeep";
   run(`spReadNames()`);
   check("SPD2 the typed name lands on p2 (by key) before any structural change",
         run("spDoneChoice.names.p2") === "JazzyX", run("spDoneChoice.names.p2"));
@@ -5498,6 +5500,15 @@ run("stopNowPolling()");
     return removeCall === 1 ? { status: 200, body: { moves: { p1: 1 } } } : { status: 200, body: REMOVED_DRAFT };
   };
   await run(`spRemovePart("p2")`);
+  // The parts screen wiped #sp-done, so in a real DOM the old name fields
+  // are gone and getElementById answers null for them. The stub keeps every
+  // id it ever saw and makes up a blank one for any other, either of which
+  // spReadNames would read back as if a field were on screen — so, for
+  // these checks only, a name field exists only while markup holds it.
+  const realGetById = document.getElementById;
+  document.getElementById = (id) => (id.startsWith("sp-name-") ? (reg[id] || null) : realGetById(id));
+  const dropNameFields = () => { for (const k of Object.keys(reg)) if (k.startsWith("sp-name-")) delete reg[k]; };
+  dropNameFields();
   check("SPD2 removing p2 leaves p3 with its OWN key, not renumbered to p2",
         run(`spDraft.parts.map((p) => p.key).join(",")`) === "p1,p3",
         run(`spDraft.parts.map((p) => p.key).join(",")`));
@@ -5507,8 +5518,23 @@ run("stopNowPolling()");
   await run(`spOpenDone()`);
   check("SPD2 a remove invalidates the choice — p3 gets its OWN suggested name, never p2's leaked one",
         /id="sp-name-p3"[^>]*value="blues"/.test(doneHtml2()) && !/JazzyX/.test(doneHtml2()), doneHtml2());
-  check("SPD2 ...and p1 is back to its own fresh default too (a full reset, not a patch)",
-        /id="sp-name-p1"[^>]*value="rock"/.test(doneHtml2()), doneHtml2());
+  // Surgical, not a reset: the untouched part keeps what was typed for it,
+  // and only the removed part's typed name is gone.
+  check("SPD2 ...while p1's typed name survives the removal, and p2's typed name is gone",
+        /id="sp-name-p1"[^>]*value="RockyKeep"/.test(doneHtml2()) && run("spDoneChoice.names.p2") === undefined,
+        doneHtml2());
+  routes["POST /api/splitparts/H1/parts"] = { status: 200, body: { ...REMOVED_DRAFT,
+    parts: [...REMOVED_DRAFT.parts, { key: "p4", name: "New part", uris: [] }] } };
+  run(`renderSpParts()`);
+  dropNameFields();
+  await run(`spAddPart()`);
+  routes["GET /api/splitparts/H1/plan?original=subset"] = { status: 200, body: {
+    calls: 5, creates: 2, empty: ["New part"], local: [], removals: 0, folders: [], folder: "" } };
+  await run(`spOpenDone()`);
+  check("SPD2 ...and survives adding a part, the new part showing its own suggested name",
+        /id="sp-name-p1"[^>]*value="RockyKeep"/.test(doneHtml2()) &&
+        /id="sp-name-p4"[^>]*value="New part"/.test(doneHtml2()) && !/JazzyX/.test(doneHtml2()), doneHtml2());
+  document.getElementById = realGetById;
   run(`spStopPolling()`);
 
   // Start over (same key scheme, entirely different songs) invalidates too.
@@ -5521,7 +5547,7 @@ run("stopNowPolling()");
     unknown: [], hint: null, scores: {}, songs: { u5: { name: "Five", artists: "E", local: false },
     u6: { name: "Six", artists: "F", local: false } }, tracks: [], done: null };
   routes["GET /api/splitparts/H1"] = { status: 200, body: RESUGGESTED };
-  await run(`spStartOver(2)`);
+  await run(`spResuggest(2)`);
   check("SPD2 Start over bumps the draft generation, so the stale choice no longer matches",
         run("spDoneChoiceGen !== spDraftGen") === true,
         `gen=${run("spDraftGen")} choiceGen=${run("spDoneChoiceGen")}`);
@@ -5725,7 +5751,7 @@ run("stopNowPolling()");
   let resolveProgressA;
   routes["POST /api/splitparts/H1/suggest"] = { status: 200, body: { started: true } };
   routes["GET /api/splitparts/H1/progress"] = () => new Promise((resolve) => { resolveProgressA = resolve; });
-  run(`spStartOver(2)`);   // fire-and-forget: confirm() always answers yes
+  run(`spResuggest(2)`);   // fire-and-forget: confirm() always answers yes
   await tick();
 
   // leave via the HEADER Back while the suggestion is still running — this
@@ -5868,6 +5894,231 @@ run("stopNowPolling()");
         $$("sp-parts").hidden === false, "");
 
   run(`spStopPolling(); show("lists")`);
+}
+
+// ============================================================================
+// SPF — final review fixes. Start over opens the counter (asking only when
+// the draft holds manual edits), Discard, folder filing shown per part in
+// the summary, a poll token that a left view's in-flight answer cannot get
+// past, the last finished Done found on entering the tab, Abandon on the
+// locked finish screen, an unknown nowState counted as playing, and the
+// "becomes the part" picker naming the parts as typed.
+// ============================================================================
+{
+  resetLog();
+  const savedConfirm = ctx.confirm;
+  const savedNow = run("JSON.stringify(nowState)");
+  const doneF = () => $$("sp-done").innerHTML;
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const IDLE = { state: "idle", phase: "", done: 0, total: 0, message: null, summary: null, kind: null };
+  const songsF = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                   u3: { name: "Three", artists: "C", local: false } };
+  const DRAFT_F = { playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 3,
+    parts: [{ key: "p1", name: "rock", uris: ["u1"] }, { key: "p2", name: "jazz", uris: ["u2"] },
+            { key: "p3", name: "blues", uris: ["u3"] }],
+    unknown: [], hint: 2, scores: {}, songs: songsF, done: null, edited: false };
+  let asked = null;
+  try {
+    routes["GET /api/splitparts/progress"] = { pid: null, kind: null, state: "idle", summary: null };
+    routes["GET /api/splitparts/homes"] = { homes: [] };
+    routes["GET /api/splitparts/H1/progress"] = IDLE;
+    routes["GET /api/splitparts/H1"] = DRAFT_F;
+    run(`show("split"); spPid = null; spDraft = null;`);
+    await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+
+    // ---- 1: Start over opens the counter at the current count ------------
+    ctx.confirm = (m) => { asked = m; return true; };
+    resetLog();
+    run(`$("sp-start-over").onclick()`);
+    check("SPF Start over opens the counter, prefilled with the draft's count",
+          $$("sp-setup").hidden === false && $$("sp-n").textContent === "3" && posts("/api/splitparts/H1/suggest") === 0,
+          `setup=${$$("sp-setup").hidden} n=${$$("sp-n").textContent}`);
+    check("SPF ...with a way back to the parts it came from",
+          $$("sp-setup-keep").hidden === false, "");
+    run(`$("sp-setup-keep").onclick()`);
+    check("SPF ...which lands on the same draft's parts",
+          $$("sp-parts").hidden === false && /blues/.test($$("sp-chips").innerHTML), "");
+
+    routes["POST /api/splitparts/H1/suggest"] = { started: true };
+    routes["GET /api/splitparts/H1/progress"] = { ...IDLE, state: "done", kind: "suggest" };
+    run(`$("sp-start-over").onclick(); $("sp-minus").onclick()`);
+    asked = null;
+    await run(`$("sp-suggest").onclick()`);
+    await tick();
+    const sentF = bodies("/api/splitparts/H1/suggest").filter(Boolean);
+    check("SPF Suggest from there, on an unedited draft, re-suggests with the new count and asks nothing",
+          asked === null && sentF.length === 1 && sentF[0].n === 2, `asked=${asked} ${JSON.stringify(sentF)}`);
+
+    routes["GET /api/splitparts/H1"] = { ...DRAFT_F, edited: true };
+    await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+    resetLog();
+    ctx.confirm = (m) => { asked = m; return false; };
+    run(`$("sp-start-over").onclick()`);
+    await run(`$("sp-suggest").onclick()`);
+    check("SPF ...on an edited draft Suggest asks first, and a no posts nothing",
+          /lost/.test(asked || "") && posts("/api/splitparts/H1/suggest") === 0, asked);
+    run(`$("sp-setup-keep").onclick()`);
+
+    // the hint keeps re-suggesting directly — asking only when edited
+    asked = null;
+    await run(`$("sp-hint-go").onclick()`);
+    check("SPF the hint on an edited draft asks first too",
+          /2 parts/.test(asked || "") && posts("/api/splitparts/H1/suggest") === 0, asked);
+    run(`spDraft.edited = false; renderSpParts()`);
+    asked = null;
+    ctx.confirm = (m) => { asked = m; return true; };
+    await run(`$("sp-hint-go").onclick()`);
+    await tick();
+    check("SPF ...and on an unedited one re-suggests with N straight away",
+          asked === null && bodies("/api/splitparts/H1/suggest").filter(Boolean).pop()?.n === 2, `asked=${asked}`);
+    run(`spStopPolling()`);
+
+    // ---- 1: Discard ----------------------------------------------------------
+    routes["GET /api/splitparts/H1"] = { ...DRAFT_F, edited: true };
+    routes["GET /api/splitparts/H1/progress"] = IDLE;
+    await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+    resetLog();
+    ctx.confirm = (m) => { asked = m; return false; };
+    check("SPF the parts screen offers Discard this split", /id="sp-discard"/.test($$("sp-actions").innerHTML),
+          $$("sp-actions").innerHTML);
+    await run(`$("sp-discard").onclick()`);
+    check("SPF ...which asks first on an edited draft, and a no deletes nothing",
+          /Discard/.test(asked || "") && log.filter((l) => l.method === "DELETE").length === 0, asked);
+    routes["DELETE /api/splitparts/H1"] = { ok: true };
+    run(`spDraft.edited = false`);
+    asked = null;
+    await run(`$("sp-discard").onclick()`);
+    await tick();
+    check("SPF ...an unedited one is deleted without a question, back on the homes list",
+          asked === null && log.filter((l) => l.method === "DELETE" && l.path === "/api/splitparts/H1").length === 1 &&
+          $$("sp-pick").hidden === false && $$("sp-work").hidden === true && run("spDraft") === null,
+          `asked=${asked} pick=${$$("sp-pick").hidden}`);
+    ctx.confirm = () => true;
+
+    // ---- 2: filing is watched per part in the summary --------------------
+    run(`SP_FILING_POLL_MS = 5`);
+    let n1 = "filing";
+    routes["GET /api/playlists/filing/N1"] = () => ({ state: n1, folder: n1 === "filed" ? "ROOT / Mix" : "ROOT / Mix", error: null });
+    routes["GET /api/playlists/filing/N2"] = { state: "failed", folder: null, error: "another playlist is also called 'Jazzy'" };
+    routes["GET /api/playlists/filing/N3"] = { state: "filing", folder: "ROOT / Mix", error: null };
+    const SUM_F = { created: [{ id: "N1", name: "Rocky", count: 1 }, { id: "N2", name: "Jazzy", count: 1 },
+                              { id: "N3", name: "Bluesy", count: 1 }],
+                    original: "part", empty: [], local: [], folder: "ROOT / Mix", name: "Big Home" };
+    resetLog();
+    run(`spPid = "H1"; spSection("sp-work"); renderSpSummary(${JSON.stringify(SUM_F)})`);
+    await tick();
+    const line = (id) => $$(`sp-filing-${id}`).textContent;
+    check("SPF the summary shows each part filing…",
+          /filing…/.test(line("N1")) && /filing…/.test(line("N3")), `${line("N1")} | ${line("N3")}`);
+    check("SPF ...and a refused one as left at the top level, with why",
+          /left at the top level — another playlist is also called 'Jazzy'/.test(line("N2")), line("N2"));
+    n1 = "filed";
+    await wait(30); await tick();
+    check("SPF a landed move reads filed in its folder",
+          /filed in ROOT \/ Mix/.test(line("N1")), line("N1"));
+    check("SPF ...and a final part is not asked about again",
+          gets("/api/playlists/filing/N2") === 1, `${gets("/api/playlists/filing/N2")} GETs`);
+    run(`show("lists")`);
+    const n3Before = gets("/api/playlists/filing/N3");
+    await wait(30); await tick();
+    check("SPF leaving the view stops the filing watch",
+          gets("/api/playlists/filing/N3") === n3Before, `${n3Before} -> ${gets("/api/playlists/filing/N3")}`);
+
+    routes["GET /api/playlists/filing/N4"] = { state: "idle" };
+    run(`show("split"); spPid = "H1"; spSection("sp-work"); renderSpSummary(${JSON.stringify({ ...SUM_F, created: [{ id: "N4", name: "Stuck", count: 1 }] })})`);
+    await wait(40); await tick();
+    check("SPF a filing job that never starts ends as left at the top level, not watched forever",
+          /left at the top level — the move never started/.test(line("N4")), line("N4"));
+    resetLog();
+    run(`renderSpSummary(${JSON.stringify({ ...SUM_F, folder: null })})`);
+    await tick();
+    check("SPF with no folder chosen nothing is watched",
+          log.filter((l) => l.path.startsWith("/api/playlists/filing/")).length === 0, "");
+    run(`spStopPolling()`);
+
+    // ---- 3: a poll in flight when the view is left draws nothing ----------
+    let resolveDone;
+    const SUM_SUBSET = { ...SUM_F, original: "subset", folder: null,
+                         created: [{ id: "N7", name: "Seven", count: 1 }, { id: "N8", name: "Eight", count: 1 }] };
+    routes["GET /api/splitparts/H1/progress"] = () => new Promise((r) => { resolveDone = r; });
+    run(`spPid = "H1"; spSection("sp-work"); spPanel("sp-progress"); spShownSummaryKey = null;`);
+    run(`spPoll("done")`);
+    await tick();
+    routes["GET /api/splitparts/progress"] = { pid: "H1", kind: "done", state: "running", summary: null };
+    await run(`$("sp-back").onclick()`);
+    await tick();
+    resetLog();
+    resolveDone({ status: 200, body: { state: "done", phase: "done", done: 2, total: 2, message: null, summary: SUM_SUBSET, kind: "done" } });
+    await tick();
+    check("SPF an in-flight poll that lands after leaving draws nothing and marks nothing shown",
+          run("spShownSummaryKey") === null && $$("sp-pick").hidden === false && !/Seven/.test(doneF()),
+          `key=${run("spShownSummaryKey")}`);
+    await wait(1100); await tick();
+    check("SPF ...and does not re-arm itself",
+          gets("/api/splitparts/H1/progress") === 0, `${gets("/api/splitparts/H1/progress")} GETs`);
+
+    // ...so entering the tab finds the finished Done and shows its summary
+    routes["GET /api/splitparts/progress"] = { pid: "H1", kind: "done", state: "done", summary: SUM_SUBSET };
+    run(`spPid = null`);
+    await run(`showSplit()`);
+    await tick();
+    check("SPF entering the Split tab shows a finished Done's unseen summary (subset mode: no home to reopen)",
+          $$("sp-work").hidden === false && /Seven/.test(doneF()) && $$("sp-title").textContent === "Big Home" &&
+          run("spPid") === "H1", `title=${$$("sp-title").textContent}`);
+    await run(`showSplit()`);
+    await tick();
+    check("SPF ...once only: the next entry lands on the homes list",
+          $$("sp-pick").hidden === false && $$("sp-work").hidden === true, "");
+
+    // ---- 4: Abandon on the locked finish screen -------------------------
+    const STARTED_F = { ...DRAFT_F, done: { opts: { original: "subset", part: null, names: { p1: "Rocky" }, folder: null },
+                                            created: { p1: "N1" }, filled: ["p1"], original_done: false } };
+    routes["GET /api/splitparts/H1/progress"] = IDLE;
+    routes["GET /api/splitparts/H1"] = STARTED_F;
+    routes["GET /api/splitparts/H1/plan?original=subset"] = { calls: 5, creates: 3, empty: [], local: [], removals: 0, folders: [], folder: "" };
+    await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+    check("SPF the locked finish screen offers Abandon — keep what was made",
+          /id="sp-finish-done"/.test(doneF()) && /id="sp-abandon"[^>]*>Abandon — keep what was made/.test(doneF()), doneF());
+    resetLog();
+    ctx.confirm = (m) => { asked = m; return false; };
+    await run(`$("sp-abandon").onclick()`);
+    check("SPF ...it asks first, saying what stays, and a no posts nothing",
+          /stay/.test(asked || "") && /original/.test(asked || "") && posts("/api/splitparts/H1/abandon") === 0, asked);
+    ctx.confirm = () => true;
+    routes["POST /api/splitparts/H1/abandon"] = { created: [{ id: "N1", name: "Rocky" }], original_done: false };
+    await run(`$("sp-abandon").onclick()`);
+    check("SPF ...a yes abandons and lists what was already made",
+          posts("/api/splitparts/H1/abandon") === 1 && /Rocky/.test(doneF()) && /id="sp-abandon-back"/.test(doneF()) &&
+          run("spDraft") === null, doneF());
+    await run(`$("sp-abandon-back").onclick()`);
+    check("SPF ...and returns to the homes list", $$("sp-pick").hidden === false, "");
+
+    // ---- minors -------------------------------------------------------------
+    routes["GET /api/splitparts/H1"] = DRAFT_F;
+    await run(`openSpHome({ id: "H1", name: "Big Home" })`);
+    routes["GET /api/track_preview?pid=H1&uri=u1"] = { url: "https://cdn/spf-u1.mp3", uri: "u1", deezer_id: 1 };
+    run(`spStopPreview(false); nowState = null`);
+    await run(`spPreview("u1")`);
+    check("SPF an unknown nowState is taken as Spotify playing, as the house player does",
+          run("spSessionPlaying") === true, String(run("spSessionPlaying")));
+    run(`spResumeOwed = false; spStopPreview(false)`);
+
+    run(`spDoneChoicePid = null; spPlan = null;`);
+    routes["GET /api/splitparts/H1/plan?original=part&part=p1"] = { calls: 4, creates: 2, empty: [], local: [], removals: 2, folders: [], folder: "" };
+    await run(`spOpenDone()`);
+    $$("sp-name-p2").value = "Jazz Typed";
+    run(`$("sp-name-p2").oninput()`);
+    check("SPF the becomes-the-part picker names the parts as typed above",
+          /Jazz Typed/.test($$("sp-orig-part-key").innerHTML) && /rock/.test($$("sp-orig-part-key").innerHTML),
+          $$("sp-orig-part-key").innerHTML);
+    run(`$("sp-orig-part").onchange()`);
+    await tick();
+    check("SPF ...and still does after a re-render",
+          /Jazz Typed/.test($$("sp-orig-part-key").innerHTML), $$("sp-orig-part-key").innerHTML);
+  } finally {
+    ctx.confirm = savedConfirm;
+    run(`spStopPolling(); spStopPreview(false); nowState = ${savedNow}; show("lists")`);
+  }
 }
 
 // ---- summary ---------------------------------------------------------------

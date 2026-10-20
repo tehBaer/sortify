@@ -16,8 +16,8 @@ let triage = null;       // {id, name, homes:Map, tracks, idx, sorted, skipped, 
 
 async function api(path, body, method) {
   // `method` is the escape hatch for verbs that carry no body — DELETE
-  // (cancelQueue) — everything else still just says "POST if there's a
-  // body, GET otherwise" the way every existing call site already relies on.
+  // (discarding a split) — everything else still just says "POST if there's
+  // a body, GET otherwise" the way every existing call site already relies on.
   const opts = (body || method)
     ? { method: method || "POST", headers: { "Content-Type": "application/json" },
         ...(body ? { body: JSON.stringify(body) } : {}) }
@@ -3629,6 +3629,12 @@ let spPid = null;       // the home being split
 let spShown = null;     // key of the part whose songs are listed
 let spN = 2;            // the counter
 let spPollTimer = null;
+// Bumped by every spStopPolling(): a poll (or the filing watch) captures it
+// before its first await and gives up — drawing nothing, re-arming
+// nothing — when it has moved. A cleared timeout cannot recall a request
+// already in flight; this is what stops that request's answer.
+let spPollToken = 0;
+let spFilingTimer = null;
 const SP_MIN = 2, SP_MAX = 6;
 
 // ---- tap = preview ----------------------------------------------------------
@@ -3716,7 +3722,9 @@ async function spPreview(uri) {
   // A session starts when nothing is playing or pending yet — captured once,
   // so switching between songs mid-session never re-asks "was it playing".
   const startingSession = !spAudio;
-  if (startingSession) spSessionPlaying = !!nowState?.is_playing;
+  // Unknown counts as playing, as in the house player (previewHold): a
+  // resume owed and not needed costs less than music left paused.
+  if (startingSession) spSessionPlaying = nowState ? !!nowState.is_playing : true;
   if (spAudio) spStopPreview(false);
   spAudioUri = uri;
   let r;
@@ -3900,9 +3908,43 @@ async function spRemovePart(key) {
   renderSpParts();
 }
 
-async function spStartOver(n) {
-  if (!confirm(`Start over with ${n} parts? Your moves and added parts are lost.`)) return;
+// A new suggestion replaces the draft. Ask only when that loses something:
+// the server marks a draft `edited` once a song was moved or a part added
+// or removed.
+function spConfirmReplace(n) {
+  if (!spDraft || !spDraft.edited) return true;
+  return confirm(`Start over with ${n} parts? Your moves and added or removed parts are lost.`);
+}
+
+// The hint's "try N": straight to a new suggestion with that count.
+async function spResuggest(n) {
+  if (!spConfirmReplace(n)) return;
   await spSuggest(n);
+}
+
+// Start over opens the counter, at the current count; Suggest from there
+// replaces the draft, and "Keep this split" goes back to it untouched.
+function spStartOver() {
+  spStopPreview();
+  spN = spDraft?.n || 2;
+  renderSpSetup("");
+}
+
+async function spDiscard() {
+  if (spDraft.edited && !confirm("Discard this split? Your moves and part changes are lost. Nothing in Spotify changes.")) return;
+  const pid = spPid, gen = spDraftGen;
+  spStopPreview();
+  try {
+    await api(spUrl("", pid), null, "DELETE");
+  } catch (e) {
+    if (pid === spPid && gen === spDraftGen) toast(e.message);
+    return;
+  }
+  if (pid !== spPid || gen !== spDraftGen) return;
+  spDraft = null;
+  spDraftGen++;
+  toast("split discarded");
+  await showSplit();
 }
 
 function spSection(id) {
@@ -3917,7 +3959,11 @@ function spPanel(id) {
   if (id !== "sp-done") $("sp-done").innerHTML = "";
   for (const s of ["sp-setup", "sp-progress", "sp-parts", "sp-done"]) $(s).hidden = s !== id;
 }
-function spStopPolling() { clearTimeout(spPollTimer); spPollTimer = null; }
+function spStopPolling() {
+  clearTimeout(spPollTimer); spPollTimer = null;
+  clearTimeout(spFilingTimer); spFilingTimer = null;
+  spPollToken++;
+}
 const spUrl = (tail = "", pid = spPid) => `/api/splitparts/${encodeURIComponent(pid)}${tail}`;
 
 async function showSplit() {
@@ -3926,12 +3972,31 @@ async function showSplit() {
   show("split");
   spSection("sp-pick");
   $("sp-homes").innerHTML = '<p class="hint">loading…</p>';
+  const token = spPollToken;
+  // A Done that finished while nobody watched (the view was left mid-run)
+  // holds its summary in the job slot. For a subset-mode Done the original
+  // is no longer a home, so this is the only way back to it.
+  let last = null;
+  try { last = await api("/api/splitparts/progress"); } catch (e) { /* the list still loads */ }
+  if (token !== spPollToken) return;
+  if (last && last.kind === "done" && last.state === "done" && last.summary && last.pid &&
+      spSummaryKey(last.pid, last.summary) !== spShownSummaryKey) {
+    spPid = last.pid;
+    spDraft = null;
+    spDraftGen++;
+    $("sp-title").textContent = last.summary.name || "";
+    spSection("sp-work");
+    renderSpSummary(last.summary);
+    return;
+  }
   try {
     spHomes = (await api("/api/splitparts/homes")).homes;
   } catch (e) {
+    if (token !== spPollToken) return;
     $("sp-homes").innerHTML = `<p class="hint">${esc(e.message)}</p>`;
     return;
   }
+  if (token !== spPollToken) return;
   renderSpHomes();
 }
 
@@ -4024,10 +4089,14 @@ function renderSpSetup(msg) {
   spPanel("sp-setup");
   $("sp-n").textContent = String(spN);
   $("sp-setup-msg").textContent = msg || "";
+  // Reached from Start over (or a failed re-suggest): the draft is still
+  // there, untouched, and this is the way back to it.
+  $("sp-setup-keep").hidden = !spDraft;
 }
+$("sp-setup-keep").onclick = () => { if (spDraft) renderSpParts(); };
 $("sp-minus").onclick = () => { spN = Math.max(SP_MIN, spN - 1); $("sp-n").textContent = String(spN); };
 $("sp-plus").onclick = () => { spN = Math.min(SP_MAX, spN + 1); $("sp-n").textContent = String(spN); };
-$("sp-suggest").onclick = () => spSuggest(spN);
+$("sp-suggest").onclick = () => { if (spConfirmReplace(spN)) return spSuggest(spN); };
 
 async function spSuggest(n) {
   spStopPreview();
@@ -4056,14 +4125,18 @@ async function spSuggest(n) {
 // flight at the moment of the switch, which a cleared timeout cannot recall.
 async function spPoll(kind, pid = spPid) {
   spStopPolling();
+  const token = spPollToken;   // after the stop above, which moves it
   let p;
   try {
     p = await api(spUrl("/progress", pid));
   } catch (e) {
-    if (pid !== spPid) return;
+    if (pid !== spPid || token !== spPollToken) return;
     spPollTimer = setTimeout(() => spPoll(kind, pid), 2000);
     return;
   }
+  // The view was left (or another poll started) while this was in flight:
+  // drawing a summary now would mark it shown on a screen nobody sees.
+  if (token !== spPollToken) return;
   if (pid !== spPid) return;   // a different home opened while this was in flight
   if (p.state === "running") {
     const count = p.total ? ` — ${p.done} of ${p.total}` : "";
@@ -4071,7 +4144,7 @@ async function spPoll(kind, pid = spPid) {
     spPollTimer = setTimeout(() => spPoll(kind, pid), 1000);
     return;
   }
-  if (kind === "done") { await spDoneFinished(p); return; }
+  if (kind === "done") { await spDoneFinished(p, token); return; }
   if (p.state === "error") { renderSpSetup(p.message || "the suggestion failed"); return; }
   // Into a LOCAL first — see openSpHome's own fetch for why: assigning
   // `spDraft` before the pid check could clobber a fresher load.
@@ -4079,11 +4152,11 @@ async function spPoll(kind, pid = spPid) {
   try {
     fetched = await api(spUrl("", pid));
   } catch (e) {
-    if (pid !== spPid) return;
+    if (pid !== spPid || token !== spPollToken) return;
     renderSpSetup(e.message);
     return;
   }
-  if (pid !== spPid) return;
+  if (pid !== spPid || token !== spPollToken) return;
   spDraft = fetched;
   spDraftGen++;   // a landed Suggest is a fresh part set — any typed Done choice for the old one is stale
   spShown = spDraft.parts[0]?.key || null;
@@ -4257,9 +4330,12 @@ function renderSpDone(opts = {}) {
       </label>`;
   }).join("");
   const folders = [`<option value="">${esc(FOLDER_TOP_LEVEL)}</option>`].concat(
-    (spPlan.folders || []).map((f) => `<option value="${esc(f.path)}"${f.blocked ? " disabled" : ""}>${esc(f.path)}${f.blocked ? " — file by hand" : ""}</option>`)).join("");
-  const parts = spDraft.parts.map((p) =>
-    `<option value="${esc(p.key)}"${p.key === spDoneChoice.part ? " selected" : ""}>${esc(p.name)}</option>`).join("");
+    (spPlan.folders || []).map((f) => `<option value="${esc(f.path)}"${f.blocked ? " disabled" : ""}>${esc(f.path)}${f.blocked ? (/input set/.test(f.blocked) ? " — an input set's folder" : " — file by hand") : ""}</option>`)).join("");
+  // Named as typed above (falling back to the suggestion), so the pick
+  // reads the same as the field it refers to.
+  const partOptions = () => spDraft.parts.map((p) =>
+    `<option value="${esc(p.key)}"${p.key === spDoneChoice.part ? " selected" : ""}>${esc(spDoneChoice.names[p.key] || p.name)}</option>`).join("");
+  const parts = partOptions();
   // A stale answer's own local/empty warnings never belong to the CURRENT
   // choice's error — they'd be describing a different plan entirely.
   const warn = [];
@@ -4288,6 +4364,13 @@ function renderSpDone(opts = {}) {
     <p id="sp-cost" class="sp-cost">${costText}</p>
     <div class="row"><button id="sp-done-back">Back</button><button id="sp-confirm" class="primary"${confirmDisabled ? " disabled" : ""}>Confirm</button></div>`;
   spDraft.parts.forEach((p, i) => { $(`sp-name-${p.key}`).value = nameVals[i]; });
+  spDraft.parts.forEach((p) => {
+    $(`sp-name-${p.key}`).oninput = () => {
+      spReadNames();
+      $("sp-orig-part-key").innerHTML = partOptions();
+      $("sp-orig-part-key").value = spDoneChoice.part || "";
+    };
+  });
   $("sp-folder").value = spDoneChoice.folder || "";
   $("sp-confirm").disabled = confirmDisabled;
   $("sp-folder").onchange = () => { spDoneChoice.folder = $("sp-folder").value; };
@@ -4347,8 +4430,36 @@ async function renderSpFinish(errorMessage) {
     <h3>The original, “${esc(spDraft.name)}”</h3><p>${origText}</p>
     ${warn.map((w) => `<p class="hint sp-warn">${w}</p>`).join("")}
     ${priceLine}
-    <div class="row"><button id="sp-finish-done" class="primary">Finish Done</button></div>`;
+    <div class="row"><button id="sp-abandon">Abandon — keep what was made</button><button id="sp-finish-done" class="primary">Finish Done</button></div>`;
   $("sp-finish-done").onclick = spConfirmDone;
+  $("sp-abandon").onclick = spAbandon;
+}
+
+// The way out when Finish Done keeps failing the same way (a created part
+// deleted in Spotify, the original unfollowed): drops the draft, zero
+// calls, and says what already exists — nothing made is undone.
+async function spAbandon() {
+  if (!confirm("Abandon this split? The playlists it already created stay in Spotify as homes, " +
+               "and the original is left as it is now. Nothing is undone.")) return;
+  const pid = spPid, gen = spDraftGen;
+  let r;
+  try {
+    r = await api(spUrl("/abandon", pid), {});
+  } catch (e) {
+    if (pid === spPid && gen === spDraftGen) toast(e.message, 6000);
+    return;
+  }
+  if (pid !== spPid || gen !== spDraftGen) return;
+  spDraft = null;
+  spDraftGen++;
+  const made = r.created.length
+    ? `<p class="hint">Already created, and kept as homes:</p><ul class="sp-summary">${r.created.map((c) => `<li>${esc(c.name)}</li>`).join("")}</ul>`
+    : '<p class="hint">Nothing had been created yet.</p>';
+  const orig = r.original_done ? "The original had already been updated." : "The original is as it was.";
+  spPanel("sp-done");
+  $("sp-done").innerHTML = `<h3>Split abandoned</h3>${made}<p class="hint">${orig}</p>
+    <div class="row"><button id="sp-abandon-back" class="primary">Back to homes</button></div>`;
+  $("sp-abandon-back").onclick = showSplit;
 }
 
 async function spConfirmDone() {
@@ -4389,7 +4500,7 @@ async function spConfirmDone() {
   await spPoll("done");
 }
 
-async function spDoneFinished(p) {
+async function spDoneFinished(p, token = spPollToken) {
   if (p.state === "done" && p.summary) { renderSpSummary(p.summary); return; }
   spPanel("sp-done");
   if (p.state === "changed") {
@@ -4411,13 +4522,13 @@ async function spDoneFinished(p) {
   } catch (e) {
     // The draft couldn't be re-read at all — never guess with the stale
     // editable form; offer to reopen the home fresh instead.
-    if (pid !== spPid || gen !== spDraftGen) return;
+    if (pid !== spPid || gen !== spDraftGen || token !== spPollToken) return;
     $("sp-done").innerHTML = `<p>${esc(p.message || "Done did not finish")}</p>
       <div class="row"><button id="sp-try-again" class="primary">Try again</button></div>`;
     $("sp-try-again").onclick = () => openSpHome({ id: pid, name: homeName });
     return;
   }
-  if (pid !== spPid || gen !== spDraftGen) return;
+  if (pid !== spPid || gen !== spDraftGen || token !== spPollToken) return;
   spDraft = refetched;
   spDraftGen++;
   if (spDraft.done) { await renderSpFinish(p.message); return; }
@@ -4430,7 +4541,8 @@ async function spDoneFinished(p) {
 function renderSpSummary(s) {
   spShownSummaryKey = spSummaryKey(spPid, s);
   spDraft = null;
-  const rows = s.created.map((c) => `<li><b>${esc(c.name)}</b> — ${c.count} song${c.count === 1 ? "" : "s"}</li>`).join("");
+  const filing = (c) => (s.folder ? `<span class="hint" id="sp-filing-${esc(c.id)}"> · filing…</span>` : "");
+  const rows = s.created.map((c) => `<li><b>${esc(c.name)}</b> — ${c.count} song${c.count === 1 ? "" : "s"}${filing(c)}</li>`).join("");
   const orig = s.original === "subset"
     ? "The original is now a subset and keeps every song."
     : "The original kept its name and now holds its part's songs.";
@@ -4441,8 +4553,58 @@ function renderSpSummary(s) {
   const again = s.original === "part" ? '<button id="sp-split-again">Split this home again</button>' : "";
   $("sp-done").innerHTML = `<h3>Done</h3><ul class="sp-summary">${rows}</ul><p class="hint">${orig}</p>${local}
     <div class="row">${again}<button id="sp-finish" class="primary">Back to homes</button></div>`;
-  if (again) $("sp-split-again").onclick = () => { spN = 2; renderSpSetup(""); };
+  if (again) $("sp-split-again").onclick = () => { spStopPolling(); spN = 2; renderSpSetup(""); };
   $("sp-finish").onclick = showSplit;
+  if (s.folder) spWatchFiling(s.created);
+}
+
+// Filing drives the desktop client after Done, about a minute per part, one
+// part after another — so a part not reached yet reads "idle" for a while,
+// and only "filed"/"failed" are final. Two polls in a row with nothing
+// filing and parts still idle means the queue is not moving (the server
+// restarted, the thread died): those parts stayed at the top level.
+let SP_FILING_POLL_MS = 3000;
+
+async function spWatchFiling(created) {
+  const token = spPollToken;
+  const open = new Map(created.map((c) => [c.id, c]));
+  const say = (id, text) => { const el = $(`sp-filing-${id}`); if (el) el.textContent = ` · ${text}`; };
+  let stalls = 0;
+  while (open.size) {
+    let moving = false;
+    for (const c of [...open.values()]) {
+      let st;
+      try {
+        st = await api(`/api/playlists/filing/${encodeURIComponent(c.id)}`);
+      } catch (e) {
+        if (token !== spPollToken) return;
+        say(c.id, `filing status unreadable — ${e.message}`);
+        open.delete(c.id);
+        continue;
+      }
+      if (token !== spPollToken) return;
+      if (st.state === "filed") {
+        say(c.id, `filed in ${st.folder}`);
+        open.delete(c.id);
+      } else if (st.state === "failed") {
+        say(c.id, `left at the top level — ${st.error || "the move failed"}`);
+        open.delete(c.id);
+      } else if (st.state === "filing") {
+        say(c.id, "filing…");
+        moving = true;
+      } else {
+        say(c.id, "waiting to be filed…");
+      }
+    }
+    if (!open.size) return;
+    stalls = moving ? 0 : stalls + 1;
+    if (stalls >= 2) {
+      for (const id of open.keys()) say(id, "left at the top level — the move never started");
+      return;
+    }
+    await new Promise((r) => { spFilingTimer = setTimeout(r, SP_FILING_POLL_MS); });
+    if (token !== spPollToken) return;
+  }
 }
 
 async function spReread() {
@@ -4482,14 +4644,16 @@ function renderSpParts() {
   $("sp-hint").hidden = !hint;
   if (hint) {
     $("sp-hint").innerHTML = `This splits more cleanly into ${hint} — <button id="sp-hint-go">try ${hint}</button>`;
-    $("sp-hint-go").onclick = () => spStartOver(hint);
+    $("sp-hint-go").onclick = () => spResuggest(hint);
   }
   const canRemove = spDraft.parts.length > SP_MIN;
   $("sp-actions").innerHTML =
     (canRemove ? '<button id="sp-remove-part">Remove this part</button>' : "") +
-    '<button id="sp-start-over">Start over</button>';
+    '<button id="sp-start-over">Start over</button>' +
+    '<button id="sp-discard">Discard this split</button>';
   if (canRemove) $("sp-remove-part").onclick = () => spRemovePart(spShown);
-  $("sp-start-over").onclick = () => spStartOver(spDraft.n);
+  $("sp-start-over").onclick = spStartOver;
+  $("sp-discard").onclick = spDiscard;
 }
 
 function renderSpChips() {

@@ -1168,9 +1168,12 @@ body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
 #sp-homes .sp-home { display: block; width: 100%; text-align: left; }
 /* The chips stay pinned while the songs scroll under them: they are the drop
    targets, so they must be on screen whenever a song is lifted. */
+/* `top` is the sticky header's height (44.8px measured on the Split view,
+   2.8rem at the 16px root size), so no gap opens under it; opaque, so the
+   rows scrolling beneath never show through. */
 #sp-chips {
-  position: sticky; top: 3.2rem; z-index: 3; display: flex; flex-wrap: wrap; gap: .4rem;
-  padding: .4rem 0; background: color-mix(in srgb, var(--bg) 92%, transparent);
+  position: sticky; top: 2.8rem; z-index: 3; display: flex; flex-wrap: wrap; gap: .4rem;
+  padding: .4rem 0; background: var(--bg);
 }
 .sp-chip { border-radius: 999px; padding: .4rem .8rem; }
 .sp-chip.on { border-color: var(--accent); color: var(--accent); }

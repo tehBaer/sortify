@@ -1170,7 +1170,11 @@ def _splitparts_run_done(pid: str, opts: dict) -> None:
         spa.drop_draft(store, pid)
         progress(state="done", phase="done", done=len(plan["new_parts"]), message=None,
                  summary={"created": created, "original": opts["original"],
-                          "empty": plan["empty"], "local": plan["local"]})
+                          "empty": plan["empty"], "local": plan["local"],
+                          # The client watches filing per created id, and in
+                          # subset mode the original is no longer a home, so
+                          # the summary itself must say what it was called.
+                          "folder": opts.get("folder"), "name": draft["name"]})
     except SpotifyError as exc:
         # Retrying into a 429 is what extends it: say to wait, not "again".
         tail = ("press Done again after the cooldown" if exc.status == 429
