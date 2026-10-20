@@ -1077,9 +1077,31 @@ body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
 .cover-title { font-weight: 700; font-size: 1.05rem; }
 .cover-artist { color: var(--muted); font-size: .92rem; }
 .cover-share { flex: 0 0 auto; color: var(--muted); }
-/* Pulled open from the button: the finger sets the size, so the button
-   must not scroll the page under it. On release the rest plays out. */
-#btn-cover { touch-action: none; user-select: none; -webkit-user-select: none; }
+/* Pulled open from the top bar: the finger sets the size, so on the Now
+   view the bar must not scroll the page under it — except while the menu or
+   input list hangs from it, which scroll and take their own gestures. On
+   release the rest plays out. */
+body.on-now header { touch-action: none; user-select: none; -webkit-user-select: none; }
+body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { touch-action: auto; }
+/* The cover behind the bar: its bottom edge, blurred to colour, as a thin
+   lip under the bar, with a grab pill. Overlaid, so it moves no layout. */
+#cover-peek {
+  position: absolute; left: 0; right: 0; top: 100%; height: 10px;
+  overflow: hidden; cursor: pointer;
+  border-radius: 0 0 8px 8px;
+}
+body:not(.on-now) #cover-peek { display: none; }
+#cover-peek-art {
+  position: absolute; inset: -16px;
+  background: center bottom / cover no-repeat;
+  filter: blur(8px) saturate(1.4);
+}
+.peek-grip {
+  position: absolute; left: 50%; top: 3px; width: 36px; height: 4px; margin-left: -18px;
+  /* White with a thin dark ring, so it reads on a pale cover and a dark one. */
+  border-radius: 2px; background: rgba(255, 255, 255, .9);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .2);
+}
 .cover-panel.cover-settle { transition: grid-template-rows .2s cubic-bezier(.2, .8, .2, 1); }
 .cover-panel.cover-settle img { transition: transform .2s cubic-bezier(.2, .8, .2, 1), opacity .2s; }
 @media (prefers-reduced-motion: reduce) {

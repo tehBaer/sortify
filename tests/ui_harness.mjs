@@ -1790,9 +1790,9 @@ run("stopNowPolling()");
         !panelOpen() && /no cover/.test($$("toast").textContent),
         `toast=${JSON.stringify($$("toast").textContent)}`);
 
-  // The button can be pulled downward too: the cover opens under the finger,
-  // and a release decides open or closed. The stub panel has no layout, so
-  // its full height falls back to 360px.
+  // The whole top bar can be pulled downward: the cover opens under the
+  // finger, and a release decides open or closed. The stub panel has no
+  // layout, so its full height falls back to 360px.
   routes["GET /api/now?light=1"].body.track =
     { uri: "spotify:track:br5", name: "Pull Song", artists: [{ name: "Pull Artist" }],
       sortable: true, image: "http://img/300" };
@@ -1801,14 +1801,30 @@ run("stopNowPolling()");
   await tick();
   run("stopNowPolling()");
   const btn = $$("btn-cover");
+  const bar = $$("topbar");
   const pt = (y, t, x = 100) => ({ clientX: x, clientY: y, timeStamp: t, pointerId: 1 });
+  check("PEEK the cover's edge peeks out under the bar, from this song's art",
+        $$("cover-peek").hidden === false &&
+        $$("cover-peek-art").style.backgroundImage === 'url("http://img/300")',
+        `hidden=${$$("cover-peek").hidden} bg=${$$("cover-peek-art").style.backgroundImage}`);
+  $$("cover-peek").onclick();
+  check("PEEK a tap on it opens the cover, and it hides while the cover is open",
+        panelOpen() && $$("cover-peek").hidden === true, `hidden=${$$("cover-peek").hidden}`);
+  run(`closeCover()`);
+  check("PEEK ...and comes back when the cover shuts", $$("cover-peek").hidden === false, "");
+  $$("nav-pop").hidden = false;
+  bar.onpointerdown({ clientX: 100, clientY: 10, timeStamp: 0, pointerId: 1 });
+  bar.onpointermove({ clientX: 100, clientY: 100, timeStamp: 400, pointerId: 1 });
+  bar.onpointerup({});
+  check("PULL with the menu open, the bar does not pull", !panelOpen() && !run("coverOpen"), "");
+  $$("nav-pop").hidden = true;
   // The click a real browser fires after every pointerup.
   const click = () => btn.onclick();
-  btn.onpointerdown(pt(10, 0));
-  btn.onpointermove(pt(13, 50));
+  bar.onpointerdown(pt(10, 0));
+  bar.onpointermove(pt(13, 50));
   check("PULL a few pixels is still a tap, not a pull",
         !panelOpen() && run("coverPull") === null, `pull=${run("coverPull")}`);
-  btn.onpointermove(pt(100, 400));
+  bar.onpointermove(pt(100, 400));
   check("PULL dragging down draws the panel at the finger's size",
         panelOpen() && Math.abs(run("coverPull") - 0.25) < 1e-9 &&
         $$("cover-panel").style.gridTemplateRows === "0.25fr" && !card().includes("cover-panel cover-in"),
@@ -1816,23 +1832,23 @@ run("stopNowPolling()");
   run(`renderNow()`);
   check("PULL a re-render mid-pull keeps the pulled size",
         card().includes('style="grid-template-rows:0.25fr"'), card().slice(0, 200));
-  btn.onpointermove(pt(160, 1000));
-  btn.onpointerup(pt(160, 1000));
+  bar.onpointermove(pt(160, 1000));
+  bar.onpointerup(pt(160, 1000));
   click();
   check("PULL released past the line, it opens and the click is not a tap",
         panelOpen() && run("coverOpen") && run("coverPull") === null &&
         btn.classList.contains("on"), `open=${run("coverOpen")} pull=${run("coverPull")}`);
-  btn.onpointerdown(pt(10, 0));
-  btn.onpointermove(pt(100, 400));
+  bar.onpointerdown(pt(10, 0));
+  bar.onpointermove(pt(100, 400));
   check("PULL an open cover is not pulled again", run("coverPull") === null, "");
-  btn.onpointerup(pt(100, 400));
+  bar.onpointerup(pt(100, 400));
   click();
   check("PULL ...a tap still closes it", !panelOpen() && !run("coverOpen"), "");
 
-  btn.onpointerdown(pt(10, 0));
-  btn.onpointermove(pt(40, 400));
-  btn.onpointermove(pt(60, 800));
-  btn.onpointerup(pt(60, 800));
+  bar.onpointerdown(pt(10, 0));
+  bar.onpointermove(pt(40, 400));
+  bar.onpointermove(pt(60, 800));
+  bar.onpointerup(pt(60, 800));
   click();
   check("PULL released short of the line, it collapses...",
         run("coverPull") === 0 && $$("cover-panel").style.gridTemplateRows === "0fr", "");
@@ -1840,18 +1856,18 @@ run("stopNowPolling()");
   check("PULL ...and then closes", !panelOpen() && !run("coverOpen") &&
         !btn.classList.contains("on"), `open=${run("coverOpen")}`);
 
-  btn.onpointerdown(pt(10, 0));
-  btn.onpointermove(pt(30, 10));
-  btn.onpointermove(pt(50, 20));
-  btn.onpointerup(pt(50, 20));
+  bar.onpointerdown(pt(10, 0));
+  bar.onpointermove(pt(30, 10));
+  bar.onpointermove(pt(50, 20));
+  bar.onpointerup(pt(50, 20));
   click();
   check("PULL a quick flick opens it even when short",
         run("coverOpen") && run("coverPull") === null, `pull=${run("coverPull")}`);
   run(`closeCover()`);
 
-  btn.onpointerdown(pt(10, 0));
-  btn.onpointermove(pt(100, 400));
-  btn.onpointercancel();
+  bar.onpointerdown(pt(10, 0));
+  bar.onpointermove(pt(100, 400));
+  bar.onpointercancel();
   await new Promise((r) => setTimeout(r, 260));
   check("PULL a cancelled pull closes", !panelOpen() && !run("coverOpen"), "");
 
@@ -1860,10 +1876,11 @@ run("stopNowPolling()");
   await tick();
   run("stopNowPolling()");
   $$("toast").textContent = "";
-  btn.onpointerdown(pt(10, 0));
-  btn.onpointermove(pt(100, 400));
-  btn.onpointerup(pt(100, 400));
+  bar.onpointerdown(pt(10, 0));
+  bar.onpointermove(pt(100, 400));
+  bar.onpointerup(pt(100, 400));
   btn.onclick();
+  check("PEEK no art, no peek", $$("cover-peek").hidden === true, "");
   check("PULL no cover: no pull, and the click's toast says why",
         !panelOpen() && !run("coverOpen") && /no cover/.test($$("toast").textContent),
         `toast=${JSON.stringify($$("toast").textContent)}`);
@@ -1879,6 +1896,7 @@ run("stopNowPolling()");
         /Failed to fetch/.test(card()) && /id="btn-now-retry"[^>]*>Try again</.test(card()),
         card().slice(0, 200));
   routes["GET /api/now?light=1&force=1"] = lightRoute;
+  check("PEEK a failed poll hides the peek with the track", $$("cover-peek").hidden === true, "");
   resetLog();
   $$("btn-now-retry").onclick();
   check("RETRY ...pressing it disables it against a double tap",
