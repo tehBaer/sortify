@@ -122,10 +122,11 @@ def build_signals(tracks: list[dict], tag_artists: dict, track_map: dict,
             if v:
                 vec[aid] = v
 
-    key_to_idx: dict[str, int] = {}
+    key_to_idx: dict[str, list[int]] = {}
     for i, t in enumerate(songs):
         for a in t.get("artists") or []:
-            key_to_idx.setdefault(track_key(a.get("name") or "", t.get("name") or ""), i)
+            k = track_key(a.get("name") or "", t.get("name") or "")
+            key_to_idx.setdefault(k, []).append(i)
     tsim: list[dict[int, float]] = [{} for _ in songs]
     tkeys: list[frozenset] = []
     has_track: list[bool] = []
@@ -135,18 +136,19 @@ def build_signals(tracks: list[dict], tag_artists: dict, track_map: dict,
         for s in sims:
             k = track_key(s.get("artist") or "", s.get("track") or "")
             keys.add(k)
-            j = key_to_idx.get(k)
-            if j is not None and j != i:
-                m = float(s.get("match") or 0.0)
-                if m > tsim[i].get(j, 0.0):
-                    tsim[i][j] = m
+            indices = key_to_idx.get(k, [])
+            for j in indices:
+                if j != i:
+                    m = float(s.get("match") or 0.0)
+                    if m > tsim[i].get(j, 0.0):
+                        tsim[i][j] = m
         tkeys.append(frozenset(keys))
         has_track.append(bool(sims))
 
-    name_to_aid: dict[str, str] = {}
+    name_to_aid: dict[str, set[str]] = {}
     for aid, name in prim:
         if aid:
-            name_to_aid.setdefault(_norm(name), aid)
+            name_to_aid.setdefault(_norm(name), set()).add(aid)
     asim: dict[tuple[str, str], float] = {}
     with_artist_sim: set[str] = set()
     for aid in sorted({a for a in artist if a}):
@@ -157,12 +159,13 @@ def build_signals(tracks: list[dict], tag_artists: dict, track_map: dict,
         if sims:
             with_artist_sim.add(aid)
         for s in sims:
-            other = name_to_aid.get(_norm(s.get("artist") or ""))
-            if other and other != aid:
-                m = float(s.get("match") or 0.0)
-                for k in ((aid, other), (other, aid)):
-                    if m > asim.get(k, 0.0):
-                        asim[k] = m
+            others = name_to_aid.get(_norm(s.get("artist") or ""), set())
+            for other in others:
+                if other != aid:
+                    m = float(s.get("match") or 0.0)
+                    for k in ((aid, other), (other, aid)):
+                        if m > asim.get(k, 0.0):
+                            asim[k] = m
 
     has = [bool(vec.get(a)) or has_track[i] or (a in with_artist_sim)
            for i, a in enumerate(artist)]

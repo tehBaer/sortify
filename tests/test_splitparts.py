@@ -230,3 +230,88 @@ def test_a_thousand_songs_in_reasonable_time():
 
     assert len(s.parts) == 4
     assert elapsed < 15, f"{elapsed:.1f}s"
+
+
+def test_duplicate_recordings_both_get_similar_credit():
+    """Two different uris with the same artist name and title should both
+    receive getSimilar credits, and results should be order-independent."""
+    # Create a base set: rock artist and jazz artist
+    tracks, tags = make({"rock": 10, "jazz": 10})
+
+    # Add two duplicate recordings: different uris but same artist name and title
+    tracks.append({"uri": "spotify:track:dup1", "name": "Dup",
+                   "artists": [{"id": "ad", "name": "Reissued"}]})
+    tracks.append({"uri": "spotify:track:dup2", "name": "Dup",
+                   "artists": [{"id": "ad", "name": "Reissued"}]})
+    tags["ad"] = {"name": "Reissued", "tags": [{"name": "rock", "count": 100}],
+                  "miss": False}
+
+    # Add a song whose getSimilar mentions the duplicates
+    tracks.append({"uri": "spotify:track:ref", "name": "Ref",
+                   "artists": [{"id": "aref", "name": "Referrer"}]})
+    track_map = {track_key("Referrer", "Ref"): {
+        "similar": [
+            {"artist": "Reissued", "track": "Dup", "match": 0.8}
+        ],
+        "tags": [], "miss": False
+    }}
+
+    # Build signals forward
+    sig_fwd = spp.build_signals(tracks, tags, track_map, {})
+    ref_idx = sig_fwd.index.get("spotify:track:ref")
+    dup1_idx = sig_fwd.index.get("spotify:track:dup1")
+    dup2_idx = sig_fwd.index.get("spotify:track:dup2")
+
+    # Build signals reversed
+    sig_rev = spp.build_signals(list(reversed(tracks)), tags, track_map, {})
+    # Map back to uris
+    uri_to_tsim_rev = {}
+    for u, idx in sig_rev.index.items():
+        uri_to_tsim_rev[u] = sig_rev.tsim[idx]
+
+    # Both duplicates should have the getSimilar match with the referrer
+    assert dup1_idx in sig_fwd.tsim[ref_idx] or ref_idx in sig_fwd.tsim[dup1_idx]
+    assert dup2_idx in sig_fwd.tsim[ref_idx] or ref_idx in sig_fwd.tsim[dup2_idx]
+
+    # Check both have the match value
+    ref_dup1_match = sig_fwd.tsim[ref_idx].get(dup1_idx, 0.0) or sig_fwd.tsim[dup1_idx].get(ref_idx, 0.0)
+    ref_dup2_match = sig_fwd.tsim[ref_idx].get(dup2_idx, 0.0) or sig_fwd.tsim[dup2_idx].get(ref_idx, 0.0)
+    assert ref_dup1_match == 0.8
+    assert ref_dup2_match == 0.8
+
+    # Check order-independence: reverse should give same matches
+    ref_uri_matches_rev = uri_to_tsim_rev.get("spotify:track:ref", {})
+    assert uri_to_tsim_rev.get("spotify:track:dup1", {}).get(sig_rev.index["spotify:track:ref"], 0.0) == 0.8 or \
+           ref_uri_matches_rev.get(sig_rev.index.get("spotify:track:dup1"), 0.0) == 0.8
+    assert uri_to_tsim_rev.get("spotify:track:dup2", {}).get(sig_rev.index["spotify:track:ref"], 0.0) == 0.8 or \
+           ref_uri_matches_rev.get(sig_rev.index.get("spotify:track:dup2"), 0.0) == 0.8
+
+
+def test_artists_sharing_a_name_both_get_artist_similarity():
+    """Two artist ids with the same normalized name should both receive
+    artist similarity credits."""
+    tracks, tags = make({"rock": 5, "jazz": 5})
+
+    # Add two artists with the same name but different ids
+    tracks.append({"uri": "spotify:track:twin1", "name": "Twin1",
+                   "artists": [{"id": "atwin1", "name": "Twin"}]})
+    tracks.append({"uri": "spotify:track:twin2", "name": "Twin2",
+                   "artists": [{"id": "atwin2", "name": "Twin"}]})
+    tags["atwin1"] = {"name": "Twin", "tags": [{"name": "rock", "count": 100}],
+                      "miss": False}
+    tags["atwin2"] = {"name": "Twin", "tags": [{"name": "jazz", "count": 100}],
+                      "miss": False}
+
+    # Add a third artist whose artist_map similar list names "Twin"
+    tracks.append({"uri": "spotify:track:ref_artist", "name": "RefArtist",
+                   "artists": [{"id": "aref", "name": "Referrer"}]})
+    tags["aref"] = {"name": "Referrer", "tags": [{"name": "indie", "count": 100}],
+                    "miss": False}
+    artist_map = {"aref": {"name": "Referrer", "miss": False,
+                           "similar": [{"artist": "Twin", "match": 0.9}]}}
+
+    sig = spp.build_signals(tracks, tags, {}, artist_map)
+
+    # Both (aref, atwin1) and (aref, atwin2) pairs should be in asim
+    assert sig.asim.get(("aref", "atwin1"), 0.0) == 0.9 or sig.asim.get(("atwin1", "aref"), 0.0) == 0.9
+    assert sig.asim.get(("aref", "atwin2"), 0.0) == 0.9 or sig.asim.get(("atwin2", "aref"), 0.0) == 0.9
