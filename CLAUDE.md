@@ -151,8 +151,11 @@ escalating penalties. Therefore:
   log is the seed for exploring those artists later, and nothing else writes it.
 - The client speaks the Feb-2026 dev-mode API (`items`/`item`, `/me/library`)
   — do not "fix" it back to pre-2026 shapes. Batch ADD exists: up to 100 uris
-  per playlist-items POST (probed 2026-08-23; 150 → 400). There is still no
-  batch delete. A dev-mode app CAN publish a playlist: `PUT /playlists/{id}`
+  per playlist-items POST (probed 2026-08-23; 150 → 400). Batch DELETE
+  exists too: `DELETE /playlists/{id}/items` with `{"items": [{"uri": …}, …]}`
+  removed two tracks in one call, read back (probed 2026-10-20). Its upper
+  limit is unprobed — assume 100 like add until tested. The old "no batch
+  delete" note was never tested. A dev-mode app CAN publish a playlist: `PUT /playlists/{id}`
   with `{"public": true}` sticks, verified by reading `public` back on
   2026-08-31 — so "make it shareable" costs one call per playlist, not a trip
   through the desktop client. Creation still sends `public: false` unless a

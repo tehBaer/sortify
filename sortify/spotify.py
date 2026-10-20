@@ -918,8 +918,9 @@ class Spotify:
     def unfollow_playlist(self, playlist_id: str) -> None:
         """Discard a whole playlist in one call.
 
-        This is why a sitting is disposable: clearing a 22-track playlist
-        track-by-track would cost 22 calls, since the Feb-2026 API has no
-        batch delete.
+        Why a sitting is disposable: one call removes the whole playlist.
+        (The old reason, "no batch delete", was wrong — removing several
+        tracks in one DELETE works, probed 2026-10-20 — but discarding the
+        playlist is still the cheapest way to clear it.)
         """
         self.request("DELETE", f"/playlists/{playlist_id}/followers")
