@@ -3662,7 +3662,10 @@ function spStopPreview(resume = true) {
 // clip that dies mid-playback, not just at the start).
 function spClipFailed() {
   if (!spAudio) return;
-  spStopPreview(false);
+  // true, not false: a clip that already took Spotify's focus (resume is
+  // owed) must give it back now — the owed flag only ever arms once play()
+  // has actually resolved, so this is a no-op for a clip that never played.
+  spStopPreview(true);
   toast("this preview failed — tap to try again");
 }
 
@@ -3674,6 +3677,11 @@ async function spPreview(uri) {
   // that resumes after an awaited fetch has already returned.
   if (spAudio && spAudioUri === uri && spAudioRefused) {
     const a = spAudio;
+    // Cleared BEFORE awaiting, not after: while this retry's own play() is
+    // buffering it is no longer "refused", so a third tap landing in that
+    // window stops the clip (the branch below) instead of matching this one
+    // again and calling play() on it a second time.
+    spAudioRefused = false;
     try {
       await a.play();
     } catch (e) {
@@ -3681,6 +3689,7 @@ async function spPreview(uri) {
       // simply aborted by a stop that raced it — neither is a failure.
       if (spAudio !== a || (e && e.name === "AbortError")) return;
       if (e && e.name === "NotAllowedError") {
+        spAudioRefused = true;
         toast("tap the song again to play its preview");
         return;
       }
@@ -3688,7 +3697,6 @@ async function spPreview(uri) {
       return;
     }
     if (spAudio !== a) return;
-    spAudioRefused = false;
     spAudioPending = false;
     if (spSessionPlaying) spResumeOwed = true;
     renderSpList();
@@ -4049,11 +4057,13 @@ function renderSpList() {
   $("sp-list").innerHTML = part && part.uris.length
     ? part.uris.map((u) => {
         const s = spDraft.songs[u] || { name: u, artists: "" };
-        // Not merely "the row this uri belongs to" — a refused or still-
-        // buffering clip keeps spAudioUri so the next tap can retry or stop
-        // it, but has never actually taken audio focus, so it earns no
-        // highlight until spAudioPending clears (see spPreview).
-        return `<div class="sp-song${u === spAudioUri && !spAudioPending ? " playing" : ""}" data-uri="${esc(u)}">
+        // Not merely "the row this uri belongs to" — spAudioUri is set
+        // before the fetch even starts, while spAudio itself (and so
+        // spAudioPending) doesn't exist yet, and a refused or still-
+        // buffering clip keeps both set without having taken audio focus.
+        // None of those earn the highlight until there's a real spAudio
+        // with spAudioPending cleared (see spPreview).
+        return `<div class="sp-song${spAudio && u === spAudioUri && !spAudioPending ? " playing" : ""}" data-uri="${esc(u)}">
           <span class="sp-song-name">${esc(s.name)}${unknown.has(u) ? ' <span class="sp-unknown" title="no Last.fm data — check where it landed">?</span>' : ""}</span>
           <span class="sp-song-artist">${esc(s.artists)}</span>
         </div>`;

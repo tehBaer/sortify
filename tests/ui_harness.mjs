@@ -4990,8 +4990,13 @@ run("stopNowPolling()");
         AudioStub.made.length === 2, `made=${AudioStub.made.length}`);
 
   // ...and a clip that dies MID-PLAYBACK (onerror, an expired CDN token)
-  // fails the exact same way.
+  // fails the exact same way. This clip actually played, so round 3's fix
+  // means spClipFailed also resumes Spotify now — give that call somewhere
+  // benign to land (a stale route from an earlier block would otherwise
+  // overwrite this toast with its own, independent of the failure path
+  // under test here).
   const liveClip = AudioStub.made[AudioStub.made.length - 1];
+  routes["POST /api/preview_resume"] = { status: 200, body: { ok: true } };
   check("SP7 the clip got an onerror handler wired to the same failure path",
         typeof liveClip.onerror === "function", "");
   if (liveClip.onerror) liveClip.onerror();
@@ -5075,6 +5080,92 @@ run("stopNowPolling()");
         /sp-song playing" data-uri="u1"/.test($$("sp-list").innerHTML), $$("sp-list").innerHTML);
 
   run(`spStopPreview(false)`);
+  run(`show("lists")`);
+}
+
+// ============================================================================
+// SP8 — fix round 3: the retry branch's own refused flag must clear while
+// IT buffers too, a clip that dies after real playback still resumes
+// Spotify, and the playing highlight needs spAudio to actually exist.
+// ============================================================================
+{
+  const songs = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                  u3: { name: "Three", artists: "C", local: false } };
+  const D = (parts, extra = {}) => ({ playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2, parts,
+    unknown: [], hint: null, scores: {}, songs, tracks: [], done: null, ...extra });
+  const two = () => [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3"] }];
+  run(`show("split")`);
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spPid = "H1"; spShown = "p1"; spSection("sp-work"); renderSpParts(); nowState = { is_playing: true }`);
+
+  // fix 1 — the retry branch must clear spAudioRefused BEFORE awaiting its
+  // own play(), so a third tap landing while that retry still buffers
+  // stops the clip instead of matching the refused branch again.
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = true;
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP8 the first tap is refused", run("spAudioRefused") === true, "");
+
+  const origPlay2 = AudioStub.prototype.play;
+  let retryPlayCalls = 0;
+  AudioStub.prototype.play = function () {
+    retryPlayCalls++;
+    this.paused = false;
+    return new Promise(() => {});   // the retry itself buffers forever
+  };
+  run(`spPointerDown("u1", 10, 10)`);
+  run(`spPointerUp(10, 10)`);        // fire-and-forget: this retry's play() never settles
+  await tick();
+  check("SP8 the retry clears spAudioRefused while IT buffers",
+        run("spAudioPending") === true && run("spAudioRefused") === false, "");
+  run(`spPointerDown("u1", 10, 10)`);
+  run(`spPointerUp(10, 10)`);        // fire-and-forget too: must not re-enter the retry branch and hang the same way
+  await tick();
+  check("SP8 a third tap mid-retry stops the clip instead of calling play() again",
+        run("spAudioUri") === null && retryPlayCalls === 1, `calls=${retryPlayCalls}`);
+  AudioStub.prototype.play = origPlay2;
+  run(`spStopPreview(false)`);
+
+  // fix 2 — a clip that dies via onerror AFTER actually playing (resume
+  // owed) must still give Spotify back once, not leave it silently paused.
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = false;
+  routes["GET /api/track_preview?pid=H1&uri=u2"] = { status: 200, body: { url: "https://cdn/u2.mp3", uri: "u2", deezer_id: 2 } };
+  routes["POST /api/preview_resume"] = { status: 200, body: { ok: true } };
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP8 the clip actually played, so a resume is owed", run("spResumeOwed") === true, "");
+  const clip2 = AudioStub.made[AudioStub.made.length - 1];
+  clip2.onerror();
+  await tick();
+  check("SP8 a clip that dies after real playback resumes Spotify exactly once",
+        log.filter((l) => l.path === "/api/preview_resume").length === 1, "");
+
+  // fix 3 — the playing highlight needs an actual spAudio, not just a
+  // pending fetch (spAudioUri set, spAudioPending still false until the
+  // Audio object exists).
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p1"; renderSpParts()`);
+  resetLog();
+  AudioStub.made.length = 0;
+  let resolveFetch;
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = () => new Promise((resolve) => { resolveFetch = resolve; });
+  run(`spPointerDown("u1", 10, 10)`);
+  run(`spPointerUp(10, 10)`);        // fire-and-forget: the fetch itself never resolves until we say so
+  await tick();
+  check("SP8 while the fetch is in flight, spAudio does not exist yet",
+        run("spAudio") === null && run("spAudioUri") === "u1" && run("spAudioPending") === false, "");
+  run(`renderSpList()`);
+  check("SP8 ...and that in-flight window is not drawn as playing",
+        !/sp-song playing" data-uri="u1"/.test($$("sp-list").innerHTML), $$("sp-list").innerHTML);
+  resolveFetch({ status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } });
+  await tick();
+  run(`spStopPreview(false)`);
+
   run(`show("lists")`);
 }
 
