@@ -4592,6 +4592,132 @@ run("stopNowPolling()");
   run(`spStopPolling(); show("lists")`);
 }
 
+// ============================================================================
+// SP2 — the parts screen: a touch that moves drags, a touch that does not is
+// a preview; songs drop on chips; parts come and go.
+// ============================================================================
+{
+  resetLog();
+  AudioStub.made.length = 0; AudioStub.refuse = false;
+  const songs = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                  u3: { name: "Three", artists: "C", local: false }, u4: { name: "Four", artists: "D", local: false } };
+  const D = (parts, extra = {}) => ({ playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2, parts,
+    unknown: [], hint: null, scores: {}, songs, tracks: [], done: null, ...extra });
+  const two = () => [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3", "u4"] }];
+  run(`show("split")`);
+  // spDraft & co are `let` bindings in app.js, not properties of the vm's
+  // global object: assign them inside run(), never through ctx.
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spPid = "H1"; spShown = "p1"; spSection("sp-work"); renderSpParts(); nowState = { is_playing: true }`);
+
+  // tap = preview
+  routes["GET /api/track_preview?pid=H1&uri=u1"] = { status: 200, body: { url: "https://cdn/u1.mp3", uri: "u1", deezer_id: 1 } };
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP2 a tap plays the song's preview",
+        AudioStub.made.length === 1 && AudioStub.made[0].src === "https://cdn/u1.mp3" && !AudioStub.made[0].paused &&
+        run("spAudioUri") === "u1", `made=${AudioStub.made.length}`);
+  check("SP2 ...and moves nothing", !log.some((l) => l.path.endsWith("/move")), "");
+  run(`spPointerDown("u1", 10, 10)`);
+  await run(`spPointerUp(11, 12)`);
+  await tick();
+  check("SP2 a tap on the playing song stops it, and Spotify is resumed once",
+        AudioStub.made[0].paused && run("spAudioUri") === null &&
+        log.filter((l) => l.path === "/api/preview_resume").length === 1, "");
+
+  // no preview available
+  routes["GET /api/track_preview?pid=H1&uri=u2"] = { status: 404, body: { detail: "no preview" } };
+  run(`spPointerDown("u2", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  check("SP2 a song with no preview says so", /no preview/.test($$("toast").textContent), $$("toast").textContent);
+
+  // drag onto another part's chip
+  routes["POST /api/splitparts/H1/move"] = { status: 200,
+    body: D([{ key: "p1", name: "rock", uris: ["u2"] }, { key: "p2", name: "jazz", uris: ["u3", "u4", "u1"] }]) };
+  document.elementFromPoint = () => ({ closest: () => ({ dataset: { key: "p2" } }) });
+  run(`spPointerDown("u1", 10, 10)`);
+  run(`spPointerMove(10, 40)`);
+  check("SP2 moving the finger lifts the song at once and lights the chip under it",
+        run("spDropKey") === "p2" && document.body.children.some((c) => c.className === "sp-ghost"),
+        `drop=${run("spDropKey")}`);
+  await run(`spPointerUp(10, 40)`);
+  await tick();
+  const mv = log.find((l) => l.path === "/api/splitparts/H1/move");
+  check("SP2 releasing over a chip moves the song to that part",
+        mv && JSON.parse(mv.body).uri === "u1" && JSON.parse(mv.body).to === "p2", JSON.stringify(mv));
+  check("SP2 ...and the list redraws without it", !/data-uri="u1"/.test($$("sp-list").innerHTML) &&
+        run("spDropKey") === null, $$("sp-list").innerHTML);
+
+  resetLog();
+  document.elementFromPoint = () => null;
+  run(`spPointerDown("u2", 10, 10); spPointerMove(10, 40)`);
+  await run(`spPointerUp(10, 40)`);
+  check("SP2 releasing away from every chip moves nothing", !log.some((l) => l.path.endsWith("/move")), "");
+  document.elementFromPoint = () => ({ closest: () => ({ dataset: { key: "p1" } }) });
+  run(`spPointerDown("u2", 10, 10); spPointerMove(10, 40)`);
+  await run(`spPointerUp(10, 40)`);
+  check("SP2 ...and so does releasing over its own part", !log.some((l) => l.path.endsWith("/move")), "");
+  document.elementFromPoint = () => null;
+
+  // add a part
+  routes["POST /api/splitparts/H1/parts"] = { status: 200,
+    body: D([...two(), { key: "p3", name: "New part", uris: [] }]) };
+  check("SP2 the chip row ends with an add chip", /id="sp-add"/.test($$("sp-chips").innerHTML), $$("sp-chips").innerHTML);
+  await run(`spAddPart()`);
+  check("SP2 adding a part shows the new, empty part",
+        run("spShown") === "p3" && /no songs in this part yet/.test($$("sp-list").innerHTML), "");
+
+  // remove the shown part: asks with destinations, then shows another part
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`spShown = "p2"; renderSpParts()`);
+  routes["POST /api/splitparts/H1/parts/p2/remove"] = (() => {
+    let n = 0;
+    return () => (n++ === 0
+      ? { status: 200, body: { moves: { p1: 2 } } }
+      : { status: 200, body: D([{ key: "p1", name: "rock", uris: ["u1", "u2", "u3", "u4"] }, { key: "p9", name: "x", uris: [] }]) });
+  })();
+  let asked = "";
+  ctx.confirm = (m) => { asked = m; return false; };
+  await run(`spRemovePart("p2")`);
+  check("SP2 removing a part asks first, naming where its songs go",
+        /jazz/.test(asked) && /2 songs/.test(asked) && /rock: 2/.test(asked), asked);
+  check("SP2 ...and a no changes nothing",
+        log.filter((l) => l.path.endsWith("/remove")).length === 1 && run("spShown") === "p2", "");
+  ctx.confirm = () => true;
+  await run(`spRemovePart("p2")`);
+  check("SP removing the shown part shows another one",
+        run("spShown") === "p1" && /data-uri="u3"/.test($$("sp-list").innerHTML), `shown=${run("spShown")}`);
+
+  // the hint and Start over
+  run(`spDraft = ${JSON.stringify(D(two(), { hint: 3 }))}`);
+  run(`renderSpParts()`);
+  check("SP2 a cleaner count is offered", $$("sp-hint").hidden === false && /3/.test($$("sp-hint").innerHTML),
+        $$("sp-hint").innerHTML);
+  routes["POST /api/splitparts/H1/suggest"] = { status: 200, body: { started: true } };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "running", phase: "grouping", done: 0, total: 0, message: null, summary: null } };
+  ctx.confirm = (m) => { asked = m; return true; };
+  await run(`spStartOver(3)`);
+  const sg = log.find((l) => l.path === "/api/splitparts/H1/suggest");
+  check("SP2 trying it asks first, then re-suggests with that count",
+        /moves/.test(asked) && sg && JSON.parse(sg.body).n === 3, asked);
+  run(`spStopPolling()`);
+
+  // leaving the view stops a preview
+  run(`spDraft = ${JSON.stringify(D(two()))}`);
+  run(`renderSpParts()`);
+  routes["GET /api/track_preview?pid=H1&uri=u3"] = { status: 200, body: { url: "https://cdn/u3.mp3", uri: "u3", deezer_id: 3 } };
+  run(`spShowPart("p2"); spPointerDown("u3", 10, 10)`);
+  await run(`spPointerUp(10, 10)`);
+  await tick();
+  const clip = AudioStub.made[AudioStub.made.length - 1];
+  run(`show("now")`);
+  check("SP2 leaving the Split tab stops the preview", clip.paused && run("spAudioUri") === null, "");
+  ctx.confirm = () => true;
+  run(`show("lists")`);
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

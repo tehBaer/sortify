@@ -3623,7 +3623,175 @@ let spN = 2;            // the counter
 let spPollTimer = null;
 const SP_MIN = 2, SP_MAX = 6;
 
-function spStopPreview() {}
+// ---- tap = preview ----------------------------------------------------------
+// One clip at a time. Spotify is paused by the phone when the clip takes the
+// audio, and given back once when previewing ends — only if it was playing.
+let spAudio = null;
+let spAudioUri = null;
+let spResumeOwed = false;
+
+function spStopPreview(resume = true) {
+  if (spAudio) { spAudio.onended = null; spAudio.pause(); spAudio.src = ""; }
+  spAudio = null;
+  const was = spAudioUri;
+  spAudioUri = null;
+  if (resume && spResumeOwed) {
+    spResumeOwed = false;
+    api("/api/preview_resume", {}).catch(() => {});
+  }
+  if (was && spDraft && !$("sp-parts").hidden) renderSpList();
+}
+
+async function spPreview(uri) {
+  if (spAudioUri === uri) { spStopPreview(); return; }
+  if (spAudio) spStopPreview(false);
+  if (!spResumeOwed && nowState?.is_playing) spResumeOwed = true;
+  spAudioUri = uri;
+  let r;
+  try {
+    r = await api(`/api/track_preview?pid=${encodeURIComponent(spPid)}&uri=${encodeURIComponent(uri)}`);
+  } catch (e) {
+    if (spAudioUri === uri) spAudioUri = null;
+    toast(e.status === 404 ? "no preview for this one" : e.message);
+    return;
+  }
+  if (spAudioUri !== uri) return;        // another tap won the race
+  spAudio = new Audio(r.url);
+  spAudio.onended = () => spStopPreview();
+  try { await spAudio.play(); } catch (_) { toast("preview blocked — tap again"); spStopPreview(); return; }
+  renderSpList();
+}
+
+// ---- touch that moves = drag -------------------------------------------------
+const SP_LIFT_PX = 8;
+let spDrag = null;      // {uri, x0, y0, lifted, ghost}
+let spDropKey = null;   // the chip under a lifted song
+
+function spChipAt(x, y) {
+  const el = document.elementFromPoint ? document.elementFromPoint(x, y) : null;
+  const chip = el && el.closest ? el.closest(".sp-chip[data-key]") : null;
+  return chip ? chip.dataset.key : null;
+}
+
+function spHighlight(key) {
+  spDropKey = key;
+  $("sp-chips").querySelectorAll("button").forEach((b, i) => {
+    const part = spDraft.parts[i];
+    if (part) b.classList.toggle("drop", part.key === key);
+  });
+}
+
+function spPointerDown(uri, x, y) {
+  spDrag = { uri, x0: x, y0: y, lifted: false, ghost: null };
+}
+
+function spPointerMove(x, y) {
+  if (!spDrag) return;
+  if (!spDrag.lifted && Math.hypot(x - spDrag.x0, y - spDrag.y0) >= SP_LIFT_PX) {
+    spDrag.lifted = true;
+    const g = document.createElement("div");
+    g.className = "sp-ghost";
+    g.textContent = spSongLabel(spDrag.uri);
+    document.body.appendChild(g);
+    spDrag.ghost = g;
+  }
+  if (!spDrag.lifted) return;
+  spDrag.ghost.style.left = `${x}px`;
+  spDrag.ghost.style.top = `${y}px`;
+  const key = spChipAt(x, y);
+  spHighlight(key && key !== spShown ? key : null);
+}
+
+function spEndDrag() {
+  const d = spDrag;
+  spDrag = null;
+  if (d && d.ghost && d.ghost.remove) d.ghost.remove();
+  if (d && d.ghost && document.body.children) {   // the harness's stub body
+    const i = document.body.children.indexOf(d.ghost);
+    if (i >= 0) document.body.children.splice(i, 1);
+  }
+  spHighlight(null);
+  return d;
+}
+
+async function spPointerUp(x, y) {
+  if (!spDrag) return;
+  const lifted = spDrag.lifted;
+  const key = lifted ? spChipAt(x, y) : null;
+  const d = spEndDrag();
+  if (!lifted) { await spPreview(d.uri); return; }
+  if (key && key !== spShown) await spMove(d.uri, key);
+}
+
+function spPointerCancel() { spEndDrag(); }
+
+function spListPointerDown(e) {
+  const row = e.target && e.target.closest ? e.target.closest(".sp-song") : null;
+  if (!row || (e.button !== undefined && e.button > 0)) return;
+  e.preventDefault();
+  spPointerDown(row.dataset.uri, e.clientX, e.clientY);
+}
+document.addEventListener("pointermove", (e) => {
+  if (!spDrag) return;
+  if (e.preventDefault) e.preventDefault();
+  spPointerMove(e.clientX, e.clientY);
+}, { passive: false });
+document.addEventListener("pointerup", (e) => { if (spDrag) spPointerUp(e.clientX, e.clientY); });
+document.addEventListener("pointercancel", () => { if (spDrag) spPointerCancel(); });
+
+async function spMove(uri, key) {
+  try {
+    spDraft = await api(spUrl("/move"), { uri, to: key });
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  renderSpParts();
+  toast(`moved to ${spPart(key)?.name || "the other part"}`);
+}
+
+// ---- parts come and go ---------------------------------------------------------
+async function spAddPart() {
+  try {
+    spDraft = await api(spUrl("/parts"), {});
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  spShown = spDraft.parts[spDraft.parts.length - 1].key;
+  renderSpParts();
+}
+
+async function spRemovePart(key) {
+  const part = spPart(key);
+  if (!part) return;
+  let dry;
+  try {
+    dry = await api(spUrl(`/parts/${encodeURIComponent(key)}/remove`), { dry: true });
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  const where = Object.entries(dry.moves || {})
+    .map(([k, n]) => `${spPart(k)?.name || k}: ${n}`).join(", ");
+  const msg = part.uris.length
+    ? `Remove “${part.name}”? Its ${part.uris.length} songs go to the parts they fit best — ${where}.`
+    : `Remove the empty part “${part.name}”?`;
+  if (!confirm(msg)) return;
+  try {
+    spDraft = await api(spUrl(`/parts/${encodeURIComponent(key)}/remove`), { dry: false });
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  if (spShown === key) spShown = spDraft.parts[0]?.key || null;
+  renderSpParts();
+}
+
+async function spStartOver(n) {
+  if (!confirm(`Start over with ${n} parts? Your moves and added parts are lost.`)) return;
+  await spSuggest(n);
+}
 
 function spSection(id) {
   for (const s of ["sp-pick", "sp-work"]) $(s).hidden = s !== id;
@@ -3757,17 +3925,32 @@ function renderSpParts() {
   if (!spPart(spShown)) spShown = spDraft.parts[0]?.key || null;
   renderSpChips();
   renderSpList();
+  const hint = spDraft.hint;
+  $("sp-hint").hidden = !hint;
+  if (hint) {
+    $("sp-hint").innerHTML = `This splits more cleanly into ${hint} — <button id="sp-hint-go">try ${hint}</button>`;
+    $("sp-hint-go").onclick = () => spStartOver(hint);
+  }
+  const canRemove = spDraft.parts.length > SP_MIN;
+  $("sp-actions").innerHTML =
+    (canRemove ? '<button id="sp-remove-part">Remove this part</button>' : "") +
+    '<button id="sp-start-over">Start over</button>';
+  if (canRemove) $("sp-remove-part").onclick = () => spRemovePart(spShown);
+  $("sp-start-over").onclick = () => spStartOver(spDraft.n);
 }
 
 function renderSpChips() {
+  const add = spDraft.parts.length < SP_MAX
+    ? '<button id="sp-add" class="sp-chip sp-add" aria-label="Add a part">+</button>' : "";
   $("sp-chips").innerHTML = spDraft.parts.map((p) =>
-    `<button class="sp-chip${p.key === spShown ? " on" : ""}" data-key="${esc(p.key)}">
+    `<button class="sp-chip${p.key === spShown ? " on" : ""}${p.key === spDropKey ? " drop" : ""}" data-key="${esc(p.key)}">
        <span class="sp-chip-name">${esc(p.name)}</span> <span class="sp-chip-n">${p.uris.length}</span>
-     </button>`).join("");
+     </button>`).join("") + add;
   $("sp-chips").querySelectorAll("button").forEach((b, i) => {
-    const key = spDraft.parts[i].key;
-    b.onclick = () => spShowPart(key);
+    const part = spDraft.parts[i];
+    if (part) b.onclick = () => spShowPart(part.key);
   });
+  if (add) $("sp-add").onclick = () => spAddPart();
 }
 
 function spShowPart(key) {
@@ -3782,12 +3965,13 @@ function renderSpList() {
   $("sp-list").innerHTML = part && part.uris.length
     ? part.uris.map((u) => {
         const s = spDraft.songs[u] || { name: u, artists: "" };
-        return `<div class="sp-song" data-uri="${esc(u)}">
+        return `<div class="sp-song${u === spAudioUri ? " playing" : ""}" data-uri="${esc(u)}">
           <span class="sp-song-name">${esc(s.name)}${unknown.has(u) ? ' <span class="sp-unknown" title="no Last.fm data — check where it landed">?</span>' : ""}</span>
           <span class="sp-song-artist">${esc(s.artists)}</span>
         </div>`;
       }).join("")
     : '<p class="hint">no songs in this part yet — drag some onto its chip</p>';
+  $("sp-list").onpointerdown = spListPointerDown;
 }
 
 // ---- keyboard --------------------------------------------------------------

@@ -1188,3 +1188,14 @@ body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
 .sp-song-name, .sp-song-artist { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sp-song-artist { color: var(--muted); font-size: .85rem; }
 .sp-unknown { color: var(--muted); font-weight: 700; }
+.sp-song.playing { outline: 2px solid var(--accent); }
+.sp-ghost {
+  position: fixed; z-index: 30; pointer-events: none; transform: translate(-50%, -120%);
+  max-width: 70vw; padding: .45rem .8rem; border-radius: 10px;
+  background: var(--fg); color: var(--bg); font-size: .9rem;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  box-shadow: var(--shadow-card);
+}
+.sp-chip.sp-add { font-weight: 700; min-width: 2.6rem; }
+#sp-hint { margin: .4rem 0; color: var(--muted); }
+#sp-actions { margin-top: 1rem; gap: .5rem; }
