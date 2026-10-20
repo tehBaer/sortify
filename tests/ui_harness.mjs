@@ -5,7 +5,7 @@
 //
 // NOT a pytest module (it is JavaScript, and the project deliberately has no
 // JS toolchain — no dependencies, no build step). It is a hand-run
-// diagnostic in the same spirit as fuzz_sittings.py:
+// diagnostic, run the same way against any copy of app.js:
 //
 //     node tests/ui_harness.mjs                     # the working tree
 //     node tests/ui_harness.mjs /tmp/app-before.js  # any other copy
@@ -13,23 +13,14 @@
 // Exits non-zero if any check fails. What it pins, and why each matters —
 // all were measured failing against the commit before the fix:
 //
-//   C1  a reservation with playlist_id:null must still show the sitting bar,
-//       disable every Start button, and leave Finish clickable. Otherwise
-//       the split is locked with its only escape outside the UI entirely.
-//   C2  three clicks on "Split it" must issue exactly one paid POST.
-//   I1  finishing with nowState===null must not throw on either exit.
-//   I2  no keep/reject may fire from the keyboard while an error card is up.
-//   I3  two Finish clicks must spend exactly one unfollow, and cleared:false
-//       must report what the resync actually found.
-//   I4  a failed startSitting must re-sync instead of hiding a live sitting.
+//   I1  renderNow() with nowState===null must not throw.
 //
 // The stub DOM models only what these paths touch, but the three details it
 // does model are load-bearing: assigning `innerHTML` replaces the subtree (so
-// renderPiles' row clearing is real, not additive), ids inside assigned
-// markup become addressable afterwards, and responses are deep-cloned —
-// app.js keeps `nowState.sitting` by reference and mutates its `decided` map
-// in place, so a shared fixture would leak one scenario's decision into the
-// next scenario's "server" answer and mask the very bug under test.
+// a re-render's row clearing is real, not additive), ids inside assigned
+// markup become addressable afterwards, and responses are deep-cloned, so a
+// shared fixture object can never leak one scenario's mutation into the next
+// scenario's "server" answer and mask the very bug under test.
 //
 // ---- two hazards that have each cost a debugging session ------------------
 //
@@ -143,6 +134,8 @@ const document = {
   createElement: () => new El("_created"),
   addEventListener: (t, f) => ((handlers[t] ||= []).push(f)),
   body: new El("_body"),   // blind mode toggles a class here
+  // The Split tab's drop target is found geometrically; checks script it.
+  elementFromPoint: () => null,
 };
 
 // ---- scripted fetch --------------------------------------------------------
@@ -167,10 +160,9 @@ async function fetchStub(path, opts) {
   if (r.status === undefined) r = { status: 200, body: r };
   return {
     status: r.status, ok: r.status >= 200 && r.status < 300,
-    // Deep-cloned: app.js keeps `nowState.sitting` by reference and mutates
-    // its `decided` map in place (applyDecision). Handing out the fixture
-    // itself would let one scenario's decision leak into the next poll's
-    // "server" answer.
+    // Deep-cloned: app.js holds onto parts of what it's given and can mutate
+    // them in place. Handing out the fixture object itself would let one
+    // scenario's mutation leak into the next poll's "server" answer.
     json: async () => structuredClone(r.body),
   };
 }
@@ -212,6 +204,8 @@ const ctx = vm.createContext({
   })(),
   // The public gate sends the page to /gate/start by assigning this.
   location: { href: "" },
+  // The Split tab asks before discarding work; checks script the answer.
+  confirm: () => true,
 });
 Object.defineProperty(ctx, "globalThis", { value: ctx });
 
@@ -230,21 +224,6 @@ function check(name, pass, detail) {
   results.push({ name, pass, detail });
   console.log(`${pass ? "PASS" : "FAIL"}  ${name}${detail ? "  — " + detail : ""}`);
 }
-
-// Shaped like what _pile_progress actually sends, materialise fields
-// included: the client never computes a call cost, so a pile row without
-// `materialise_calls` renders its Save button disabled — which would make the
-// "no disabled buttons" assertions below pass or fail for the wrong reason.
-const PILES = [
-  { id: "p1", name: "one", tags: ["a"], uris: ["u1", "u2"], decided: 0, total: 2,
-    materialise_calls: 3, materialised: null },
-  { id: "p2", name: "two", tags: ["b"], uris: ["u3"], decided: 0, total: 1,
-    materialise_calls: 2, materialised: null },
-];
-const splitBody = (active) => ({
-  piles: PILES, decided: {}, active_sitting: active,
-  params: { resolution: 1, min_pile: 15 },
-});
 
 function resetLog() { log.length = 0; }
 
@@ -287,521 +266,23 @@ $$("picker").hidden = true;
 run("stopNowPolling()");
 
 // ============================================================================
-// C1 — a reservation with playlist_id:null must be visible and finishable
-// ============================================================================
-{
-  resetLog();
-  routes["GET /api/split/PL1"] = {
-    status: 200,
-    body: splitBody({ playlist_id: null, pile_id: "p1", uris: [], claim: "c1" }),
-  };
-  run(`openSplit("PL1", "PL1")`);
-  await tick();
-
-  const barShown = $$("split-sitting-bar").hidden === false;
-  check("C1 split-view sitting bar is shown for a playlist_id:null reservation",
-        barShown, `hidden=${$$("split-sitting-bar").hidden}`);
-  check("C1 bar text explains the stuck reservation",
-        /never created|reserved/i.test($$("split-sitting-status").textContent),
-        JSON.stringify($$("split-sitting-status").textContent.slice(0, 80)));
-
-  const rows = $$("piles").children.map((c) => c.innerHTML);
-  const allDisabled = rows.length === 2 && rows.every((h) => /<button[^>]*disabled/.test(h));
-  check("C1 every pile's Start button is disabled (backend would 409 them)",
-        allDisabled, `${rows.length} rows`);
-
-  const sittingGlobal = run("sitting && sitting.splitId");
-  check("C1 the `sitting` global is populated (Now-view bar has something to show)",
-        sittingGlobal === "PL1", `sitting.splitId=${sittingGlobal}`);
-
-  // The escape has to be reachable by a click.
-  routes["POST /api/split/PL1/sitting/finish"] = { status: 200, body: { cleared: true } };
-  resetLog();
-  run(`$("btn-split-finish-sitting").onclick()`);
-  await tick();
-  check("C1 clicking Finish reaches the server-side escape",
-        posts("/api/split/PL1/sitting/finish") === 1,
-        `${posts("/api/split/PL1/sitting/finish")} POST(s)`);
-  check("C1 after finishing, the split is usable again (bar hidden, Starts enabled)",
-        $$("split-sitting-bar").hidden === true &&
-        $$("piles").children.every((c) => !/<button[^>]*disabled/.test(c.innerHTML)),
-        `bar hidden=${$$("split-sitting-bar").hidden}`);
-}
-
-// ============================================================================
-// C2 — "Split it" must not multiply the paid read
-// ============================================================================
-{
-  routes["GET /api/split/PL2"] = { status: 404, body: { detail: "no split for that playlist" } };
-  let release;
-  const pending = new Promise((r) => (release = r));
-  routes["POST /api/split/PL2"] = () => pending;
-
-  run(`openSplit("PL2", "PL2")`);
-  await tick();
-  resetLog();
-
-  const btn = $$("btn-do-split");
-  check("C2 the paid offer rendered a Split button", !!btn.id, btn.id);
-
-  btn.onclick(); btn.onclick(); btn.onclick();   // three clicks in one tick
-  await tick();
-
-  check("C2 three clicks issue exactly one paid POST",
-        posts("/api/split/PL2") === 1, `${posts("/api/split/PL2")} POST(s)`);
-  check("C2 the button is disabled and relabelled for the duration",
-        btn.disabled === true && /splitting/i.test(btn.textContent),
-        `disabled=${btn.disabled} label=${JSON.stringify(btn.textContent)}`);
-
-  release({ status: 200, body: { piles: PILES, tagged: 3, untagged: 0 } });
-  routes["GET /api/split/PL2"] = { status: 200, body: splitBody(null) };
-  await tick();
-  check("C2 the offer is cleared once the split lands",
-        $$("split-empty").innerHTML === "", JSON.stringify($$("split-empty").innerHTML.slice(0, 40)));
-}
-
-// ============================================================================
-// C2b — a FAILED split must re-offer the button (re-enabled, original label)
-// ============================================================================
-{
-  routes["GET /api/split/PL3"] = { status: 404, body: { detail: "no split for that playlist" } };
-  routes["POST /api/split/PL3"] = { status: 502, body: { detail: "Last.fm exploded" } };
-  run(`openSplit("PL3", "PL3")`);
-  await tick();
-  const btn = $$("btn-do-split");
-  const label = btn.textContent;
-  btn.onclick();
-  await tick();
-  check("C2b after a failure the Split button is usable again with its price label",
-        btn.disabled === false && btn.textContent === label,
-        `disabled=${btn.disabled} label=${JSON.stringify(btn.textContent)}`);
-
-  // …and a 404 from the POST explains the Refresh, not "unknown playlist".
-  routes["POST /api/split/PL3"] = { status: 404, body: { detail: "unknown playlist" } };
-  btn.onclick();
-  await tick();
-  check("deferred-note: a 404 from create_split points at Refresh",
-        /refresh/i.test($$("toast").textContent),
-        JSON.stringify($$("toast").textContent.slice(0, 90)));
-}
-
-// ============================================================================
 // I1 — renderNow() with nowState === null must not throw
 // ============================================================================
 {
-  routes["GET /api/split/PL4"] = {
-    status: 200,
-    body: splitBody({ playlist_id: "SP4", pile_id: "p1", uris: ["u1"], claim: "c4" }),
-  };
-  run(`openSplit("PL4", "PL4")`);
-  await tick();
-  run(`nowState = null; show("now");`);          // Finish before any successful poll
-  routes["POST /api/split/PL4/sitting/finish"] = { status: 200, body: { cleared: true } };
-
+  run(`nowState = null; show("now");`);
   let threw = null;
   process.once("unhandledRejection", (e) => (threw = e));
   try {
-    run(`$("btn-now-finish-sitting").onclick()`);
+    run(`renderNow()`);
     await tick();
   } catch (e) { threw = e; }
-  check("I1 finish with nowState===null does not throw",
+  check("I1 renderNow() with nowState===null does not throw",
         threw === null, threw ? String(threw) : "");
-  check("I1 the success toast survives",
-        /finished/i.test($$("toast").textContent),
-        JSON.stringify($$("toast").textContent.slice(0, 60)));
-
-  // …and the 404 exit too.
-  run(`sitting = {splitId:"PL4", pileName:"one", uris:["u1"], decided:{}}; nowState = null;`);
-  routes["POST /api/split/PL4/sitting/finish"] = { status: 404, body: { detail: "no active sitting" } };
-  threw = null;
-  try {
-    run(`$("btn-now-finish-sitting").onclick()`);
-    await tick();
-  } catch (e) { threw = e; }
-  check("I1 the 404 finish exit does not throw either",
-        threw === null && /clearing it here/i.test($$("toast").textContent),
-        threw ? String(threw) : JSON.stringify($$("toast").textContent.slice(0, 60)));
-}
-
-// ============================================================================
-// I2 — no irreversible keep from the error screen
-// ============================================================================
-{
-  run(`show("now");`);
-  // A good poll first: a live sitting card with a suggestion under key "1".
-  setNow({
-    status: 200,
-    body: {
-      playing: true, poll_after_ms: 999999,
-      track: { uri: "spotify:track:u1", name: "T", artists: [{ name: "A" }], sortable: true, image: null },
-      context: { id: "SP5", name: "s" },
-      sitting: { split_id: "PL5", pile_id: "p1", pile_name: "one", uris: ["spotify:track:u1"], decided: {} },
-      suggestions: [{ playlist_id: "H1", pct: 90, reasons: [], already: false }],
-      homes: [{ id: "H1", name: "Home", folder: "" }],
-      inputs: [],
-    },
-  });
-  run(`pollNow(true)`);
-  await tick();
-  run("stopNowPolling()");
-  routes["POST /api/split/PL5/decide"] = { status: 200, body: { changed: true, decision: { action: "keep", to_id: "H1" }, remaining: 0 } };
-
-  resetLog();
-  fireKey("1");
-  await tick();
-  check("I2 baseline: `1` keeps while the live card is on screen",
-        posts("/api/split/PL5/decide") === 1, `${posts("/api/split/PL5/decide")} POST(s)`);
-  check("I2 the kept card celebrates with the same big drawn check",
-        $$("now-card").innerHTML.includes('class="done-mark"') &&
-        /kept to/.test($$("now-card").innerHTML),
-        `mark=${$$("now-card").innerHTML.includes('class="done-mark"')}`);
-
-  // Re-poll first: the keep above wrote `decided` into nowState.sitting, and
-  // a decided track short-circuits the keyboard for a legitimate reason
-  // ("final — nothing left to press"), which would mask the bug under test.
-  run(`pollNow(true)`);
-  await tick();
-  run("stopNowPolling()");
-  check("I2 the track is undecided again after a fresh poll",
-        run(`Object.keys(nowState.sitting.decided).length`) === 0, "");
-
-  // Now a failed poll: nowState is deliberately left intact, card replaced.
-  routes["GET /api/now?light=1"] = { status: 500, body: { detail: "boom" } };
-  run(`pollNow()`);
-  await tick();
-  run("stopNowPolling()");
-  resetLog();
-  fireKey("1");
-  fireKey("r");
-  await tick();
-  check("I2 no keep (and no reject) fires from the error screen",
-        posts("/api/split/PL5/decide") === 0, `${posts("/api/split/PL5/decide")} POST(s)`);
-}
-
-// ============================================================================
-// I3 — Finish must not spend twice, and must not misdirect on cleared:false
-// ============================================================================
-{
-  routes["GET /api/split/PL6"] = {
-    status: 200,
-    body: splitBody({ playlist_id: "SP6", pile_id: "p1", uris: ["u1"], claim: "c6" }),
-  };
-  run(`openSplit("PL6", "PL6")`);
-  await tick();
-
-  let release;
-  const pending = new Promise((r) => (release = r));
-  routes["POST /api/split/PL6/sitting/finish"] = () => pending;
-  resetLog();
-  run(`$("btn-split-finish-sitting").onclick()`);
-  run(`$("btn-split-finish-sitting").onclick()`);   // second click, first in flight
-  await tick();
-  check("I3 two Finish clicks spend exactly one unfollow",
-        posts("/api/split/PL6/sitting/finish") === 1,
-        `${posts("/api/split/PL6/sitting/finish")} POST(s)`);
-  check("I3 both Finish buttons are disabled while in flight",
-        $$("btn-split-finish-sitting").disabled === true &&
-        $$("btn-now-finish-sitting").disabled === true, "");
-
-  // cleared:false with nothing actually active any more -> honest wording.
-  routes["GET /api/split/PL6"] = { status: 200, body: splitBody(null) };
-  release({ status: 200, body: { cleared: false } });
-  await tick();
-  check("I3 cleared:false + nothing active says so instead of 'finish it again'",
-        /already finished/i.test($$("toast").textContent) &&
-        !/finish it again/i.test($$("toast").textContent),
-        JSON.stringify($$("toast").textContent.slice(0, 90)));
-  check("I3 buttons re-enabled afterwards",
-        $$("btn-split-finish-sitting").disabled === false &&
-        $$("btn-split-finish-sitting").textContent === "Finish sitting", "");
-}
-
-// ============================================================================
-// I4 — a failed startSitting must re-sync, not hide a live reservation
-// ============================================================================
-{
-  routes["GET /api/split/PL7"] = { status: 200, body: splitBody(null) };
-  run(`openSplit("PL7", "PL7")`);
-  await tick();
-  check("I4 precondition: no sitting, Start buttons enabled",
-        $$("split-sitting-bar").hidden === true &&
-        $$("piles").children.every((c) => !/<button[^>]*disabled/.test(c.innerHTML)), "");
-
-  routes["POST /api/split/PL7/sitting"] = { status: 429, body: { detail: "rate limited" } };
-  // The server holds a reservation WITH a playlist id — a real ▶ playlist exists.
-  routes["GET /api/split/PL7"] = {
-    status: 200,
-    body: splitBody({ playlist_id: "SP7", pile_id: "p1", uris: ["u1", "u2"], claim: "c7" }),
-  };
-  resetLog();
-  run(`startSitting("p1", "one")`);
-  await tick();
-  check("I4 the failure triggers a free re-read of the split",
-        gets("/api/split/PL7") === 1, `${gets("/api/split/PL7")} GET(s)`);
-  check("I4 the live sitting is now visible with its Finish button",
-        $$("split-sitting-bar").hidden === false &&
-        $$("piles").children.every((c) => /<button[^>]*disabled/.test(c.innerHTML)),
-        JSON.stringify($$("split-sitting-status").textContent.slice(0, 70)));
-}
-
-// ============================================================================
-// O1 — the ownership guard: a non-owned playlist must never offer a live
-// split button. (The playlist-row DOM itself is out of reach here — the
-// stub's querySelectorAll() always returns [], by design, since it only
-// models the ids the sitting/piles paths touch — so this pins the pure
-// gating function renderLists() calls per row rather than the wired-up
-// button. The zero-Spotify-calls guarantee itself is pinned server-side, in
-// tests/test_split_api.py; this only pins that the UI won't let a click
-// through in the first place.)
-// ============================================================================
-{
-  const notOwned = run(`splitDisabledReason({ editable: false })`);
-  check("O1 a non-owned playlist gets a disabled reason",
-        typeof notOwned === "string" && notOwned.length > 0, JSON.stringify(notOwned));
-  check("O1 the reason says what to do about it",
-        /copy/i.test(notOwned), JSON.stringify(notOwned));
-
-  const owned = run(`splitDisabledReason({ editable: true })`);
-  check("O1 an owned playlist gets no disabled reason",
-        owned === null, JSON.stringify(owned));
-}
-
-// ============================================================================
-// M — saving piles into permanent playlists via the queue. The price must be
-// on the button before the click, it must be the server's number echoed
-// back unchanged — that echo is the only thing standing between a misclick
-// on the 309-track pile and 310 silent Spotify calls — and every price is a
-// FLOOR (finding I2), not a promise of the final total.
-// ============================================================================
-{
-  routes["GET /api/split/PL8"] = {
-    status: 200,
-    body: {
-      ...splitBody(null),
-      piles: [
-        { id: "p1", name: "fresh", tags: [], uris: ["u1", "u2"], decided: 0, total: 2,
-          materialise_calls: 3, materialised: null },
-        { id: "p2", name: "half done", tags: [], uris: ["u3", "u4", "u5"], decided: 0, total: 3,
-          materialise_calls: 2, materialised: { playlist_id: "SAVED2", added: 1, name: "half done", stale: false } },
-        { id: "p3", name: "complete", tags: [], uris: ["u6"], decided: 0, total: 1,
-          materialise_calls: 0, materialised: { playlist_id: "SAVED3", added: 1, name: "complete", stale: false } },
-        { id: "p4", name: "changed", tags: [], uris: ["u7"], decided: 0, total: 1,
-          materialise_calls: 2, materialised: { playlist_id: "SAVED4", added: 1, name: "old", stale: true } },
-      ],
-    },
-  };
-  run(`openSplit("PL8", "PL8")`);
-  await tick();
-  const rows = $$("piles").children.map((c) => c.innerHTML);
-
-  check("M the price is on the button before the click, as a floor",
-        /Save as playlist \(≥ 3 calls\)/.test(rows[0]), rows[0].slice(-120));
-  check("M a partly-saved pile offers to resume at the price of what's left",
-        /Resume saving \(≥ 2 calls\)/.test(rows[1]) && /1 of 3 saved so far/.test(rows[1]),
-        rows[1].slice(-160));
-  check("M a finished pile is not clickable and says so",
-        /Saved as a playlist/.test(rows[2]) && /<button[^>]*disabled[^>]*>Saved as a playlist/.test(rows[2]),
-        rows[2].slice(-140));
-  check("M a re-clustered pile is offered as a NEW playlist, at full price",
-        /Save as a new playlist \(≥ 2 calls\)/.test(rows[3]) && /pile has changed/.test(rows[3]),
-        rows[3].slice(-180));
-  check("M the tooltip states the honest server-side pace range and the floor disclosure, not just the price",
-        /one per track/.test(rows[0]) && /server-side worker/.test(rows[0]) &&
-        /at least/.test(rows[0]) && !/Leave this tab open/.test(rows[0]) &&
-        /runs on the server/.test(rows[0]) && /closing it/.test(rows[0]), rows[0]);
-
-  // A double-click on the SAME pile (identical queue signature) must not
-  // double-queue — the same misclick guard materialisePile had, now scoped
-  // per (split, pile-set) so it doesn't block an unrelated save-all/other-pile
-  // click (see the next block).
-  {
-    let release;
-    const pending = new Promise((r) => (release = r));
-    routes["POST /api/split/PL8/queue"] = () => pending;
-    resetLog();
-    run(`queuePiles(["p1"], 3)`);
-    run(`queuePiles(["p1"], 3)`);   // second click, first in flight
-    await tick();
-    check("M two clicks on the same pile issue exactly one paid POST",
-          posts("/api/split/PL8/queue") === 1,
-          `${posts("/api/split/PL8/queue")} POST(s)`);
-    release({ status: 200, body: { ok: true, queued: ["p1"], total_calls: 3 } });
-    await tick();
-  }
-
-  // A refusal (the cost guard, or a queue already running) must re-read too
-  // — the row that produced the stale number is exactly what needs
-  // replacing.
-  routes["POST /api/split/PL8/queue"] = {
-    status: 409, body: { detail: "cost has changed: saving these piles now spends 2 Spotify calls" } };
-  resetLog();
-  run(`queuePiles(["p1"], 3)`);
-  await tick();
-  check("M a refused enqueue says why and re-reads the split for free",
-        /cost has changed/.test($$("toast").textContent) && gets("/api/split/PL8") === 1,
-        `${gets("/api/split/PL8")} GET(s)`);
-
-  // The queue replaces the one-shot save. Same misclick contract: the number
-  // POSTed is the number the button displayed, now summed across piles.
-  resetLog();
-  routes["POST /api/split/PL8/queue"] = { ok: true, queued: ["p2", "p1"], total_calls: 5 };
-  run(`queuePiles(null, 5)`);          // "Save all" — null means every pile
-  check("save-all posts the summed price it displayed",
-        bodies("/api/split/PL8/queue")[0]?.expected_calls === 5,
-        JSON.stringify(bodies("/api/split/PL8/queue")[0]));
-  // The check above is deliberately synchronous (pins that the body is
-  // logged before any await, per the misclick contract) — but queuePiles'
-  // own trailing re-read + queue-poll are still pending after it. Drain
-  // them here so they can't land, unattributed, inside a later test's tick().
-  await tick();
-
-  resetLog();
-  run(`queuePiles(["p1"], 3)`);        // single pile goes through the same gate
-  check("single-pile save is a one-pile queue",
-        JSON.stringify(bodies("/api/split/PL8/queue")[0]?.pile_ids) === '["p1"]');
-  await tick();
-
-  // Finding I2: every displayed price is a floor, not a ceiling — request()
-  // retries a transient 429 up to 3x and each attempt is charged.
-  const saveAllLabel5 = run(`renderSaveAllLabel(5)`);
-  check("the price label discloses it is a floor",
-        /at least|minst|floor/i.test(saveAllLabel5), saveAllLabel5);
-
-  // Pause is one click and free; the button reflects the effective state.
-  resetLog();
-  routes["POST /api/split/PL8/queue/pause"] = { ok: true };
-  run(`pauseQueue()`);
-  check("pause posts exactly once and nowhere else",
-        posts("/api/split/PL8/queue/pause") === 1 && log.length === 1);
-  await tick();
-
-  // Review fix (Important 1): a 409 here means the on-screen state was
-  // already stale — a poll must reconcile it immediately rather than
-  // leaving a dead Pause button until the next scheduled tick (or none, if
-  // polling had already stopped).
-  routes["POST /api/split/PL8/queue/pause"] = {
-    status: 409, body: { detail: "queue is stopped, not running — nothing to pause" } };
-  resetLog();
-  run(`pauseQueue()`);
-  await tick();
-  check("a refused pause polls the queue so the UI reconciles immediately",
-        gets("/api/split/PL8/queue") === 1, `${gets("/api/split/PL8/queue")} GET(s)`);
-
-  // Review fix (Minor 2): the same in-flight guard the spend buttons use,
-  // now covering Pause/Resume/Cancel too.
-  {
-    let release;
-    const pending = new Promise((r) => (release = r));
-    routes["POST /api/split/PL8/queue/pause"] = () => pending;
-    resetLog();
-    run(`pauseQueue()`);
-    run(`pauseQueue()`);   // second click, first still in flight
-    await tick();
-    check("two clicks on Pause post exactly once",
-          posts("/api/split/PL8/queue/pause") === 1,
-          `${posts("/api/split/PL8/queue/pause")} POST(s)`);
-    release({ status: 200, body: { ok: true } });
-    await tick();
-  }
-
-  const restartPanel = run(`renderQueuePanel({ queue: { state: "paused", stop_reason: null,
-    pending: ["p2", "p3"], current: null,
-    progress: { pile_index: 1, pile_count: 8, track: 40, track_total: 309 } },
-    pacing: { rate_per_min: 2.5, ceiling: 7.0, max_clean_rate: 2.1 } })`);
-  check("a restart's leftover running state renders as paused with Resume",
-        restartPanel.includes("Resume"));
-
-  // Review fix (Important 2): Resume must not render enabled when there's
-  // nothing left to resume — cancel leaves exactly this shape (stopped,
-  // pending: [], current: null) and resume() 409s "nothing queued" against
-  // it, so a state-only gate left Resume a permanent dead end after Cancel.
-  const resumeTag = (html) => (html.match(/<button id="btn-queue-resume"[^>]*>/) || [""])[0];
-  const cancelledPanel = run(`renderQueuePanel({ queue: { state: "stopped", stop_reason: "cancelled",
-    pending: [], current: null, progress: {} }, pacing: {} })`);
-  check("a cancelled, empty queue renders Resume disabled",
-        /disabled/.test(resumeTag(cancelledPanel)), cancelledPanel);
-  const pausedWithWorkPanel = run(`renderQueuePanel({ queue: { state: "paused", stop_reason: null,
-    pending: ["p2"], current: null,
-    progress: { pile_index: 1, pile_count: 8, track: 40, track_total: 309 } },
-    pacing: { rate_per_min: 2.5, ceiling: 7.0, max_clean_rate: 2.1 } })`);
-  check("a paused queue with pending work renders Resume enabled",
-        !/disabled/.test(resumeTag(pausedWithWorkPanel)), pausedWithWorkPanel);
-
-  // Review fix (Minor 1): a quota trip is the severe case (Development
-  // Mode's daily allowance, gone until the window resets — see CLAUDE.md)
-  // and must not look like a routine 429 note.
-  const quotaPanel = run(`renderQueuePanel({ queue: { state: "stopped", stop_reason: "quota",
-    pending: [], current: null, progress: {} }, pacing: {} })`);
-  check("a quota trip renders its own distinct, prominent marker",
-        /queue-stop-quota/.test(quotaPanel) && /quota tripped/i.test(quotaPanel) &&
-        /resume is manual/i.test(quotaPanel),
-        quotaPanel);
-  const rateLimitPanel = run(`renderQueuePanel({ queue: { state: "sleeping", stop_reason: "rate limited",
-    pending: ["p2"], current: "p1", progress: {} }, pacing: {} })`);
-  check("an ordinary rate-limit note does NOT get the quota marker",
-        !/queue-stop-quota/.test(rateLimitPanel), rateLimitPanel);
-
-  // M-3: spend vs. cap+reserve, and the pacing side's last 429 — both already
-  // ride along in the GET's progress/pacing objects (free, local reads).
-  const spendPanel = run(`renderQueuePanel({ queue: { state: "running", stop_reason: null,
-    pending: ["p2"], current: "p1",
-    progress: { pile_index: 1, pile_count: 2, track: 1, track_total: 3,
-                spent_today: 210, bulk_today: 40, daily_cap: 600, reserve: 150 } },
-    pacing: { rate_per_min: 3.4, ceiling: 7.0,
-              history_429: [{ kind: "rate", rate: 1.8, when: 1755500000 },
-                             { kind: "quota", rate: 3.4, when: 1755500600 }] } })`);
-  check("M the queue panel shows spend vs. cap and reserve",
-        /210\/600/.test(spendPanel) && /bulk 40/.test(spendPanel) && /reserve 150/.test(spendPanel),
-        spendPanel);
-  check("M the queue panel shows the LAST of pacing's history_429, not an earlier one",
-        /last 429/.test(spendPanel) && /quota/.test(spendPanel) && /3\.4\/min/.test(spendPanel) &&
-        !spendPanel.includes(">last 429: rate at"),
-        spendPanel);
-  const noHistoryPanel = run(`renderQueuePanel({ queue: { state: "running", stop_reason: null,
-    pending: [], current: "p1", progress: { pile_count: 1 } },
-    pacing: { rate_per_min: 1.8, ceiling: 7.0, history_429: [] } })`);
-  check("M no last-429 line when pacing has no history yet",
-        !/last 429/.test(noHistoryPanel), noHistoryPanel);
-
-  // Review fix (Minor 3): pins the disclosed-but-untested claim — a
-  // single-pile save in flight must not block save-all's guard key, and
-  // vice versa, since the two are different (split, pile-set) signatures.
-  {
-    let release;
-    const pending = new Promise((r) => (release = r));
-    routes["POST /api/split/PL8/queue"] = () => pending;
-    resetLog();
-    run(`queuePiles(["p1"], 3)`);
-    run(`queuePiles(null, 5)`);
-    await tick();
-    check("a single-pile save in flight doesn't block save-all's guard key (and vice versa)",
-          posts("/api/split/PL8/queue") === 2,
-          `${posts("/api/split/PL8/queue")} POST(s)`);
-    release({ status: 200, body: { ok: true, queued: ["p1", "p2"], total_calls: 5 } });
-    await tick();
-  }
-
-  // A server that sends no cost must not be guessed at.
-  routes["GET /api/split/PL9"] = {
-    status: 200,
-    body: { ...splitBody(null), piles: [{ id: "p1", name: "n", tags: [], uris: ["u1"], decided: 0, total: 1 }] },
-  };
-  run(`openSplit("PL9", "PL9")`);
-  await tick();
-  resetLog();
-  const row = $$("piles").children[0].innerHTML;
-  check("M an unpriced pile is offered as un-clickable rather than guessed at",
-        /<button[^>]*disabled[^>]*>Save as playlist</.test(row), row.slice(-120));
-  run(`queuePiles(["p1"], null)`);
-  await tick();
-  check("M and calling it with no price spends nothing",
-        posts("/api/split/PL9/queue") === 0,
-        `${posts("/api/split/PL9/queue")} POST(s)`);
 }
 
 // ============================================================================
 // V — Now-tab presentation pins (2026-08 visual refresh): cooldown countdown
-// card, hidden-until-useful Undo, sitting banner de-dupe, nav active state.
+// card, hidden-until-useful Undo, nav active state.
 // ============================================================================
 {
   // V5 — the nav marks which view you're in; triage/split count as the
@@ -923,39 +404,11 @@ run("stopNowPolling()");
         `hidden=${$$("btn-undo-now").hidden} disabled=${$$("btn-undo-now").disabled}`);
 }
 
-{
-  // V4 — in a sitting, the banner owns the pile name; the context line must
-  // not repeat it one line below.
-  setNow({
-    status: 200,
-    body: {
-      playing: true, poll_after_ms: 999999,
-      track: { uri: "spotify:track:u9", name: "T", artists: [{ name: "A" }], sortable: true, image: null },
-      context: { id: "SP9", name: "sit" },
-      sitting: { split_id: "PL9", pile_id: "p1", pile_name: "dreamy pile",
-                 uris: ["spotify:track:u9", "u2"], decided: { u2: { action: "keep", to_id: "H1" } } },
-      suggestions: [], homes: [], inputs: [],
-    },
-  });
-  run(`pollNow(true)`);
-  await tick();
-  run("stopNowPolling()");
-  const status = $$("now-sitting-status").innerHTML;
-  check("V4 the sitting banner names the pile and the progress",
-        $$("now-sitting-bar").hidden === false && /dreamy pile/.test(status) && /1 of 2 left/.test(status),
-        JSON.stringify(status.slice(0, 100)));
-  // The old #now-context line is gone; the input-switch trigger inherited
-  // the "what's playing from" role, and it must not echo the pile either.
-  check("V4 nothing above the banner repeats the pile name",
-        !/dreamy pile/.test($$("input-switch-label").textContent),
-        JSON.stringify($$("input-switch-label").textContent));
-}
-
 // ============================================================================
 // W — weak guesses: sub-threshold suggestions render as labeled guesses,
-// visually distinct from confident ones, in both the ordinary now card and
-// the sitting decide list. The server only ever sends weak entries when
-// NOTHING was confident, so the lead-in hint keys off suggestions[0].
+// visually distinct from confident ones, in the now card. The server only
+// ever sends weak entries when NOTHING was confident, so the lead-in hint
+// keys off suggestions[0].
 // ============================================================================
 {
   setNow({
@@ -995,309 +448,6 @@ run("stopNowPolling()");
   check("W1 confident suggestions keep today's rendering",
         !/closest guesses/.test($$("now-card").innerHTML) &&
         !/class="sugg weak"/.test($$("now-card").innerHTML), "");
-
-  // And the sitting decide list gets the same treatment.
-  routes["GET /api/now?light=1"].body.sitting =
-    { split_id: "PLW", pile_id: "p1", pile_name: "pile", uris: ["spotify:track:w1"], decided: {} };
-  routes["GET /api/now/suggest?force=1"].body.suggestions = [
-    { playlist_id: "H1", pct: 3, reasons: ["artist tags: cumbia"], already: false, weak: true },
-  ];
-  run(`pollNow(true)`);
-  await tick();
-  run("stopNowPolling()");
-  const decide = $$("now-card").innerHTML;
-  check("W2 the decide list leads weak entries with the guesses hint",
-        /No confident match — closest guesses:/.test(decide) &&
-        (decide.match(/class="sugg weak"/g) || []).length === 1,
-        JSON.stringify(decide.slice(0, 200)));
-}
-
-// ============================================================================
-// P — split progress: a bar that moves, a poll that stops, and failures that
-// say what to do next.
-//
-// The poll is the sensitive part. GET /api/split/{id}/progress reads one
-// module dict and cannot reach Spotify (pinned server-side by
-// test_split_progress_spends_no_api_calls), which is the only reason a
-// once-a-second poll is allowed here at all. What this harness pins is the
-// other half: that the poll STOPS. An interval left running after the split
-// ends is the shape of the bug that once cost ~600 Spotify calls an hour.
-// ============================================================================
-{
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const PROG = "/api/split/PL-P/progress";
-
-  routes["GET /api/split/PL-P"] = { status: 404, body: { detail: "no split for that playlist" } };
-  let release;
-  routes["POST /api/split/PL-P"] = () => new Promise((r) => (release = r));
-  // A fast poll_after_ms so the harness doesn't sit for seconds — the client
-  // takes its interval from the server, so this also pins that it obeys it
-  // rather than hard-coding one of its own.
-  routes[`GET ${PROG}`] = { status: 200, body: {
-    state: "running", phase: "tagging", done: 120, total: 700, detail: null, poll_after_ms: 5 } };
-
-  run(`openSplit("PL-P", "PL-P")`);
-  await tick();
-  resetLog();
-  // The stub DOM creates elements on demand with hidden=false, so without
-  // this the "is it showing?" check below would pass against an app.js that
-  // never touches the bar at all. Seed it the way index.html ships it.
-  $$("split-progress").hidden = true;
-  $$("btn-do-split").onclick();
-  await sleep(40);
-
-  check("P1 the progress bar is showing while the split runs",
-        $$("split-progress").hidden === false,
-        `hidden=${$$("split-progress").hidden}`);
-  check("P1 it reports artists done against the total",
-        /120/.test($$("split-progress").innerHTML) && /700/.test($$("split-progress").innerHTML),
-        JSON.stringify($$("split-progress").innerHTML.slice(0, 120)));
-  check("P1 it estimates the time left rather than only a count",
-        /min|sec/i.test($$("split-progress").innerHTML),
-        JSON.stringify($$("split-progress").innerHTML.slice(0, 120)));
-
-  const polled = gets(PROG);
-  check("P1 it polls on the interval the server handed it",
-        polled >= 2, `${polled} poll(s) in 40ms at poll_after_ms=5`);
-
-  routes[`GET ${PROG}`] = { status: 200, body: {
-    state: "done", phase: "complete", done: 700, total: 700, detail: null, poll_after_ms: 0 } };
-  routes["GET /api/split/PL-P"] = { status: 200, body: splitBody(null) };
-  release({ status: 200, body: { piles: PILES, tagged: 3, untagged: 0 } });
-  await tick();
-
-  const settled = gets(PROG);
-  await sleep(60);
-  check("P2 polling stops when the split finishes (no orphaned timer)",
-        gets(PROG) === settled,
-        `${gets(PROG) - settled} extra poll(s) in the 60ms after it finished`);
-  check("P2 the bar is hidden once the split is done",
-        $$("split-progress").hidden === true, `hidden=${$$("split-progress").hidden}`);
-}
-
-// ============================================================================
-// P3 — a partial Last.fm failure must say that retrying RESUMES.
-//
-// The server already saves the partial and says so in its 502 detail, but the
-// client dropped that into a 2600ms toast. A user who reads "stopped after
-// 431 of 712 artists" three seconds before it vanishes has no way to know
-// that pressing Split again resumes instead of starting over, and that the
-// several hundred answers already paid for are not lost.
-// ============================================================================
-{
-  routes["GET /api/split/PL-R"] = { status: 404, body: { detail: "no split for that playlist" } };
-  routes[`GET /api/split/PL-R/progress`] = { status: 200, body: {
-    state: "failed", phase: "tagging", done: 431, total: 712, poll_after_ms: 0,
-    detail: "Last.fm tagging stopped after 431 of 712 artists in this playlist" } };
-  routes["POST /api/split/PL-R"] = { status: 502, body: {
-    detail: "Last.fm tagging stopped after 431 of 712 artists in this playlist " +
-            "(Last.fm error 29: rate limited); progress was saved — re-running " +
-            "the split will resume instead of starting over." } };
-
-  run(`openSplit("PL-R", "PL-R")`);
-  await tick();
-  $$("btn-do-split").onclick();
-  await tick();
-
-  const card = $$("split-empty").innerHTML;
-  check("P3 the partial failure is a persistent card, not a vanishing toast",
-        /431/.test(card) && /712/.test(card), JSON.stringify(card.slice(0, 140)));
-  check("P3 it says plainly that trying again resumes",
-        /resume/i.test(card), JSON.stringify(card.slice(0, 200)));
-  check("P3 it offers a button to do exactly that",
-        /id="btn-resume-split"/.test(card), JSON.stringify(card.slice(0, 200)));
-
-  resetLog();
-  // Guarded: an unwired button is a failed check, not an exception that ends
-  // the run before P4 gets to say anything.
-  if (typeof $$("btn-resume-split").onclick === "function") $$("btn-resume-split").onclick();
-  await tick();
-  check("P3 pressing it re-runs the split",
-        posts("/api/split/PL-R") === 1, `${posts("/api/split/PL-R")} POST(s)`);
-}
-
-// ============================================================================
-// P4 — a playlist that isn't ours can never succeed, so it must NOT be
-// re-offered as a retry. The 403 is deliberately a different status from the
-// two 502s for exactly this reason; the client has to honour that.
-// ============================================================================
-{
-  routes["GET /api/split/PL-F"] = { status: 404, body: { detail: "no split for that playlist" } };
-  routes["POST /api/split/PL-F"] = { status: 403, body: {
-    detail: '"the bomb" belongs to rightkillthaz, not you. The Feb-2026 dev-mode API ' +
-            "won't let sortify read another user's playlist tracks at all, so splitting " +
-            'it can never succeed here. Make your own copy first' } };
-
-  run(`openSplit("PL-F", "the bomb")`);
-  await tick();
-  $$("split-progress").hidden = false;   // see P1 — prove app.js hides it
-  $$("btn-do-split").onclick();
-  await tick();
-
-  const card = $$("split-empty").innerHTML;
-  check("P4 the ownership refusal is explained persistently",
-        /belongs to rightkillthaz/.test(card), JSON.stringify(card.slice(0, 140)));
-  check("P4 it does not offer a retry of something that can never work",
-        !/btn-resume-split/.test(card) && !/btn-do-split/.test(card),
-        JSON.stringify(card.slice(0, 200)));
-  check("P4 the progress bar is not left up after an instant refusal",
-        $$("split-progress").hidden === true, `hidden=${$$("split-progress").hidden}`);
-}
-
-// ============================================================================
-// R1 — leftover sitting playlists are surfaced, priced, and removable
-// ============================================================================
-{
-  resetLog();
-  routes["GET /api/playlists"] = { status: 200, body: {
-    playlists: [], fetched_at: 0,
-    sitting_orphans: [{ id: "S1", name: "\u25b6 one" }, { id: "S2", name: "\u25b6 two" }] } };
-
-  await run("loadLists()");
-  await tick();
-  check("R1 the orphan bar is shown when the server reports leftovers",
-        $$("pl-orphan-bar").hidden === false, `hidden=${$$("pl-orphan-bar").hidden}`);
-  check("R1 it says how many and names them",
-        /2 leftover sitting playlists/.test($$("pl-orphan-status").textContent),
-        JSON.stringify($$("pl-orphan-status").textContent));
-  // Every spending control in this app states its price before it is pressed.
-  check("R1 the button prices the removal in Spotify calls",
-        /Remove \(2 calls\)/.test($$("btn-clean-sittings").textContent),
-        JSON.stringify($$("btn-clean-sittings").textContent));
-
-  routes["POST /api/sittings/cleanup"] = { status: 200, body: {
-    ok: true, removed: ["S1", "S2"], remaining: 0, deferred: false } };
-  routes["GET /api/playlists"] = { status: 200, body: {
-    playlists: [], fetched_at: 0, sitting_orphans: [] } };
-  resetLog();
-  await run(`$("btn-clean-sittings").onclick()`);
-  await tick();
-  check("R1 pressing Remove reaches the cleanup endpoint exactly once",
-        posts("/api/sittings/cleanup") === 1, `${posts("/api/sittings/cleanup")} POST(s)`);
-  check("R1 the bar disappears once the account is clean",
-        $$("pl-orphan-bar").hidden === true, `hidden=${$$("pl-orphan-bar").hidden}`);
-
-  // Nothing to remove must not leave a bar advertising an action that would
-  // spend a call and find nothing.
-  routes["GET /api/playlists"] = { status: 200, body: {
-    playlists: [], fetched_at: 0, sitting_orphans: [] } };
-  await run("loadLists()");
-  await tick();
-  check("R1 no bar at all when there are no leftovers",
-        $$("pl-orphan-bar").hidden === true, `hidden=${$$("pl-orphan-bar").hidden}`);
-
-  // A start in flight defers the sweep; the user is told to retry, not that
-  // nothing was wrong.
-  routes["GET /api/playlists"] = { status: 200, body: {
-    playlists: [], fetched_at: 0, sitting_orphans: [{ id: "S3", name: "\u25b6 three" }] } };
-  routes["POST /api/sittings/cleanup"] = { status: 200, body: {
-    ok: true, removed: [], remaining: null, deferred: true } };
-  await run("loadLists()");
-  await tick();
-  await run(`$("btn-clean-sittings").onclick()`);
-  await tick();
-  check("R1 a deferred sweep says a sitting is starting rather than failing silently",
-        /starting right now/.test($$("toast").textContent),
-        JSON.stringify($$("toast").textContent));
-}
-
-// ============================================================================
-// C-tab — the Split tab: picker lists eligible playlists, Back returns here
-// ============================================================================
-{
-  resetLog();
-  routes["GET /api/playlists"] = { playlists: [
-    { id: "liked", name: "Liked Songs", total: 900, editable: false, role: null },
-    { id: "PB", name: "big", total: 250, editable: true, role: null },
-    { id: "PS", name: "small", total: 30, editable: true, role: null },
-    { id: "PB2", name: "bigger", total: 400, editable: true, role: null },
-  ], fetched_at: 0 };
-  // GET queue is deliberately global regardless of the path id (M4).
-  routes["GET /api/split/_/queue"] = {
-    queue: { state: "paused", playlist_id: "PB2", pending: ["p2"], current: null },
-    pacing: {} };
-  run("showSplitPicker()");
-  await tick();
-  const rows = $$("splitpick-list").children;
-  check("C-tab picker shows only 100+-track, non-Liked playlists",
-        rows.length === 2, `${rows.length} rows`);
-  check("C-tab the in-progress split is pinned first",
-        /bigger/.test(rows[0]?.innerHTML || ""),
-        (rows[0]?.innerHTML || "").slice(0, 60));
-  check("C-tab the picker view is the visible one",
-        $$("view-splitpick").hidden === false);
-  check("C-tab opening the picker costs zero Spotify-priced POSTs",
-        log.every((c) => c.method === "GET"), JSON.stringify(log));
-
-  routes["GET /api/split/PB2"] = { status: 200, body: splitBody(null) };
-  routes["GET /api/split/PB2/queue"] = { queue: { state: "done", playlist_id: "PB2",
-    pending: [], current: null }, pacing: {} };
-  rows[0].onclick();
-  await tick();
-  check("C-tab clicking a row opens the split view",
-        $$("view-split").hidden === false);
-  run(`$("btn-split-back").onclick()`);
-  await tick();
-  check("C-tab Back returns to the picker, not Playlists",
-        $$("view-splitpick").hidden === false && $$("view-lists").hidden === true);
-}
-
-// ============================================================================
-// RN — the rename offer: the only price this branch computes client-side
-// ============================================================================
-// The server re-derives this number and 409s if it disagrees, so the two
-// computations have to walk the same collection. Nothing covered the offer at
-// all until review finding I2 — which was exactly a mismatch between them —
-// so the count, the quoted price, and the number the POST carries are all
-// pinned here.
-{
-  const matPiles = (names) => names.map((n, i) => ({
-    id: `p${i}`, name: n.replace(/^\{src\} · /, ""), tags: ["a"], uris: ["u1"],
-    decided: 0, total: 1, materialise_calls: 2,
-    materialised: { playlist_id: `SP${i}`, name: n, pile_id: `p${i}` },
-  }));
-  const renameBody = (names) => ({
-    piles: matPiles(names), decided: {}, active_sitting: null,
-    params: { resolution: 1, min_pile: 15 },
-  });
-
-  resetLog();
-  routes["GET /api/split/PRN"] = { status: 200, body: renameBody(
-    ["jazz · funk", "{src} · already done", "dub · techno"]) };
-  await run(`openSplit("PRN", "{src}")`);
-  await tick();
-  const btn = $$("btn-rename-outputs");
-  check("RN the offer appears when outputs still carry bare pile names",
-        btn.hidden === false, `hidden=${btn.hidden}`);
-  check("RN it counts only the ones missing the prefix, and prices them 1:1",
-        /Rename 2 saved playlists/.test(btn.textContent)
-        && /\(2 calls\)/.test(btn.textContent),
-        JSON.stringify(btn.textContent));
-
-  routes["POST /api/split/PRN/rename_outputs"] = { ok: true, renamed: [] };
-  resetLog();
-  await run(`$("btn-rename-outputs").onclick()`);
-  await tick();
-  check("RN pressing it POSTs exactly once",
-        posts("/api/split/PRN/rename_outputs") === 1,
-        `${posts("/api/split/PRN/rename_outputs")} POST(s)`);
-  // The echo the server validates against. If the button ever displays one
-  // number and sends another, the action 409s and nothing is renamed.
-  check("RN the POST echoes the same number the button displayed",
-        bodies("/api/split/PRN/rename_outputs")[0]?.expected_calls === 2,
-        JSON.stringify(bodies("/api/split/PRN/rename_outputs")[0]));
-  check("RN the offer is withdrawn once it succeeds",
-        $$("btn-rename-outputs").hidden === true,
-        `hidden=${$$("btn-rename-outputs").hidden}`);
-
-  // Nothing to do must not advertise a paid action that would rename nothing.
-  routes["GET /api/split/PRN2"] = { status: 200, body: renameBody(
-    ["{src} · jazz · funk", "{src} · dub · techno"]) };
-  await run(`openSplit("PRN2", "{src}")`);
-  await tick();
-  check("RN no offer when every output already carries the prefix",
-        $$("btn-rename-outputs").hidden === true,
-        `hidden=${$$("btn-rename-outputs").hidden}`);
 }
 
 // ============================================================================
@@ -3331,13 +2481,6 @@ run("stopNowPolling()");
   check("RG phase 1 (no inputs payload yet) stays live rather than flashing grey",
         live1 === true, `live=${live1}`);
 
-  // A sitting renders the strip too, and an input context never occurs there,
-  // so an always-drawn button could only ever be dead weight.
-  await paint({ isInput: false, sitting: { split_id: "S1", pile_id: "p1", pile_name: "x",
-                                           uris: ["spotify:track:rg1"], decided: {} } });
-  check("RG a sitting keeps the slot empty — the verb can never apply there",
-        !html().includes('id="btn-now-remove"'), `html=${html().slice(0, 200)}`);
-
   // Pressing the dead button explains itself instead of doing nothing.
   await paint({ isInput: false });
   resetLog();
@@ -4075,14 +3218,6 @@ run("stopNowPolling()");
           `both=${has('id="btn-now-both"')} trio=${has("np-trio")} ` +
           `undo=${has('id="btn-now-undo-remove"')}`);
 
-    // A sitting never has an input context, so it gets neither circle nor
-    // trio — the old empty-slot layout, unchanged.
-    await paint({ isInput: false, uri: "spotify:track:nc6",
-                  sitting: { split_id: "S1", pile_id: "p1", pile_name: "x",
-                             uris: ["spotify:track:nc6"], decided: {} } });
-    check("NC a sitting draws neither circle nor trio",
-          !has('id="btn-now-both"') && !has("np-trio") && has("np-remove-slot"),
-          `both=${has('id="btn-now-both"')} trio=${has("np-trio")}`);
   } finally {
     routes["POST /api/act"] = { status: 200, body: {} };
     run("stopNowPolling()");
@@ -5290,6 +4425,88 @@ run("stopNowPolling()");
   check("GT ...and does not show the Spotify setup view",
         $$("view-setup").hidden === true, `setup hidden=${$$("view-setup").hidden}`);
   delete routes["GET /api/status"];
+}
+
+// ============================================================================
+// SP — split a home into parts: the picker, the counter, Suggest, the parts.
+// Spec: docs/superpowers/specs/2026-10-20-split-into-parts-design.md.
+// ============================================================================
+{
+  resetLog();
+  const HOMES = { homes: [
+    { id: "H1", name: "Big Home", total: 24, folder: "ROOT / Mix", splittable: true, reason: null, draft: false },
+    { id: "H2", name: "Tiny", total: 5, folder: null, splittable: false, reason: "too small to split — fewer than 10 songs", draft: false },
+  ] };
+  const DRAFT = {
+    playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2,
+    parts: [{ key: "p1", name: "rock", uris: ["u1", "u2", "u3"] },
+            { key: "p2", name: "jazz", uris: ["u4", "u5"] }],
+    unknown: ["u3"], hint: null, scores: { "2": 0.3 },
+    songs: { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+             u3: { name: "Three", artists: "C", local: false }, u4: { name: "Four", artists: "D", local: false },
+             u5: { name: "Five", artists: "E", local: false } },
+    tracks: [], done: null,
+  };
+  routes["GET /api/splitparts/homes"] = { status: 200, body: HOMES };
+  routes["GET /api/splitparts/H1"] = { status: 404, body: { detail: "no split in progress for this playlist" } };
+  await run(`showSplit()`);
+  await tick();
+  const homesHtml = () => $$("sp-homes").innerHTML;
+  check("SP the Split tab lists homes",
+        /Big Home/.test(homesHtml()) && /Tiny/.test(homesHtml()), homesHtml().slice(0, 300));
+  check("SP ...a too-small home is listed but disabled, with why",
+        /<button[^>]*data-id="H2"[^>]*disabled/.test(homesHtml()) && /fewer than 10/.test(homesHtml()),
+        homesHtml());
+  $$("sp-filter").value = "tin";
+  run(`renderSpHomes()`);
+  check("SP the filter narrows the list", !/Big Home/.test(homesHtml()) && /Tiny/.test(homesHtml()), homesHtml());
+  $$("sp-filter").value = "";
+  run(`renderSpHomes()`);
+
+  await run(`openSpHome(spHomes[0])`);
+  await tick();
+  check("SP a home without a draft opens on the counter, at 2",
+        $$("sp-setup").hidden === false && $$("sp-parts").hidden === true && $$("sp-n").textContent === "2",
+        `setup=${$$("sp-setup").hidden} n=${$$("sp-n").textContent}`);
+  run(`$("sp-minus").onclick()`);
+  check("SP ...the counter does not go below 2", $$("sp-n").textContent === "2", $$("sp-n").textContent);
+  for (let i = 0; i < 6; i++) run(`$("sp-plus").onclick()`);
+  check("SP ...nor above 6", $$("sp-n").textContent === "6", $$("sp-n").textContent);
+  run(`$("sp-minus").onclick(); $("sp-minus").onclick(); $("sp-minus").onclick(); $("sp-minus").onclick()`);
+
+  routes["POST /api/splitparts/H1/suggest"] = { status: 200, body: { started: true } };
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "done", phase: "done", done: 0, total: 0, message: null, summary: null } };
+  routes["GET /api/splitparts/H1"] = { status: 200, body: DRAFT };
+  await run(`$("sp-suggest").onclick()`);
+  await tick(); await tick();
+  const sent = log.find((l) => l.method === "POST" && l.path === "/api/splitparts/H1/suggest");
+  check("SP Suggest posts the chosen number", sent && JSON.parse(sent.body).n === 2, JSON.stringify(sent));
+  check("SP ...and lands on the parts, one chip per part with its count",
+        $$("sp-parts").hidden === false &&
+        /data-key="p1"[^>]*>[\s\S]*rock[\s\S]*3/.test($$("sp-chips").innerHTML) &&
+        /data-key="p2"[\s\S]*jazz[\s\S]*2/.test($$("sp-chips").innerHTML),
+        $$("sp-chips").innerHTML);
+  check("SP ...the first part's songs are listed, title and artist",
+        /One[\s\S]*A/.test($$("sp-list").innerHTML) && !/Four/.test($$("sp-list").innerHTML),
+        $$("sp-list").innerHTML);
+  check("SP ...a song without Last.fm data carries the ? mark",
+        /data-uri="u3"[\s\S]*sp-unknown/.test($$("sp-list").innerHTML), $$("sp-list").innerHTML);
+  run(`spShowPart("p2")`);
+  check("SP tapping another chip lists that part",
+        /Four/.test($$("sp-list").innerHTML) && !/One/.test($$("sp-list").innerHTML), $$("sp-list").innerHTML);
+
+  routes["GET /api/splitparts/H1/progress"] = { status: 200, body: { state: "error", phase: "", done: 0, total: 0, message: "not enough Last.fm data on these songs to suggest a split", summary: null } };
+  await run(`spSuggest(2)`);
+  await tick(); await tick();
+  check("SP a failed suggestion shows its reason on the counter screen",
+        $$("sp-setup").hidden === false && /not enough Last\.fm data/.test($$("sp-setup-msg").textContent),
+        $$("sp-setup-msg").textContent);
+
+  routes["GET /api/splitparts/H1"] = { status: 200, body: DRAFT };
+  await run(`openSpHome(spHomes[0])`);
+  await tick();
+  check("SP a home with a draft opens straight on its parts", $$("sp-parts").hidden === false, "");
+  run(`spStopPolling(); show("lists")`);
 }
 
 // ---- summary ---------------------------------------------------------------
