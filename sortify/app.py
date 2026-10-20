@@ -29,6 +29,8 @@ from . import gate
 from . import quickadds
 from . import rootlist
 from . import suggest as sugg
+from . import splitparts as spp
+from . import splitparts_api as spa
 from . import tabletshare
 from .deezer import Deezer
 from . import inputsets
@@ -616,6 +618,164 @@ def mark_subset(playlist_id: str, body: SubsetMarkIn):
         new, (store.folders().get(playlist_id) or {}).get("path"), inputsets.resolve_sets(cfg))))
     role = roles.role_of(new, is_input=is_input, is_home=in_home_ids, editable=True)
     return {"playlist_id": playlist_id, "name": new, "role": None if role == "archived" else role}
+
+
+# ---- split into parts ------------------------------------------------------
+#
+# Spec: docs/superpowers/specs/2026-10-20-split-into-parts-design.md. Before
+# Done, the only Spotify calls are reads: the snapshot (1) and the track
+# list when that moved (~1 per 100). Suggest runs on a thread because the
+# Last.fm fill-in for never-seen songs is paced at ~4 requests a second.
+
+_splitparts_job: dict = {}
+_splitparts_job_lock = threading.Lock()
+# Tests flip this to run jobs inline.
+_splitparts_threaded = True
+
+
+class SplitSuggestIn(BaseModel):
+    n: int
+
+
+def _splitparts_home(pid: str) -> dict:
+    cfg = store.config()
+    items = sp.my_playlists()
+    homes = _resolve_homes(cfg, items, "", _effective_input_ids(cfg, items))
+    for p in homes:
+        if p["id"] == pid:
+            return p
+    raise HTTPException(404, "not one of your homes")
+
+
+@app.get("/api/splitparts/homes")
+def splitparts_homes():
+    cfg = store.config()
+    items = sp.my_playlists()
+    homes = _resolve_homes(cfg, items, "", _effective_input_ids(cfg, items))
+    drafts = store.splitparts()["drafts"]
+    folders = store.folders()
+    out = []
+    for p in sorted(homes, key=lambda p: (p.get("name") or "").lower()):
+        total = p.get("total") or 0
+        reason = None
+        if total < spp.MIN_TRACKS:
+            reason = f"too small to split — fewer than {spp.MIN_TRACKS} songs"
+        elif total > spp.MAX_TRACKS:
+            reason = f"too big to split here — more than {spp.MAX_TRACKS} songs"
+        out.append({"id": p["id"], "name": p.get("name") or "", "total": total,
+                    "folder": (folders.get(p["id"]) or {}).get("path"),
+                    "splittable": reason is None, "reason": reason,
+                    "draft": p["id"] in drafts})
+    return {"homes": out}
+
+
+def _splitparts_fill(tracks: list[dict], progress) -> None:
+    """Fetch Last.fm data for never-seen songs; never raises. A missing key
+    or a Last.fm failure just leaves those songs without data ("?")."""
+    fm = _lastfm_client()
+    if fm is None:
+        return
+    need_tags, need_tracks, need_similar = spa.missing_lastfm(
+        tracks, store.tag_artists(), store.lastfm_track_map(), store.lastfm_artist_map())
+    total = len(need_tags) + len(need_tracks) + len(need_similar)
+    done = 0
+    progress(phase="looking up songs on Last.fm", done=0, total=total)
+    if need_tags:
+        cached = store.tag_artists()
+        try:
+            merged = enrich(need_tags, cached, fm, _now_iso(),
+                            on_progress=lambda d, t: progress(done=d))
+        except LastFmError as exc:
+            log.warning("split: tag fetch stopped early: %s", exc)
+            merged = exc.partial if exc.partial is not None else cached
+        if len(merged) > len(cached):
+            _merge_save_tag_artists(merged)
+        done = len(need_tags)
+    for artist, title in need_tracks:
+        try:
+            record = fetch_track(fm, artist, title, time.time())
+            _merge_save_lastfm_tracks({track_key(artist, title): record})
+        except Exception:
+            log.warning("split: track record failed for %r — %r", artist, title, exc_info=True)
+        done += 1
+        progress(done=done)
+    for aid, name in need_similar:
+        try:
+            similar = fm.artist_similar(name)
+            _merge_save_lastfm_artists({aid: {"name": name, "similar": similar or [],
+                                              "fetched_at": _now_iso(), "miss": similar is None}})
+        except Exception:
+            log.warning("split: artist-similar failed for %r", name, exc_info=True)
+        done += 1
+        progress(done=done)
+
+
+def _splitparts_run_suggest(playlist: dict, n: int) -> None:
+    pid = playlist["id"]
+
+    def progress(**fields):
+        with _splitparts_job_lock:
+            _splitparts_job.update(fields)
+
+    try:
+        progress(phase="reading the playlist", done=0, total=0)
+        snap = sp.snapshot(pid)
+        tracks = _cached_tracks(pid, snap)
+        _splitparts_fill(tracks, progress)
+        progress(phase="grouping", done=0, total=0)
+        sugg = spp.suggest(tracks, n, store.tag_artists(), store.lastfm_track_map(),
+                           store.lastfm_artist_map())
+        spa.put_draft(store, spa.draft_from(playlist, snap, tracks, sugg, n))
+        progress(state="done", phase="done", message=None)
+    except spp.SplitError as exc:
+        progress(state="error", message=str(exc))
+    except SpotifyError as exc:
+        progress(state="error", message=str(exc))
+    except Exception as exc:  # never leave the job "running" forever
+        log.exception("split: suggest failed")
+        progress(state="error", message=f"suggest failed: {exc}")
+
+
+@app.post("/api/splitparts/{pid}/suggest")
+def splitparts_suggest(pid: str, body: SplitSuggestIn):
+    if not spp.MIN_PARTS <= body.n <= spp.MAX_PARTS:
+        raise HTTPException(400, f"choose between {spp.MIN_PARTS} and {spp.MAX_PARTS} parts")
+    playlist = _splitparts_home(pid)
+    with _splitparts_job_lock:
+        if _splitparts_job.get("state") == "running":
+            raise HTTPException(409, "already running")
+        _splitparts_job.clear()
+        _splitparts_job.update({"pid": pid, "state": "running", "phase": "starting",
+                                "done": 0, "total": 0, "message": None})
+    if _splitparts_threaded:
+        threading.Thread(target=_splitparts_run_suggest, args=(playlist, body.n),
+                         daemon=True).start()
+    else:
+        _splitparts_run_suggest(playlist, body.n)
+    return {"started": True}
+
+
+@app.get("/api/splitparts/{pid}/progress")
+def splitparts_progress(pid: str):
+    with _splitparts_job_lock:
+        job = dict(_splitparts_job)
+    if job.get("pid") != pid:
+        return {"state": "idle", "phase": "", "done": 0, "total": 0, "message": None}
+    return {k: job.get(k) for k in ("state", "phase", "done", "total", "message")}
+
+
+@app.get("/api/splitparts/{pid}")
+def splitparts_get(pid: str):
+    draft = spa.get_draft(store, pid)
+    if draft is None:
+        raise HTTPException(404, "no split in progress for this playlist")
+    return draft
+
+
+@app.delete("/api/splitparts/{pid}")
+def splitparts_discard(pid: str):
+    spa.drop_draft(store, pid)
+    return {"ok": True}
 
 
 @app.post("/api/config")

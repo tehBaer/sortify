@@ -183,6 +183,17 @@ class Store:
     def save_preview_rejects(self, mapping: dict) -> None:
         self._save("preview_rejects.json", mapping)
 
+    # splitparts.json: {version, drafts: {playlist_id: draft}} — the
+    # split-into-parts drafts. Every move the user makes is written here at
+    # once, so leaving the Split tab and coming back restores the split.
+    SPLITPARTS_DEFAULT = {"version": 1, "drafts": {}}
+
+    def splitparts(self) -> dict:
+        return self._versioned("splitparts.json", self.SPLITPARTS_DEFAULT)
+
+    def save_splitparts(self, payload: dict) -> None:
+        self._save("splitparts.json", payload)
+
     # usage.json: {day, count} — local daily API-call budget accounting
     def usage(self) -> dict:
         return self._load("usage.json", {"day": "", "count": 0})
