@@ -2913,13 +2913,17 @@ function closeCover(rerender = true, animate = false) {
 // part ways. It opens from a tap on the strip, or a pull downward on the
 // strip or anywhere on the top bar: the cover follows the finger, and lets
 // go into open past COVER_PULL_OPEN (or on a downward flick) and back to the
-// strip short of it. A press only becomes a pull past COVER_PULL_START, so
-// every button on the bar still takes its tap. renderNow draws the panel at
+// strip short of it. Open, it is pushed back up the same way: a swipe up on
+// the cover folds it under the finger, and lets go into the strip past the
+// same fraction (or on an upward flick), back open short of it. A press only
+// becomes a pull past COVER_PULL_START, so every button on the bar still
+// takes its tap, and a tap on the open cover still folds it. renderNow draws
+// the panel at
 // `coverPull`, so a poll landing mid-pull does not snap it; the moves
 // themselves restyle the panel in place rather than re-render the card.
 const COVER_PULL_START = 6;     // px before a press becomes a pull
-const COVER_PULL_OPEN = 0.3;    // fraction past which a release opens
-const COVER_FLICK = 0.5;        // px/ms downward that opens regardless
+const COVER_PULL_OPEN = 0.3;    // fraction of travel past which a release commits
+const COVER_FLICK = 0.5;        // px/ms in the pull's direction that commits regardless
 function paintCoverPull(f) {
   $("cover-panel")?.style.setProperty("--f", String(f));
 }
@@ -2947,9 +2951,11 @@ function settleCoverPull(open) {
   const bar = $("topbar");
   const card = $("now-card");
   let y0 = null, x0 = 0, full = 0, lastY = 0, lastT = 0, speed = 0, from = null;
+  // +1 pulls a shut cover down open, -1 pushes an open one back up.
+  let dir = 1;
   // A pull must not end in a click: not on the bar button it started on,
-  // and not on the strip, whose tap opens. Capture phase, so it is
-  // swallowed before either sees it.
+  // and not on the cover, whose tap opens or folds it. Capture phase, so it
+  // is swallowed before either sees it.
   const swallow = (e) => {
     if (coverDragged) { coverDragged = false; e.stopPropagation(); e.preventDefault(); }
   };
@@ -2958,15 +2964,18 @@ function settleCoverPull(open) {
   const down = (el, e) => {
     coverDragged = false;
     y0 = null;
-    // Only a shut cover on the Now card can be pulled open; an open one
-    // closes on a tap. An open menu or input list owns its own gestures.
-    if (coverOpen || !document.body.classList.contains("on-now")) return;
+    // A shut cover on the Now card is pulled open (from the bar or the
+    // strip); an open one is pushed shut, from the cover itself only. An
+    // open menu or input list owns its own gestures.
+    if (!document.body.classList.contains("on-now")) return;
+    if (coverOpen && el !== card) return;
     if (!$("nav-pop").hidden || !$("input-pop").hidden) return;
     y0 = e.clientY; x0 = e.clientX; lastY = e.clientY; lastT = e.timeStamp; speed = 0;
     from = el;
+    dir = coverOpen ? -1 : 1;
   };
   bar.onpointerdown = (e) => down(bar, e);
-  // On the card only the strip pulls; everywhere else the card scrolls.
+  // On the card only the cover pulls; everywhere else the card scrolls.
   card.onpointerdown = (e) => {
     if (e.target?.closest?.(".cover-panel")) down(card, e);
     else { coverDragged = false; y0 = null; }
@@ -2975,7 +2984,22 @@ function settleCoverPull(open) {
     if (y0 === null) return;
     const dy = e.clientY - y0;
     if (!coverDragged) {
-      if (dy < COVER_PULL_START || Math.abs(e.clientX - x0) > dy) return;
+      const travel = dir * dy;
+      if (travel < COVER_PULL_START || Math.abs(e.clientX - x0) > travel) return;
+      if (dir < 0) {
+        // Pushing an open cover shut: it is already drawn, so the pull
+        // starts at full size and no render is needed.
+        if (!coverOpen) { y0 = null; return; }
+        coverDragged = true;
+        from.setPointerCapture?.(e.pointerId);
+        coverPull = 1;
+        // A release that settled it open left the transition on; the finger
+        // must not lag behind it.
+        $("cover-panel")?.classList.remove?.("cover-settle");
+        full = $("cover-panel")?.clientWidth || 360;
+      }
+    }
+    if (!coverDragged) {
       const t = nowState?.track;
       // The card must be showing a track with art.
       if (!t?.image || nowProblem || !nowState.playing) { y0 = null; return; }
@@ -2995,18 +3019,21 @@ function settleCoverPull(open) {
     if (coverPull === null) { y0 = null; return; }   // the track changed under it
     if (e.timeStamp > lastT) speed = (e.clientY - lastY) / (e.timeStamp - lastT);
     lastY = e.clientY; lastT = e.timeStamp;
-    coverPull = Math.max(0, Math.min(1, dy / full));
+    coverPull = Math.max(0, Math.min(1, (dir > 0 ? 0 : 1) + dy / full));
     paintCoverPull(coverPull);
   };
   const up = () => {
     if (y0 === null) return;
     y0 = null;
-    if (coverDragged) settleCoverPull(coverPull >= COVER_PULL_OPEN || speed > COVER_FLICK);
+    if (!coverDragged) return;
+    if (dir > 0) settleCoverPull(coverPull >= COVER_PULL_OPEN || speed > COVER_FLICK);
+    else settleCoverPull(!(1 - coverPull >= COVER_PULL_OPEN || -speed > COVER_FLICK));
   };
+  // A cancelled pull goes back to where it started.
   const cancel = () => {
     if (y0 === null) return;
     y0 = null;
-    if (coverDragged) settleCoverPull(false);
+    if (coverDragged) settleCoverPull(dir < 0);
   };
   bar.onpointermove = card.onpointermove = move;
   bar.onpointerup = card.onpointerup = up;

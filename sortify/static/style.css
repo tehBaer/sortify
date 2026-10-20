@@ -1085,8 +1085,11 @@ body:not(.peeked) #now-card .sugg:not(.sugg-more):not(.sugg-capture) .s-why {
      under it down only a little; open, it takes its full room. */
   margin: calc((1 - var(--f)) * -.4rem) 0 calc(.45rem + var(--f) * .45rem);
 }
-/* The strip takes the pull itself, so it must not scroll the page. */
+/* The strip takes the pull itself, so it must not scroll the page. Open,
+   the cover takes a swipe up (which folds it) but still lets a swipe down
+   scroll the page back up. */
 .cover-panel.cover-shut { touch-action: none; }
+.cover-panel:not(.cover-shut) { touch-action: pan-up; }
 .cover-shade {
   position: relative; overflow: hidden;
   border-radius: calc(4px + var(--f) * 8px);

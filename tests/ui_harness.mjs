@@ -1897,6 +1897,61 @@ run("stopNowPolling()");
         `pull=${run("coverPull")}`);
   cardEl.onpointerup(pt(160, 1000));
   check("PULL ...and letting go past the line opens it", run("coverOpen") && run("coverPull") === null, "");
+  click();
+
+  // Open, a swipe up on the cover pushes it back into the strip, the same
+  // gesture in reverse: under the finger, then past the line (or a flick)
+  // it folds, short of it it springs back open.
+  const cardClick = () => {
+    let stopped = false;
+    const ev = { stopPropagation() { stopped = true; }, preventDefault() {} };
+    for (const h of cardEl._ls?.click || []) h(ev);
+    return stopped;
+  };
+  cardEl.onpointerdown({ ...pt(400, 0), target: on(true) });
+  cardEl.onpointermove({ ...pt(396, 50), target: on(true) });
+  check("PUSH a few pixels up is still a tap", run("coverPull") === null && run("coverOpen"), "");
+  cardEl.onpointermove({ ...pt(310, 400), target: on(true) });
+  check("PUSH swiping up folds the open cover under the finger",
+        panelOpen() && Math.abs(run("coverPull") - 0.75) < 1e-9 && $$("cover-panel").style["--f"] === "0.75",
+        `pull=${run("coverPull")} f=${$$("cover-panel").style["--f"]}`);
+  cardEl.onpointerup(pt(310, 400));
+  check("PUSH let go short of the line, it springs back open and the click is not a tap",
+        run("coverOpen") && run("coverPull") === null && cardClick(),
+        `open=${run("coverOpen")} pull=${run("coverPull")}`);
+  cardEl.onpointerdown({ ...pt(400, 0), target: on(true) });
+  cardEl.onpointermove({ ...pt(300, 400), target: on(true) });
+  cardEl.onpointermove({ ...pt(200, 800), target: on(true) });
+  cardEl.onpointerup(pt(200, 800));
+  cardClick();
+  check("PUSH let go past the line, it folds into the strip...",
+        run("coverPull") === 0 && $$("cover-panel").style["--f"] === "0", `pull=${run("coverPull")}`);
+  await new Promise((r) => setTimeout(r, 260));
+  check("PUSH ...and then is shut", strip() && !run("coverOpen"), `open=${run("coverOpen")}`);
+  run(`openCover()`);
+  cardEl.onpointerdown({ ...pt(400, 0), target: on(true) });
+  cardEl.onpointermove({ ...pt(380, 10), target: on(true) });
+  cardEl.onpointermove({ ...pt(360, 20), target: on(true) });
+  cardEl.onpointerup(pt(360, 20));
+  cardClick();
+  await new Promise((r) => setTimeout(r, 260));
+  check("PUSH a quick flick up folds it even when short", strip() && !run("coverOpen"), "");
+  run(`openCover()`);
+  cardEl.onpointerdown({ ...pt(10, 0), target: on(true) });
+  cardEl.onpointermove({ ...pt(100, 400), target: on(true) });
+  cardEl.onpointerup(pt(100, 400));
+  check("PUSH dragging an open cover down does nothing",
+        run("coverOpen") && run("coverPull") === null && cardClick() === false, "");
+  bar.onpointerdown(pt(400, 0));
+  bar.onpointermove(pt(100, 400));
+  bar.onpointerup(pt(100, 400));
+  check("PUSH the bar does not push an open cover shut",
+        run("coverOpen") && run("coverPull") === null && click() === false, "");
+  cardEl.onpointerdown({ ...pt(400, 0), target: on(true) });
+  cardEl.onpointermove({ ...pt(200, 400), target: on(true) });
+  cardEl.onpointercancel();
+  cardClick();
+  check("PUSH a cancelled push leaves it open", run("coverOpen") && run("coverPull") === null, "");
   run(`closeCover()`);
 
   routes["GET /api/now?light=1"].body.track.image = null;
