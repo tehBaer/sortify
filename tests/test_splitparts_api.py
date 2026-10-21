@@ -1097,3 +1097,142 @@ def test_the_parts_actions_sit_above_the_song_list():
     chips, done_row = html.index('id="sp-chips"'), html.index('id="sp-done-row"')
     actions, song_list = html.index('id="sp-actions"'), html.index('id="sp-list"')
     assert chips < done_row < actions < song_list
+
+
+# ---- a part's preview: the house player over the part's songs ---------------
+
+
+@pytest.fixture
+def previewing(drafted, monkeypatch):
+    asked = []
+
+    class FakeDeezer:
+        def fetch_preview(self, artist, title, exclude=()):
+            asked.append((artist, title, list(exclude)))
+            return {"url": f"https://cdn/{title}.mp3", "deezer_id": 5, "miss": False}
+
+    monkeypatch.setattr(appmod, "_deezer_client", lambda: FakeDeezer())
+    appmod._preview_cache.clear()
+    appmod.store.save_preview_rejects({})
+    drafted.asked = asked
+    yield drafted
+    appmod._preview_cache.clear()
+    appmod.store.save_preview_rejects({})
+
+
+def part_uris(c, key):
+    return next(p["uris"] for p in c.get("/api/splitparts/H1").json()["parts"] if p["key"] == key)
+
+
+def test_a_part_preview_starts_at_the_tapped_song_in_the_parts_order(previewing):
+    uris = part_uris(previewing, "p1")
+
+    page = previewing.get("/api/splitparts/H1/preview",
+                          params={"key": "p1", "start": uris[2]}).json()
+
+    assert [c["uri"] for c in page["clips"]] == uris[2:2 + appmod.PREVIEW_CLIPS]
+    assert page["next_offset"] == 2 + appmod.PREVIEW_CLIPS
+    assert page["total"] == len(uris)
+    assert set(page) == {"clips", "next_offset", "tracks", "total"}
+    c0 = page["clips"][0]
+    assert c0["deezer_id"] == 5 and c0["url"].startswith("https://cdn/") and c0["name"] and c0["artist"]
+    assert previewing.calls == []   # zero Spotify calls
+
+
+def test_the_next_page_carries_on_down_the_part(previewing):
+    uris = part_uris(previewing, "p1")
+    first = previewing.get("/api/splitparts/H1/preview",
+                           params={"key": "p1", "start": uris[2]}).json()
+
+    page = previewing.get("/api/splitparts/H1/preview",
+                          params={"key": "p1", "offset": first["next_offset"]}).json()
+
+    assert [c["uri"] for c in page["clips"]] == uris[5:5 + appmod.PREVIEW_CLIPS]
+
+
+def test_without_a_start_the_part_plays_from_its_top(previewing):
+    uris = part_uris(previewing, "p2")
+
+    page = previewing.get("/api/splitparts/H1/preview", params={"key": "p2"}).json()
+
+    assert [c["uri"] for c in page["clips"]] == uris[:appmod.PREVIEW_CLIPS]
+    assert page["total"] == len(uris)
+
+
+def test_the_last_page_says_the_part_is_walked(previewing):
+    uris = part_uris(previewing, "p2")
+
+    page = previewing.get("/api/splitparts/H1/preview",
+                          params={"key": "p2", "start": uris[-1]}).json()
+
+    assert [c["uri"] for c in page["clips"]] == [uris[-1]]
+    assert page["next_offset"] is None
+
+
+def test_local_files_and_nameless_songs_are_never_offered(previewing):
+    uris = part_uris(previewing, "p1")
+
+    def strip(d):
+        for t in d["tracks"]:
+            if t["uri"] == uris[0]:
+                t["is_local"] = True
+            if t["uri"] == uris[1]:
+                t["name"] = ""
+            if t["uri"] == uris[2]:
+                t["artists"] = []
+    edit_draft(strip)
+
+    page = previewing.get("/api/splitparts/H1/preview", params={"key": "p1"}).json()
+
+    assert [c["uri"] for c in page["clips"]] == uris[3:3 + appmod.PREVIEW_CLIPS]
+    # a start that is not a candidate starts at the top of the candidates
+    page = previewing.get("/api/splitparts/H1/preview",
+                          params={"key": "p1", "start": uris[0]}).json()
+    assert page["clips"][0]["uri"] == uris[3]
+
+
+def test_a_rejected_recording_is_excluded_from_the_search(previewing):
+    uris = part_uris(previewing, "p1")
+    appmod.store.save_preview_rejects({uris[0]: {"artist": "", "title": "", "rejected": [77]}})
+
+    previewing.get("/api/splitparts/H1/preview", params={"key": "p1", "start": uris[0]})
+
+    assert previewing.asked[0][2] == [77]
+
+
+def test_a_deezer_failure_or_miss_skips_that_song(previewing, monkeypatch):
+    uris = part_uris(previewing, "p1")
+    songs = appmod.store.splitparts()["drafts"]["H1"]["songs"]
+    broken, missing = songs[uris[0]]["name"], songs[uris[1]]["name"]
+
+    class Flaky:
+        def fetch_preview(self, artist, title, exclude=()):
+            if title == broken:
+                raise RuntimeError("deezer down")
+            if title == missing:
+                return {"miss": True}
+            return {"url": f"https://cdn/{title}.mp3", "deezer_id": 6, "miss": False}
+
+    monkeypatch.setattr(appmod, "_deezer_client", lambda: Flaky())
+
+    page = previewing.get("/api/splitparts/H1/preview", params={"key": "p1"})
+
+    assert page.status_code == 200
+    assert [c["uri"] for c in page.json()["clips"]] == uris[2:2 + appmod.PREVIEW_CLIPS]
+
+
+def test_no_draft_or_no_such_part_is_a_404(previewing):
+    assert previewing.get("/api/splitparts/H2/preview", params={"key": "p1"}).status_code == 404
+    assert previewing.get("/api/splitparts/H1/preview", params={"key": "p9"}).status_code == 404
+
+
+def test_a_moved_song_never_comes_back_from_a_cached_page(previewing):
+    uris = part_uris(previewing, "p1")
+    previewing.get("/api/splitparts/H1/preview", params={"key": "p1", "start": uris[0]})
+    previewing.post("/api/splitparts/H1/move", json={"uri": uris[1], "to": "p2"})
+
+    page = previewing.get("/api/splitparts/H1/preview",
+                          params={"key": "p1", "start": uris[0]}).json()
+
+    assert uris[1] not in [c["uri"] for c in page["clips"]]
+    assert page["total"] == len(uris) - 1

@@ -1250,7 +1250,6 @@ body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { t
 .sp-song-name, .sp-song-artist { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sp-song-artist { color: var(--muted); font-size: .85rem; }
 .sp-unknown { color: var(--muted); font-weight: 700; }
-.sp-song.playing { outline: 2px solid var(--accent); }
 .sp-ghost {
   position: fixed; z-index: 30; pointer-events: none; transform: translate(-50%, -120%);
   max-width: 70vw; padding: .45rem .8rem; border-radius: 10px;

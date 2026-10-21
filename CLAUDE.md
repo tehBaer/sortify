@@ -221,8 +221,9 @@ escalating penalties. Therefore:
 ## Split a home into parts
 
 - The Split tab (since 2026-10): pick a home, choose 2–6 parts, get a
-  suggestion, drag songs between parts on the phone, tap a song for its
-  30 s Deezer preview, then Done. Spec:
+  suggestion, drag songs between parts on the phone, tap a song to open
+  the house preview player on it (it walks on down that part, via
+  `GET /api/splitparts/{pid}/preview`, zero Spotify calls), then Done. Spec:
   `docs/superpowers/specs/2026-10-20-split-into-parts-design.md`.
 - **Nothing is written to Spotify before Done.** Suggest reads the snapshot
   (1 call) and the track list only when it moved (~1 per 100).
