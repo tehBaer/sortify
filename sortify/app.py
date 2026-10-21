@@ -672,7 +672,8 @@ def splitparts_homes():
     drafts = store.splitparts()["drafts"]
     folders = store.folders()
     out = []
-    for p in sorted(homes, key=lambda p: (p.get("name") or "").lower()):
+    # A split in progress first: it is the one you came back for.
+    for p in sorted(homes, key=lambda p: (p["id"] not in drafts, (p.get("name") or "").lower())):
         total = p.get("total") or 0
         reason = None
         if total < spp.MIN_TRACKS:

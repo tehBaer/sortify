@@ -72,6 +72,14 @@ def test_homes_lists_only_homes_with_splittability(client):
     assert client.calls == []
 
 
+def test_homes_with_a_split_in_progress_come_first(client):
+    appmod.store.save_splitparts({"version": 1, "drafts": {"H2": {"playlist_id": "H2"}}})
+
+    res = client.get("/api/splitparts/homes").json()["homes"]
+
+    assert [(h["id"], h["draft"]) for h in res] == [("H2", True), ("H1", False)]   # then by name
+
+
 def test_suggest_builds_and_saves_a_draft(client):
     res = client.post("/api/splitparts/H1/suggest", json={"n": 2})
     assert res.status_code == 200
