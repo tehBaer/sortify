@@ -3094,7 +3094,8 @@ function openPicker(homesMap, onPick, onCreate, onHomeless, verb = "File here",
     // Recency first: the home you filed into most recently is the likeliest
     // target again (ISO Zulu stamps compare fine as strings; homes never
     // added to sink to the bottom in the old folder → name order).
-    const homes = [...homesMap.values()].sort((a, b) =>
+    // `opts.keepOrder`: the caller's list is already in the order to show.
+    const homes = opts.keepOrder ? [...homesMap.values()] : [...homesMap.values()].sort((a, b) =>
       (b.last_added_at || "").localeCompare(a.last_added_at || "") ||
       (a.folder || "").localeCompare(b.folder || "") || a.name.localeCompare(b.name));
     let shown = 0;
@@ -3727,9 +3728,50 @@ function spPreview(uri) {
     offset == null ? `${base}&start=${encodeURIComponent(uri)}` : `${base}&offset=${offset}`);
 }
 
+// ---- the row's icon: move the song to another playlist instead --------------
+// A tap on it (never a drag — a press on it that moves lifts the song like
+// the rest of the row) opens the picker on every playlist the song can go
+// to; a pick moves it there at once: added there first, then removed from
+// the playlist being split (2 calls). No undo.
+const ICON_ELSEWHERE = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>';
+
+async function spOpenElsewhere(uri) {
+  const pid = spPid, gen = spDraftGen;
+  let targets;
+  try {
+    targets = (await api(spUrl("/targets", pid))).targets || [];
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  if (pid !== spPid || gen !== spDraftGen || $("sp-parts").hidden) return;
+  const map = new Map(targets.map((t) => [t.id, t]));
+  // The server's order (by name); no hold-to-preview on these rows, and no
+  // keyboard thrown over the list on open — the box is one tap away.
+  openPicker(map, (id) => spElsewhere(uri, id), null, null, "Move here", "home",
+             { focus: false, preview: false, keepOrder: true });
+}
+
+async function spElsewhere(uri, toId) {
+  const pid = spPid, gen = spDraftGen;
+  let d;
+  try {
+    d = await api(spUrl("/elsewhere", pid), { uri, to_id: toId });
+  } catch (e) {
+    // "now in both playlists" is worth the time to read.
+    toast(e.message, 6000);
+    return;
+  }
+  if (pid !== spPid || gen !== spDraftGen) return;
+  const { moved_to: to, ...draft } = d;
+  spDraft = draft;
+  if (!$("sp-parts").hidden) renderSpParts();
+  toast(`moved to ${to?.name || "the other playlist"}`);
+}
+
 // ---- touch that moves = drag -------------------------------------------------
 const SP_LIFT_PX = 8;
-let spDrag = null;      // {uri, x0, y0, lifted, ghost, pointerId}
+let spDrag = null;      // {uri, x0, y0, lifted, ghost, pointerId, onIcon}
 let spDropKey = null;   // the chip under a lifted song
 
 function spChipAt(x, y) {
@@ -3746,13 +3788,13 @@ function spHighlight(key) {
   });
 }
 
-function spPointerDown(uri, x, y, id) {
+function spPointerDown(uri, x, y, id, onIcon = false) {
   // A new touch always ends whatever drag is already in progress — without
   // this a second finger silently overwrote spDrag, orphaning the first
   // finger's ghost and leaving its eventual pointerup to act on someone
   // else's drag.
   spEndDrag();
-  spDrag = { uri, x0: x, y0: y, lifted: false, ghost: null, pointerId: id };
+  spDrag = { uri, x0: x, y0: y, lifted: false, ghost: null, pointerId: id, onIcon };
 }
 
 function spPointerMove(x, y, id) {
@@ -3789,7 +3831,9 @@ async function spPointerUp(x, y, id) {
   const lifted = spDrag.lifted;
   const key = lifted ? spChipAt(x, y) : null;
   const d = spEndDrag();
-  if (!lifted) { spPreview(d.uri); return; }
+  // Not lifted: a tap — on the icon it moves the song elsewhere, anywhere
+  // else on the row it previews.
+  if (!lifted) { if (d.onIcon) spOpenElsewhere(d.uri); else spPreview(d.uri); return; }
   if (key && key !== spShown) await spMove(d.uri, key);
 }
 
@@ -3802,7 +3846,8 @@ function spListPointerDown(e) {
   const row = e.target && e.target.closest ? e.target.closest(".sp-song") : null;
   if (!row || (e.button !== undefined && e.button > 0)) return;
   e.preventDefault();
-  spPointerDown(row.dataset.uri, e.clientX, e.clientY, e.pointerId);
+  const onIcon = !!(e.target.closest && e.target.closest(".sp-elsewhere"));
+  spPointerDown(row.dataset.uri, e.clientX, e.clientY, e.pointerId, onIcon);
 }
 document.addEventListener("pointermove", (e) => {
   if (!spDrag) return;
@@ -4648,9 +4693,14 @@ function renderSpList() {
   $("sp-list").innerHTML = part && part.uris.length
     ? part.uris.map((u) => {
         const s = spDraft.songs[u] || { name: u, artists: "" };
+        // The icon sits inside the row, so pressing it starts the row's own
+        // drag; only a tap on it is its own (see spPointerUp).
         return `<div class="sp-song" data-uri="${esc(u)}">
-          <span class="sp-song-name">${esc(s.name)}${unknown.has(u) ? ' <span class="sp-unknown" title="no Last.fm data — check where it landed">?</span>' : ""}</span>
-          <span class="sp-song-artist">${esc(s.artists)}</span>
+          <span class="sp-song-text">
+            <span class="sp-song-name">${esc(s.name)}${unknown.has(u) ? ' <span class="sp-unknown" title="no Last.fm data — check where it landed">?</span>' : ""}</span>
+            <span class="sp-song-artist">${esc(s.artists)}</span>
+          </span>
+          <button type="button" class="icon-btn sp-elsewhere" aria-label="Move to another playlist">${ICON_ELSEWHERE}</button>
         </div>`;
       }).join("")
     : '<p class="hint">no songs in this part yet — drag some onto its chip</p>';

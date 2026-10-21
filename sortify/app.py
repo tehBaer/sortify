@@ -958,6 +958,73 @@ def splitparts_remove_part(pid: str, key: str, body: SplitRemoveIn):
     return spa.without_tracks(draft)
 
 
+def _splitparts_targets(pid: str) -> list[dict]:
+    # The cached listing, never sp.my_playlists(): a cold one is ~21 calls.
+    listing = (store.cache().get("playlist_list") or {}).get("items") or []
+    return spa.move_targets(listing, pid, store.folders(), LIKED_ID)
+
+
+@app.get("/api/splitparts/{pid}/targets")
+def splitparts_targets(pid: str):
+    """The playlists a song of this split can be moved to instead. Zero calls."""
+    return {"targets": _splitparts_targets(pid)}
+
+
+class SplitElsewhereIn(BaseModel):
+    uri: str
+    to_id: str
+
+
+@app.post("/api/splitparts/{pid}/elsewhere")
+def splitparts_elsewhere(pid: str, body: SplitElsewhereIn):
+    """Move one song out of the split's playlist into another playlist,
+    right away (2 calls). The add goes first, so a failure can never lose
+    the song: an add that fails changes nothing, and a removal that fails
+    after it leaves the song in both playlists and says so. The draft lock
+    is held throughout, so a move or a Done cannot interleave with it."""
+    with spa._lock:
+        draft = _splitparts_draft(pid)
+        if draft.get("done") is not None:
+            raise HTTPException(409, _SPLITPARTS_DONE_STARTED_MSG)
+        with _splitparts_job_lock:
+            running = (_splitparts_job.get("state") == "running"
+                       and _splitparts_job.get("pid") == pid)
+        if running:
+            raise HTTPException(409, "already running")
+        uri = body.uri
+        if not spa.has_song(draft, uri):
+            raise HTTPException(400, "that song is not in this split")
+        if ((draft.get("songs") or {}).get(uri) or {}).get("local"):
+            raise HTTPException(400, "a local file cannot be added through Spotify's API")
+        if body.to_id == pid:
+            raise HTTPException(400, "that is the playlist being split")
+        target = next((t for t in _splitparts_targets(pid) if t["id"] == body.to_id), None)
+        if target is None:
+            raise HTTPException(400, "not a playlist this song can be moved to")
+        add_snap = sp.add_to_playlist(body.to_id, [uri])
+        _apply_snapshot(body.to_id, add_snap)
+        try:
+            snap = sp.remove_from_playlist(pid, uri)
+        except Exception as exc:
+            # The add landed: mirror that much, it is true.
+            _cache_move(uri, [], body.to_id)
+            _sync_membership(uri, add_to=body.to_id, remove_from=[])
+            log.warning("split: elsewhere removal failed after the add", exc_info=True)
+            raise HTTPException(
+                502, f"added to “{target['name']}”, but removing it from “{draft['name']}” "
+                     f"failed ({exc}) — the song is now in both playlists")
+        _apply_snapshot(pid, snap)
+        _cache_move(uri, [pid], body.to_id)
+        _sync_membership(uri, add_to=body.to_id, remove_from=[pid])
+        entry = store.cache()["playlists"].get(pid)
+        _sync_listing_snapshot(pid, snap, total=len(entry["tracks"]) if entry else None)
+        spa.forget_song(draft, uri)
+        if snap:
+            draft["snapshot_id"] = snap
+        spa.put_draft(store, draft)
+    return {**spa.without_tracks(draft), "moved_to": {"id": target["id"], "name": target["name"]}}
+
+
 class SplitDoneIn(BaseModel):
     names: dict[str, str] = Field(default_factory=dict)
     folder: str | None = None

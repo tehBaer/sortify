@@ -225,8 +225,15 @@ escalating penalties. Therefore:
   the house preview player on it (it walks on down that part, via
   `GET /api/splitparts/{pid}/preview`, zero Spotify calls), then Done. Spec:
   `docs/superpowers/specs/2026-10-20-split-into-parts-design.md`.
-- **Nothing is written to Spotify before Done.** Suggest reads the snapshot
-  (1 call) and the track list only when it moved (~1 per 100).
+- **Nothing is written to Spotify before Done** — with one exception the
+  user triggers per song: the row's "Move to another playlist" icon
+  (`POST /api/splitparts/{pid}/elsewhere`, 2 calls, no undo) adds the song
+  to the picked playlist first and only then removes it from the one being
+  split, so a failure can leave it in both but never in neither. It takes
+  the removal's snapshot into the draft, so Done does not see "changed".
+  Its targets (`GET .../targets`) come from the cached listing, zero calls.
+  Suggest reads the snapshot (1 call) and the track list only when it
+  moved (~1 per 100).
 - The grouping (`sortify/splitparts.py`) is pure and offline: artist tags,
   Last.fm getSimilar and artist-similar, average-linkage clustering cut at
   exactly N with slivers folded in. Weights are constants in that file.

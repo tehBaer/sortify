@@ -5906,6 +5906,112 @@ run("stopNowPolling()");
   }
 }
 
+// ============================================================================
+// SPE — "move to another playlist instead": each song row carries an icon
+// button. Pressed and moved, it drags like the rest of the row; tapped, it
+// opens the picker on the split's move targets; a pick moves the song at once.
+// ============================================================================
+{
+  const savedNow = run("JSON.stringify(nowState)");
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    const songs = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                    u3: { name: "Three", artists: "C", local: false }, u4: { name: "Four", artists: "D", local: false } };
+    const D = (parts, extra = {}) => ({ playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2, parts,
+      unknown: [], hint: null, scores: {}, songs, done: null, edited: false, ...extra });
+    const two = () => [{ key: "p1", name: "rock", uris: ["u1", "u2", "u3"] }, { key: "p2", name: "jazz", uris: ["u4"] }];
+    run(`show("split"); nowState = { is_playing: false }; previewHold.stop(true); $("picker").hidden = true`);
+    run(`spDraft = ${JSON.stringify(D(two()))}; spPid = "H1"; spShown = "p1"; spSection("sp-work"); renderSpParts()`);
+    // A real pointerdown on the icon lands on its svg; closest() walks up to
+    // the button and to the row. Scripted here: the stub DOM has no closest.
+    const press = (uri, onIcon, x, y, id) => run(`spListPointerDown({
+      target: { closest: (sel) => sel === ".sp-song" ? { dataset: { uri: ${JSON.stringify(uri)} } }
+                                : sel === ".sp-elsewhere" ? (${onIcon} ? {} : null) : null },
+      clientX: ${x}, clientY: ${y}, pointerId: ${id}, preventDefault() {} })`);
+    const listHtml = () => $$("sp-list").innerHTML;
+    check("SPE every song row ends with a labelled move-elsewhere icon button",
+          /data-uri="u1"[\s\S]*?<button[^>]*class="[^"]*sp-elsewhere[^"]*"[^>]*aria-label="Move to another playlist"[^>]*>\s*<svg/.test(listHtml()) &&
+          (listHtml().match(/sp-elsewhere/g) || []).length === 3, listHtml().slice(0, 400));
+
+    routes["GET /api/splitparts/H1/targets"] = { targets: [
+      { id: "A1", name: "alpha", folder: "ROOT / Mix" }, { id: "X1", name: "[Inbox]", folder: null }] };
+    // 1: press on the icon and move: it lifts and drags like the row does
+    routes["POST /api/splitparts/H1/move"] = D([{ key: "p1", name: "rock", uris: ["u2", "u3"] },
+                                               { key: "p2", name: "jazz", uris: ["u4", "u1"] }]);
+    document.elementFromPoint = () => ({ closest: () => ({ dataset: { key: "p2" } }) });
+    press("u1", true, 10, 10, 21);
+    run(`spPointerMove(10, 40, 21)`);
+    check("SPE a press on the icon then a move lifts the song",
+          document.body.children.some((c) => c.className === "sp-ghost") && run("spDropKey") === "p2",
+          `drop=${run("spDropKey")}`);
+    await run(`spPointerUp(10, 40, 21)`);
+    await tick();
+    document.elementFromPoint = () => null;
+    const mvE = bodies("/api/splitparts/H1/move").filter(Boolean);
+    check("SPE ...and a drop on a chip moves it, with no picker and no targets asked",
+          mvE.length === 1 && mvE[0].uri === "u1" && mvE[0].to === "p2" && $$("picker").hidden === true &&
+          gets("/api/splitparts/H1/targets") === 0, JSON.stringify(mvE));
+
+    // 2: a tap on the icon opens the picker on the targets — no preview
+    run(`spDraft = ${JSON.stringify(D(two()))}; spShown = "p1"; renderSpParts()`);
+    resetLog();
+    press("u1", true, 10, 10, 22);
+    await run(`spPointerUp(11, 12, 22)`);
+    await tick();
+    const rows = $$("picker-list").children;
+    check("SPE a tap on the icon opens the picker listing the move targets",
+          $$("picker").hidden === false && gets("/api/splitparts/H1/targets") === 1 &&
+          rows.length === 2 && /alpha/.test(rows[0].innerHTML) && /ROOT \/ Mix/.test(rows[0].innerHTML) &&
+          /\[Inbox\]/.test(rows[1].innerHTML), rows.map((r) => r.innerHTML).join(" | "));
+    check("SPE ...and asks for no preview", !log.some((l) => l.path.includes("/preview")) &&
+          $$("preview-pop").hidden === true, JSON.stringify(log.map((l) => l.path)));
+
+    // 3: picking one moves the song there at once
+    routes["POST /api/splitparts/H1/elsewhere"] = { ...D([{ key: "p1", name: "rock", uris: ["u2", "u3"] },
+                                                         { key: "p2", name: "jazz", uris: ["u4"] }], { edited: true }),
+                                                    moved_to: { id: "A1", name: "alpha" } };
+    rows[0].onclick();
+    await tick();
+    const sentE = bodies("/api/splitparts/H1/elsewhere").filter(Boolean);
+    check("SPE picking one posts the song and the playlist to /elsewhere",
+          sentE.length === 1 && sentE[0].uri === "u1" && sentE[0].to_id === "A1" && $$("picker").hidden === true,
+          JSON.stringify(sentE));
+    check("SPE ...the song leaves the list, the part's count drops, and a toast says where it went",
+          !/data-uri="u1"/.test(listHtml()) && /data-uri="u2"/.test(listHtml()) &&
+          /data-key="p1"[\s\S]*?sp-chip-n">2</.test($$("sp-chips").innerHTML) &&
+          $$("toast").textContent === "moved to alpha", `${$$("toast").textContent} | ${$$("sp-chips").innerHTML}`);
+    check("SPE ...and the draft held keeps no moved_to of its own", run("spDraft.moved_to") === undefined, "");
+
+    // 4: a removal that failed after the add says so and changes nothing here
+    run(`spDraft = ${JSON.stringify(D(two()))}; spShown = "p1"; renderSpParts()`);
+    resetLog();
+    routes["POST /api/splitparts/H1/elsewhere"] = { status: 502, body: { detail:
+      "added to “alpha”, but removing it from “Big Home” failed (boom) — the song is now in both playlists" } };
+    press("u2", true, 10, 10, 23);
+    await run(`spPointerUp(10, 10, 23)`);
+    await tick();
+    $$("picker-list").children[0].onclick();
+    await tick();
+    check("SPE a move that landed in both playlists says so, and the song stays listed",
+          /now in both playlists/.test($$("toast").textContent) && /data-uri="u2"/.test(listHtml()),
+          $$("toast").textContent);
+
+    // 5: a plain tap on the row (not the icon) still previews, no picker
+    resetLog();
+    routes["GET /api/splitparts/H1/preview?key=p1&start=u3"] = { clips: [], next_offset: null, tracks: [], total: 3 };
+    press("u3", false, 10, 10, 24);
+    await run(`spPointerUp(10, 10, 24)`);
+    await tick();
+    check("SPE a tap on the row itself still opens the player, not the picker",
+          gets("/api/splitparts/H1/preview?key=p1&start=u3") === 1 && gets("/api/splitparts/H1/targets") === 0 &&
+          $$("picker").hidden === true, JSON.stringify(log.map((l) => l.path)));
+  } finally {
+    document.elementFromPoint = () => null;
+    run(`spStopPolling(); previewHold.stop(true); $("picker").hidden = true; nowState = ${savedNow}; show("lists")`);
+  }
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

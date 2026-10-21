@@ -1236,3 +1236,199 @@ def test_a_moved_song_never_comes_back_from_a_cached_page(previewing):
 
     assert uris[1] not in [c["uri"] for c in page["clips"]]
     assert page["total"] == len(uris) - 1
+
+
+# ---- move one song to another playlist instead -------------------------------
+
+ALPHA = {"id": "A1", "name": "alpha", "owner": "me", "editable": True,
+         "total": 3, "snapshot_id": "snap-a", "image": None, "description": ""}
+ARCHIVED = {"id": "Z1", "name": "🗄️ old stuff", "owner": "me", "editable": True,
+            "total": 9, "snapshot_id": "snap-z", "image": None, "description": ""}
+THEIRS = {"id": "T1", "name": "Theirs", "owner": "them", "editable": False,
+          "total": 50, "snapshot_id": "snap-t", "image": None, "description": ""}
+LIKED = {"id": "liked", "name": "Liked Songs", "owner": "you", "editable": True,
+         "total": 900, "snapshot_id": None, "image": None, "description": ""}
+
+
+@pytest.fixture
+def elsewhere(drafted, monkeypatch):
+    cache = appmod.store.cache()
+    cache["playlist_list"]["items"] = [HOME, SMALL, OTHER, ALPHA, ARCHIVED, THEIRS, LIKED]
+    cache["playlists"]["A1"] = {"snapshot_id": "snap-a", "tracks": [], "fetched_at": 1.0}
+    appmod.store.save_cache(cache)
+    appmod.store.save_folders({"A1": {"path": "ROOT / Mix"}, "H2": {"path": "ROOT"}})
+    log = []
+
+    def add(pid, uris, bulk=False, spend_reserve=False):
+        log.append(("add", pid, [uris] if isinstance(uris, str) else list(uris)))
+        return "snap-added"
+
+    def remove(pid, uri):
+        log.append(("remove", pid, [uri]))
+        return "snap-removed"
+
+    def remove_many(pid, uris):
+        log.append(("remove", pid, list(uris)))
+        return "snap-removed"
+
+    def listing(refresh=False):
+        log.append(("my_playlists",))
+        return [HOME, SMALL, OTHER, ALPHA, ARCHIVED, THEIRS]
+
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", add)
+    monkeypatch.setattr(appmod.sp, "remove_from_playlist", remove)
+    monkeypatch.setattr(appmod.sp, "remove_many", remove_many)
+    monkeypatch.setattr(appmod.sp, "my_playlists", listing)
+    drafted.log = log
+    return drafted
+
+
+def stored():
+    return appmod.store.splitparts()["drafts"]["H1"]
+
+
+def test_targets_are_every_editable_playlist_but_this_one_sorted_with_folders(elsewhere):
+    res = elsewhere.get("/api/splitparts/H1/targets")
+
+    assert res.status_code == 200
+    targets = res.json()["targets"]
+    assert [t["id"] for t in targets] == ["X1", "A1", "H2"]   # "[inbox]" < "alpha" < "tiny"
+    assert targets[1] == {"id": "A1", "name": "alpha", "folder": "ROOT / Mix"}
+    assert targets[0]["folder"] is None
+    assert elsewhere.log == [] and elsewhere.calls == []      # the cached listing, zero calls
+
+
+def test_moving_a_song_elsewhere_adds_first_then_removes(elsewhere):
+    uri = stored()["parts"][0]["uris"][0]
+
+    res = elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "A1"})
+
+    assert res.status_code == 200, res.text
+    assert elsewhere.log == [("add", "A1", [uri]), ("remove", "H1", [uri])]
+    body = res.json()
+    assert body["moved_to"] == {"id": "A1", "name": "alpha"}
+    assert "tracks" not in body
+    assert all(uri not in p["uris"] for p in body["parts"])
+    assert uri not in body["songs"] and body["edited"] is True
+
+
+def test_the_draft_forgets_the_song_and_takes_the_new_snapshot(elsewhere):
+    d = stored()
+    uri = d["parts"][0]["uris"][0]
+    d["unknown"] = [uri]
+    appmod.store.save_splitparts({"version": 1, "drafts": {"H1": d}})
+
+    elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "A1"})
+
+    d = stored()
+    assert all(uri not in p["uris"] for p in d["parts"])
+    assert uri not in d["unknown"] and uri not in d["songs"]
+    assert uri not in [t["uri"] for t in d["tracks"]]
+    assert d["snapshot_id"] == "snap-removed" and d["edited"] is True
+    assert sum(len(p["uris"]) for p in d["parts"]) == 23
+
+
+def test_the_local_cache_and_listing_follow_the_move(elsewhere):
+    uri = stored()["parts"][0]["uris"][0]
+
+    elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "A1"})
+
+    cache = appmod.store.cache()
+    assert uri not in [t["uri"] for t in cache["playlists"]["H1"]["tracks"]]
+    assert uri in [t["uri"] for t in cache["playlists"]["A1"]["tracks"]]
+    assert cache["playlists"]["H1"]["snapshot_id"] == "snap-removed"
+    assert cache["playlists"]["A1"]["snapshot_id"] == "snap-added"
+    by_id = {p["id"]: p for p in cache["playlist_list"]["items"]}
+    assert by_id["H1"]["snapshot_id"] == "snap-removed" and by_id["H1"]["total"] == 23
+    assert by_id["A1"]["total"] == 4
+
+
+def test_a_split_song_moved_elsewhere_lets_done_go_ahead(elsewhere, monkeypatch):
+    uri = stored()["parts"][0]["uris"][0]
+    elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "A1"})
+    monkeypatch.setattr(appmod.sp, "snapshot", lambda pid: "snap-removed")
+    monkeypatch.setattr(appmod.sp, "create_playlist_full",
+                        lambda name, **kw: (f"N-{name}", f"snap-N-{name}"))
+    monkeypatch.setattr(appmod.sp, "rename_playlist", lambda pid, name: None)
+
+    elsewhere.post("/api/splitparts/H1/done", json={"names": {"p1": "Rocky", "p2": "Jazzy"},
+                                                    "original": "subset"})
+
+    prog = elsewhere.get("/api/splitparts/H1/progress").json()
+    assert prog["state"] == "done", prog
+
+
+@pytest.mark.parametrize("bad", ["unknown", "local", "self", "archived", "theirs", "liked", "nope"])
+def test_refusals_cost_nothing_and_change_nothing(elsewhere, bad):
+    d = stored()
+    uri = d["parts"][0]["uris"][0]
+    to = {"self": "H1", "archived": "Z1", "theirs": "T1", "liked": "liked", "nope": "NOPE"}.get(bad, "A1")
+    if bad == "unknown":
+        uri = "spotify:track:never"
+    if bad == "local":
+        edit_draft(lambda d: d["songs"][uri].update(local=True))
+    before = stored()
+
+    res = elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": to})
+
+    assert res.status_code == 400, res.text
+    assert elsewhere.log == []
+    assert stored() == before
+
+
+def test_refused_once_done_has_started(elsewhere):
+    edit_draft(lambda d: d.update(done={"opts": {}, "created": {}, "filled": [], "original_done": False}))
+    uri = stored()["parts"][0]["uris"][0]
+
+    res = elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "A1"})
+
+    assert res.status_code == 409
+    assert res.json()["detail"] == appmod._SPLITPARTS_DONE_STARTED_MSG
+    assert elsewhere.log == []
+
+
+def test_refused_while_a_job_runs_for_this_split(elsewhere):
+    appmod._splitparts_job.update({"pid": "H1", "state": "running"})
+    uri = stored()["parts"][0]["uris"][0]
+
+    res = elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "A1"})
+
+    assert res.status_code == 409 and "already running" in res.json()["detail"]
+    assert elsewhere.log == []
+
+
+def test_no_draft_is_a_404(elsewhere):
+    res = elsewhere.post("/api/splitparts/H2/elsewhere", json={"uri": "x", "to_id": "A1"})
+
+    assert res.status_code == 404
+    assert elsewhere.log == []
+
+
+def test_a_failed_add_changes_nothing(elsewhere, monkeypatch):
+    def add(pid, uris, bulk=False, spend_reserve=False):
+        raise SpotifyError(500, "boom")
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", add)
+    before = stored()
+    uri = before["parts"][0]["uris"][0]
+
+    res = elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "A1"})
+
+    assert res.status_code >= 400
+    assert elsewhere.log == [] and stored() == before
+
+
+def test_added_but_not_removed_says_it_is_in_both_and_keeps_the_draft(elsewhere, monkeypatch):
+    def remove(pid, uri):
+        elsewhere.log.append(("remove", pid, [uri]))
+        raise SpotifyError(500, "boom")
+    monkeypatch.setattr(appmod.sp, "remove_from_playlist", remove)
+    monkeypatch.setattr(appmod.sp, "remove_many", lambda pid, uris: remove(pid, uris[0]))
+    before = stored()
+    uri = before["parts"][0]["uris"][0]
+
+    res = elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "A1"})
+
+    assert res.status_code >= 400
+    assert "both" in res.json()["detail"] and "alpha" in res.json()["detail"]
+    assert [e[0] for e in elsewhere.log] == ["add", "remove"]
+    assert stored() == before
