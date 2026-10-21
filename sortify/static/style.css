@@ -1243,9 +1243,9 @@ body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { t
 .sp-chip.drop { background: var(--accent); color: var(--bg); }
 .sp-chip-n { color: var(--muted); font-size: .85rem; }
 .sp-chip.drop .sp-chip-n { color: inherit; }
-/* Song rows stop short of the right edge: a swipe in that free strip
-   scrolls the list, a touch on a song drags it. */
-#sp-list { padding-right: 20%; }
+/* Song rows stop short of both edges, centred: a swipe in either free
+   strip scrolls the list, a touch on a song drags it. */
+#sp-list { padding-left: 10%; padding-right: 10%; }
 .sp-song {
   position: relative; overflow: hidden;   /* the hold's press bar (::before) */
   touch-action: none; user-select: none; -webkit-user-select: none;
