@@ -3273,6 +3273,15 @@ const previewHold = (() => {
   // `pageUrl(offset)` for each next one. A playlist's medley by default;
   // openList hands in another source (a split part's songs).
   let pageUrl = null;
+  // Told the uri of the song on the card each time it changes, and null when
+  // the player closes or is replaced — so a list the player was opened from
+  // can mark the row being heard. Only openList callers hand one in.
+  let onTrack = null, shownUri = null;
+  function noteTrack(u) {
+    if (u === shownUri) return;
+    shownUri = u;
+    if (onTrack) onTrack(u);
+  }
   const playlistPages = (p) => (offset) =>
     offset == null ? `/api/playlist_preview/${p}` : `/api/playlist_preview/${p}?offset=${offset}`;
 
@@ -3379,6 +3388,7 @@ const previewHold = (() => {
 
   function render(statusLine) {
     const c = clips[idx];
+    noteTrack((c && c.uri) || null);
     const now = statusLine ? `<div class="pv-now">${esc(statusLine)}</div>` :
       c ? `<div class="pv-now">${esc(c.artist)} — ${esc(c.name)}</div>` : "";
     // The text list only fills in when there is no audio at all — with a
@@ -3546,8 +3556,11 @@ const previewHold = (() => {
   // `p` is then only the key its position stash is kept under. Such a list
   // never resumes a stash: it is opened on one chosen song, and must start
   // there (its order can also have changed since, under the stash).
-  async function open(p, t, a, pages = null) {
+  async function open(p, t, a, pages = null, onTrack_ = null) {
     seq++; const mySeq = seq;
+    // The list the old popup was marking hears that it ended.
+    noteTrack(null);
+    onTrack = onTrack_;
     // Whatever was playing keeps its place first — replacing the popup with
     // another playlist's must not forget where this one stood.
     stashPosition();
@@ -3615,6 +3628,7 @@ const previewHold = (() => {
     pop().hidden = true;
     document.body.classList.remove("previewing");
     needsTap = false; act = null;
+    noteTrack(null); onTrack = null;
     // One budgeted call per popup session, and only when preview audio
     // actually took focus from a playback that was running (resumeSpotify
     // checks exactly that; it is a no-op after the end-of-playlist resume).
@@ -3678,7 +3692,7 @@ const previewHold = (() => {
     consumeClick() { const f = fired; fired = false; return f; },
     // The player opened by a tap rather than a hold, on a caller's own page
     // source (see open). `key` keeps its stash apart from real playlists.
-    openList: (key, title_, pages) => open(key, title_, null, pages),
+    openList: (key, title_, pages, onTrack_) => open(key, title_, null, pages, onTrack_),
     stop: (hard) => close(hard),
   };
 })();
@@ -3725,7 +3739,21 @@ function spPreview(uri) {
   if (!part) return;
   const base = `${spUrl("/preview")}?key=${encodeURIComponent(part.key)}`;
   previewHold.openList(`split:${spPid}:${part.key}`, part.name, (offset) =>
-    offset == null ? `${base}&start=${encodeURIComponent(uri)}` : `${base}&offset=${offset}`);
+    offset == null ? `${base}&start=${encodeURIComponent(uri)}` : `${base}&offset=${offset}`,
+    spMarkPlaying);
+}
+// The song the open player is on, marked in the list (null when it closes).
+// The two rows are re-classed in place, not redrawn: the list must not be
+// replaced under a finger that may be mid-drag; renderSpList draws the mark
+// on every redraw after.
+let spPlaying = null;
+function spMarkPlaying(u) {
+  const row = (x) => x && $("sp-list").querySelector(`.sp-song[data-uri="${x.replace(/"/g, '\\"')}"]`);
+  const was = row(spPlaying);
+  if (was) was.classList.remove("playing");
+  spPlaying = u;
+  const now = row(u);
+  if (now) now.classList.add("playing");
 }
 
 // ---- the row's icon: move the song to another home instead -----------------
@@ -4728,7 +4756,7 @@ function renderSpList() {
         const s = spDraft.songs[u] || { name: u, artists: "" };
         // The icon sits inside the row, so pressing it starts the row's own
         // drag; only a tap on it is its own (see spPointerUp).
-        return `<div class="sp-song" data-uri="${esc(u)}">
+        return `<div class="sp-song${u === spPlaying ? " playing" : ""}" data-uri="${esc(u)}">
           <span class="sp-song-text">
             <span class="sp-song-name">${esc(s.name)}${unknown.has(u) ? ' <span class="sp-unknown" title="no Last.fm data — check where it landed">?</span>' : ""}</span>
             <span class="sp-song-artist">${esc(s.artists)}</span>
