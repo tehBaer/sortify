@@ -1278,6 +1278,8 @@ ARCHIVED = {"id": "Z1", "name": "🗄️ old stuff", "owner": "me", "editable": 
             "total": 9, "snapshot_id": "snap-z", "image": None, "description": ""}
 THEIRS = {"id": "T1", "name": "Theirs", "owner": "them", "editable": False,
           "total": 50, "snapshot_id": "snap-t", "image": None, "description": ""}
+PLAIN = {"id": "P1", "name": "just a playlist", "owner": "me", "editable": True,
+         "total": 7, "snapshot_id": "snap-p", "image": None, "description": ""}
 LIKED = {"id": "liked", "name": "Liked Songs", "owner": "you", "editable": True,
          "total": 900, "snapshot_id": None, "image": None, "description": ""}
 
@@ -1342,10 +1344,13 @@ def test_targets_are_the_other_editable_homes_sorted_with_folders(elsewhere):
     assert elsewhere.log == [] and elsewhere.calls == []      # the cached listing, zero calls
 
 
-def test_a_song_cannot_be_moved_to_a_playlist_that_is_not_a_home(elsewhere):
+def test_a_song_cannot_be_moved_to_a_playlist_that_is_neither_a_home_nor_an_input(elsewhere):
+    cache = appmod.store.cache()
+    cache["playlist_list"]["items"].append(PLAIN)
+    appmod.store.save_cache(cache)
     uri = stored()["parts"][0]["uris"][0]
 
-    res = elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "X1"})
+    res = elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "P1"})
 
     assert res.status_code == 400
     assert elsewhere.log == []
@@ -2044,3 +2049,88 @@ def test_a_failed_first_into_add_leaves_the_split_unlocked(into, monkeypatch):
 
     assert progress(into)["state"] == "error"
     assert stored()["done"] is None
+
+
+
+# ---- back to a buffer: one song from the split to an input -------------------
+
+BUF_A = {"id": "B1", "name": "[Hazy]", "owner": "me", "editable": True,
+         "total": 4, "snapshot_id": "snap-b1", "image": None, "description": ""}
+BUF_BOMB = {"id": "B2", "name": "Progressive rock", "owner": "me", "editable": True,
+            "total": 8, "snapshot_id": "snap-b2", "image": None, "description": ""}
+BUF_OLD = {"id": "B3", "name": "🗄️ [Gone]", "owner": "me", "editable": True,
+           "total": 1, "snapshot_id": "snap-b3", "image": None, "description": ""}
+BUF_THEIRS = {"id": "B4", "name": "[Theirs]", "owner": "them", "editable": False,
+              "total": 3, "snapshot_id": "snap-b4", "image": None, "description": ""}
+
+
+@pytest.fixture
+def buffers(elsewhere):
+    cache = appmod.store.cache()
+    cache["playlist_list"]["items"] += [BUF_A, BUF_BOMB, BUF_OLD, BUF_THEIRS, PLAIN]
+    cache["playlists"]["B1"] = {"snapshot_id": "snap-b1", "tracks": [], "fetched_at": 1.0}
+    appmod.store.save_cache(cache)
+    folders = appmod.store.folders()
+    folders["B2"] = {"path": "ROOT / THE BOMB"}
+    appmod.store.save_folders(folders)
+    # X1 "[Inbox]" is an input by id; liked is marked one too, and must still
+    # never be offered; H1 (the split) matching no rule is not one.
+    appmod.store.update_config(input_ids=["X1", "liked", "B3"], input_sets=INPUT_SETS)
+    elsewhere.snaps["B1"] = "snap-b1"
+    return elsewhere
+
+
+def test_buffer_targets_are_the_inputs_with_their_set_sorted_and_free(buffers):
+    res = buffers.get("/api/splitparts/H1/targets", params={"kind": "buffer"})
+
+    assert res.status_code == 200, res.text
+    assert res.json()["targets"] == [
+        {"id": "B1", "name": "[Hazy]", "set": "buffer"},
+        {"id": "X1", "name": "[Inbox]", "set": "buffer"},
+        {"id": "B2", "name": "Progressive rock", "set": "the-bomb"},
+    ]
+    assert buffers.log == [] and buffers.calls == []
+
+
+def test_the_default_targets_stay_homes_only(buffers):
+    homes = buffers.get("/api/splitparts/H1/targets").json()["targets"]
+    also = buffers.get("/api/splitparts/H1/targets", params={"kind": "home"}).json()["targets"]
+
+    assert [t["id"] for t in homes] == ["A1", "H2"] and also == homes
+
+
+def test_an_unknown_targets_kind_is_a_400(buffers):
+    assert buffers.get("/api/splitparts/H1/targets", params={"kind": "subset"}).status_code == 400
+
+
+def test_a_song_can_be_moved_back_to_a_buffer(buffers):
+    uri = stored()["parts"][0]["uris"][0]
+
+    res = buffers.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "B1"})
+
+    assert res.status_code == 200, res.text
+    assert buffers.log == [("snapshot", "H1"), ("add", "B1", [uri]), ("remove", "H1", [uri])]
+    assert res.json()["moved_to"] == {"id": "B1", "name": "[Hazy]"}
+    assert all(uri not in p["uris"] for p in stored()["parts"])
+    assert uri in [t["uri"] for t in appmod.store.cache()["playlists"]["B1"]["tracks"]]
+
+
+@pytest.mark.parametrize("to", ["B3", "B4", "liked", "P1"])
+def test_an_archived_readonly_liked_or_plain_playlist_is_no_buffer_target(buffers, to):
+    uri = stored()["parts"][0]["uris"][0]
+    before = stored()
+
+    res = buffers.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": to})
+
+    assert res.status_code == 400, res.text
+    assert buffers.log == [] and stored() == before
+
+
+def test_moving_to_a_buffer_keeps_the_changed_playlist_guard(buffers):
+    buffers.snaps["H1"] = "snap-9"
+    uri = stored()["parts"][0]["uris"][0]
+
+    res = buffers.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "B1"})
+
+    assert res.status_code == 409
+    assert buffers.log == [("snapshot", "H1")]

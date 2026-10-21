@@ -6423,6 +6423,108 @@ run("stopNowPolling()");
   }
 }
 
+// ============================================================================
+// SPB — 2026-10-21: "Move back to a buffer" beside the magnifier. It acts
+// like the magnifier (press and move drags, a hold plays, a tap opens a
+// picker) but its picker lists the inputs, each with its set as the grey
+// line, kept apart from the homes the magnifier lists.
+// ============================================================================
+{
+  const savedNow = run("JSON.stringify(nowState)");
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    const songs = { u1: { name: "Ronda", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                    u3: { name: "Three", artists: "C", local: false } };
+    const D = (parts, extra = {}) => ({ playlist_id: "H6", name: "Big Home", snapshot_id: "s1", n: 2, parts,
+      unknown: [], hint: null, scores: {}, songs, done: null, edited: false, ...extra });
+    const two = () => [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3"] }];
+    run(`show("split"); nowState = { is_playing: false }; previewHold.stop(true); $("picker").hidden = true;
+         spTargets = null; spBuffers = null`);
+    run(`spDraft = ${JSON.stringify(D(two()))}; spPid = "H6"; spShown = "p1"; spSection("sp-work"); renderSpParts()`);
+    // icon: "buffer", "elsewhere" or null — what closest() finds above the target
+    const press = (uri, icon, x, y, id) => run(`spListPointerDown({
+      target: { closest: (sel) => sel === ".sp-song" ? { dataset: { uri: ${JSON.stringify(uri)} } }
+                                : sel === ".sp-buffer" ? (${JSON.stringify(icon)} === "buffer" ? {} : null)
+                                : sel === ".sp-elsewhere" ? (${JSON.stringify(icon)} === "elsewhere" ? {} : null) : null },
+      clientX: ${x}, clientY: ${y}, pointerId: ${id}, preventDefault() {} })`);
+    const listHtml = () => $$("sp-list").innerHTML;
+    check("SPB every song row carries both icons, the tray labelled 'Move back to a buffer'",
+          (listHtml().match(/class="[^"]*sp-buffer[^"]*"[^>]*aria-label="Move back to a buffer"[^>]*>\s*<svg/g) || []).length === 2 &&
+          (listHtml().match(/aria-label="Move to another home"/g) || []).length === 2 &&
+          listHtml().includes(run("ICON_INBOX_SM")), listHtml().slice(0, 500));
+
+    routes["GET /api/splitparts/H6/targets?kind=buffer"] = { targets: [
+      { id: "B1", name: "[Hazy]", set: "buffer" }, { id: "B2", name: "Progressive rock", set: "the-bomb" }] };
+    routes["GET /api/splitparts/H6/targets"] = { targets: [{ id: "A1", name: "alpha", folder: "ROOT / Mix" }] };
+
+    // 1: a tap on the tray opens the buffer picker, no preview
+    resetLog();
+    press("u1", "buffer", 10, 10, 61);
+    await run(`spPointerUp(10, 10, 61)`);
+    await tick();
+    const rows = $$("picker-list").children;
+    check("SPB a tap on the tray opens the picker on the inputs, set as the grey line",
+          $$("picker").hidden === false && gets("/api/splitparts/H6/targets?kind=buffer") === 1 &&
+          gets("/api/splitparts/H6/targets") === 0 && rows.length === 2 &&
+          rows.some((r) => /\[Hazy\]/.test(r.innerHTML) && /p-sub">buffer</.test(r.innerHTML)) &&
+          rows.some((r) => /Progressive rock/.test(r.innerHTML) && /p-sub">the bomb</.test(r.innerHTML)),
+          rows.map((r) => r.innerHTML).join(" | "));
+    check("SPB ...with no preview and no create row",
+          !log.some((l) => l.path.includes("/preview")) && $$("preview-pop").hidden === true &&
+          !rows.some((r) => /picker-create/.test(r.className)), JSON.stringify(log.map((l) => l.path)));
+
+    // 2: a pick moves the song through /elsewhere
+    routes["POST /api/splitparts/H6/elsewhere"] = { ...D([{ key: "p1", name: "rock", uris: ["u2"] },
+      { key: "p2", name: "jazz", uris: ["u3"] }], { edited: true }), moved_to: { id: "B1", name: "[Hazy]" } };
+    rows.find((r) => /\[Hazy\]/.test(r.innerHTML)).onclick();
+    const early = $$("toast").textContent;
+    await tick(); await tick();
+    const sent = bodies("/api/splitparts/H6/elsewhere").filter(Boolean);
+    check("SPB a pick posts /elsewhere with that input's id",
+          sent.length === 1 && sent[0].uri === "u1" && sent[0].to_id === "B1", JSON.stringify(sent));
+    check("SPB ...saying 'moving to' at once, then 'moved to', and the song leaves the list",
+          early === "moving to [Hazy]…" && $$("toast").textContent === "moved to [Hazy]" && !/data-uri="u1"/.test(listHtml()),
+          `${early} | ${$$("toast").textContent}`);
+
+    // 3: the buffer list is kept per split, and the magnifier still lists homes
+    resetLog();
+    press("u2", "elsewhere", 10, 10, 62);
+    await run(`spPointerUp(10, 10, 62)`);
+    await tick();
+    check("SPB the magnifier still opens the homes list, asked for apart from the buffers",
+          $$("picker").hidden === false && gets("/api/splitparts/H6/targets") === 1 &&
+          $$("picker-list").children.length === 1 && /alpha/.test($$("picker-list").children[0].innerHTML),
+          $$("picker-list").children.map((r) => r.innerHTML).join(" | "));
+    run(`$("picker").hidden = true`);
+    resetLog();
+    press("u2", "buffer", 10, 10, 63);
+    await run(`spPointerUp(10, 10, 63)`);
+    check("SPB a second tray tap opens at once, without asking again",
+          $$("picker").hidden === false && gets("/api/splitparts/H6/targets?kind=buffer") === 0 &&
+          /\[Hazy\]/.test($$("picker-list").children.map((r) => r.innerHTML).join(" ")), JSON.stringify(log.map((l) => l.path)));
+    run(`$("picker").hidden = true`);
+
+    // 4: press on the tray and move: a drag, no picker
+    resetLog();
+    routes["POST /api/splitparts/H6/move"] = D([{ key: "p1", name: "rock", uris: [] }, { key: "p2", name: "jazz", uris: ["u3", "u2"] }]);
+    document.elementFromPoint = () => ({ closest: () => ({ dataset: { key: "p2" } }) });
+    press("u2", "buffer", 10, 10, 64);
+    run(`spPointerMove(10, 40, 64)`);
+    const lifted = document.body.children.some((c) => c.className === "sp-ghost");
+    await run(`spPointerUp(10, 40, 64)`);
+    await tick();
+    document.elementFromPoint = () => null;
+    const mv = bodies("/api/splitparts/H6/move").filter(Boolean);
+    check("SPB a press on the tray that moves drags the song, with no picker",
+          lifted && mv.length === 1 && mv[0].uri === "u2" && mv[0].to === "p2" && $$("picker").hidden === true &&
+          gets("/api/splitparts/H6/targets?kind=buffer") === 0, JSON.stringify(mv));
+  } finally {
+    document.elementFromPoint = () => null;
+    run(`spStopPolling(); previewHold.stop(true); $("picker").hidden = true; spTargets = null; spBuffers = null; nowState = ${savedNow}; show("lists")`);
+  }
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

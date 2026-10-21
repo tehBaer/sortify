@@ -252,6 +252,16 @@ escalating penalties. Therefore:
   buried them in the search. Opening that picker closes the preview
   player first: the player sits above the picker, and a tap meant for a
   lower row landed on it, so the pick never happened.
+  Beside it, the row's tray icon, "Move back to a buffer" (2026-10-21),
+  is the same move over the other list: `GET .../targets?kind=buffer`
+  gives every input (`_effective_input_ids`, so archived ones are out;
+  never Liked Songs, a read-only one or the split playlist) with its set
+  key, from config and the cached listing, zero calls. The picker shows
+  the set as the grey line, like the Now card's "Move to buffer…", with
+  no create row and no preview. `/elsewhere` accepts a `to_id` from
+  either list, with every guard unchanged; the magnifier's list stays
+  homes only. The two lists are cached per split apart (`spTargets`,
+  `spBuffers`).
   Suggest reads the snapshot (1 call) and the track list only when it
   moved (~1 per 100).
 - The grouping (`sortify/splitparts.py`) is pure and offline: artist tags,

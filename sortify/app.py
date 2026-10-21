@@ -995,10 +995,30 @@ def _splitparts_targets(pid: str) -> list[dict]:
                             store.config().get("home_ids") or [])
 
 
+def _splitparts_buffer_targets(pid: str) -> list[dict]:
+    """The inputs a song of this split can go back to, from the cached
+    listing and config (zero calls) — the playlists the Now card's "Move to
+    buffer…" offers, each with its input set."""
+    listing = (store.cache().get("playlist_list") or {}).get("items") or []
+    cfg = store.config()
+    inputs = _effective_input_ids(cfg, listing)
+    sets, folders = inputsets.resolve_sets(cfg), store.folders()
+    set_keys = {p["id"]: (inputsets.set_of(p.get("name") or "", (folders.get(p["id"]) or {}).get("path"),
+                                           sets) or inputsets.DEFAULT_KEY)
+                for p in listing if p.get("id") in inputs}
+    return spa.buffer_targets(listing, pid, inputs, set_keys, LIKED_ID)
+
+
 @app.get("/api/splitparts/{pid}/targets")
-def splitparts_targets(pid: str):
-    """The playlists a song of this split can be moved to instead. Zero calls."""
-    return {"targets": _splitparts_targets(pid)}
+def splitparts_targets(pid: str, kind: str = "home"):
+    """The playlists a song of this split can be moved to instead. Zero
+    calls. `kind=home` (the magnifier) lists other homes only; `kind=buffer`
+    (the tray) lists the inputs, for a song going back to an inbox."""
+    if kind == "home":
+        return {"targets": _splitparts_targets(pid)}
+    if kind == "buffer":
+        return {"targets": _splitparts_buffer_targets(pid)}
+    raise HTTPException(400, "kind is home or buffer")
 
 
 class SplitElsewhereIn(BaseModel):
@@ -1037,7 +1057,9 @@ def splitparts_elsewhere(pid: str, body: SplitElsewhereIn):
             raise HTTPException(400, "a local file cannot be added through Spotify's API")
         if body.to_id == pid:
             raise HTTPException(400, "that is the playlist being split")
-        target = next((t for t in _splitparts_targets(pid) if t["id"] == body.to_id), None)
+        # Either list: another home (the magnifier) or an input (the tray).
+        target = next((t for t in _splitparts_targets(pid) + _splitparts_buffer_targets(pid)
+                       if t["id"] == body.to_id), None)
         if target is None:
             raise HTTPException(400, "not a playlist this song can be moved to")
         if sp.snapshot(pid) != draft["snapshot_id"]:

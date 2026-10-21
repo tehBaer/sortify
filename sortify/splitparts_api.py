@@ -172,6 +172,22 @@ def move_targets(listing: list[dict], pid: str, folders: dict, liked_id: str,
     return sorted(out, key=lambda t: (t["name"].casefold(), t["id"]))
 
 
+def buffer_targets(listing: list[dict], pid: str, input_ids, set_keys: dict[str, str],
+                   liked_id: str) -> list[dict]:
+    """Where a song of this split can go back to an inbox: the input
+    playlists in the cached listing that can take an add, each with the key
+    of its input set (the picker's grey line). Never the split one itself,
+    archived ones (already left out of `input_ids`) or Liked Songs. Kept
+    apart from `move_targets`, whose list stays homes only. Sorted by name."""
+    from .playlist_roles import is_archived
+    inputs = set(input_ids)
+    out = [{"id": p["id"], "name": p.get("name") or "", "set": set_keys.get(p["id"])}
+           for p in listing
+           if p.get("id") in inputs and p["id"] not in (pid, liked_id) and p.get("editable")
+           and not is_archived(p.get("name") or "")]
+    return sorted(out, key=lambda t: (t["name"].casefold(), t["id"]))
+
+
 def add_part(draft: dict) -> dict:
     from .splitparts import MAX_PARTS
     if len(draft["parts"]) >= MAX_PARTS:

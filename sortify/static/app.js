@@ -1509,6 +1509,9 @@ const ICON_REMOVE = '<svg viewBox="0 0 24 24" width="22" height="22" fill="curre
 // The magnifier the card uses wherever a control opens a searchable list —
 // Add to… wears the 18px one inline; this is the chip-sized twin.
 const ICON_SEARCH_SM = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>';
+// An inbox tray, drawn like the magnifier beside it: the Split tab's "Move
+// back to a buffer".
+const ICON_INBOX_SM = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 13h5l1.5 3h5l1.5-3h5"/><path d="M5.5 5h13L21 13v6H3v-6z"/></svg>';
 // Take this song back out of a home it is already in. A minus rather than an
 // ✕: the song is not being deleted, it is being un-filed, and the row it sits
 // on goes back to being an ordinary guess.
@@ -3773,21 +3776,32 @@ function spMarkPlaying(u) {
 // trip): a picker opened in the same task as the tap raises the keyboard
 // everywhere, one opened after an await does not on every phone.
 let spTargets = null;   // {pid, map} — the last split's move targets
+// The tray's list ("Move back to a buffer"): the inputs, kept apart from the
+// homes — the magnifier's search stays homes only, by the user's wish.
+let spBuffers = null;   // {pid, map}
 
-// The split's homes, kept once fetched. Called as `spTargetsFor(pid) ||
-// await spFetchTargets(pid)`, so a cached list opens the picker without
-// an await — in the tap's own task, which is what raises the keyboard.
-function spTargetsFor(pid) { return spTargets?.pid === pid ? spTargets.map : null; }
-async function spFetchTargets(pid) {
+// The split's homes (or, `kind` "buffer", its inputs), kept once fetched.
+// Called as `spTargetsFor(pid) || await spFetchTargets(pid)`, so a cached
+// list opens the picker without an await — in the tap's own task, which is
+// what raises the keyboard.
+function spTargetsFor(pid, kind = "home") {
+  const held = kind === "buffer" ? spBuffers : spTargets;
+  return held?.pid === pid ? held.map : null;
+}
+async function spFetchTargets(pid, kind = "home") {
   let targets;
   try {
-    targets = (await api(spUrl("/targets", pid))).targets || [];
+    targets = (await api(spUrl(kind === "buffer" ? "/targets?kind=buffer" : "/targets", pid))).targets || [];
   } catch (e) {
     toast(e.message);
     return null;
   }
-  spTargets = { pid, map: new Map(targets.map((t) => [t.id, t])) };
-  return spTargets.map;
+  // An input carries no folder in the picker's sense: its set label is the
+  // grey line, as on the Now card's "Move to buffer…".
+  const map = new Map(targets.map((t) => [t.id, kind === "buffer"
+    ? { id: t.id, name: t.name, folder: setLabel(t.set) } : t]));
+  if (kind === "buffer") spBuffers = { pid, map }; else spTargets = { pid, map };
+  return map;
 }
 
 async function spOpenElsewhere(uri) {
@@ -3798,6 +3812,20 @@ async function spOpenElsewhere(uri) {
   // The server's order (by name); no hold-to-preview on these rows.
   openPicker(map, (id) => spElsewhere(uri, id, map.get(id)?.name), null, null, "Move here", "home",
              { preview: false, keepOrder: true });
+}
+
+// The tray: back to an inbox. The same move as the magnifier's (one song,
+// at once, through /elsewhere, 3 calls), over the list "Move to buffer…"
+// offers on the Now card: every input, grouped by set, no create row and
+// no hold-to-preview. Opened without the keyboard, as there: the list is a
+// handful of inboxes, and the keyboard would cover it.
+async function spOpenBuffer(uri) {
+  previewHold.stop();
+  const pid = spPid, gen = spDraftGen;
+  const map = spTargetsFor(pid, "buffer") || await spFetchTargets(pid, "buffer");
+  if (!map || pid !== spPid || gen !== spDraftGen || $("sp-parts").hidden) return;
+  openPicker(map, (id) => spElsewhere(uri, id, map.get(id)?.name), null, null, "Move here", "input",
+             { preview: false, focus: false });
 }
 
 async function spElsewhere(uri, toId, toName) {
@@ -3918,13 +3946,15 @@ async function spPointerUp(x, y, id) {
   const lifted = spDrag.lifted;
   const key = lifted ? spChipAt(x, y) : null;
   const d = spEndDrag();
-  // Not lifted: a tap — on the icon it moves the song elsewhere, anywhere
-  // else on the row it previews.
+  // Not lifted: a tap — on the magnifier it moves the song to another
+  // home, on the tray back to a buffer, anywhere else on the row it previews.
   if (!lifted) {
     spSwallowGhostClick();
     // A hold already played it in Spotify; its release is not also a tap.
     if (d.held) return;
-    if (d.onIcon) spOpenElsewhere(d.uri); else spPreview(d.uri);
+    if (d.onIcon === "buffer") spOpenBuffer(d.uri);
+    else if (d.onIcon) spOpenElsewhere(d.uri);
+    else spPreview(d.uri);
     return;
   }
   if (key && key !== spShown) await spMove(d.uri, key);
@@ -3953,7 +3983,9 @@ function spListPointerDown(e) {
   const row = e.target && e.target.closest ? e.target.closest(".sp-song") : null;
   if (!row || (e.button !== undefined && e.button > 0)) return;
   e.preventDefault();
-  const onIcon = !!(e.target.closest && e.target.closest(".sp-elsewhere"));
+  // Which icon, if any: the two open different pickers on a tap.
+  const on = (sel) => !!(e.target.closest && e.target.closest(sel));
+  const onIcon = on(".sp-buffer") ? "buffer" : on(".sp-elsewhere") ? "elsewhere" : false;
   spPointerDown(row.dataset.uri, e.clientX, e.clientY, e.pointerId, onIcon, row);
 }
 document.addEventListener("pointermove", (e) => {
@@ -4907,13 +4939,14 @@ function renderSpList() {
   $("sp-list").innerHTML = part && part.uris.length
     ? part.uris.map((u) => {
         const s = spDraft.songs[u] || { name: u, artists: "" };
-        // The icon sits inside the row, so pressing it starts the row's own
-        // drag; only a tap on it is its own (see spPointerUp).
+        // The icons sit inside the row, so pressing one starts the row's own
+        // drag; only a tap on one is its own (see spPointerUp).
         return `<div class="sp-song${u === spPlaying ? " playing" : ""}" data-uri="${esc(u)}">
           <span class="sp-song-text">
             <span class="sp-song-name">${esc(s.name)}${unknown.has(u) ? ' <span class="sp-unknown" title="no Last.fm data — check where it landed">?</span>' : ""}</span>
             <span class="sp-song-artist">${esc(s.artists)}</span>
           </span>
+          <button type="button" class="icon-btn sp-buffer" aria-label="Move back to a buffer">${ICON_INBOX_SM}</button>
           <button type="button" class="icon-btn sp-elsewhere" aria-label="Move to another home">${ICON_SEARCH_SM}</button>
         </div>`;
       }).join("")
