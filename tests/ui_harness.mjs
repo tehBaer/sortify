@@ -180,7 +180,7 @@ async function fetchStub(path, opts) {
   // the client sends back, which a method+path log cannot see.
   log.push({ method: opts?.method || "GET", path, body: opts?.body });
   let r = routes[k];
-  if (typeof r === "function") r = r();
+  if (typeof r === "function") r = r(opts);
   r = await r;
   if (!r) r = { status: 200, body: {} };
   // Shorthand for the common "just a success body" case: a route value with
@@ -4805,21 +4805,22 @@ run("stopNowPolling()");
   // remove the shown part: asks with destinations, then shows another part
   run(`spDraft = ${JSON.stringify(D(two()))}`);
   run(`spShown = "p2"; renderSpParts()`);
-  routes["POST /api/splitparts/H1/parts/p2/remove"] = (() => {
-    let n = 0;
-    return () => (n++ === 0
-      ? { status: 200, body: { moves: { p1: 2 } } }
-      : { status: 200, body: D([{ key: "p1", name: "rock", uris: ["u1", "u2", "u3", "u4"] }, { key: "p9", name: "x", uris: [] }]) });
-  })();
+  routes["POST /api/splitparts/H1/parts/p2/remove"] = (opts) => (JSON.parse(opts.body).dry
+    ? { status: 200, body: { moves: { p1: 2 } } }
+    : { status: 200, body: D([{ key: "p1", name: "rock", uris: ["u1", "u2", "u3", "u4"] }, { key: "p9", name: "x", uris: [] }]) });
   let asked = "";
-  ctx.confirm = (m) => { asked = m; return false; };
   await run(`spRemovePart("p2")`);
+  asked = $$("sp-actions").innerHTML;
   check("SP2 removing a part asks first, naming where its songs go",
         /jazz/.test(asked) && /2 songs/.test(asked) && /rock: 2/.test(asked), asked);
-  check("SP2 ...and a no changes nothing",
-        log.filter((l) => l.path.endsWith("/remove")).length === 1 && run("spShown") === "p2", "");
-  ctx.confirm = () => true;
+  $$("sp-rm-cancel").onclick();
+  // (Two parts here, so the redrawn actions carry no Remove button.)
+  check("SP2 ...and Cancel changes nothing",
+        log.filter((l) => l.path.endsWith("/remove")).length === 1 && run("spShown") === "p2" &&
+        /id="sp-start-over"/.test($$("sp-actions").innerHTML) && !/sp-rm-/.test($$("sp-actions").innerHTML),
+        `removes=${log.filter((l) => l.path.endsWith("/remove")).length} shown=${run("spShown")} ${$$("sp-actions").innerHTML.slice(0, 120)}`);
   await run(`spRemovePart("p2")`);
+  await $$("sp-rm-best").onclick();
   check("SP removing the shown part shows another one",
         run("spShown") === "p1" && /data-uri="u3"/.test($$("sp-list").innerHTML), `shown=${run("spShown")}`);
 
@@ -5242,6 +5243,7 @@ run("stopNowPolling()");
     return removeCall === 1 ? { status: 200, body: { moves: { p1: 1 } } } : { status: 200, body: REMOVED_DRAFT };
   };
   await run(`spRemovePart("p2")`);
+  await $$("sp-rm-best").onclick();
   // The parts screen wiped #sp-done, so in a real DOM the old name fields
   // are gone and getElementById answers null for them. The stub keeps every
   // id it ever saw and makes up a blank one for any other, either of which
@@ -6210,6 +6212,91 @@ run("stopNowPolling()");
           run("spPlaying") === null && !marked("u2"), `spPlaying=${run("spPlaying")}`);
   } finally {
     run(`spStopPolling(); previewHold.stop(true); nowState = ${savedNow}; show("lists")`);
+  }
+}
+
+// ============================================================================
+// SPX — 2026-10-21: a hold on a song plays it in Spotify (in the playlist
+// being split), and removing a part can send all of its songs to one part.
+// ============================================================================
+{
+  const savedNow = run("JSON.stringify(nowState)");
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    const songs = { u1: { name: "Ronda", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                    u3: { name: "Three", artists: "C", local: false }, u4: { name: "Four", artists: "D", local: false } };
+    const D = (parts, extra = {}) => ({ playlist_id: "H8", name: "Big Home", snapshot_id: "s1", n: 3, parts,
+      unknown: [], hint: null, scores: {}, songs, done: null, edited: false, ...extra });
+    const three = () => [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3"] },
+                         { key: "p3", name: "blues", uris: ["u4"] }];
+    // Playing, so a preview owes a resume — the hold must not spend it.
+    run(`show("split"); nowState = { is_playing: true }; previewHold.stop(true); $("picker").hidden = true`);
+    run(`spDraft = ${JSON.stringify(D(three()))}; spPid = "H8"; spShown = "p1"; spSection("sp-work"); renderSpParts()`);
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    const posts = (tail) => bodies(`/api/splitparts/H8${tail}`).filter(Boolean);
+
+    // 1: a hold plays the song in Spotify; its release is not a tap
+    routes["POST /api/splitparts/H8/play"] = { ok: true };
+    routes["GET /api/splitparts/H8/preview?key=p1&start=u2"] = {
+      clips: [{ uri: "u2", name: "Two", artist: "B", url: "/x2.mp3", deezer_id: 2 }], next_offset: null, tracks: [], total: 2 };
+    run(`spPointerDown("u2", 10, 10, 51)`);
+    await run(`spPointerUp(10, 10, 51)`);
+    await tick(); await tick();
+    const previewOpen = $$("preview-pop").hidden === false;
+    resetLog();
+    run(`spPointerDown("u1", 10, 10, 52)`);
+    await wait(650);
+    check("SPX a hold on a song plays it in Spotify, in the playlist being split",
+          posts("/play").length === 1 && posts("/play")[0].uri === "u1", JSON.stringify(log.map((l) => l.path)));
+    check("SPX ...closing the open preview without spending its own resume",
+          previewOpen && $$("preview-pop").hidden === true && !log.some((l) => l.path === "/api/preview_resume"),
+          `open=${previewOpen} ${JSON.stringify(log.map((l) => l.path))}`);
+    await run(`spPointerUp(10, 10, 52)`);
+    await tick();
+    check("SPX ...and its release opens no preview and no picker",
+          !log.some((l) => l.path.includes("/preview") || l.path.includes("/targets")) && $$("picker").hidden === true,
+          JSON.stringify(log.map((l) => l.path)));
+    check("SPX ...and says so", /in Spotify/.test($$("toast").textContent) && /Ronda/.test($$("toast").textContent),
+          $$("toast").textContent);
+
+    // 2: a press that moves is a drag, never a play
+    resetLog();
+    document.elementFromPoint = () => null;
+    run(`spPointerDown("u1", 10, 10, 53)`);
+    run(`spPointerMove(10, 40, 53)`);
+    await wait(650);
+    await run(`spPointerUp(10, 40, 53)`);
+    check("SPX a press that moves drags and plays nothing", posts("/play").length === 0, JSON.stringify(log.map((l) => l.path)));
+
+    // 3: a quick tap still previews, and plays nothing
+    resetLog();
+    routes["GET /api/splitparts/H8/preview?key=p1&start=u1"] = { clips: [], next_offset: null, tracks: [], total: 2 };
+    run(`spPointerDown("u1", 10, 10, 54)`);
+    await run(`spPointerUp(10, 10, 54)`);
+    await wait(650);
+    check("SPX a tap previews and plays nothing",
+          gets("/api/splitparts/H8/preview?key=p1&start=u1") === 1 && posts("/play").length === 0, JSON.stringify(log.map((l) => l.path)));
+    run(`previewHold.stop(true, true)`);
+
+    // 4: removing a part offers each other part as the one destination
+    resetLog();
+    routes["POST /api/splitparts/H8/parts/p1/remove"] = (opts) => (JSON.parse(opts.body).dry
+      ? { moves: { p2: 1, p3: 1 } }
+      : D([{ key: "p2", name: "jazz", uris: ["u3"] }, { key: "p3", name: "blues", uris: ["u4", "u1", "u2"] }], { edited: true }));
+    await run(`spRemovePart("p1")`);
+    const ask = $$("sp-actions").innerHTML;
+    check("SPX removing a part offers best fit, or all its songs to one named part",
+          /id="sp-rm-best"/.test(ask) && /jazz: 1/.test(ask) && /id="sp-rm-to-p2"/.test(ask) && /all to “blues”/.test(ask) &&
+          !/sp-rm-to-p1/.test(ask), ask);
+    await $$("sp-rm-to-p3").onclick();
+    const sent = posts("/parts/p1/remove");
+    check("SPX ...picking one sends every song there and shows that part",
+          sent.length === 2 && sent[1].dry === false && sent[1].to === "p3" && run("spShown") === "p3" &&
+          /data-uri="u1"/.test($$("sp-list").innerHTML), JSON.stringify(sent));
+  } finally {
+    document.elementFromPoint = () => null;
+    run(`spStopPolling(); previewHold.stop(true, true); $("picker").hidden = true; nowState = ${savedNow}; show("lists")`);
   }
 }
 

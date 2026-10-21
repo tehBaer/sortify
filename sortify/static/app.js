@@ -3619,7 +3619,9 @@ const previewHold = (() => {
   // into seconds of clip that keep playing OVER the music resumeSpotify()
   // restarts on the very next line — audible, and invisible to the harness,
   // whose timers are never throttled.
-  function close(hard) {
+  // `noResume`: the caller is starting Spotify itself (a hold in the Split
+  // tab), so the resume this would owe is that call, not a second one.
+  function close(hard, noResume = false) {
     seq++;
     clearTimeout(timer); timer = null; holding = false;
     unpress();
@@ -3632,7 +3634,7 @@ const previewHold = (() => {
     // One budgeted call per popup session, and only when preview audio
     // actually took focus from a playback that was running (resumeSpotify
     // checks exactly that; it is a no-op after the end-of-playlist resume).
-    resumeSpotify();
+    if (!noResume) resumeSpotify();
     wasPlaying = audioPlayed = false; resumed = false;
   }
 
@@ -3693,7 +3695,7 @@ const previewHold = (() => {
     // The player opened by a tap rather than a hold, on a caller's own page
     // source (see open). `key` keeps its stash apart from real playlists.
     openList: (key, title_, pages, onTrack_) => open(key, title_, null, pages, onTrack_),
-    stop: (hard) => close(hard),
+    stop: (hard, noResume) => close(hard, noResume),
   };
 })();
 
@@ -3814,6 +3816,7 @@ async function spElsewhere(uri, toId, toName) {
 
 // ---- touch that moves = drag -------------------------------------------------
 const SP_LIFT_PX = 8;
+const SP_HOLD_MS = 550;   // the house hold (previewHold's HOLD_MS)
 let spDrag = null;      // {uri, x0, y0, lifted, ghost, pointerId, onIcon}
 let spDropKey = null;   // the chip under a lifted song
 
@@ -3831,19 +3834,47 @@ function spHighlight(key) {
   });
 }
 
-function spPointerDown(uri, x, y, id, onIcon = false) {
+function spPointerDown(uri, x, y, id, onIcon = false, row = null) {
   // A new touch always ends whatever drag is already in progress — without
   // this a second finger silently overwrote spDrag, orphaning the first
   // finger's ghost and leaving its eventual pointerup to act on someone
   // else's drag.
   spEndDrag();
-  spDrag = { uri, x0: x, y0: y, lifted: false, ghost: null, pointerId: id, onIcon };
+  spDrag = { uri, x0: x, y0: y, lifted: false, ghost: null, pointerId: id, onIcon,
+             row, held: false, holdTimer: null };
+  // Held still: play it in Spotify. The row paints the house's press bar
+  // from 150ms in (style.css), so the hold is watched, not guessed.
+  if (row && row.classList) row.classList.add("holding");
+  const d = spDrag;
+  d.holdTimer = setTimeout(() => {
+    if (spDrag !== d || d.lifted) return;
+    d.held = true;
+    if (d.row && d.row.classList) d.row.classList.remove("holding");
+    if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate(12);
+    spPlaySong(d.uri);
+  }, SP_HOLD_MS);
+}
+
+// One call: the song starts in Spotify inside the playlist being split, and
+// the music carries on down that playlist after it. The preview player
+// closes first, without its own resume call: the play IS the music
+// coming back.
+async function spPlaySong(uri) {
+  previewHold.stop(true, true);
+  toast(`playing “${spSongLabel(uri)}” in Spotify…`);
+  try {
+    await api(spUrl("/play"), { uri });
+    toast(`playing “${spSongLabel(uri)}” in Spotify`);
+  } catch (e) {
+    toast(e.message);
+  }
 }
 
 function spPointerMove(x, y, id) {
   if (!spDrag || id !== spDrag.pointerId) return;
-  if (!spDrag.lifted && Math.hypot(x - spDrag.x0, y - spDrag.y0) >= SP_LIFT_PX) {
+  if (!spDrag.lifted && !spDrag.held && Math.hypot(x - spDrag.x0, y - spDrag.y0) >= SP_LIFT_PX) {
     spDrag.lifted = true;
+    spHoldCancel(spDrag);
     const g = document.createElement("div");
     g.className = "sp-ghost";
     g.textContent = spSongLabel(spDrag.uri);
@@ -3857,9 +3888,16 @@ function spPointerMove(x, y, id) {
   spHighlight(key && key !== spShown ? key : null);
 }
 
+function spHoldCancel(d) {
+  clearTimeout(d.holdTimer);
+  d.holdTimer = null;
+  if (d.row && d.row.classList) d.row.classList.remove("holding");
+}
+
 function spEndDrag() {
   const d = spDrag;
   spDrag = null;
+  if (d) spHoldCancel(d);
   // Only ever the element's own remove() — a real HTMLCollection (what
   // document.body.children actually is) has no indexOf, so searching it by
   // hand threw before this ever got as far as clearing the highlight or
@@ -3878,6 +3916,8 @@ async function spPointerUp(x, y, id) {
   // else on the row it previews.
   if (!lifted) {
     spSwallowGhostClick();
+    // A hold already played it in Spotify; its release is not also a tap.
+    if (d.held) return;
     if (d.onIcon) spOpenElsewhere(d.uri); else spPreview(d.uri);
     return;
   }
@@ -3908,7 +3948,7 @@ function spListPointerDown(e) {
   if (!row || (e.button !== undefined && e.button > 0)) return;
   e.preventDefault();
   const onIcon = !!(e.target.closest && e.target.closest(".sp-elsewhere"));
-  spPointerDown(row.dataset.uri, e.clientX, e.clientY, e.pointerId, onIcon);
+  spPointerDown(row.dataset.uri, e.clientX, e.clientY, e.pointerId, onIcon, row);
 }
 document.addEventListener("pointermove", (e) => {
   if (!spDrag) return;
@@ -3957,14 +3997,30 @@ async function spRemovePart(key) {
     toast(e.message);
     return;
   }
+  // Asked in place of the part's actions, not in a confirm(): there is a
+  // choice to make — each song to the part it fits best, or every one of
+  // them to a part you name.
+  const others = spDraft.parts.filter((p) => p.key !== key);
   const where = Object.entries(dry.moves || {})
-    .map(([k, n]) => `${spPart(k)?.name || k}: ${n}`).join(", ");
-  const msg = part.uris.length
-    ? `Remove “${part.name}”? Its ${part.uris.length} songs go to the parts they fit best — ${where}.`
-    : `Remove the empty part “${part.name}”?`;
-  if (!confirm(msg)) return;
+    .map(([k, n]) => `${esc(spPart(k)?.name || k)}: ${n}`).join(", ");
+  const n = part.uris.length;
+  $("sp-actions").innerHTML = n
+    ? `<p class="sp-rm-ask">Remove “${esc(part.name)}”? Its ${n} song${n === 1 ? "" : "s"} go to:</p>
+       <button id="sp-rm-best">where each fits best — ${where}</button>` +
+      others.map((p) => `<button id="sp-rm-to-${esc(p.key)}">all to “${esc(p.name)}”</button>`).join("") +
+      '<button id="sp-rm-cancel">Cancel</button>'
+    : `<p class="sp-rm-ask">Remove the empty part “${esc(part.name)}”?</p>
+       <button id="sp-rm-best">Remove it</button><button id="sp-rm-cancel">Cancel</button>`;
+  $("sp-rm-best").onclick = () => spDoRemovePart(key, null);
+  if (n) for (const p of others) $(`sp-rm-to-${p.key}`).onclick = () => spDoRemovePart(key, p.key);
+  $("sp-rm-cancel").onclick = renderSpParts;
+}
+
+// `to`: a part key that takes every song, or null for each one's best fit.
+async function spDoRemovePart(key, to) {
   try {
-    spDraft = await api(spUrl(`/parts/${encodeURIComponent(key)}/remove`), { dry: false });
+    spDraft = await api(spUrl(`/parts/${encodeURIComponent(key)}/remove`),
+                        to ? { dry: false, to } : { dry: false });
   } catch (e) {
     toast(e.message);
     return;
@@ -3977,7 +4033,7 @@ async function spRemovePart(key) {
   // meaning that unrelated new part instead of being caught as stale.
   delete spDoneChoice.names[key];
   if (spDoneChoice.part === key) spDoneChoice.part = spDraft.parts[0]?.key || null;
-  if (spShown === key) spShown = spDraft.parts[0]?.key || null;
+  if (spShown === key) spShown = to || spDraft.parts[0]?.key || null;
   renderSpParts();
 }
 
@@ -4766,6 +4822,8 @@ function renderSpList() {
       }).join("")
     : '<p class="hint">no songs in this part yet — drag some onto its chip</p>';
   $("sp-list").onpointerdown = spListPointerDown;
+  // A long press would otherwise raise the phone's own menu over the hold.
+  $("sp-list").oncontextmenu = (e) => e.preventDefault();
 }
 
 // ---- keyboard --------------------------------------------------------------

@@ -225,6 +225,13 @@ escalating penalties. Therefore:
   the house preview player on it (it walks on down that part, via
   `GET /api/splitparts/{pid}/preview`, zero Spotify calls), then Done. Spec:
   `docs/superpowers/specs/2026-10-20-split-into-parts-design.md`.
+- **A hold on a song plays it in Spotify** (`POST /api/splitparts/{pid}/play`,
+  1 call, `play_in_context`): inside the playlist being split, so the music
+  carries on down it. It closes the preview player without that player's
+  own resume call — the play is the music coming back. A press that moves
+  is still a drag, a quick tap still previews.
+- **Removing a part** asks where its songs go: each to its best fit, or all
+  of them to one part you name (`to` in the remove body). Zero calls.
 - **Nothing is written to Spotify before Done** — with one exception the
   user triggers per song: the row's "Move to another home" icon (the Now
   card's magnifier)
