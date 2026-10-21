@@ -1260,7 +1260,7 @@ body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { t
 }
 .sp-chip.sp-add { font-weight: 700; min-width: 2.6rem; }
 #sp-hint { margin: .4rem 0; color: var(--muted); }
-#sp-actions { margin-top: 1rem; gap: .5rem; }
+#sp-actions { margin: 0 0 .5rem; gap: .5rem; }
 #sp-done-row { margin: .5rem 0; }
 
 #sp-done h3 { font-size: 1rem; margin: 1.1rem 0 .4rem; }

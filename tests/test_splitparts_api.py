@@ -1088,3 +1088,12 @@ def test_the_summary_names_the_folder_and_the_original(env):
 
     s = progress(env)["summary"]
     assert s["folder"] == "ROOT / Mix" and s["name"] == "Big Home"
+
+
+def test_the_parts_actions_sit_above_the_song_list():
+    """A part can hold hundreds of songs; its actions (Done, Remove this
+    part, Start over, Discard) must not be a long scroll away below it."""
+    html = (appmod.STATIC / "index.html").read_text()
+    chips, done_row = html.index('id="sp-chips"'), html.index('id="sp-done-row"')
+    actions, song_list = html.index('id="sp-actions"'), html.index('id="sp-list"')
+    assert chips < done_row < actions < song_list
