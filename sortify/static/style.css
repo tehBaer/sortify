@@ -1047,14 +1047,14 @@ kbd {
    already the suggestion's confidence bar. The 150ms delay means an ordinary
    tap never paints one; the 400ms sweep ends exactly as the hold fires, so
    the bar is a countdown the user can watch and abort. */
-.holdable::before {
+.holdable::before, .sp-song::before {
   content: ""; position: absolute; left: 0; top: 0; height: 3px; width: 100%;
   transform: scaleX(0); transform-origin: left; pointer-events: none;
   border-radius: 0 999px 999px 0;
   background: color-mix(in srgb, var(--accent) 80%, transparent);
   transition: transform .12s ease-out;
 }
-.holdable.holding::before { transform: scaleX(1); transition: transform .4s linear .15s; }
+.holdable.holding::before, .sp-song.holding::before { transform: scaleX(1); transition: transform .4s linear .15s; }
 /* while the card is up it must not sit on top of the picker's last rows or
    its Cancel button — the row just held is usually the one underneath it */
 body.previewing .picker-inner { max-height: min(80vh, calc(100dvh - 19rem)); }
@@ -1247,6 +1247,7 @@ body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { t
    scrolls the list, a touch on a song drags it. */
 #sp-list { padding-right: 20%; }
 .sp-song {
+  position: relative; overflow: hidden;   /* the hold's press bar (::before) */
   touch-action: none; user-select: none; -webkit-user-select: none;
   padding: .55rem .7rem; margin: .3rem 0; border-radius: 10px; background: var(--card);
   cursor: grab; display: flex; align-items: center; gap: .5rem;
@@ -1276,6 +1277,7 @@ body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { t
 .sp-chip.sp-add { font-weight: 700; min-width: 2.6rem; }
 #sp-hint { margin: .4rem 0; color: var(--muted); }
 #sp-actions { margin: 0 0 .5rem; gap: .5rem; }
+.sp-rm-ask { flex-basis: 100%; margin: 0; }
 #sp-done-row { margin: .5rem 0; }
 
 #sp-done h3 { font-size: 1rem; margin: 1.1rem 0 .4rem; }

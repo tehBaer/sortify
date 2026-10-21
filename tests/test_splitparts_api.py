@@ -344,6 +344,30 @@ def test_remove_part_moves_each_song_to_its_best_part(drafted):
     assert all(part_of(d2, u) == "p1" for u in moved)
 
 
+def test_remove_part_can_send_every_song_to_one_chosen_part(drafted):
+    drafted.post("/api/splitparts/H1/parts")
+    d = drafted.get("/api/splitparts/H1").json()
+    moved = list(d["parts"][1]["uris"])
+
+    d2 = drafted.post("/api/splitparts/H1/parts/p2/remove", json={"dry": False, "to": "p3"}).json()
+
+    assert [p["key"] for p in d2["parts"]] == ["p1", "p3"]
+    assert d2["parts"][1]["uris"] == moved          # all of them, in their order
+    assert d2["edited"] is True
+    assert appmod.store.splitparts()["drafts"]["H1"]["parts"] == d2["parts"]
+    assert drafted.calls == []
+
+
+def test_remove_part_refuses_a_chosen_part_that_is_not_another_part(drafted):
+    drafted.post("/api/splitparts/H1/parts")
+    before = drafted.get("/api/splitparts/H1").json()
+
+    for to in ("p2", "p9"):   # itself, and no such part
+        res = drafted.post("/api/splitparts/H1/parts/p2/remove", json={"dry": False, "to": to})
+        assert res.status_code == 400
+    assert drafted.get("/api/splitparts/H1").json() == before
+
+
 def test_at_least_two_parts_remain(drafted):
     res = drafted.post("/api/splitparts/H1/parts/p2/remove", json={"dry": False})
 
@@ -1581,3 +1605,53 @@ def test_the_song_list_clears_the_open_preview_player():
     assert 'document.body.classList.add("previewing")' in js
     m = re.search(r"body\.previewing\s+#sp-list\s*\{[^}]*padding-bottom:\s*[^;]+;", css)
     assert m, "no padding under #sp-list while previewing"
+
+
+# ---- hold a song to play it in Spotify ---------------------------------
+
+
+def test_play_starts_the_song_in_the_playlist_being_split(drafted, monkeypatch):
+    played = []
+    monkeypatch.setattr(appmod.sp, "play_in_context",
+                        lambda pid, uri: played.append((pid, uri)), raising=False)
+    uri = drafted.get("/api/splitparts/H1").json()["parts"][0]["uris"][0]
+
+    res = drafted.post("/api/splitparts/H1/play", json={"uri": uri})
+
+    assert res.status_code == 200 and res.json() == {"ok": True}
+    assert played == [("H1", uri)]
+
+
+def test_play_refuses_a_song_not_in_the_split(drafted, monkeypatch):
+    played = []
+    monkeypatch.setattr(appmod.sp, "play_in_context",
+                        lambda pid, uri: played.append((pid, uri)), raising=False)
+
+    res = drafted.post("/api/splitparts/H1/play", json={"uri": "spotify:track:nope"})
+
+    assert res.status_code == 400 and played == []
+
+
+def test_play_without_a_device_says_so(drafted, monkeypatch):
+    from sortify.spotify import SpotifyError
+
+    def no_device(pid, uri):
+        raise SpotifyError(404, "no active device")
+    monkeypatch.setattr(appmod.sp, "play_in_context", no_device, raising=False)
+    uri = drafted.get("/api/splitparts/H1").json()["parts"][0]["uris"][0]
+
+    res = drafted.post("/api/splitparts/H1/play", json={"uri": uri})
+
+    assert res.status_code == 400 and "No active Spotify device" in res.json()["detail"]
+
+
+def test_play_in_context_starts_the_playlist_at_that_song(monkeypatch):
+    from sortify import spotify as spmod
+    sent = []
+    client = spmod.Spotify.__new__(spmod.Spotify)
+    monkeypatch.setattr(client, "request", lambda method, path, **kw: sent.append((method, path, kw)), raising=False)
+
+    client.play_in_context("P1", "spotify:track:t1")
+
+    assert sent == [("PUT", "/me/player/play", {"json": {
+        "context_uri": "spotify:playlist:P1", "offset": {"uri": "spotify:track:t1"}}})]

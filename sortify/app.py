@@ -647,6 +647,8 @@ class SplitMoveIn(BaseModel):
 
 class SplitRemoveIn(BaseModel):
     dry: bool = False
+    # A part key: every song goes there, instead of each to its best fit.
+    to: str | None = None
 
 
 _SPLITPARTS_DONE_STARTED_MSG = "Done has already started for this split — press Done again to finish it"
@@ -947,11 +949,19 @@ def splitparts_remove_part(pid: str, key: str, body: SplitRemoveIn):
             raise HTTPException(409, _SPLITPARTS_DONE_STARTED_MSG)
         if len(draft["parts"]) <= spp.MIN_PARTS:
             raise HTTPException(409, f"at least {spp.MIN_PARTS} parts must remain")
-        try:
-            moves = spa.removal_moves(draft, key, store.tag_artists(),
-                                      store.lastfm_track_map(), store.lastfm_artist_map())
-        except KeyError as exc:
-            raise HTTPException(400, exc.args[0])
+        if body.to is not None:
+            if body.to == key or not any(p["key"] == body.to for p in draft["parts"]):
+                raise HTTPException(400, "pick another part for its songs")
+            leaving = next((p for p in draft["parts"] if p["key"] == key), None)
+            if leaving is None:
+                raise HTTPException(400, f"no part {key}")
+            moves = {u: body.to for u in leaving["uris"]}
+        else:
+            try:
+                moves = spa.removal_moves(draft, key, store.tag_artists(),
+                                          store.lastfm_track_map(), store.lastfm_artist_map())
+            except KeyError as exc:
+                raise HTTPException(400, exc.args[0])
         if body.dry:
             counts: dict[str, int] = {}
             for dest in moves.values():
@@ -960,6 +970,22 @@ def splitparts_remove_part(pid: str, key: str, body: SplitRemoveIn):
         spa.remove_part(draft, key, moves)
         spa.put_draft(store, draft)
     return spa.without_tracks(draft)
+
+
+class SplitPlayIn(BaseModel):
+    uri: str
+
+
+@app.post("/api/splitparts/{pid}/play")
+def splitparts_play(pid: str, body: SplitPlayIn):
+    """A hold on a song: play it in Spotify, in the playlist being split, so
+    the music carries on through that playlist after it. One call; nothing
+    in the draft changes."""
+    with spa._lock:
+        draft = _splitparts_draft(pid)
+        if not spa.has_song(draft, body.uri):
+            raise HTTPException(400, "that song is not in this split")
+    return _playback_call(sp.play_in_context, pid, body.uri)
 
 
 def _splitparts_targets(pid: str) -> list[dict]:

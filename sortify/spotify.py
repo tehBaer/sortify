@@ -802,6 +802,13 @@ class Spotify:
             "PUT", "/me/player/play", json={"context_uri": f"spotify:playlist:{playlist_id}"}
         )
 
+    def play_in_context(self, playlist_id: str, uri: str) -> None:
+        """Play one song of a playlist, the playlist carrying on after it.
+        The uri is the playlist's own (not a relinked stand-in): the offset
+        names a playlist item. One call."""
+        self.request("PUT", "/me/player/play", json={
+            "context_uri": f"spotify:playlist:{playlist_id}", "offset": {"uri": uri}})
+
     def has_scope(self, scope: str) -> bool:
         """Whether the CURRENT token carries a scope — not whether we asked.
 
