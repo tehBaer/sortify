@@ -226,7 +226,8 @@ escalating penalties. Therefore:
   `GET /api/splitparts/{pid}/preview`, zero Spotify calls), then Done. Spec:
   `docs/superpowers/specs/2026-10-20-split-into-parts-design.md`.
 - **Nothing is written to Spotify before Done** — with one exception the
-  user triggers per song: the row's "Move to another playlist" icon
+  user triggers per song: the row's "Move to another home" icon (the Now
+  card's magnifier)
   (`POST /api/splitparts/{pid}/elsewhere`, 3 calls, no undo) first reads the
   split playlist's snapshot and refuses (409, Done's "changed — re-read"
   message) if Spotify moved on since the draft, then adds the song to the
@@ -239,7 +240,11 @@ escalating penalties. Therefore:
   both playlists" error a clean recovery.
   It takes the removal's snapshot into the draft, so Done does not see
   "changed".
-  Its targets (`GET .../targets`) come from the cached listing, zero calls.
+  Its targets (`GET .../targets`) are the other homes in the cached
+  listing, zero calls — homes only since 2026-10-21: inputs and subsets
+  buried them in the search. Opening that picker closes the preview
+  player first: the player sits above the picker, and a tap meant for a
+  lower row landed on it, so the pick never happened.
   Suggest reads the snapshot (1 call) and the track list only when it
   moved (~1 per 100).
 - The grouping (`sortify/splitparts.py`) is pure and offline: artist tags,

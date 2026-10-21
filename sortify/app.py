@@ -964,7 +964,8 @@ def splitparts_remove_part(pid: str, key: str, body: SplitRemoveIn):
 def _splitparts_targets(pid: str) -> list[dict]:
     # The cached listing, never sp.my_playlists(): a cold one is ~21 calls.
     listing = (store.cache().get("playlist_list") or {}).get("items") or []
-    return spa.move_targets(listing, pid, store.folders(), LIKED_ID)
+    return spa.move_targets(listing, pid, store.folders(), LIKED_ID,
+                            store.config().get("home_ids") or [])
 
 
 @app.get("/api/splitparts/{pid}/targets")

@@ -155,15 +155,19 @@ def forget_song(draft: dict, uri: str) -> dict:
     return draft
 
 
-def move_targets(listing: list[dict], pid: str, folders: dict, liked_id: str) -> list[dict]:
-    """Where a song of this split can go instead: every playlist in the
-    cached listing that can take an add, except the split one itself,
-    archived (🗄️) ones and Liked Songs. Sorted by name."""
+def move_targets(listing: list[dict], pid: str, folders: dict, liked_id: str,
+                 home_ids) -> list[dict]:
+    """Where a song of this split can go instead: the other homes in the
+    cached listing that can take an add — never the split one itself,
+    archived (🗄️) ones or Liked Songs. Homes only: a song leaving a home is
+    being re-filed, and inputs and subsets buried the homes in the search
+    (2026-10-21). Sorted by name."""
     from .playlist_roles import is_archived
+    homes = set(home_ids)
     out = [{"id": p["id"], "name": p.get("name") or "",
             "folder": (folders.get(p["id"]) or {}).get("path")}
            for p in listing
-           if p.get("id") and p["id"] not in (pid, liked_id) and p.get("editable")
+           if p.get("id") in homes and p["id"] not in (pid, liked_id) and p.get("editable")
            and not is_archived(p.get("name") or "")]
     return sorted(out, key=lambda t: (t["name"].casefold(), t["id"]))
 

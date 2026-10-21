@@ -1257,6 +1257,9 @@ def elsewhere(drafted, monkeypatch):
     cache["playlists"]["A1"] = {"snapshot_id": "snap-a", "tracks": [], "fetched_at": 1.0}
     appmod.store.save_cache(cache)
     appmod.store.save_folders({"A1": {"path": "ROOT / Mix"}, "H2": {"path": "ROOT"}})
+    cfg = appmod.store.config()
+    cfg["home_ids"] = ["H1", "H2", "A1", "Z1", "T1"]
+    appmod.store.save_config(cfg)
     log = []
 
     def add(pid, uris, bulk=False, spend_reserve=False):
@@ -1295,15 +1298,25 @@ def stored():
     return appmod.store.splitparts()["drafts"]["H1"]
 
 
-def test_targets_are_every_editable_playlist_but_this_one_sorted_with_folders(elsewhere):
+def test_targets_are_the_other_editable_homes_sorted_with_folders(elsewhere):
     res = elsewhere.get("/api/splitparts/H1/targets")
 
     assert res.status_code == 200
     targets = res.json()["targets"]
-    assert [t["id"] for t in targets] == ["X1", "A1", "H2"]   # "[inbox]" < "alpha" < "tiny"
-    assert targets[1] == {"id": "A1", "name": "alpha", "folder": "ROOT / Mix"}
-    assert targets[0]["folder"] is None
+    # Homes only: the [Inbox] input is left out, and so are an archived and a
+    # read-only playlist even when they sit in home_ids.
+    assert [t["id"] for t in targets] == ["A1", "H2"]   # "alpha" < "tiny"
+    assert targets[0] == {"id": "A1", "name": "alpha", "folder": "ROOT / Mix"}
     assert elsewhere.log == [] and elsewhere.calls == []      # the cached listing, zero calls
+
+
+def test_a_song_cannot_be_moved_to_a_playlist_that_is_not_a_home(elsewhere):
+    uri = stored()["parts"][0]["uris"][0]
+
+    res = elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "X1"})
+
+    assert res.status_code == 400
+    assert elsewhere.log == []
 
 
 def test_moving_a_song_elsewhere_adds_first_then_removes(elsewhere):

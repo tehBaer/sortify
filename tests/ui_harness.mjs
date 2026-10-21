@@ -5960,7 +5960,7 @@ run("stopNowPolling()");
       clientX: ${x}, clientY: ${y}, pointerId: ${id}, preventDefault() {} })`);
     const listHtml = () => $$("sp-list").innerHTML;
     check("SPE every song row ends with a labelled move-elsewhere icon button",
-          /data-uri="u1"[\s\S]*?<button[^>]*class="[^"]*sp-elsewhere[^"]*"[^>]*aria-label="Move to another playlist"[^>]*>\s*<svg/.test(listHtml()) &&
+          /data-uri="u1"[\s\S]*?<button[^>]*class="[^"]*sp-elsewhere[^"]*"[^>]*aria-label="Move to another home"[^>]*>\s*<svg/.test(listHtml()) &&
           (listHtml().match(/sp-elsewhere/g) || []).length === 3, listHtml().slice(0, 400));
 
     routes["GET /api/splitparts/H1/targets"] = { targets: [
@@ -6094,6 +6094,78 @@ run("stopNowPolling()");
     check("SPG a drag installs no swallower", [...captureFns].length === 0, `${[...captureFns].length}`);
   } finally {
     run(`spStopPolling(); previewHold.stop(true); nowState = ${savedNow}; show("lists")`);
+  }
+}
+
+// ============================================================================
+// SPM — 2026-10-21, from the phone: a pick with the preview player open never
+// posted (the player sits above the picker), nothing said a move was under
+// way, and the icon is the Now card's magnifier, opening ready to type.
+// ============================================================================
+{
+  const savedNow = run("JSON.stringify(nowState)");
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    const songs = { u1: { name: "Ronda", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                    u3: { name: "Three", artists: "C", local: false } };
+    const D = (parts, extra = {}) => ({ playlist_id: "H9", name: "Big Home", snapshot_id: "s1", n: 2, parts,
+      unknown: [], hint: null, scores: {}, songs, done: null, edited: false, ...extra });
+    const two = () => [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3"] }];
+    run(`show("split"); nowState = { is_playing: false }; previewHold.stop(true); $("picker").hidden = true; spTargets = null`);
+    run(`spDraft = ${JSON.stringify(D(two()))}; spPid = "H9"; spShown = "p1"; spSection("sp-work"); renderSpParts()`);
+    const press = (uri, onIcon, id) => run(`spListPointerDown({
+      target: { closest: (sel) => sel === ".sp-song" ? { dataset: { uri: ${JSON.stringify(uri)} } }
+                                : sel === ".sp-elsewhere" ? (${onIcon} ? {} : null) : null },
+      clientX: 10, clientY: 10, pointerId: ${id}, preventDefault() {} })`);
+    const listHtml = () => $$("sp-list").innerHTML;
+    check("SPM the row's icon is the Now card's magnifier",
+          listHtml().includes(run("ICON_SEARCH_SM")) && !/ICON_ELSEWHERE/.test(listHtml()), listHtml().slice(0, 300));
+
+    routes["GET /api/splitparts/H9/targets"] = { targets: [
+      { id: "T1", name: "Throttle Back", folder: "ROOT" }, { id: "A1", name: "alpha", folder: null }] };
+    routes["GET /api/splitparts/H9/preview?key=p1&start=u1"] = {
+      clips: [{ uri: "u1", name: "Ronda", artists: "A", url: "/c1.mp3" }], next_offset: null,
+      tracks: [{ uri: "u1", name: "Ronda", artists: "A" }], total: 2 };
+    // 1: open the player on a song, then tap that song's icon
+    press("u1", false, 31);
+    await run(`spPointerUp(10, 10, 31)`);
+    await tick(); await tick();
+    const playerWasOpen = $$("preview-pop").hidden === false;
+    run(`$("picker-filter").focused = 0; $("picker-filter").focus = function () { this.focused++; };`);
+    press("u1", true, 32);
+    await run(`spPointerUp(10, 10, 32)`);
+    await tick();
+    check("SPM a tap on the icon closes the open player before the picker shows",
+          playerWasOpen && $$("preview-pop").hidden === true && $$("picker").hidden === false,
+          `wasOpen=${playerWasOpen} pop=${$$("preview-pop").hidden} picker=${$$("picker").hidden}`);
+    check("SPM ...and opens it ready to type, like the Now card's magnifier",
+          run(`$("picker-filter").focused`) === 1, `focused=${run(`$("picker-filter").focused`)}`);
+
+    // 2: a pick says "moving…" before the answer, then "moved to …"
+    // The toast is read before any await can settle: the pick's own task.
+    routes["POST /api/splitparts/H9/elsewhere"] = { ...D([{ key: "p1", name: "rock", uris: ["u2"] },
+      { key: "p2", name: "jazz", uris: ["u3"] }], { edited: true }), moved_to: { id: "T1", name: "Throttle Back" } };
+    const pick = $$("picker-list").children.find((r) => /Throttle Back/.test(r.innerHTML));
+    pick.onclick();
+    const early = $$("toast").textContent;
+    await tick(); await tick();
+    check("SPM a pick says it is moving at once, by the home's name",
+          early === "moving to Throttle Back…", early);
+    check("SPM ...then posts it and says where it went",
+          bodies("/api/splitparts/H9/elsewhere").filter(Boolean).length === 1 &&
+          $$("toast").textContent === "moved to Throttle Back" && !/data-uri="u1"/.test(listHtml()),
+          $$("toast").textContent);
+
+    // 3: the targets are kept for the split — a second tap asks again for nothing
+    resetLog();
+    press("u2", true, 33);
+    await run(`spPointerUp(10, 10, 33)`);
+    check("SPM a second tap opens the picker at once, without asking for the targets again",
+          $$("picker").hidden === false && gets("/api/splitparts/H9/targets") === 0,
+          `picker=${$$("picker").hidden} gets=${gets("/api/splitparts/H9/targets")}`);
+  } finally {
+    run(`spStopPolling(); previewHold.stop(true); $("picker").hidden = true; spTargets = null; nowState = ${savedNow}; show("lists")`);
   }
 }
 
