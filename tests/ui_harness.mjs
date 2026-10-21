@@ -136,6 +136,11 @@ function registerIds(html) {
 }
 
 const handlers = {};
+// Listeners registered for the capture phase (third argument `true` or
+// `{capture: true}`). They also sit in `handlers` in registration order, so
+// every existing loop over `handlers[type]` is unchanged; dispatchClick uses
+// this set to run them BEFORE the target, as a real dispatch does.
+const captureFns = new Set();
 
 // A real DOM runs EVERY listener registered for an event; addressing one by
 // index silently couples the checks to registration order, so adding a
@@ -148,7 +153,16 @@ const document = {
   hidden: false,
   getElementById: $$,
   createElement: () => new El("_created"),
-  addEventListener: (t, f) => ((handlers[t] ||= []).push(f)),
+  addEventListener: (t, f, o) => {
+    if (o === true || (o && o.capture)) captureFns.add(f);
+    (handlers[t] ||= []).push(f);
+  },
+  removeEventListener: (t, f) => {
+    const a = handlers[t] || [];
+    const i = a.indexOf(f);
+    if (i >= 0) a.splice(i, 1);
+    captureFns.delete(f);
+  },
   body: new El("_body"),   // blind mode toggles a class here
   // The Split tab's drop target is found geometrically; checks script it.
   elementFromPoint: () => null,
@@ -258,6 +272,21 @@ function check(name, pass, detail) {
 }
 
 function resetLog() { log.length = 0; }
+
+// A click as a real browser dispatches one at `el`: document capture-phase
+// listeners first, then the target's own onclick, then the document's
+// bubble-phase listeners — the last two only if nothing stopped it.
+function dispatchClick(el) {
+  let stopped = false;
+  const ev = { type: "click", target: el, defaultPrevented: false,
+               preventDefault() { this.defaultPrevented = true; },
+               stopPropagation() { stopped = true; }, stopImmediatePropagation() { stopped = true; } };
+  const all = [...(handlers.click || [])];
+  for (const h of all) if (captureFns.has(h) && !stopped) h(ev);
+  if (!stopped && el.onclick) el.onclick(ev);
+  for (const h of all) if (!captureFns.has(h) && !stopped) h(ev);
+  return ev;
+}
 
 // Two-phase now card: pollNow asks /api/now?light=1[&force=1] for the track
 // and /api/now/suggest[?force=1] for the suggestion side, merging the second
@@ -5991,11 +6020,13 @@ run("stopNowPolling()");
     press("u2", true, 10, 10, 23);
     await run(`spPointerUp(10, 10, 23)`);
     await tick();
+    const draftBefore = run("JSON.stringify(spDraft)");
     $$("picker-list").children[0].onclick();
     await tick();
     check("SPE a move that landed in both playlists says so, and the song stays listed",
-          /now in both playlists/.test($$("toast").textContent) && /data-uri="u2"/.test(listHtml()),
-          $$("toast").textContent);
+          /now in both playlists/.test($$("toast").textContent) && /data-uri="u2"/.test(listHtml()) &&
+          run("JSON.stringify(spDraft)") === draftBefore,
+          `${$$("toast").textContent} | draft same=${run("JSON.stringify(spDraft)") === draftBefore}`);
 
     // 5: a plain tap on the row (not the icon) still previews, no picker
     resetLog();
@@ -6009,6 +6040,60 @@ run("stopNowPolling()");
   } finally {
     document.elementFromPoint = () => null;
     run(`spStopPolling(); previewHold.stop(true); $("picker").hidden = true; nowState = ${savedNow}; show("lists")`);
+  }
+}
+
+// ============================================================================
+// SPG — fix round 1: the click a phone synthesizes after a tap must not land
+// on the player's Close button just drawn under the finger; and the open
+// player marks the body so the song list keeps its last rows clear of it.
+// ============================================================================
+{
+  const savedNow = run("JSON.stringify(nowState)");
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    const songs = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false } };
+    const D = { playlist_id: "H1", name: "Big Home", snapshot_id: "s1", n: 2,
+      parts: [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: [] }],
+      unknown: [], hint: null, scores: {}, songs, done: null, edited: false };
+    run(`show("split"); nowState = { is_playing: false }; previewHold.stop(true); $("picker").hidden = true`);
+    run(`spDraft = ${JSON.stringify(D)}; spPid = "H1"; spShown = "p1"; spSection("sp-work"); renderSpParts()`);
+    routes["GET /api/splitparts/H1/preview?key=p1&start=u1"] = {
+      clips: [{ name: "One", artist: "A", url: "https://cdn/spg-u1.mp3", uri: "u1", deezer_id: 1 }],
+      next_offset: null, tracks: [], total: 2 };
+
+    run(`spPointerDown("u1", 10, 10, 31)`);
+    await run(`spPointerUp(10, 10, 31)`);
+    await tick();
+    check("SPG a tap opens the player and marks the body as previewing",
+          $$("preview-pop").hidden === false && run(`document.body.classList.contains("previewing")`) === true, "");
+    const ghost = dispatchClick($$("pv-close"));
+    check("SPG the tap's own synthesized click, landing on Close at once, is swallowed",
+          $$("preview-pop").hidden === false && ghost.defaultPrevented === true, `hidden=${$$("preview-pop").hidden}`);
+    await wait(450);
+    dispatchClick($$("pv-close"));
+    check("SPG a real tap on Close after the window closes the player",
+          $$("preview-pop").hidden === true && run(`document.body.classList.contains("previewing")`) === false, "");
+    check("SPG ...and the swallower is gone, not left on the document",
+          (handlers.click || []).every((h) => !captureFns.has(h)), `${[...captureFns].length} capture listener(s)`);
+
+    // A click that never comes still lets the swallower go on its timeout.
+    run(`spPointerDown("u1", 10, 10, 32)`);
+    await run(`spPointerUp(10, 10, 32)`);
+    await tick();
+    check("SPG while the window is open one capture listener waits", [...captureFns].length === 1, `${[...captureFns].length}`);
+    await wait(450);
+    check("SPG ...and the timeout removes it", [...captureFns].length === 0, `${[...captureFns].length}`);
+
+    // A drag is not a tap: no click to swallow, nothing installed.
+    run(`previewHold.stop(true)`);
+    run(`spPointerDown("u1", 10, 10, 33); spPointerMove(10, 60, 33)`);
+    await run(`spPointerUp(10, 60, 33)`);
+    check("SPG a drag installs no swallower", [...captureFns].length === 0, `${[...captureFns].length}`);
+  } finally {
+    run(`spStopPolling(); previewHold.stop(true); nowState = ${savedNow}; show("lists")`);
   }
 }
 

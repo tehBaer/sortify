@@ -1058,6 +1058,10 @@ kbd {
 /* while the card is up it must not sit on top of the picker's last rows or
    its Cancel button — the row just held is usually the one underneath it */
 body.previewing .picker-inner { max-height: min(80vh, calc(100dvh - 19rem)); }
+/* the same card over the Split tab: the part's last rows must scroll clear
+   of it (it floats ~14rem up from the bottom edge: 4.2rem offset plus its
+   own height with the big controls) */
+body.previewing #sp-list { padding-bottom: 15rem; }
 .picker-row .p-name { display: block; font-weight: 600; }
 .picker-row .p-sub { display: block; color: var(--muted); font-size: .78rem; margin-top: .1rem; }
 .picker-create .p-name { color: var(--accent); }

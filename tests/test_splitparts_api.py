@@ -1275,11 +1275,18 @@ def elsewhere(drafted, monkeypatch):
         log.append(("my_playlists",))
         return [HOME, SMALL, OTHER, ALPHA, ARCHIVED, THEIRS]
 
+    def snapshot(pid):
+        log.append(("snapshot", pid))
+        return elsewhere_snap[0]
+
+    elsewhere_snap = ["snap-1"]     # what Spotify says now; the draft holds snap-1
+    monkeypatch.setattr(appmod.sp, "snapshot", snapshot)
     monkeypatch.setattr(appmod.sp, "add_to_playlist", add)
     monkeypatch.setattr(appmod.sp, "remove_from_playlist", remove)
     monkeypatch.setattr(appmod.sp, "remove_many", remove_many)
     monkeypatch.setattr(appmod.sp, "my_playlists", listing)
     drafted.log = log
+    drafted.snap = elsewhere_snap
     return drafted
 
 
@@ -1304,7 +1311,7 @@ def test_moving_a_song_elsewhere_adds_first_then_removes(elsewhere):
     res = elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "A1"})
 
     assert res.status_code == 200, res.text
-    assert elsewhere.log == [("add", "A1", [uri]), ("remove", "H1", [uri])]
+    assert elsewhere.log == [("snapshot", "H1"), ("add", "A1", [uri]), ("remove", "H1", [uri])]
     body = res.json()
     assert body["moved_to"] == {"id": "A1", "name": "alpha"}
     assert "tracks" not in body
@@ -1414,7 +1421,7 @@ def test_a_failed_add_changes_nothing(elsewhere, monkeypatch):
     res = elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "A1"})
 
     assert res.status_code >= 400
-    assert elsewhere.log == [] and stored() == before
+    assert elsewhere.log == [("snapshot", "H1")] and stored() == before
 
 
 def test_added_but_not_removed_says_it_is_in_both_and_keeps_the_draft(elsewhere, monkeypatch):
@@ -1430,5 +1437,92 @@ def test_added_but_not_removed_says_it_is_in_both_and_keeps_the_draft(elsewhere,
 
     assert res.status_code >= 400
     assert "both" in res.json()["detail"] and "alpha" in res.json()["detail"]
-    assert [e[0] for e in elsewhere.log] == ["add", "remove"]
+    assert [e[0] for e in elsewhere.log] == ["snapshot", "add", "remove"]
     assert stored() == before
+
+
+# ---- fix round 1 ----------------------------------------------------------
+
+
+def test_a_destination_that_already_holds_the_song_gets_no_second_add(elsewhere):
+    """The retry after a "now in both playlists" error is then a clean
+    recovery: only the removal is left to do."""
+    uri = stored()["parts"][0]["uris"][0]
+    cache = appmod.store.cache()
+    cache["playlists"]["A1"]["tracks"] = [{"uri": uri, "name": "x", "artists": []}]
+    appmod.store.save_cache(cache)
+
+    res = elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "A1"})
+
+    assert res.status_code == 200, res.text
+    assert elsewhere.log == [("snapshot", "H1"), ("remove", "H1", [uri])]
+    assert res.json()["moved_to"] == {"id": "A1", "name": "alpha"}
+    assert all(uri not in p["uris"] for p in stored()["parts"])
+    assert [t["uri"] for t in appmod.store.cache()["playlists"]["A1"]["tracks"]] == [uri]
+
+
+def test_a_playlist_changed_in_spotify_is_refused_before_any_write(elsewhere):
+    elsewhere.snap[0] = "snap-9"
+    before = stored()
+    uri = before["parts"][0]["uris"][0]
+
+    res = elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "A1"})
+
+    assert res.status_code == 409
+    assert res.json()["detail"] == appmod._SPLITPARTS_CHANGED_MSG
+    assert "re-read" in appmod._SPLITPARTS_CHANGED_MSG
+    assert elsewhere.log == [("snapshot", "H1")]
+    assert stored() == before
+
+
+def test_a_second_move_matches_the_snapshot_the_first_one_left(elsewhere):
+    first, second = stored()["parts"][0]["uris"][:2]
+    elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": first, "to_id": "A1"})
+    elsewhere.snap[0] = "snap-removed"     # Spotify's snapshot after that removal
+
+    res = elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": second, "to_id": "A1"})
+
+    assert res.status_code == 200, res.text
+
+
+def test_a_tap_on_an_unplayable_song_starts_at_the_next_playable_one(previewing):
+    uris = part_uris(previewing, "p1")
+    edit_draft(lambda d: [t.update(is_local=True) for t in d["tracks"] if t["uri"] in (uris[3], uris[-1])])
+
+    page = previewing.get("/api/splitparts/H1/preview",
+                          params={"key": "p1", "start": uris[3]}).json()
+    assert page["clips"][0]["uri"] == uris[4]
+
+    # nothing playable after it: the top of the part
+    page = previewing.get("/api/splitparts/H1/preview",
+                          params={"key": "p1", "start": uris[-1]}).json()
+    assert page["clips"][0]["uri"] == uris[0]
+
+    # not in the part at all: the top of the part
+    page = previewing.get("/api/splitparts/H1/preview",
+                          params={"key": "p1", "start": "spotify:track:elsewhere"}).json()
+    assert page["clips"][0]["uri"] == uris[0]
+
+
+def test_split_preview_pages_are_keyed_on_a_hash_and_expired_ones_go(previewing):
+    import time as _time
+    appmod._preview_cache[("stale",)] = (_time.monotonic() - appmod.PREVIEW_TTL - 1, {})
+
+    previewing.get("/api/splitparts/H1/preview", params={"key": "p1"})
+
+    assert ("stale",) not in appmod._preview_cache
+    split_keys = [k for k in appmod._preview_cache if k[0] == "split"]
+    assert split_keys
+    for k in split_keys:
+        assert isinstance(k[-1], str) and len(k[-1]) == 40 and all(c in "0123456789abcdef" for c in k[-1])
+
+
+def test_the_song_list_clears_the_open_preview_player():
+    """The house player floats over the bottom of the screen; while it is
+    open the last rows of a part must still scroll clear of it."""
+    import re
+    css = (appmod.STATIC / "style.css").read_text()
+    js = (appmod.STATIC / "app.js").read_text()
+    assert 'document.body.classList.add("previewing")' in js
+    m = re.search(r"body\.previewing\s+#sp-list\s*\{[^}]*padding-bottom:\s*[^;]+;", css)
+    assert m, "no padding under #sp-list while previewing"

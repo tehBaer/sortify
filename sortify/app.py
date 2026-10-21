@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import logging
@@ -649,6 +650,8 @@ class SplitRemoveIn(BaseModel):
 
 
 _SPLITPARTS_DONE_STARTED_MSG = "Done has already started for this split — press Done again to finish it"
+_SPLITPARTS_CHANGED_MSG = ("the playlist changed in Spotify since the suggestion — "
+                           "re-read it to continue")
 
 
 def _splitparts_home(pid: str) -> dict:
@@ -978,10 +981,17 @@ class SplitElsewhereIn(BaseModel):
 @app.post("/api/splitparts/{pid}/elsewhere")
 def splitparts_elsewhere(pid: str, body: SplitElsewhereIn):
     """Move one song out of the split's playlist into another playlist,
-    right away (2 calls). The add goes first, so a failure can never lose
-    the song: an add that fails changes nothing, and a removal that fails
-    after it leaves the song in both playlists and says so. The draft lock
-    is held throughout, so a move or a Done cannot interleave with it."""
+    right away (3 calls: the snapshot, the add, the removal; 2 when the
+    destination already holds the song). The playlist must still be the
+    one the draft knows — otherwise the draft would adopt the removal's
+    snapshot over changes it never saw, and Done's "the playlist changed"
+    guard would wave them through. The add goes first, so a failure can
+    never lose the song: an add that fails changes nothing, and a removal
+    that fails after it leaves the song in both playlists and says so (a
+    retry then skips the add and only removes)."""
+    # Held across the Spotify calls on purpose: a move, a part change or a
+    # Done started mid-move waits for it rather than interleaving with it.
+    # One user on one phone, so the wait (a second or so) is acceptable.
     with spa._lock:
         draft = _splitparts_draft(pid)
         if draft.get("done") is not None:
@@ -1001,8 +1011,13 @@ def splitparts_elsewhere(pid: str, body: SplitElsewhereIn):
         target = next((t for t in _splitparts_targets(pid) if t["id"] == body.to_id), None)
         if target is None:
             raise HTTPException(400, "not a playlist this song can be moved to")
-        add_snap = sp.add_to_playlist(body.to_id, [uri])
-        _apply_snapshot(body.to_id, add_snap)
+        if sp.snapshot(pid) != draft["snapshot_id"]:
+            raise HTTPException(409, _SPLITPARTS_CHANGED_MSG)
+        # The same check /api/act makes: a song the destination already
+        # holds is not added a second time.
+        dest = (store.cache()["playlists"].get(body.to_id) or {}).get("tracks") or []
+        if not any(t.get("uri") == uri for t in dest):
+            _apply_snapshot(body.to_id, sp.add_to_playlist(body.to_id, [uri]))
         try:
             snap = sp.remove_from_playlist(pid, uri)
         except Exception as exc:
@@ -1144,9 +1159,7 @@ def _splitparts_run_done(pid: str, opts: dict) -> None:
             progress(phase="checking the playlist")
             if sp.snapshot(pid) != draft["snapshot_id"]:
                 draft["done"] = None
-                progress(state="changed", message=(
-                    "the playlist changed in Spotify since the suggestion — "
-                    "re-read it to continue"))
+                progress(state="changed", message=_SPLITPARTS_CHANGED_MSG)
                 return
         plan = spa.done_plan(draft, opts["original"], opts.get("part"),
                              names=opts.get("names"), remove_batch=REMOVE_BATCH)
@@ -2493,14 +2506,25 @@ def splitparts_preview(pid: str, key: str, offset: int = 0, start: str | None = 
     candidates = [by_uri[u] for u in part["uris"]
                   if u in by_uri and not by_uri[u].get("is_local") and _previewable(by_uri[u])]
     if not offset and start:
-        offset = next((i for i, t in enumerate(candidates) if t["uri"] == start), 0)
-    cache_key = ("split", pid, key, offset, tuple(part["uris"]))
+        # A tapped song that cannot play (a local file, no name or artist)
+        # starts the walk at the next one that can, in the part's order.
+        pos = {u: i for i, u in enumerate(part["uris"])}
+        at = pos.get(start)
+        offset = next((i for i, t in enumerate(candidates)
+                       if at is not None and pos[t["uri"]] >= at), 0)
+    digest = hashlib.sha1("\n".join(part["uris"]).encode()).hexdigest()
+    cache_key = ("split", pid, key, offset, digest)
     with _preview_lock:
+        now = time.monotonic()
         cached = _preview_cache.get(cache_key)
-        if cached and time.monotonic() - cached[0] < PREVIEW_TTL:
+        if cached and now - cached[0] < PREVIEW_TTL:
             return cached[1]
         payload = _preview_page(candidates, offset, len(part["uris"]))
-        _preview_cache[cache_key] = (time.monotonic(), payload)
+        now = time.monotonic()   # resolving the page took Deezer round trips
+        # Every move makes new keys, so the old pages are let go here.
+        for k in [k for k, (at_, _) in _preview_cache.items() if now - at_ >= PREVIEW_TTL]:
+            del _preview_cache[k]
+        _preview_cache[cache_key] = (now, payload)
         return payload
 
 

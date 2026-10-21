@@ -3833,8 +3833,26 @@ async function spPointerUp(x, y, id) {
   const d = spEndDrag();
   // Not lifted: a tap — on the icon it moves the song elsewhere, anywhere
   // else on the row it previews.
-  if (!lifted) { if (d.onIcon) spOpenElsewhere(d.uri); else spPreview(d.uri); return; }
+  if (!lifted) {
+    spSwallowGhostClick();
+    if (d.onIcon) spOpenElsewhere(d.uri); else spPreview(d.uri);
+    return;
+  }
   if (key && key !== spShown) await spMove(d.uri, key);
+}
+
+// A phone follows the tap's pointerup with a synthesized click at the same
+// spot — by then the player (or the picker) has been drawn under the finger,
+// so that click landed on its Close button and shut it at once. Capture
+// phase on the document, so it is eaten before any element sees it; one
+// click only, and gone after SP_GHOST_CLICK_MS whether one came or not.
+const SP_GHOST_CLICK_MS = 400;
+function spSwallowGhostClick() {
+  let timer = null;
+  const done = () => { clearTimeout(timer); document.removeEventListener("click", eat, true); };
+  const eat = (e) => { e.preventDefault(); e.stopPropagation(); done(); };
+  document.addEventListener("click", eat, true);
+  timer = setTimeout(done, SP_GHOST_CLICK_MS);
 }
 
 function spPointerCancel(id) {
