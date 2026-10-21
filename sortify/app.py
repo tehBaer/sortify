@@ -981,8 +981,9 @@ class SplitElsewhereIn(BaseModel):
 @app.post("/api/splitparts/{pid}/elsewhere")
 def splitparts_elsewhere(pid: str, body: SplitElsewhereIn):
     """Move one song out of the split's playlist into another playlist,
-    right away (3 calls: the snapshot, the add, the removal; 2 when the
-    destination already holds the song). The playlist must still be the
+    right away (3 calls: the snapshot, the add, the removal; when the
+    destination's cache holds the song, its snapshot is read instead of
+    the add when it proves the cache current — still 3). The playlist must still be the
     one the draft knows — otherwise the draft would adopt the removal's
     snapshot over changes it never saw, and Done's "the playlist changed"
     guard would wave them through. The add goes first, so a failure can
@@ -1013,10 +1014,18 @@ def splitparts_elsewhere(pid: str, body: SplitElsewhereIn):
             raise HTTPException(400, "not a playlist this song can be moved to")
         if sp.snapshot(pid) != draft["snapshot_id"]:
             raise HTTPException(409, _SPLITPARTS_CHANGED_MSG)
-        # The same check /api/act makes: a song the destination already
-        # holds is not added a second time.
-        dest = (store.cache()["playlists"].get(body.to_id) or {}).get("tracks") or []
-        if not any(t.get("uri") == uri for t in dest):
+        # A song the destination already holds is not added a second time
+        # (the retry after a "now in both playlists" error) — but only when
+        # the cached track list is proven current: it can be days old, and a
+        # song since removed from the destination in Spotify would otherwise
+        # be skipped here, removed below, and end up in neither playlist.
+        # Its snapshot is the proof (1 call); on a mismatch, or nothing
+        # cached to compare, add as usual — a duplicate is the safe side.
+        dest = store.cache()["playlists"].get(body.to_id) or {}
+        held = any(t.get("uri") == uri for t in dest.get("tracks") or [])
+        current = (held and bool(dest.get("snapshot_id"))
+                   and sp.snapshot(body.to_id) == dest["snapshot_id"])
+        if not current:
             _apply_snapshot(body.to_id, sp.add_to_playlist(body.to_id, [uri]))
         try:
             snap = sp.remove_from_playlist(pid, uri)

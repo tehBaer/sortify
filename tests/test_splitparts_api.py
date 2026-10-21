@@ -1277,16 +1277,17 @@ def elsewhere(drafted, monkeypatch):
 
     def snapshot(pid):
         log.append(("snapshot", pid))
-        return elsewhere_snap[0]
+        return snaps[pid]
 
-    elsewhere_snap = ["snap-1"]     # what Spotify says now; the draft holds snap-1
+    # What Spotify says now: the draft holds snap-1, A1's track cache snap-a.
+    snaps = {"H1": "snap-1", "A1": "snap-a"}
     monkeypatch.setattr(appmod.sp, "snapshot", snapshot)
     monkeypatch.setattr(appmod.sp, "add_to_playlist", add)
     monkeypatch.setattr(appmod.sp, "remove_from_playlist", remove)
     monkeypatch.setattr(appmod.sp, "remove_many", remove_many)
     monkeypatch.setattr(appmod.sp, "my_playlists", listing)
     drafted.log = log
-    drafted.snap = elsewhere_snap
+    drafted.snaps = snaps
     return drafted
 
 
@@ -1444,25 +1445,58 @@ def test_added_but_not_removed_says_it_is_in_both_and_keeps_the_draft(elsewhere,
 # ---- fix round 1 ----------------------------------------------------------
 
 
-def test_a_destination_that_already_holds_the_song_gets_no_second_add(elsewhere):
-    """The retry after a "now in both playlists" error is then a clean
-    recovery: only the removal is left to do."""
-    uri = stored()["parts"][0]["uris"][0]
+def _cache_holds(uri, pid="A1"):
     cache = appmod.store.cache()
-    cache["playlists"]["A1"]["tracks"] = [{"uri": uri, "name": "x", "artists": []}]
+    cache["playlists"][pid]["tracks"] = [{"uri": uri, "name": "x", "artists": []}]
     appmod.store.save_cache(cache)
+
+
+def test_a_destination_proven_to_hold_the_song_gets_no_second_add(elsewhere):
+    """The retry after a "now in both playlists" error is then a clean
+    recovery: only the removal is left to do — but only once the cached
+    destination is shown to be current (its snapshot still matches)."""
+    uri = stored()["parts"][0]["uris"][0]
+    _cache_holds(uri)
 
     res = elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "A1"})
 
     assert res.status_code == 200, res.text
-    assert elsewhere.log == [("snapshot", "H1"), ("remove", "H1", [uri])]
+    assert elsewhere.log == [("snapshot", "H1"), ("snapshot", "A1"), ("remove", "H1", [uri])]
     assert res.json()["moved_to"] == {"id": "A1", "name": "alpha"}
     assert all(uri not in p["uris"] for p in stored()["parts"])
     assert [t["uri"] for t in appmod.store.cache()["playlists"]["A1"]["tracks"]] == [uri]
 
 
+def test_a_stale_cached_destination_still_gets_the_add(elsewhere):
+    """A days-old cache can hold a song the user since removed from the
+    destination in Spotify: skipping the add then would leave the song in
+    neither playlist. A possible duplicate is the safe direction."""
+    uri = stored()["parts"][0]["uris"][0]
+    _cache_holds(uri)
+    elsewhere.snaps["A1"] = "snap-a-moved-on"
+
+    res = elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "A1"})
+
+    assert res.status_code == 200, res.text
+    assert elsewhere.log == [("snapshot", "H1"), ("snapshot", "A1"),
+                             ("add", "A1", [uri]), ("remove", "H1", [uri])]
+
+
+def test_a_cached_destination_without_a_snapshot_still_gets_the_add(elsewhere):
+    uri = stored()["parts"][0]["uris"][0]
+    _cache_holds(uri)
+    cache = appmod.store.cache()
+    cache["playlists"]["A1"]["snapshot_id"] = None
+    appmod.store.save_cache(cache)
+
+    elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": uri, "to_id": "A1"})
+
+    # nothing to compare against: no destination read, just the add
+    assert elsewhere.log == [("snapshot", "H1"), ("add", "A1", [uri]), ("remove", "H1", [uri])]
+
+
 def test_a_playlist_changed_in_spotify_is_refused_before_any_write(elsewhere):
-    elsewhere.snap[0] = "snap-9"
+    elsewhere.snaps["H1"] = "snap-9"
     before = stored()
     uri = before["parts"][0]["uris"][0]
 
@@ -1478,7 +1512,7 @@ def test_a_playlist_changed_in_spotify_is_refused_before_any_write(elsewhere):
 def test_a_second_move_matches_the_snapshot_the_first_one_left(elsewhere):
     first, second = stored()["parts"][0]["uris"][:2]
     elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": first, "to_id": "A1"})
-    elsewhere.snap[0] = "snap-removed"     # Spotify's snapshot after that removal
+    elsewhere.snaps["H1"] = "snap-removed"     # Spotify's snapshot after that removal
 
     res = elsewhere.post("/api/splitparts/H1/elsewhere", json={"uri": second, "to_id": "A1"})
 

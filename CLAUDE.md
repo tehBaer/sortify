@@ -232,8 +232,11 @@ escalating penalties. Therefore:
   message) if Spotify moved on since the draft, then adds the song to the
   picked playlist and only then removes it from the one being split, so a
   failure can leave it in both but never in neither. A destination whose
-  cached tracks already hold the song gets no second add (2 calls), which
-  makes the retry after a "now in both playlists" error a clean recovery.
+  cached tracks already hold the song gets no second add — but only when
+  its snapshot, read then (1 call), still matches the cached one; a stale
+  cache could otherwise skip the add for a song since removed there and
+  leave it in neither. Still 3 calls; it makes the retry after a "now in
+  both playlists" error a clean recovery.
   It takes the removal's snapshot into the draft, so Done does not see
   "changed".
   Its targets (`GET .../targets`) come from the cached listing, zero calls.
