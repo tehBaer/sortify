@@ -2092,6 +2092,15 @@ def test_buffer_targets_are_the_inputs_with_their_set_sorted_and_free(buffers):
     assert buffers.log == [] and buffers.calls == []
 
 
+def test_homeless_is_no_buffer_target_as_on_the_now_card(buffers):
+    appmod.store.update_config(homeless_id="B1")
+
+    ids = [t["id"] for t in buffers.get("/api/splitparts/H1/targets",
+                                        params={"kind": "buffer"}).json()["targets"]]
+
+    assert "B1" not in ids and "X1" in ids
+
+
 def test_the_default_targets_stay_homes_only(buffers):
     homes = buffers.get("/api/splitparts/H1/targets").json()["targets"]
     also = buffers.get("/api/splitparts/H1/targets", params={"kind": "home"}).json()["targets"]

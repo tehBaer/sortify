@@ -1042,6 +1042,10 @@ def _splitparts_buffer_targets(pid: str) -> list[dict]:
     set_keys = {p["id"]: (inputsets.set_of(p.get("name") or "", (folders.get(p["id"]) or {}).get("path"),
                                            sets) or inputsets.DEFAULT_KEY)
                 for p in listing if p.get("id") in inputs}
+    # Homeless is left out, as the Now card's "Move to buffer…" leaves it
+    # out: "no home fits" is its own decision, not an inbox to go back to.
+    homeless = cfg.get("homeless_id") or cfg.get("needs_home_id")
+    inputs = [i for i in inputs if i != homeless]
     return spa.buffer_targets(listing, pid, inputs, set_keys, LIKED_ID)
 
 
