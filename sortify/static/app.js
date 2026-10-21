@@ -4578,7 +4578,8 @@ function renderSpDone(opts = {}) {
         </div>${choice}</div>`
       : `<div class="sp-name-part"><label class="sp-name-row">
           <span class="hint">${count}${keeps ? ` · keeps the name “${esc(spDraft.name)}”` : ""}</span>
-          <input id="sp-name-${k}" value="${esc(nameVals[i])}" placeholder="${esc(p.name)}" autocomplete="off"${keeps ? " disabled" : ""}>
+          <span class="sp-name-line"><input id="sp-name-${k}" value="${esc(nameVals[i])}" placeholder="${esc(p.name)}" autocomplete="off"${keeps ? " disabled" : ""}>${keeps ? "" :
+          `<button type="button" id="sp-prefix-${k}" class="chip sp-prefix${spPrefixed(nameVals[i]) ? " on" : ""}">${esc(spPrefixBase())}</button>`}</span>
         </label>${choice}</div>`;
   }).join("");
   const folders = [`<option value="">${esc(FOLDER_TOP_LEVEL)}</option>`].concat(
@@ -4619,10 +4620,23 @@ function renderSpDone(opts = {}) {
   const fielded = spDraft.parts.filter((p) => !spIntoOf(p));
   fielded.forEach((p) => { $(`sp-name-${p.key}`).value = nameVals[spDraft.parts.indexOf(p)]; });
   fielded.forEach((p) => {
-    $(`sp-name-${p.key}`).oninput = () => {
+    const el = $(`sp-name-${p.key}`);
+    const typed = () => {
       spReadNames();
       $("sp-orig-part-key").innerHTML = partOptions();
       $("sp-orig-part-key").value = spDoneChoice.part || "";
+      const b = $(`sp-prefix-${p.key}`);
+      if (b && !(isPart && p.key === spDoneChoice.part)) b.classList.toggle("on", spPrefixed(el.value));
+    };
+    el.oninput = typed;
+    if (isPart && p.key === spDoneChoice.part) return;   // the kept part's field is not its own
+    // Saved into the draft too, so the parts screen and a later visit show it.
+    el.onchange = () => spSaveName(p.key, el.value);
+    $(`sp-prefix-${p.key}`).onclick = () => {
+      el.value = spTogglePrefix(el.value);
+      typed();
+      spFocusEnd(el);
+      return spSaveName(p.key, el.value);
     };
   });
   spDraft.parts.filter((p) => !(isPart && p.key === spDoneChoice.part) && spPartWillBeCreated(p)).forEach((p) => {
@@ -4909,6 +4923,7 @@ function renderSpParts() {
   // part is showing.
   $("sp-done-row").innerHTML = '<button id="sp-open-done" class="primary">Done…</button>';
   $("sp-open-done").onclick = spOpenDone;
+  renderSpNameField();
   renderSpList();
   const hint = spDraft.hint;
   $("sp-hint").hidden = !hint;
@@ -4943,7 +4958,109 @@ function renderSpChips() {
 function spShowPart(key) {
   spShown = key;
   renderSpChips();
+  renderSpNameField();
   renderSpList();
+}
+
+// ---- a part's name, drafted while editing -----------------------------------
+// The shown part's name is a field under Done…, saved into the draft on the
+// box when it changes (blur, or the keyboard's done) — never per keystroke —
+// so it survives leaving and coming back, and Done starts from it. The Done
+// screen's name fields save the same way: one name per part, wherever it
+// was last typed.
+//
+// Text typed and not yet saved is kept here. A redraw for some other reason
+// (a drag, a move, a song sent elsewhere) leaves the field alone while it
+// holds such text, so neither the text nor the keyboard is taken away.
+let spNameTyped = null;   // {pid, gen, key, value}
+
+function spTyping(key) {
+  const t = spNameTyped;
+  return !!t && t.pid === spPid && t.gen === spDraftGen && t.key === key;
+}
+
+// "<original> //": the button beside a part's name field. On when the field
+// already starts with it; a tap then takes it off, otherwise puts it in
+// front of whatever follows any earlier one — so it never stacks.
+function spPrefixBase() { return `${spDraft.name} //`; }
+function spPrefixed(v) { return v.startsWith(spPrefixBase()); }
+function spTogglePrefix(v) {
+  const base = spPrefixBase();
+  return v.startsWith(base) ? v.slice(base.length).replace(/^\s+/, "") : `${base} ${v.replace(/^\s+/, "")}`;
+}
+// The cursor at the end, ready to type on.
+function spFocusEnd(el) {
+  if (!el) return;
+  el.focus();
+  if (el.setSelectionRange) el.setSelectionRange(el.value.length, el.value.length);
+}
+
+function renderSpNameField() {
+  const box = $("sp-part-name");
+  const part = spPart(spShown);
+  if (!part) { box.innerHTML = ""; box.dataset.key = ""; return; }
+  if (spTyping(part.key) && box.dataset.key === part.key && box.dataset.gen === String(spDraftGen)) {
+    $("sp-part-prefix").classList.toggle("on", spPrefixed($("sp-part-name-input").value));
+    return;
+  }
+  const value = spTyping(part.key) ? spNameTyped.value : part.name;
+  box.dataset.key = part.key;
+  box.dataset.gen = String(spDraftGen);
+  box.innerHTML = `<label class="sp-part-name-row"><span class="hint">Name this part</span>
+      <span class="sp-name-line"><input id="sp-part-name-input" value="${esc(value)}" autocomplete="off" enterkeyhint="done">
+      <button type="button" id="sp-part-prefix" class="chip sp-prefix${spPrefixed(value) ? " on" : ""}">${esc(spPrefixBase())}</button></span>
+    </label>`;
+  const input = $("sp-part-name-input");
+  const prefix = $("sp-part-prefix");
+  input.value = value;
+  const key = part.key;
+  const typed = () => {
+    spNameTyped = { pid: spPid, gen: spDraftGen, key, value: input.value };
+    prefix.classList.toggle("on", spPrefixed(input.value));
+  };
+  input.oninput = typed;
+  input.onchange = () => spSaveName(key, input.value, input);
+  prefix.onclick = () => {
+    input.value = spTogglePrefix(input.value);
+    typed();
+    spFocusEnd(input);
+    return spSaveName(key, input.value, input);
+  };
+}
+
+// Saves a part's name into the draft (zero Spotify calls). An emptied field
+// goes back to the name it had: a part always has one. Only the name is
+// patched in, never the whole draft from the answer — a move answered in
+// between must not be undone by an older copy.
+async function spSaveName(key, raw, input = null) {
+  const part = spDraft && spPart(key);
+  if (!part) return;
+  const name = (raw || "").trim();
+  if (!name) {
+    if (input) input.value = part.name;
+    if (spTyping(key)) spNameTyped = null;
+    return;
+  }
+  if (name === part.name) return;
+  const pid = spPid, gen = spDraftGen;
+  let d;
+  try {
+    d = await api(spUrl(`/parts/${encodeURIComponent(key)}/name`, pid), { name });
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  if (pid !== spPid || gen !== spDraftGen || !spDraft) return;
+  const saved = d.parts?.find((p) => p.key === key)?.name || name;
+  const live = spPart(key);
+  if (!live) return;
+  live.name = saved;
+  spDraft.edited = true;
+  // One source of truth: a name typed earlier on the Done screen for this
+  // part gives way to the one just saved.
+  if (spDoneChoice.names) delete spDoneChoice.names[key];
+  if (spTyping(key) && spNameTyped.value === saved) spNameTyped = null;
+  renderSpChips();
 }
 
 function renderSpList() {

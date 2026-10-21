@@ -972,6 +972,29 @@ def splitparts_remove_part(pid: str, key: str, body: SplitRemoveIn):
     return spa.without_tracks(draft)
 
 
+class SplitNameIn(BaseModel):
+    name: str
+
+
+@app.post("/api/splitparts/{pid}/parts/{key}/name")
+def splitparts_name_part(pid: str, key: str, body: SplitNameIn):
+    """Name a part while editing; the name is kept in the draft, so it
+    survives leaving and coming back, and Done uses it. Zero calls. Whether
+    the name can become a home is Done's check, as for a name typed there."""
+    with spa._lock:
+        draft = _splitparts_draft(pid)
+        if draft.get("done") is not None:
+            raise HTTPException(409, _SPLITPARTS_DONE_STARTED_MSG)
+        try:
+            spa.rename_part(draft, key, body.name)
+        except KeyError as exc:
+            raise HTTPException(400, exc.args[0])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        spa.put_draft(store, draft)
+    return spa.without_tracks(draft)
+
+
 class SplitPlayIn(BaseModel):
     uri: str
 

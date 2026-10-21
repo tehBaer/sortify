@@ -6590,6 +6590,121 @@ run("stopNowPolling()");
   }
 }
 
+// ============================================================================
+// SPR — 2026-10-21: name the parts while editing. The shown part's name is a
+// field on the parts screen, saved into the draft on change (not per key);
+// a redraw mid-typing keeps the text; the "<original> //" button prefixes
+// once and toggles off, here and on the Done screen; Done prefills from it.
+// ============================================================================
+{
+  const savedNow = run("JSON.stringify(nowState)");
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    const songs = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                    u3: { name: "Three", artists: "C", local: false } };
+    const parts = (n1 = "rock", n2 = "jazz") => [{ key: "p1", name: n1, uris: ["u1", "u2"] }, { key: "p2", name: n2, uris: ["u3"] }];
+    const D = (ps, extra = {}) => ({ playlist_id: "H3", name: "Big Home", snapshot_id: "s1", n: 2, parts: ps,
+      unknown: [], hint: null, scores: {}, songs, done: null, edited: false, ...extra });
+    run(`show("split"); nowState = { is_playing: false }; previewHold.stop(true); $("picker").hidden = true; spTargets = null`);
+    run(`spDraft = ${JSON.stringify(D(parts()))}; spPid = "H3"; spShown = "p1"; spDraftGen++; spDoneChoicePid = null;
+         spSection("sp-work"); renderSpParts()`);
+    const field = () => $$("sp-part-name-input");
+    const names = () => bodies("/api/splitparts/H3/parts/p1/name").filter(Boolean).map((b) => b.name);
+    check("SPR the parts screen shows the shown part's name in a field, with the original's // button",
+          /id="sp-part-name-input"/.test($$("sp-part-name").innerHTML) && field().value === "rock" &&
+          /id="sp-part-prefix"[^>]*>Big Home \/\//.test($$("sp-part-name").innerHTML), $$("sp-part-name").innerHTML);
+
+    // 1: typing posts nothing; a change saves it, and the chip follows
+    routes["POST /api/splitparts/H3/parts/p1/name"] = (opts) => D(parts(JSON.parse(opts.body).name.trim()), { edited: true });
+    field().value = "Loud";
+    field().oninput();
+    check("SPR typing alone posts nothing", names().length === 0, JSON.stringify(log.map((l) => l.path)));
+    await run(`$("sp-part-name-input").onchange()`);
+    await tick();
+    check("SPR a change saves the name into the draft", JSON.stringify(names()) === '["Loud"]', JSON.stringify(names()));
+    check("SPR ...and the chip shows it", /data-key="p1"[\s\S]*?sp-chip-name">Loud</.test($$("sp-chips").innerHTML) &&
+          run("spPart('p1').name") === "Loud", $$("sp-chips").innerHTML.slice(0, 200));
+
+    // 2: a redraw from something else (a move) keeps what is being typed
+    resetLog();
+    field().value = "Louder and mo";
+    field().oninput();
+    routes["POST /api/splitparts/H3/move"] = D([{ key: "p1", name: "Loud", uris: ["u2"] }, { key: "p2", name: "jazz", uris: ["u3", "u1"] }]);
+    await run(`spMove("u1", "p2")`);
+    check("SPR a redraw mid-typing keeps the typed text", field().value === "Louder and mo" && names().length === 0,
+          `value=${field().value}`);
+    run(`renderSpParts()`);
+    check("SPR ...through any number of redraws", field().value === "Louder and mo", `value=${field().value}`);
+
+    // 3: the // button prefixes once, shows on, and a second tap takes it off
+    resetLog();
+    field().value = "loud";
+    field().oninput();
+    await run(`$("sp-part-prefix").onclick()`);
+    await tick();
+    const once = field().value;
+    const onAfter = $$("sp-part-prefix").classList.contains("on");
+    await run(`$("sp-part-prefix").onclick()`);
+    await tick();
+    const off = field().value;
+    const offAfter = $$("sp-part-prefix").classList.contains("on");
+    await run(`$("sp-part-prefix").onclick()`);
+    await tick();
+    check("SPR the // button prefixes the original's name once, and shows on",
+          once === "Big Home // loud" && onAfter === true, `${once} on=${onAfter}`);
+    check("SPR ...a tap when on takes the prefix off, and another puts back just one",
+          off === "loud" && offAfter === false && field().value === "Big Home // loud", `${off} | ${field().value}`);
+    check("SPR ...each tap saves the name", JSON.stringify(names()) === JSON.stringify(["Big Home // loud", "loud", "Big Home // loud"]),
+          JSON.stringify(names()));
+
+    // 4: the Done screen prefills from the drafted name, even over a name
+    // typed there earlier for that part, and has the // button too
+    run(`spDraft = ${JSON.stringify(D(parts("Big Home // loud")))}; renderSpParts()`);
+    routes["GET /api/splitparts/H3/plan?original=subset"] = { calls: 6, creates: 2, empty: [], local: [], removals: 0,
+      folders: [], folder: null, into_parts: [] };
+    run(`spDoneChoicePid = spPid; spDoneChoiceGen = spDraftGen; spPlan = null;
+         spDoneChoice = { original: "subset", part: "p1", folder: "", names: { p1: "typed on Done", p2: "jazz" }, into: {} }`);
+    await run(`$("sp-part-name-input").onchange()`);   // unchanged: saves nothing, but clears nothing either
+    field().value = "Big Home // softer";
+    field().oninput();
+    await run(`$("sp-part-name-input").onchange()`);
+    await tick();
+    await run(`spOpenDone()`);
+    check("SPR the Done screen prefills from the name set on the parts screen",
+          $$("sp-name-p1").value === "Big Home // softer" && /id="sp-name-p1"[^>]*value="Big Home \/\/ softer"/.test($$("sp-done").innerHTML),
+          $$("sp-name-p1").value);
+    check("SPR ...and has the // button beside each name field, on where the name already has it",
+          /id="sp-prefix-p1"[^>]*class="[^"]*\bon\b/.test($$("sp-done").innerHTML) && /id="sp-prefix-p2"/.test($$("sp-done").innerHTML),
+          $$("sp-done").innerHTML.slice(0, 900));
+    resetLog();
+    routes["POST /api/splitparts/H3/parts/p2/name"] = (opts) => D(parts("Big Home // softer", JSON.parse(opts.body).name.trim()), { edited: true });
+    await run(`$("sp-prefix-p2").onclick()`);
+    await tick();
+    check("SPR ...where a tap prefixes the field and saves it",
+          $$("sp-name-p2").value === "Big Home // jazz" &&
+          JSON.stringify(bodies("/api/splitparts/H3/parts/p2/name").filter(Boolean).map((b) => b.name)) === '["Big Home // jazz"]',
+          `${$$("sp-name-p2").value} ${JSON.stringify(log.map((l) => l.path))}`);
+
+    // 5: the kept part and an into-part have no // button
+    routes["GET /api/splitparts/H3/plan?original=part&part=p1"] = { calls: 4, creates: 1, empty: [], local: [], removals: 1,
+      folders: [], folder: null, into_parts: [] };
+    run(`spDoneChoice.original = "part"; spDoneChoice.part = "p1"`);
+    await run(`spRefreshPlan()`);
+    const keptNoButton = !/id="sp-prefix-p1"/.test($$("sp-done").innerHTML) && /id="sp-prefix-p2"/.test($$("sp-done").innerHTML);
+    routes[`GET /api/splitparts/H3/plan?original=part&part=p1&into=${encodeURIComponent("p2:TB")}`] = { calls: 4, creates: 0,
+      empty: [], local: [], removals: 1, folders: [], folder: null,
+      into_parts: [{ key: "p2", to_id: "TB", to_name: "THROTTLE BACK", count: 1 }] };
+    run(`spDoneChoice.into = { p2: { id: "TB", name: "THROTTLE BACK" } }`);
+    await run(`spRefreshPlan()`);
+    check("SPR the kept part and a part going into a home have no // button",
+          keptNoButton && !/id="sp-prefix-p2"/.test($$("sp-done").innerHTML) && /→ THROTTLE BACK/.test($$("sp-done").innerHTML),
+          $$("sp-done").innerHTML.slice(0, 900));
+  } finally {
+    run(`spStopPolling(); previewHold.stop(true); $("picker").hidden = true; spTargets = null; nowState = ${savedNow}; show("lists")`);
+  }
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

@@ -188,6 +188,19 @@ def buffer_targets(listing: list[dict], pid: str, input_ids, set_keys: dict[str,
     return sorted(out, key=lambda t: (t["name"].casefold(), t["id"]))
 
 
+def rename_part(draft: dict, key: str, name: str) -> dict:
+    """A name drafted for a part while editing. Trimmed; an empty one is
+    refused (ValueError), as a part with no name could never be created."""
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("a part needs a name")
+    part = _part(draft, key)
+    if part["name"] != name:
+        part["name"] = name
+        draft["edited"] = True
+    return draft
+
+
 def add_part(draft: dict) -> dict:
     from .splitparts import MAX_PARTS
     if len(draft["parts"]) >= MAX_PARTS:

@@ -1285,6 +1285,13 @@ body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { t
 #sp-done h3 { font-size: 1rem; margin: 1.1rem 0 .4rem; }
 .sp-name-row { display: block; margin: .4rem 0; }
 .sp-name-row input { width: 100%; }
+/* A name field with its "<original> //" button beside it. */
+.sp-name-line { display: flex; align-items: center; gap: .4rem; }
+.sp-name-line input { flex: 1; min-width: 0; width: auto; }
+.sp-prefix { flex: none; max-width: 45%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sp-prefix.on { border-color: var(--accent); color: var(--accent); }
+#sp-part-name { margin: .2rem 0 .5rem; }
+.sp-part-name-row { display: block; }
 /* A part going into a home you have says so where its name field was;
    the two chips under it are the choice. */
 .sp-name-part { margin: .4rem 0 .9rem; }

@@ -239,6 +239,18 @@ escalating penalties. Therefore:
   quick tap still previews.
 - **Removing a part** asks where its songs go: each to its best fit, or all
   of them to one part you name (`to` in the remove body). Zero calls.
+- **Parts are named while editing** (2026-10-21): the shown part's name is
+  a field under Done…, saved into the draft on change, never per keystroke
+  (`POST /api/splitparts/{pid}/parts/{key}/name`, zero calls, trimmed,
+  400 when empty, 409 once Done started, sets `edited`). The Done
+  screen's name fields save the same way, so there is one name per part:
+  a save also drops any name typed on the Done screen for that part.
+  Unsaved typed text survives a redraw (a drag, a move) because the field
+  is left alone while it holds some. Beside each name field (not the kept
+  part's, and an into-part has none) a "<original> //" button puts the
+  original's name and " // " in front once, or takes it off when the
+  field already starts with it. Done's name and twin checks apply to the
+  result as to any name. A re-suggest replaces names like everything else.
 - **Nothing is written to Spotify before Done** — with one exception the
   user triggers per song: the row's "Move to another home" icon (the Now
   card's magnifier)

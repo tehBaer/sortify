@@ -2167,3 +2167,65 @@ def test_playing_the_song_already_playing_arms_no_settle_window(drafted, monkeyp
     drafted.post("/api/splitparts/H1/play", json={"uri": uri})
 
     assert appmod._skip_settle["uri"] is None
+
+
+# ---- name the parts while editing ------------------------------------------
+
+
+def test_a_part_is_named_in_the_draft_trimmed_and_marked_edited(drafted):
+    res = drafted.post("/api/splitparts/H1/parts/p1/name", json={"name": "  Big Home // loud  "})
+
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["parts"][0]["name"] == "Big Home // loud" and body["edited"] is True
+    assert "tracks" not in body
+    assert stored()["parts"][0]["name"] == "Big Home // loud"
+    assert drafted.calls == []
+
+
+def test_an_empty_part_name_is_refused(drafted):
+    before = stored()
+
+    res = drafted.post("/api/splitparts/H1/parts/p1/name", json={"name": "   "})
+
+    assert res.status_code == 400
+    assert stored() == before
+
+
+def test_naming_an_unknown_part_is_refused(drafted):
+    assert drafted.post("/api/splitparts/H1/parts/p9/name", json={"name": "x"}).status_code == 400
+
+
+def test_naming_a_part_is_refused_once_done_has_started(drafted):
+    edit_draft(lambda d: d.update(done={"opts": {}, "created": {}, "filled": [], "original_done": False}))
+    before = stored()
+
+    res = drafted.post("/api/splitparts/H1/parts/p1/name", json={"name": "Later"})
+
+    assert res.status_code == 409
+    assert res.json()["detail"] == appmod._SPLITPARTS_DONE_STARTED_MSG
+    assert stored() == before
+
+
+def test_done_uses_the_name_drafted_for_a_part(env):
+    env.post("/api/splitparts/H1/parts/p1/name", json={"name": "Big Home // loud"})
+
+    env.post("/api/splitparts/H1/done", json={"names": {}, "folder": None, "original": "subset"})
+
+    assert progress(env)["state"] == "done"
+    assert [e[1] for e in env.log if e[0] == "create"][0] == "Big Home // loud"
+
+
+def test_a_drafted_name_still_meets_the_twin_check(env):
+    env.post("/api/splitparts/H1/parts/p1/name", json={"name": "tiny"})   # H2 is "Tiny"
+
+    res = env.post("/api/splitparts/H1/done", json={"names": {}, "folder": None, "original": "subset"})
+
+    assert res.status_code == 400 and "already exists" in res.json()["detail"]
+    assert env.log == []
+
+
+def test_the_part_name_field_sits_between_the_done_row_and_the_actions():
+    html = (appmod.STATIC / "index.html").read_text()
+    done_row, name = html.index('id="sp-done-row"'), html.index('id="sp-part-name"')
+    assert done_row < name < html.index('id="sp-actions"')
