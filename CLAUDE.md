@@ -225,11 +225,18 @@ escalating penalties. Therefore:
   the house preview player on it (it walks on down that part, via
   `GET /api/splitparts/{pid}/preview`, zero Spotify calls), then Done. Spec:
   `docs/superpowers/specs/2026-10-20-split-into-parts-design.md`.
-- **A hold on a song plays it in Spotify** (`POST /api/splitparts/{pid}/play`,
-  1 call, `play_in_context`): inside the playlist being split, so the music
-  carries on down it. It closes the preview player without that player's
-  own resume call — the play is the music coming back. A press that moves
-  is still a drag, a quick tap still previews.
+- **A hold on a song plays it in Spotify and opens it in Now**
+  (`POST /api/splitparts/{pid}/play`, 1 call, `play_in_context`): inside
+  the playlist being split, so the music carries on down it. It closes the
+  preview player without that player's own resume call — the play is the
+  music coming back. On success it switches to the Now view so the song's
+  card is up for filing (since 2026-10-21; it used to stay in Split): no
+  poll at once, but Next's settle repoll (`repollAfterPlaybackChange`,
+  900 ms), and `/play` arms the same settle window as Next so an answer
+  still on the song from before is cached only briefly. The cost is the
+  Now polls the view makes anyway. A failed play stays in Split with the
+  error. The draft is untouched. A press that moves is still a drag, a
+  quick tap still previews.
 - **Removing a part** asks where its songs go: each to its best fit, or all
   of them to one part you name (`to` in the remove body). Zero calls.
 - **Nothing is written to Spotify before Done** — with one exception the

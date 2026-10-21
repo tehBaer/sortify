@@ -2134,3 +2134,36 @@ def test_moving_to_a_buffer_keeps_the_changed_playlist_guard(buffers):
 
     assert res.status_code == 409
     assert buffers.log == [("snapshot", "H1")]
+
+
+# ---- a hold opens the song in Now ------------------------------------------
+
+
+def test_play_arms_the_settle_window_so_the_now_card_reaches_the_new_song(drafted, monkeypatch):
+    """The hold switches to Now and repolls once Spotify has had a moment.
+    If that answer is still the song from before, it must get the short
+    settle TTL (as after Next), not the old song's whole remaining runtime."""
+    monkeypatch.setattr(appmod.sp, "play_in_context", lambda pid, uri: None, raising=False)
+    appmod._skip_settle.update(uri=None, until=0.0)
+    appmod._now_cache.update(at=9_999_999.0, value={"track": {"uri": "spotify:track:before"}}, ttl=300)
+    uri = drafted.get("/api/splitparts/H1").json()["parts"][0]["uris"][0]
+    try:
+        res = drafted.post("/api/splitparts/H1/play", json={"uri": uri})
+
+        assert res.status_code == 200
+        assert appmod._skip_settle["uri"] == "spotify:track:before"
+        assert appmod._now_cache["at"] == 0.0
+        assert drafted.calls == []
+    finally:
+        appmod._skip_settle.update(uri=None, until=0.0)
+
+
+def test_playing_the_song_already_playing_arms_no_settle_window(drafted, monkeypatch):
+    monkeypatch.setattr(appmod.sp, "play_in_context", lambda pid, uri: None, raising=False)
+    appmod._skip_settle.update(uri=None, until=0.0)
+    uri = drafted.get("/api/splitparts/H1").json()["parts"][0]["uris"][0]
+    appmod._now_cache.update(at=9_999_999.0, value={"track": {"uri": uri}}, ttl=300)
+
+    drafted.post("/api/splitparts/H1/play", json={"uri": uri})
+
+    assert appmod._skip_settle["uri"] is None

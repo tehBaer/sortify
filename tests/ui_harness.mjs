@@ -6259,6 +6259,10 @@ run("stopNowPolling()");
           JSON.stringify(log.map((l) => l.path)));
     check("SPX ...and says so", /in Spotify/.test($$("toast").textContent) && /Ronda/.test($$("toast").textContent),
           $$("toast").textContent);
+    // The hold went on to Now (SPN covers that); the rest of this block is
+    // about the parts screen, so come back to it before the settle repoll
+    // (900ms out) can poll a Now view this block has no fixture for.
+    run(`stopNowPolling(); show("split"); spSection("sp-work"); renderSpParts()`);
 
     // 2: a press that moves is a drag, never a play
     resetLog();
@@ -6522,6 +6526,67 @@ run("stopNowPolling()");
   } finally {
     document.elementFromPoint = () => null;
     run(`spStopPolling(); previewHold.stop(true); $("picker").hidden = true; spTargets = null; spBuffers = null; nowState = ${savedNow}; show("lists")`);
+  }
+}
+
+// ============================================================================
+// SPN — 2026-10-21: a hold opens the song in Now. It still plays it in
+// Spotify (the same /play), then shows the Now view and repolls once Spotify
+// has settled, so the card ends on that song. A failed play stays on Split.
+// ============================================================================
+{
+  const savedNow = run("JSON.stringify(nowState)");
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    const songs = { u1: { name: "Ronda", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false } };
+    const D = { playlist_id: "H4", name: "Big Home", snapshot_id: "s1", n: 2,
+      parts: [{ key: "p1", name: "rock", uris: ["u1"] }, { key: "p2", name: "jazz", uris: ["u2"] }],
+      unknown: [], hint: null, scores: {}, songs, done: null, edited: false };
+    setNow({ playing: true, is_playing: true, poll_after_ms: 999999, progress_ms: 1000,
+             track: { uri: "u1", name: "Ronda", artists: [{ name: "A" }], duration_ms: 200000, sortable: true },
+             context: { id: "H4", name: "Big Home", is_input: false }, suggestions: [] });
+    run(`nowState = { playing: true, is_playing: true, track: { uri: "before" } }`);
+    run(`show("split"); previewHold.stop(true); $("picker").hidden = true`);
+    run(`spDraft = ${JSON.stringify(D)}; spPid = "H4"; spShown = "p1"; spSection("sp-work"); renderSpParts()`);
+    const draftBefore = run("JSON.stringify(spDraft)");
+
+    // 1: a hold plays it, then opens Now, which polls once Spotify settled
+    routes["POST /api/splitparts/H4/play"] = { ok: true };
+    run(`spPointerDown("u1", 10, 10, 71)`);
+    await wait(650);
+    check("SPN a hold posts /play, then shows the Now view",
+          bodies("/api/splitparts/H4/play").filter(Boolean).length === 1 &&
+          $$("view-now").hidden === false && $$("view-split").hidden === true,
+          `now=${$$("view-now").hidden} split=${$$("view-split").hidden} ${JSON.stringify(log.map((l) => l.path))}`);
+    check("SPN ...and says it is opening it there", /Ronda/.test($$("toast").textContent) && /Now/.test($$("toast").textContent),
+          $$("toast").textContent);
+    await run(`spPointerUp(10, 10, 71)`);
+    await wait(1000); await tick();
+    check("SPN ...a moment later it polls /api/now and the card is on that song",
+          gets("/api/now?light=1&force=1") >= 1 && run("nowState.track?.uri") === "u1",
+          `${run("nowState.track?.uri")} ${JSON.stringify(log.map((l) => l.path))}`);
+    check("SPN ...its release opened no preview or picker, and the draft is untouched",
+          !log.some((l) => l.path.includes("/preview") || l.path.includes("/targets")) &&
+          run("JSON.stringify(spDraft)") === draftBefore, "");
+
+    // 2: a failed play stays on Split, says why, and polls nothing
+    run(`stopNowPolling(); show("split"); spSection("sp-work"); renderSpParts()`);
+    resetLog();
+    routes["POST /api/splitparts/H4/play"] = { status: 400, body: {
+      detail: "No active Spotify device — start playing something in Spotify first." } };
+    run(`spPointerDown("u1", 10, 10, 72)`);
+    await wait(650);
+    await run(`spPointerUp(10, 10, 72)`);
+    await wait(1000);
+    check("SPN a failed play stays on Split with the error toast",
+          $$("view-split").hidden === false && $$("view-now").hidden === true &&
+          /No active Spotify device/.test($$("toast").textContent) && gets("/api/now?light=1&force=1") === 0,
+          `${$$("toast").textContent} ${JSON.stringify(log.map((l) => l.path))}`);
+  } finally {
+    setNow({ status: 200, body: { playing: false, poll_after_ms: 999999 } });
+    run(`stopNowPolling(); spStopPolling(); previewHold.stop(true, true); $("picker").hidden = true; nowState = ${savedNow}; show("lists")`);
   }
 }
 

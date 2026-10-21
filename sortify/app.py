@@ -979,13 +979,26 @@ class SplitPlayIn(BaseModel):
 @app.post("/api/splitparts/{pid}/play")
 def splitparts_play(pid: str, body: SplitPlayIn):
     """A hold on a song: play it in Spotify, in the playlist being split, so
-    the music carries on through that playlist after it. One call; nothing
-    in the draft changes."""
+    the music carries on through that playlist after it, and (client side)
+    open it in Now to be filed. One call; nothing in the draft changes.
+
+    Arms the same settle window as Next: the Now view repolls a moment
+    after this, and if Spotify still reports the song from before, that
+    answer must get the short settle TTL rather than be cached for the old
+    song's whole remaining runtime — or the card would stay on it."""
     with spa._lock:
         draft = _splitparts_draft(pid)
         if not spa.has_song(draft, body.uri):
             raise HTTPException(400, "that song is not in this split")
-    return _playback_call(sp.play_in_context, pid, body.uri)
+    with _now_lock:
+        prev_uri = ((_now_cache["value"] or {}).get("track") or {}).get("uri")
+    out = _playback_call(sp.play_in_context, pid, body.uri)
+    # Already that song: nothing to settle, and arming it would only
+    # shorten every answer for the next 15 seconds.
+    if prev_uri and prev_uri != body.uri:
+        with _now_lock:
+            _skip_settle.update(uri=prev_uri, until=time.time() + NOW_SKIP_SETTLE_WINDOW)
+    return out
 
 
 def _splitparts_targets(pid: str) -> list[dict]:

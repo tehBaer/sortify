@@ -3892,16 +3892,29 @@ function spPointerDown(uri, x, y, id, onIcon = false, row = null) {
 // One call: the song starts in Spotify inside the playlist being split, and
 // the music carries on down that playlist after it. The preview player
 // closes first, without its own resume call: the play IS the music
-// coming back.
+// coming back. Then it opens in Now, its card up for filing (2026-10-21,
+// in place of staying here). Spotify takes about a second to report the
+// new song, so this is Next's settle repoll, not showNow's poll at once:
+// that one would most likely get the song from before, and spend the
+// server's one upstream read for the next 10 s on it. The server arms the
+// same settle window as Next, so an answer still on the old song is only
+// cached briefly and the card moves on. The draft is untouched; the Split
+// tab finds it again as ever. A failure stays here and says why.
 async function spPlaySong(uri) {
   previewHold.stop(true, true);
-  toast(`playing “${spSongLabel(uri)}” in Spotify…`);
+  const label = spSongLabel(uri);
+  const prevUri = nowState?.track?.uri || null;
+  toast(`playing “${label}” in Spotify…`);
   try {
     await api(spUrl("/play"), { uri });
-    toast(`playing “${spSongLabel(uri)}” in Spotify`);
   } catch (e) {
     toast(e.message);
+    return;
   }
+  show("now");
+  stopNowPolling();
+  toast(`playing “${label}” in Spotify — opening it in Now`);
+  repollAfterPlaybackChange(prevUri);
 }
 
 function spPointerMove(x, y, id) {
