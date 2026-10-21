@@ -1655,3 +1655,392 @@ def test_play_in_context_starts_the_playlist_at_that_song(monkeypatch):
 
     assert sent == [("PUT", "/me/player/play", {"json": {
         "context_uri": "spotify:playlist:P1", "offset": {"uri": "spotify:track:t1"}}})]
+
+
+# ---- a part can go into an existing home at Done -----------------------------
+#
+# Brief 2026-10-21 ("At Done"): instead of becoming a new playlist, a part's
+# songs can be added to a home that already exists. Nothing is created for
+# it; a song the home already holds is not added again, judged only from a
+# track list proven current by the home's snapshot.
+
+THROTTLE = {"id": "TB", "name": "THROTTLE BACK", "owner": "me", "editable": True,
+            "total": 2, "snapshot_id": "snap-tb-0", "image": None, "description": ""}
+
+
+def _track(uri):
+    return {"uri": uri, "name": f"held {uri}", "artists": [{"id": "ah", "name": "Held"}],
+            "is_local": False}
+
+
+@pytest.fixture
+def into(env, monkeypatch):
+    """`env`, plus a small model of Spotify for the homes a part goes into:
+    each add appends and moves the snapshot on, as Spotify does, so a
+    resume sees what an earlier attempt really left there."""
+    d = spa.get_draft(appmod.store, "H1")
+    p2 = d["parts"][1]["uris"]
+    held = p2[0]                                    # TB already holds one of p2's songs
+    spot = {"TB": {"n": 0, "uris": ["spotify:track:other", held]}}
+    cache = appmod.store.cache()
+    cache["playlist_list"]["items"] = [HOME, SMALL, OTHER, dict(THROTTLE), ARCHIVED, LIKED]
+    cache["playlists"]["TB"] = {"snapshot_id": "snap-tb-0", "fetched_at": 1.0,
+                                "tracks": [_track(u) for u in spot["TB"]["uris"]]}
+    appmod.store.save_cache(cache)
+    appmod.store.update_config(home_ids=["H1", "H2", "H3", "TB", "Z1"])
+    log = env.log
+
+    def snap_of(pid):
+        return f"snap-{pid.lower()}-{spot[pid]['n']}"
+
+    def snapshot(pid):
+        log.append(("snapshot", pid))
+        return snap_of(pid) if pid in spot else "snap-1"
+
+    def tracks(pid):
+        log.append(("tracks", pid))
+        return [_track(u) for u in spot[pid]["uris"]] if pid in spot else list(TRACKS)
+
+    def add(pid, uris, bulk=False, spend_reserve=False):
+        log.append(("add", pid, list(uris)))
+        if pid in spot:
+            spot[pid]["uris"] += list(uris)
+            spot[pid]["n"] += 1
+            return snap_of(pid)
+        return f"snap-add-{pid}"
+
+    monkeypatch.setattr(appmod.sp, "snapshot", snapshot)
+    monkeypatch.setattr(appmod.sp, "playlist_tracks", tracks)
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", add)
+    env.spot = spot
+    env.held = held
+    env.p2 = list(p2)
+    env.p1 = list(d["parts"][0]["uris"])
+    return env
+
+
+def grow_p2(n):
+    """More songs in p2, held the way a real draft holds them: in the part,
+    in `tracks` and in `songs`."""
+    def grow(dr):
+        for i in range(n):
+            u = f"spotify:track:x{i}"
+            dr["parts"][1]["uris"].append(u)
+            dr["tracks"].append({"uri": u, "name": f"Extra {i}", "artists": [], "is_local": False})
+            dr["songs"][u] = {"name": f"Extra {i}", "artists": "", "local": False}
+    edit_draft(grow)
+
+
+def into_adds(c, pid="TB"):
+    return [u for e in c.log if e[0] == "add" and e[1] == pid for u in e[2]]
+
+
+def test_plan_prices_a_part_going_into_an_existing_home(into):
+    plan = into.get("/api/splitparts/H1/plan",
+                    params={"original": "subset", "into": "p2:TB"}).json()
+
+    # snapshot + (create + 1 add) for p1 + (TB's snapshot + 1 add) for p2 + rename
+    assert plan["calls"] == 6
+    assert plan["creates"] == 1
+    # 10 songs, one already in the cached (assumed current) list: 9 to add
+    assert plan["into_parts"] == [{"key": "p2", "to_id": "TB", "to_name": "THROTTLE BACK", "count": 9}]
+    assert into.log == [] and into.calls == []           # the plan itself costs nothing
+
+
+def test_the_plan_without_into_lists_no_into_parts(into):
+    plan = into.get("/api/splitparts/H1/plan", params={"original": "subset"}).json()
+
+    assert plan["into_parts"] == [] and plan["creates"] == 2
+
+
+def test_the_plan_counts_a_read_when_nothing_of_the_home_is_cached(into):
+    cache = appmod.store.cache()
+    del cache["playlists"]["TB"]
+    appmod.store.save_cache(cache)
+
+    plan = into.get("/api/splitparts/H1/plan",
+                    params={"original": "subset", "into": "p2:TB"}).json()
+
+    # nothing cached to trust: the track read (TB holds 2, one page) is certain
+    assert plan["into_parts"][0]["count"] == 10
+    assert plan["calls"] == 7
+
+
+def test_done_adds_a_part_to_the_home_and_creates_nothing_for_it(into):
+    before = appmod.store.config()
+    res = into.post("/api/splitparts/H1/done", json={
+        "names": {"p1": "Rocky", "p2": "[Not a name]"}, "folder": "ROOT / Mix",
+        "original": "subset", "into": {"p2": "TB"}})
+    assert res.status_code == 200, res.text
+
+    p = progress(into)
+    assert p["state"] == "done", p
+    creates = [e for e in into.log if e[0] == "create"]
+    assert [e[1] for e in creates] == ["Rocky"]
+    assert into_adds(into) == [u for u in into.p2 if u != into.held]
+    cfg = appmod.store.config()
+    assert "TB" in cfg["home_ids"] and "TB" not in cfg["sticky_home_ids"]
+    assert set(cfg["sticky_home_ids"]) - set(before.get("sticky_home_ids") or []) == {"N1"}
+    assert into.filed == [("N1", "Rocky", "ROOT / Mix")]  # no filing for an into-part
+    assert p["summary"]["created"] == [{"id": "N1", "name": "Rocky", "count": 14}]
+    assert p["summary"]["into"] == [{"key": "p2", "id": "TB", "name": "THROTTLE BACK",
+                                     "count": 9, "already": 1}]
+    # every write to TB came after the snapshot that proved its cache
+    first_tb = next(i for i, e in enumerate(into.log) if e[1:2] == ("TB",))
+    assert into.log[first_tb] == ("snapshot", "TB")
+    assert ("tracks", "TB") not in into.log
+
+
+def test_into_adds_go_in_batches_of_100(into):
+    grow_p2(140)
+
+    into.post("/api/splitparts/H1/done", json={"names": {}, "folder": None,
+                                                "original": "subset", "into": {"p2": "TB"}})
+
+    assert progress(into)["state"] == "done"
+    batches = [e[2] for e in into.log if e[0] == "add" and e[1] == "TB"]
+    assert [len(b) for b in batches] == [100, 49]
+    assert progress(into)["summary"]["into"][0]["count"] == 149
+
+
+def test_the_homes_cache_and_listing_follow_the_adds(into):
+    into.post("/api/splitparts/H1/done", json={"names": {}, "folder": None,
+                                                "original": "subset", "into": {"p2": "TB"}})
+
+    cache = appmod.store.cache()
+    entry = cache["playlists"]["TB"]
+    assert entry["snapshot_id"] == "snap-tb-1"
+    assert [t["uri"] for t in entry["tracks"]] == into.spot["TB"]["uris"]
+    tb = next(p for p in cache["playlist_list"]["items"] if p["id"] == "TB")
+    assert tb["snapshot_id"] == "snap-tb-1" and tb["total"] == 11
+
+
+def test_a_stale_cache_is_reread_and_a_song_it_wrongly_listed_is_added(into):
+    # In Spotify the held song was taken out of TB since the cache was read.
+    into.spot["TB"]["uris"].remove(into.held)
+    into.spot["TB"]["n"] = 7
+
+    into.post("/api/splitparts/H1/done", json={"names": {}, "folder": None,
+                                                "original": "part", "part": "p1",
+                                                "into": {"p2": "TB"}})
+
+    assert progress(into)["state"] == "done"
+    assert ("tracks", "TB") in into.log
+    assert into_adds(into) == into.p2                     # the held song too: never lost
+    assert progress(into)["summary"]["into"][0]["count"] == 10
+    removed = next(e for e in into.log if e[0] == "remove")
+    assert into.held in removed[2]
+
+
+def test_a_resume_after_a_failed_batch_neither_duplicates_nor_skips(into, monkeypatch):
+    grow_p2(140)
+    want = [u for u in spa.get_draft(appmod.store, "H1")["parts"][1]["uris"] if u != into.held]
+    real_add = appmod.sp.add_to_playlist
+    seen = {"n": 0}
+
+    def flaky(pid, uris, bulk=False, spend_reserve=False):
+        if pid == "TB":
+            seen["n"] += 1
+            if seen["n"] == 2:
+                raise SpotifyError(429, "rate limited")
+        return real_add(pid, uris)
+
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", flaky)
+    body = {"names": {}, "folder": None, "original": "part", "part": "p1", "into": {"p2": "TB"}}
+
+    into.post("/api/splitparts/H1/done", json=body)
+    assert progress(into)["state"] == "error"
+    assert not any(e[0] == "remove" for e in into.log)    # the original waits
+
+    res = into.post("/api/splitparts/H1/done", json=body)
+    assert res.status_code == 200, res.text
+    assert progress(into)["state"] == "done"
+    added = into_adds(into)
+    assert sorted(added) == sorted(want) and len(added) == len(set(added))
+    assert progress(into)["summary"]["into"][0]["count"] == len(want)
+
+
+def test_a_batch_that_landed_before_its_answer_failed_is_not_added_again(into, monkeypatch):
+    """The add reached Spotify but its response never came back: the next
+    attempt reads TB's snapshot, finds it moved on, and re-reads the list."""
+    real_add = appmod.sp.add_to_playlist
+    lost = []
+
+    def lossy(pid, uris, bulk=False, spend_reserve=False):
+        real_add(pid, uris)
+        if pid == "TB" and not lost:
+            lost.append(1)
+            raise SpotifyError(500, "connection reset")
+        return f"snap-tb-{into.spot['TB']['n']}"
+
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", lossy)
+    body = {"names": {}, "folder": None, "original": "subset", "into": {"p2": "TB"}}
+    into.post("/api/splitparts/H1/done", json=body)
+    assert progress(into)["state"] == "error"
+
+    into.post("/api/splitparts/H1/done", json=body)
+
+    assert progress(into)["state"] == "done"
+    assert into.spot["TB"]["uris"].count(into.p2[1]) == 1
+    assert len(into.spot["TB"]["uris"]) == len(set(into.spot["TB"]["uris"]))
+
+
+def test_the_original_is_touched_only_after_the_into_part_and_loses_its_songs(into):
+    res = into.post("/api/splitparts/H1/done", json={
+        "names": {}, "folder": None, "original": "part", "part": "p1", "into": {"p2": "TB"}})
+    assert res.status_code == 200, res.text
+
+    assert progress(into)["state"] == "done"
+    kinds = [e[0] for e in into.log]
+    assert "create" not in kinds
+    last_tb = max(i for i, e in enumerate(into.log) if e[1:2] == ("TB",))
+    remove_at = kinds.index("remove")
+    assert remove_at > last_tb
+    assert sorted(into.log[remove_at][2]) == sorted(into.p2)   # the held song leaves H1 too
+    assert progress(into)["summary"]["created"] == []
+
+
+def test_two_parts_can_go_into_the_same_home(into):
+    res = into.post("/api/splitparts/H1/done", json={
+        "names": {}, "folder": None, "original": "subset", "into": {"p1": "TB", "p2": "TB"}})
+    assert res.status_code == 200, res.text
+
+    assert progress(into)["state"] == "done"
+    added = into_adds(into)
+    assert sorted(added) == sorted(into.p1 + [u for u in into.p2 if u != into.held])
+    assert not any(e[0] == "create" for e in into.log)
+
+
+@pytest.mark.parametrize("bad", ["X1", "H1", "Z1", "liked", "NOPE", "T1"])
+def test_a_target_that_is_not_an_offered_home_is_refused_before_any_call(into, bad):
+    if bad == "T1":
+        cache = appmod.store.cache()
+        cache["playlist_list"]["items"].append(THEIRS)
+        appmod.store.save_cache(cache)
+        appmod.store.update_config(home_ids=["H1", "H2", "H3", "TB", "Z1", "T1"])
+    before = stored()
+
+    res = into.post("/api/splitparts/H1/done", json={
+        "names": {}, "folder": None, "original": "subset", "into": {"p2": bad}})
+    plan = into.get("/api/splitparts/H1/plan", params={"original": "subset", "into": f"p2:{bad}"})
+
+    assert res.status_code == 400, res.text
+    assert plan.status_code == 400
+    assert into.log == [] and stored() == before
+
+
+@pytest.mark.parametrize("into_", [{"p1": "TB"}, {"p9": "TB"}])
+def test_the_kept_part_or_an_unknown_part_cannot_go_into_a_home(into, into_):
+    res = into.post("/api/splitparts/H1/done", json={
+        "names": {}, "folder": None, "original": "part", "part": "p1", "into": into_})
+
+    assert res.status_code == 400
+    assert into.log == []
+
+
+def test_a_malformed_into_on_the_plan_is_a_400(into):
+    res = into.get("/api/splitparts/H1/plan", params={"original": "subset", "into": "p2"})
+
+    assert res.status_code == 400
+
+
+def test_at_least_two_counts_destinations_not_created_playlists(into):
+    # kept part + one into-part: two destinations and nothing created
+    ok = into.get("/api/splitparts/H1/plan",
+                  params={"original": "part", "part": "p1", "into": "p2:TB"})
+    assert ok.status_code == 200 and ok.json()["creates"] == 0
+
+    # every song into one home, the original kept as a subset: one destination
+    edit_draft(lambda dr: dr["parts"][0]["uris"].extend(dr["parts"][1]["uris"])
+               or dr["parts"][1].update(uris=[]))
+    res = into.post("/api/splitparts/H1/done", json={
+        "names": {}, "folder": None, "original": "subset", "into": {"p1": "TB"}})
+    assert res.status_code == 400 and "at least 2" in res.json()["detail"]
+    assert into.log == []
+
+
+def test_a_resumed_done_keeps_its_into_target_even_once_it_is_no_longer_offered(into, monkeypatch):
+    """Decided: a resume keeps the opts it started with, `into` included.
+    Refusing would strand the split (every other action 409s once Done has
+    started), and the run only ever adds to the home the user confirmed —
+    no song can be lost by finishing it."""
+    def boom(name, **kw):
+        into.log.append(("create", name, None))
+        raise SpotifyError(429, "rate limited")
+
+    real_create = appmod.sp.create_playlist_full
+    monkeypatch.setattr(appmod.sp, "create_playlist_full", boom)
+    body = {"names": {}, "folder": None, "original": "subset", "into": {"p2": "TB"}}
+    into.post("/api/splitparts/H1/done", json=body)
+    assert progress(into)["state"] == "error"
+    # p1's create failed before anything was written: not started, so a
+    # changed target is still refused on the next first attempt
+    assert stored()["done"] is None
+
+    # This time p1 is created, then the into-part's add fails.
+    monkeypatch.setattr(appmod.sp, "create_playlist_full", real_create)
+    real_add = appmod.sp.add_to_playlist
+    failed = []
+
+    def flaky(pid, uris, bulk=False, spend_reserve=False):
+        if pid == "TB" and not failed:
+            failed.append(1)
+            raise SpotifyError(429, "rate limited")
+        return real_add(pid, uris)
+
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", flaky)
+    into.post("/api/splitparts/H1/done", json=body)
+    assert progress(into)["state"] == "error" and stored()["done"] is not None
+
+    appmod.store.update_config(home_ids=["H1", "H2", "H3"])   # TB stopped being a home
+    res = into.post("/api/splitparts/H1/done", json={"names": {}, "folder": None, "original": "subset"})
+
+    assert res.status_code == 200, res.text
+    assert progress(into)["state"] == "done"
+    assert sorted(into_adds(into)) == sorted(u for u in into.p2 if u != into.held)
+
+
+def test_the_finish_screens_plan_prices_the_stored_into_even_when_no_longer_offered(into):
+    edit_draft(lambda dr: dr.update(done={"opts": {"names": {}, "folder": None, "original": "subset",
+                                                   "part": None, "into": {"p2": "TB"}},
+                                          "created": {"p1": "N1"}, "filled": [], "original_done": False}))
+    appmod.store.update_config(home_ids=["H1", "H2", "H3"])
+
+    res = into.get("/api/splitparts/H1/plan", params={"original": "subset", "into": "p2:TB"})
+
+    assert res.status_code == 200, res.text
+    assert res.json()["into_parts"][0]["to_name"] == "THROTTLE BACK"
+
+
+def test_a_done_started_before_into_existed_still_resumes(into, monkeypatch):
+    real_add = appmod.sp.add_to_playlist
+    failed = []
+
+    def flaky(pid, uris, bulk=False, spend_reserve=False):
+        if pid == "N2" and not failed:
+            failed.append(1)
+            raise SpotifyError(429, "rate limited")
+        return real_add(pid, uris)
+
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", flaky)
+    into.post("/api/splitparts/H1/done", json={"names": {}, "folder": None, "original": "subset"})
+    edit_draft(lambda dr: dr["done"]["opts"].pop("into", None))   # opts stored by the old code
+
+    into.post("/api/splitparts/H1/done", json={"names": {}, "folder": None, "original": "subset"})
+
+    assert progress(into)["state"] == "done"
+    assert progress(into)["summary"]["into"] == []
+
+
+def test_a_failed_first_into_add_leaves_the_split_unlocked(into, monkeypatch):
+    """Nothing written yet: `done` must not lock the split (the same rule
+    as a failed first create)."""
+    def boom(pid, uris, bulk=False, spend_reserve=False):
+        raise SpotifyError(429, "rate limited")
+    monkeypatch.setattr(appmod.sp, "add_to_playlist", boom)
+
+    into.post("/api/splitparts/H1/done", json={"names": {}, "folder": None, "original": "part",
+                                                "part": "p1", "into": {"p2": "TB"}})
+
+    assert progress(into)["state"] == "error"
+    assert stored()["done"] is None

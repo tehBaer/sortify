@@ -3774,21 +3774,27 @@ function spMarkPlaying(u) {
 // everywhere, one opened after an await does not on every phone.
 let spTargets = null;   // {pid, map} — the last split's move targets
 
+// The split's homes, kept once fetched. Called as `spTargetsFor(pid) ||
+// await spFetchTargets(pid)`, so a cached list opens the picker without
+// an await — in the tap's own task, which is what raises the keyboard.
+function spTargetsFor(pid) { return spTargets?.pid === pid ? spTargets.map : null; }
+async function spFetchTargets(pid) {
+  let targets;
+  try {
+    targets = (await api(spUrl("/targets", pid))).targets || [];
+  } catch (e) {
+    toast(e.message);
+    return null;
+  }
+  spTargets = { pid, map: new Map(targets.map((t) => [t.id, t])) };
+  return spTargets.map;
+}
+
 async function spOpenElsewhere(uri) {
   previewHold.stop();
   const pid = spPid, gen = spDraftGen;
-  if (spTargets?.pid !== pid) {
-    let targets;
-    try {
-      targets = (await api(spUrl("/targets", pid))).targets || [];
-    } catch (e) {
-      toast(e.message);
-      return;
-    }
-    spTargets = { pid, map: new Map(targets.map((t) => [t.id, t])) };
-  }
-  if (pid !== spPid || gen !== spDraftGen || $("sp-parts").hidden) return;
-  const map = spTargets.map;
+  const map = spTargetsFor(pid) || await spFetchTargets(pid);
+  if (!map || pid !== spPid || gen !== spDraftGen || $("sp-parts").hidden) return;
   // The server's order (by name); no hold-to-preview on these rows.
   openPicker(map, (id) => spElsewhere(uri, id, map.get(id)?.name), null, null, "Move here", "home",
              { preview: false, keepOrder: true });
@@ -4032,6 +4038,7 @@ async function spDoRemovePart(key, to) {
   // leaving the choice pointed at the dead key could silently start
   // meaning that unrelated new part instead of being caught as stale.
   delete spDoneChoice.names[key];
+  if (spDoneChoice.into) delete spDoneChoice.into[key];
   if (spDoneChoice.part === key) spDoneChoice.part = spDraft.parts[0]?.key || null;
   if (spShown === key) spShown = to || spDraft.parts[0]?.key || null;
   renderSpParts();
@@ -4292,7 +4299,9 @@ async function spPoll(kind, pid = spPid) {
 }
 
 // ---- Done ---------------------------------------------------------------------
-let spDoneChoice = { original: "subset", part: null, folder: null, names: {} };
+// `into`: {part key: {id, name}} — a part whose songs go into a home you
+// already have instead of a new playlist.
+let spDoneChoice = { original: "subset", part: null, folder: null, names: {}, into: {} };
 // Which pid AND draft generation spDoneChoice (typed names, folder,
 // original/part choice) was built for — reopening Done… for the SAME
 // split, SAME generation (Back → parts → Done…, or after an add/remove,
@@ -4319,14 +4328,15 @@ let spConfirmBusy = false;
 // so a FRESH summary for the same pid (started right after) is shown.
 let spShownSummaryKey = null;
 function spSummaryKey(pid, summary) {
-  return `${pid}:${(summary.created || []).map((c) => c.id).join(",")}`;
+  return `${pid}:${(summary.created || []).map((c) => c.id).join(",")}` +
+    `:${(summary.into || []).map((c) => `${c.id}+${c.count}`).join(",")}`;
 }
 
 async function spOpenDone() {
   previewHold.stop();   // no clip plays on under the Done screen
   if (spDoneChoicePid !== spPid || spDoneChoiceGen !== spDraftGen) {
     spDoneChoice = { original: "subset", part: spDraft.parts[0]?.key || null,
-                     folder: undefined, names: {} };
+                     folder: undefined, names: {}, into: {} };
     spDoneChoicePid = spPid;
     spDoneChoiceGen = spDraftGen;
     spPlan = null;
@@ -4352,10 +4362,14 @@ async function spRefreshPlan() {
   if (spDoneChoice.original === "part" && !spPart(spDoneChoice.part)) {
     spDoneChoice.part = spDraft.parts[0]?.key || null;
   }
+  // The part the original becomes stays in it: a home it was headed for
+  // before it became that part is dropped, not kept for later.
+  spDoneChoice.into ||= {};   // a choice made before `into` existed has none
+  if (spDoneChoice.original === "part") delete spDoneChoice.into[spDoneChoice.part];
   if (hadPlan) renderSpDone({ pending: true });
-  const q = spDoneChoice.original === "part"
+  const q = (spDoneChoice.original === "part"
     ? `?original=part&part=${encodeURIComponent(spDoneChoice.part)}`
-    : "?original=subset";
+    : "?original=subset") + spIntoQuery(spIntoIds());
   // Into a LOCAL first — the pid/gen/seq check below decides whether this
   // answer is even still relevant before it touches `spPlan` at all.
   let plan;
@@ -4393,6 +4407,7 @@ async function spRefreshPlan() {
 function spReadNames() {
   if (!spDraft) return;
   spDraft.parts.forEach((p) => {
+    if (spIntoOf(p)) return;   // no name field: it goes into a home
     const el = $(`sp-name-${p.key}`);
     const v = el && typeof el.value === "string" ? el.value.trim() : "";
     if (el && !el.disabled) spDoneChoice.names[p.key] = v || p.name;
@@ -4401,11 +4416,59 @@ function spReadNames() {
 
 function spCostLine(plan, isPart) {
   const n = plan.creates;
-  const made = `${n} new playlist${n === 1 ? "" : "s"}`;
-  const orig = isPart
+  // Two parts may go into the same home: said once, with their sum.
+  const into = new Map();
+  for (const p of plan.into_parts || []) {
+    const was = into.get(p.to_id);
+    into.set(p.to_id, { name: p.to_name, count: (was?.count || 0) + p.count });
+  }
+  const bits = n || !into.size ? [`${n} new playlist${n === 1 ? "" : "s"}`] : [];
+  for (const t of into.values()) bits.push(`adds ${t.count} song${t.count === 1 ? "" : "s"} to ${esc(t.name)}`);
+  bits.push(isPart
     ? `removes ${plan.removals} song${plan.removals === 1 ? "" : "s"} from the original`
-    : "renames the original with the subset mark";
-  return `${made} · ${orig} · about ${plan.calls} calls`;
+    : "renames the original with the subset mark");
+  return `${bits.join(" · ")} · about ${plan.calls} calls`;
+}
+
+// The home a part goes into instead of a new playlist, or null. Never for
+// the part the original becomes, nor for a part that creates nothing.
+function spIntoOf(p, choice = spDoneChoice) {
+  if (choice.original === "part" && p.key === choice.part) return null;
+  if (!spPartWillBeCreated(p)) return null;
+  return (choice.into || {})[p.key] || null;
+}
+// {part key: home id}, in part order: what the plan and Done are sent.
+function spIntoIds(choice = spDoneChoice) {
+  const out = {};
+  for (const p of spDraft.parts) {
+    const t = spIntoOf(p, choice);
+    if (t) out[p.key] = t.id;
+  }
+  return out;
+}
+// Repeated `into=p2:ID` pairs; nothing at all when no part goes into a home.
+function spIntoQuery(ids) {
+  return Object.entries(ids).map(([k, id]) => `&into=${encodeURIComponent(`${k}:${id}`)}`).join("");
+}
+
+// "Add to an existing home": the house picker on the split's homes (the
+// list the row's magnifier moves songs to; never the split playlist).
+async function spPickInto(key) {
+  spReadNames();
+  const pid = spPid, gen = spDraftGen;
+  const map = spTargetsFor(pid) || await spFetchTargets(pid);
+  if (!map || pid !== spPid || gen !== spDraftGen || !spDraft || spDraft.done || $("sp-done").hidden) return;
+  openPicker(map, (id) => {
+    (spDoneChoice.into ||= {})[key] = { id, name: map.get(id)?.name || id };
+    spRefreshPlan();
+  }, null, null, "Add here", "home", { preview: false, keepOrder: true });
+}
+
+function spNewPlaylist(key) {
+  if (!spDoneChoice.into?.[key]) return;
+  spReadNames();
+  delete spDoneChoice.into[key];
+  spRefreshPlan();
 }
 
 // Shared by the editable Done screen and the locked finish screen — the
@@ -4450,12 +4513,28 @@ function renderSpDone(opts = {}) {
     const keeps = isPart && p.key === spDoneChoice.part;
     return keeps ? spDraft.name : (spDoneChoice.names[p.key] || p.name);
   });
+  // A part that would be created chooses: a new playlist (its name field)
+  // or a home you already have ("→ name" in the field's place). The kept
+  // part and a part with no songs have no such choice.
   const names = spDraft.parts.map((p, i) => {
     const keeps = isPart && p.key === spDoneChoice.part;
-    return `<label class="sp-name-row">
-        <span class="hint">${p.uris.length} song${p.uris.length === 1 ? "" : "s"}${keeps ? ` · keeps the name “${esc(spDraft.name)}”` : ""}</span>
-        <input id="sp-name-${esc(p.key)}" value="${esc(nameVals[i])}" placeholder="${esc(p.name)}" autocomplete="off"${keeps ? " disabled" : ""}>
-      </label>`;
+    const into = spIntoOf(p);
+    const count = `${p.uris.length} song${p.uris.length === 1 ? "" : "s"}`;
+    const k = esc(p.key);
+    const choice = !keeps && spPartWillBeCreated(p)
+      ? `<div class="sp-into-choice">
+          <button type="button" id="sp-new-${k}" class="chip${into ? "" : " on"}">a new playlist</button>
+          <button type="button" id="sp-into-${k}" class="chip${into ? " on" : ""}">add to an existing home</button>
+        </div>` : "";
+    return into
+      ? `<div class="sp-name-part"><div class="sp-name-row">
+          <span class="hint">${count} · ${esc(spDoneChoice.names[p.key] || p.name)}</span>
+          <span class="sp-into-to">→ ${esc(into.name)}</span>
+        </div>${choice}</div>`
+      : `<div class="sp-name-part"><label class="sp-name-row">
+          <span class="hint">${count}${keeps ? ` · keeps the name “${esc(spDraft.name)}”` : ""}</span>
+          <input id="sp-name-${k}" value="${esc(nameVals[i])}" placeholder="${esc(p.name)}" autocomplete="off"${keeps ? " disabled" : ""}>
+        </label>${choice}</div>`;
   }).join("");
   const folders = [`<option value="">${esc(FOLDER_TOP_LEVEL)}</option>`].concat(
     (spPlan.folders || []).map((f) => `<option value="${esc(f.path)}"${f.blocked ? " disabled" : ""}>${esc(f.path)}${f.blocked ? (/input set/.test(f.blocked) ? " — an input set's folder" : " — file by hand") : ""}</option>`)).join("");
@@ -4491,13 +4570,19 @@ function renderSpDone(opts = {}) {
     ${warn.map((w) => `<p class="hint sp-warn">${w}</p>`).join("")}
     <p id="sp-cost" class="sp-cost">${costText}</p>
     <div class="row"><button id="sp-done-back">Back</button><button id="sp-confirm" class="primary"${confirmDisabled ? " disabled" : ""}>Confirm</button></div>`;
-  spDraft.parts.forEach((p, i) => { $(`sp-name-${p.key}`).value = nameVals[i]; });
-  spDraft.parts.forEach((p) => {
+  // Only the parts drawn with a name field: an into-part has none.
+  const fielded = spDraft.parts.filter((p) => !spIntoOf(p));
+  fielded.forEach((p) => { $(`sp-name-${p.key}`).value = nameVals[spDraft.parts.indexOf(p)]; });
+  fielded.forEach((p) => {
     $(`sp-name-${p.key}`).oninput = () => {
       spReadNames();
       $("sp-orig-part-key").innerHTML = partOptions();
       $("sp-orig-part-key").value = spDoneChoice.part || "";
     };
+  });
+  spDraft.parts.filter((p) => !(isPart && p.key === spDoneChoice.part) && spPartWillBeCreated(p)).forEach((p) => {
+    $(`sp-into-${p.key}`).onclick = () => spPickInto(p.key);
+    $(`sp-new-${p.key}`).onclick = () => spNewPlaylist(p.key);
   });
   $("sp-folder").value = spDoneChoice.folder || "";
   $("sp-confirm").disabled = confirmDisabled;
@@ -4528,7 +4613,10 @@ async function renderSpFinish(errorMessage) {
   const opts = spDraft.done.opts;
   const isPart = opts.original === "part";
   const pid = spPid, gen = spDraftGen;
-  const q = isPart ? `?original=part&part=${encodeURIComponent(opts.part)}` : "?original=subset";
+  // Opts stored before `into` existed have none.
+  const intoIds = opts.into || {};
+  const q = (isPart ? `?original=part&part=${encodeURIComponent(opts.part)}` : "?original=subset") +
+    spIntoQuery(intoIds);
   spPanel("sp-done");
   $("sp-done").innerHTML = '<div class="spinner"></div>';
   let plan = null;
@@ -4540,8 +4628,13 @@ async function renderSpFinish(errorMessage) {
   // spDraft.songs), never by matching a (possibly renamed) display name
   // against /plan's suggested-name-based `empty` list — see
   // spPartWillBeCreated.
-  const kept = newParts.filter((p) => spPartWillBeCreated(p));
+  const kept = newParts.filter((p) => spPartWillBeCreated(p) && !intoIds[p.key]);
   const names = kept.map((p) => `<li>${esc(displayName(p))}</li>`).join("");
+  // Named by the plan when it answered, else by the split's homes if held.
+  const homeName = (key) => plan?.into_parts?.find((t) => t.key === key)?.to_name ||
+    spTargetsFor(pid)?.get(intoIds[key])?.name || "a home you have";
+  const intoRows = newParts.filter((p) => spPartWillBeCreated(p) && intoIds[p.key])
+    .map((p) => `<li>${esc(p.name)} → ${esc(homeName(p.key))}</li>`).join("");
   const folderText = opts.folder || FOLDER_TOP_LEVEL;
   const origText = isPart
     ? `“${esc(spDraft.name)}” keeps its name and becomes the part “${esc(spPart(opts.part)?.name || opts.part)}” — the other parts' songs are removed from it`
@@ -4553,7 +4646,8 @@ async function renderSpFinish(errorMessage) {
     ${errorMessage ? `<p class="hint sp-warn">${esc(errorMessage)}</p>` : ""}
     <h3>Finishing this split</h3>
     <p class="hint">This split already started — the choices below are locked in and can no longer be changed.</p>
-    <h3>New parts</h3><ul class="sp-summary">${names}</ul>
+    ${names ? `<h3>New parts</h3><ul class="sp-summary">${names}</ul>` : ""}
+    ${intoRows ? `<h3>Into homes you have</h3><ul class="sp-summary">${intoRows}</ul>` : ""}
     <h3>Folder</h3><p>${esc(folderText)}</p>
     <h3>The original, “${esc(spDraft.name)}”</h3><p>${origText}</p>
     ${warn.map((w) => `<p class="hint sp-warn">${w}</p>`).join("")}
@@ -4611,7 +4705,8 @@ async function spConfirmDone() {
     spReadNames();
     const isPart = spDoneChoice.original === "part";
     body = { names: spDoneChoice.names, folder: spDoneChoice.folder || null,
-             original: spDoneChoice.original, part: isPart ? spDoneChoice.part : null };
+             original: spDoneChoice.original, part: isPart ? spDoneChoice.part : null,
+             into: spIntoIds() };
   }
   try {
     await api(spUrl("/done"), body);
@@ -4670,7 +4765,9 @@ function renderSpSummary(s) {
   spShownSummaryKey = spSummaryKey(spPid, s);
   spDraft = null;
   const filing = (c) => (s.folder ? `<span class="hint" id="sp-filing-${esc(c.id)}"> · filing…</span>` : "");
-  const rows = s.created.map((c) => `<li><b>${esc(c.name)}</b> — ${c.count} song${c.count === 1 ? "" : "s"}${filing(c)}</li>`).join("");
+  const rows = s.created.map((c) => `<li><b>${esc(c.name)}</b> — ${c.count} song${c.count === 1 ? "" : "s"}${filing(c)}</li>`).join("") +
+    // N is what was really added: a song the home already held is not counted.
+    (s.into || []).map((c) => `<li>added ${c.count} song${c.count === 1 ? "" : "s"} to <b>${esc(c.name)}</b>${c.already ? ` · ${c.already} already there` : ""}</li>`).join("");
   const orig = s.original === "subset"
     ? "The original is now a subset and keeps every song."
     : "The original kept its name and now holds its part's songs.";

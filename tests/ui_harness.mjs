@@ -6300,6 +6300,129 @@ run("stopNowPolling()");
   }
 }
 
+// ============================================================================
+// SPI — 2026-10-21 ("At Done"): a part can go into an existing home instead
+// of becoming a new playlist. The choice sits on its row; a pick opens the
+// house picker on the split's homes, the row then says where it goes, and
+// the plan, Confirm, the kept part and the summary all follow it.
+// ============================================================================
+{
+  const savedNow = run("JSON.stringify(nowState)");
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    const songs = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                    u3: { name: "Three", artists: "C", local: false }, u4: { name: "Four", artists: "D", local: false } };
+    const D = { playlist_id: "H5", name: "Big Home", snapshot_id: "s1", n: 3,
+      parts: [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3"] },
+              { key: "p3", name: "blues", uris: ["u4"] }],
+      unknown: [], hint: null, scores: {}, songs, done: null, edited: false };
+    run(`show("split"); nowState = { is_playing: false }; previewHold.stop(true); $("picker").hidden = true; spTargets = null`);
+    run(`spDraft = ${JSON.stringify(D)}; spPid = "H5"; spDoneChoicePid = null; spPlan = null; spShown = "p1";
+         spSection("sp-work"); renderSpParts()`);
+    const plan = (extra) => ({ calls: 8, creates: 3, empty: [], local: [], removals: 0,
+      folders: [], folder: null, into_parts: [], ...extra });
+    const IP2 = encodeURIComponent("p2:TB");
+    routes["GET /api/splitparts/H5/plan?original=subset"] = plan();
+    routes[`GET /api/splitparts/H5/plan?original=subset&into=${IP2}`] = plan({ calls: 7, creates: 2,
+      into_parts: [{ key: "p2", to_id: "TB", to_name: "THROTTLE BACK", count: 1 }] });
+    routes["GET /api/splitparts/H5/targets"] = { targets: [
+      { id: "TB", name: "THROTTLE BACK", folder: "ROOT" }, { id: "A1", name: "alpha", folder: null }] };
+    await run(`spOpenDone()`);
+    const html = () => $$("sp-done").innerHTML;
+    check("SPI each part that would be created offers a new playlist or an existing home",
+          ["p1", "p2", "p3"].every((k) => html().includes(`id="sp-new-${k}"`) && html().includes(`id="sp-into-${k}"`)) &&
+          /a new playlist/.test(html()) && /add to an existing home/.test(html()) && /id="sp-name-p2"/.test(html()),
+          html().slice(0, 600));
+
+    // 1: "add to an existing home" opens the house picker on the homes
+    resetLog();
+    await run(`$("sp-into-p2").onclick()`);
+    await tick();
+    const rows = $$("picker-list").children;
+    check("SPI ...which opens the picker on the split's homes, with no preview",
+          $$("picker").hidden === false && gets("/api/splitparts/H5/targets") === 1 && rows.length === 2 &&
+          /THROTTLE BACK/.test(rows[0].innerHTML) && !log.some((l) => l.path.includes("/preview")),
+          rows.map((r) => r.innerHTML).join(" | "));
+
+    // 2: a pick shows "→ name" in place of the field, and the plan carries it
+    rows[0].onclick();
+    await tick(); await tick();
+    check("SPI a pick shows where the part goes in place of its name field",
+          /→ THROTTLE BACK/.test(html()) && !/id="sp-name-p2"/.test(html()) && /id="sp-name-p1"/.test(html()) &&
+          $$("picker").hidden === true, html().slice(0, 900));
+    check("SPI ...the plan request carries the into pair",
+          gets(`/api/splitparts/H5/plan?original=subset&into=${IP2}`) === 1, JSON.stringify(log.map((l) => l.path)));
+    check("SPI ...and the cost line says what it adds where",
+          /adds 1 song to THROTTLE BACK/.test($$("sp-cost").innerHTML || html()) && /2 new playlists/.test(html()) &&
+          /about 7 calls/.test(html()), html().match(/id="sp-cost"[^>]*>[^<]*/)?.[0]);
+
+    // 3: "a new playlist" brings the field back
+    resetLog();
+    await run(`$("sp-new-p2").onclick()`);
+    await tick();
+    check("SPI 'a new playlist' brings the name field back and drops the into",
+          /id="sp-name-p2"[^>]*value="jazz"/.test(html()) && !/→ THROTTLE BACK/.test(html()) &&
+          gets("/api/splitparts/H5/plan?original=subset") === 1 && /3 new playlists/.test(html()), html().slice(0, 600));
+
+    // 4: Confirm posts into
+    await run(`$("sp-into-p2").onclick()`);
+    await tick();
+    $$("picker-list").children[0].onclick();
+    await tick(); await tick();
+    routes["POST /api/splitparts/H5/done"] = { started: true };
+    routes["GET /api/splitparts/H5/progress"] = { state: "done", phase: "done", done: 3, total: 3, message: null,
+      summary: { created: [{ id: "N1", name: "rock", count: 2 }, { id: "N3", name: "blues", count: 1 }],
+                 into: [{ key: "p2", id: "TB", name: "THROTTLE BACK", count: 1, already: 0 }],
+                 original: "subset", empty: [], local: [], folder: null, name: "Big Home" } };
+    resetLog();
+    await run(`spConfirmDone()`);
+    await tick();
+    const sent = bodies("/api/splitparts/H5/done").filter(Boolean);
+    check("SPI Confirm posts the into choice",
+          sent.length === 1 && JSON.stringify(sent[0].into) === JSON.stringify({ p2: "TB" }), JSON.stringify(sent));
+    check("SPI the summary says what was added where",
+          /added 1 song to <b>THROTTLE BACK<\/b>/.test(html()) && /rock/.test(html()) && /blues/.test(html()), html());
+
+    // 5: the kept part offers no such choice, and becoming it drops its into
+    run(`spDraft = ${JSON.stringify(D)}; spDraftGen++; spDoneChoicePid = null; spPlan = null; spSection("sp-work"); renderSpParts()`);
+    routes["GET /api/splitparts/H5/plan?original=part&part=p1"] = plan({ creates: 2, removals: 2, calls: 6 });
+    routes["GET /api/splitparts/H5/plan?original=part&part=p2"] = plan({ creates: 2, removals: 3, calls: 6 });
+    routes[`GET /api/splitparts/H5/plan?original=part&part=p1&into=${IP2}`] = plan({ creates: 1, removals: 2, calls: 5,
+      into_parts: [{ key: "p2", to_id: "TB", to_name: "THROTTLE BACK", count: 1 }] });
+    await run(`spOpenDone()`);
+    run(`spDoneChoice.original = "part"; spDoneChoice.part = "p1"`);
+    await run(`spRefreshPlan()`);
+    check("SPI the part the original becomes offers no into choice",
+          !/id="sp-into-p1"/.test(html()) && /id="sp-into-p2"/.test(html()) && /keeps the name/.test(html()), html().slice(0, 600));
+    await run(`$("sp-into-p2").onclick()`);
+    await tick();
+    $$("picker-list").children[0].onclick();
+    await tick(); await tick();
+    const pickedInPart = /→ THROTTLE BACK/.test(html()) && gets(`/api/splitparts/H5/plan?original=part&part=p1&into=${IP2}`) === 1;
+    resetLog();
+    $$("sp-orig-part-key").value = "p2";
+    await run(`$("sp-orig-part-key").onchange()`);
+    await tick();
+    check("SPI switching the kept part to one that had an into-target drops that target",
+          pickedInPart && run(`JSON.stringify(spDoneChoice.into)`) === "{}" &&
+          gets("/api/splitparts/H5/plan?original=part&part=p2") === 1 && !/→ THROTTLE BACK/.test(html()) &&
+          !/id="sp-into-p2"/.test(html()), `${pickedInPart} ${run(`JSON.stringify(spDoneChoice.into)`)} ${JSON.stringify(log.map((l) => l.path))}`);
+
+    // 6: the locked finish screen prices and names the stored into
+    const STARTED = { ...D, done: { opts: { original: "subset", part: null, names: {}, folder: null, into: { p2: "TB" } },
+                                    created: { p1: "N1" }, filled: ["p1"], original_done: false } };
+    run(`spDraft = ${JSON.stringify(STARTED)}; spDraftGen++`);
+    resetLog();
+    await run(`renderSpFinish("")`);
+    check("SPI the locked finish screen asks the plan with the stored into and says where the part goes",
+          gets(`/api/splitparts/H5/plan?original=subset&into=${IP2}`) === 1 && /jazz/.test(html()) &&
+          /→ THROTTLE BACK/.test(html()) && /adds 1 song to THROTTLE BACK/.test(html()), html());
+  } finally {
+    run(`spStopPolling(); previewHold.stop(true); $("picker").hidden = true; spTargets = null; nowState = ${savedNow}; show("lists")`);
+  }
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

@@ -267,14 +267,32 @@ escalating penalties. Therefore:
   "Abandon" (`POST /api/splitparts/{pid}/abandon`, zero calls) is the way
   out of a failure that repeats: it drops the draft and keeps whatever was
   already created.
-- Done creates and fills the new parts first and touches the original only
-  after that (🐾 rename and dropped from the home lists, or batched
+- Done creates and fills the new parts, then adds the into-parts (below),
+  and touches the original only after all of them (🐾 rename and dropped from the home lists, or batched
   removal). It is resumable per add batch (no duplicates), marks every
   created part a home on every pass, and refuses a folder that wasn't
   offered on a first attempt (a resume doesn't refuse one, since filing
   fails without damage). Batch removal takes 100 songs per call
   (`REMOVE_BATCH`, probed 2026-10-21), so "becomes a part" costs one call
   per 100 songs moved out of the original.
+- **A part can go into a home you already have** instead of becoming a
+  new playlist (since 2026-10-21): the Done screen's "add to an existing
+  home" picks one of the `/targets` homes, sent as `into: {part key: home
+  id}` (the plan takes repeated `into=p2:ID` query pairs). Nothing is
+  created, marked or filed for it, and the twin-name check skips it. Its
+  songs are only added, in batches of 100, after a snapshot read of the
+  home; "already there" is decided from the cached tracks only when that
+  snapshot matches them, else from a fresh read (`_cached_tracks`), on
+  every pass, a resume too. That makes a resume exact (landed batches are
+  in the mirrored cache, or found by the re-read when an add's answer was
+  lost), and a song a stale cache wrongly listed is never skipped and
+  then removed from the original. The plan prices 1 snapshot + the adds
+  per into-part, plus the read only when nothing is cached. The "at least
+  2" rule counts destinations (new + into + the kept part). Targets are
+  checked on a first attempt only: a resume keeps its stored home even
+  once it stopped being offered, since refusing would strand the split
+  and finishing only adds. The summary's `into` says how many were really
+  added (`count`) and how many were there already.
 - Replaced the 2026-08 split (piles, sittings, the queued materialiser):
   all of that code is gone; its data files are moved aside as
   `*.bak-2026-10-20` at rollout.

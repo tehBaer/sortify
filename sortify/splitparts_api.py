@@ -209,8 +209,17 @@ ORIGINAL_CHOICES = ("subset", "part")
 
 
 def done_plan(draft: dict, original: str, part_key: str | None,
-              names: dict[str, str] | None = None, remove_batch: int = 100) -> dict:
-    """What Done will do, and what it costs, without doing any of it."""
+              names: dict[str, str] | None = None, remove_batch: int = 100,
+              into: dict[str, str] | None = None, homes: dict[str, dict] | None = None) -> dict:
+    """What Done will do, and what it costs, without doing any of it.
+
+    `into` maps a part key to an existing home its songs are added to
+    instead of a new playlist. `homes` describes those homes from the cache
+    (zero calls): `{id: {"name", "uris": set, "cached": bool, "total"}}`.
+    The price assumes a cached track list is current (Done proves it with
+    a snapshot read and re-reads it when it is not); with nothing cached at
+    all the read is certain, so it is counted. Whether a target may be used
+    is the caller's check — this only refuses what no target could fix."""
     if original not in ORIGINAL_CHOICES:
         raise ValueError("choose what happens to the original")
     keys = [p["key"] for p in draft["parts"]]
@@ -219,21 +228,41 @@ def done_plan(draft: dict, original: str, part_key: str | None,
         raise ValueError("pick the part the original becomes")
     songs = draft.get("songs") or {}
     names = names or {}
+    into = into or {}
+    homes = homes or {}
+    for key, to_id in into.items():
+        if key not in keys:
+            raise ValueError(f"no part {key!r}")
+        if key == keep_key:
+            raise ValueError("the part the original becomes stays in it — it cannot also go into another home")
+        if not to_id:
+            raise ValueError(f"pick the home part {key!r} goes into")
 
     def local(u: str) -> bool:
         return bool((songs.get(u) or {}).get("local"))
 
-    new_parts, empty = [], []
+    new_parts, into_parts, empty = [], [], []
     for p in draft["parts"]:
         name = (names.get(p["key"]) or p["name"]).strip() or p["name"]
         if p["key"] == keep_key:
             continue
         uris = list(dict.fromkeys(u for u in p["uris"] if not local(u)))
-        if uris:
-            new_parts.append({"key": p["key"], "name": name, "uris": uris})
-        else:
+        if not uris:
             empty.append(name)
-    if len(new_parts) + (1 if keep_key else 0) < 2:
+        elif p["key"] in into:
+            to_id = into[p["key"]]
+            home = homes.get(to_id) or {}
+            held = home.get("uris") or set()
+            into_parts.append({"key": p["key"], "to_id": to_id,
+                               "to_name": home.get("name") or to_id, "uris": uris,
+                               "count": sum(1 for u in uris if u not in held),
+                               "read": 0 if home.get("cached") else
+                               max(1, math.ceil((home.get("total") or 0) / 100))})
+        else:
+            new_parts.append({"key": p["key"], "name": name, "uris": uris})
+    # Destinations, not created playlists: a part going into a home is
+    # as much a place for songs as a new one, and so is the kept part.
+    if len(new_parts) + len(into_parts) + (1 if keep_key else 0) < 2:
         raise ValueError("at least 2 parts need songs in them")
 
     removals: list[str] = []
@@ -243,8 +272,11 @@ def done_plan(draft: dict, original: str, part_key: str | None,
             u for p in draft["parts"] if p["key"] != keep_key
             for u in p["uris"] if u not in keep and not local(u)))
     calls = 1 + sum(1 + math.ceil(len(p["uris"]) / 100) for p in new_parts)
+    # Per into-part: the home's snapshot, its track read when nothing is
+    # cached, and the adds for the songs it does not already hold.
+    calls += sum(1 + p["read"] + math.ceil(p["count"] / 100) for p in into_parts)
     calls += 1 if original == "subset" else math.ceil(len(removals) / remove_batch)
-    return {"new_parts": new_parts, "empty": empty,
+    return {"new_parts": new_parts, "into_parts": into_parts, "empty": empty,
             "local": [songs[u]["name"] for u in songs if local(u)],
             "removals": removals, "calls": calls, "creates": len(new_parts)}
 

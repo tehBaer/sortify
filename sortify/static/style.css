@@ -1283,6 +1283,13 @@ body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { t
 #sp-done h3 { font-size: 1rem; margin: 1.1rem 0 .4rem; }
 .sp-name-row { display: block; margin: .4rem 0; }
 .sp-name-row input { width: 100%; }
+/* A part going into a home you have says so where its name field was;
+   the two chips under it are the choice. */
+.sp-name-part { margin: .4rem 0 .9rem; }
+.sp-name-part .sp-name-row { margin-bottom: .3rem; }
+.sp-into-to { display: block; padding: .45rem 0; font-weight: 600; }
+.sp-into-choice { display: flex; flex-wrap: wrap; gap: .4rem; }
+.sp-into-choice .chip.on { border-color: var(--accent); color: var(--accent); }
 .sp-orig { display: block; margin: .35rem 0; }
 .sp-warn { color: var(--muted); }
 .sp-cost { margin-top: 1rem; font-weight: 600; }

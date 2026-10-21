@@ -19,7 +19,7 @@ from typing import Any
 
 import httpx
 import uvicorn
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -1082,6 +1082,54 @@ class SplitDoneIn(BaseModel):
     folder: str | None = None
     original: str = "subset"
     part: str | None = None
+    # {part key: home id}: that part's songs are added to an existing home
+    # instead of becoming a new playlist.
+    into: dict[str, str] = Field(default_factory=dict)
+
+
+def _splitparts_into_homes(into: dict[str, str]) -> dict[str, dict]:
+    """What the cache knows of the homes parts go into, for the plan: name,
+    the songs its cached track list holds, and whether it has one at all.
+    Zero calls. Named from the whole cached listing, not just the offered
+    targets, so a resumed Done whose home stopped being offered still
+    names it."""
+    cache = store.cache()
+    listing = {p.get("id"): p for p in (cache.get("playlist_list") or {}).get("items") or []}
+    out = {}
+    for to_id in set(into.values()):
+        entry = cache["playlists"].get(to_id)
+        item = listing.get(to_id) or {}
+        out[to_id] = {"name": item.get("name") or to_id, "total": item.get("total") or 0,
+                      "cached": entry is not None,
+                      "uris": {t.get("uri") for t in (entry or {}).get("tracks") or []}}
+    return out
+
+
+def _splitparts_into_problem(pid: str, into: dict[str, str]) -> str | None:
+    """Why a part cannot go into this playlist: it must be one of the
+    split's move targets — another home, editable, not archived, not the
+    split playlist and not Liked Songs."""
+    offered = {t["id"] for t in _splitparts_targets(pid)}
+    names = {p.get("id"): p.get("name") for p in
+             (store.cache().get("playlist_list") or {}).get("items") or []}
+    for key, to_id in into.items():
+        if to_id == pid:
+            return "a part cannot go into the playlist being split"
+        if to_id not in offered:
+            return f"{names.get(to_id) or to_id!r} is not a home a part can go into"
+    return None
+
+
+def _splitparts_parse_into(pairs: list[str]) -> dict[str, str]:
+    """The plan's `into=p2:ID` query pairs as a mapping. Part keys and
+    Spotify ids never hold a colon, so the first one splits them."""
+    out = {}
+    for pair in pairs:
+        key, sep, to_id = pair.partition(":")
+        if not sep or not key or not to_id:
+            raise HTTPException(400, f"into wants part:home pairs, not {pair!r}")
+        out[key] = to_id
+    return out
 
 
 def _splitparts_name_problem(names: list[str]) -> str | None:
@@ -1121,12 +1169,24 @@ def _splitparts_input_set_folder(folder: str | None) -> str | None:
 
 
 @app.get("/api/splitparts/{pid}/plan")
-def splitparts_plan(pid: str, original: str = "subset", part: str | None = None):
+def splitparts_plan(pid: str, original: str = "subset", part: str | None = None,
+                    into: list[str] = Query(default=[])):
+    """The price of a Done choice, zero calls. `into` comes as repeated
+    `into=p2:ID` pairs: a GET with nothing to post, and the pairs keep the
+    callers that send no `into` at all exactly as they were."""
     draft = _splitparts_draft(pid)
+    into_map = _splitparts_parse_into(into)
     try:
-        plan = spa.done_plan(draft, original, part, remove_batch=REMOVE_BATCH)
+        plan = spa.done_plan(draft, original, part, remove_batch=REMOVE_BATCH,
+                             into=into_map, homes=_splitparts_into_homes(into_map))
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    # The locked finish screen prices the STORED choice, which a resume
+    # keeps even once its home stopped being offered (see the done route).
+    if draft.get("done") is None:
+        problem = _splitparts_into_problem(pid, into_map)
+        if problem:
+            raise HTTPException(400, problem)
     choices, default = _home_folder_choices(store.config(), pid)
     for c in choices:
         c["blocked"] = c["blocked"] or _splitparts_input_set_folder(c["path"])
@@ -1134,6 +1194,8 @@ def splitparts_plan(pid: str, original: str = "subset", part: str | None = None)
         default = None
     return {"calls": plan["calls"], "creates": plan["creates"], "empty": plan["empty"],
             "local": plan["local"], "removals": len(plan["removals"]),
+            "into_parts": [{k: p[k] for k in ("key", "to_id", "to_name", "count")}
+                           for p in plan["into_parts"]],
             "folders": choices, "folder": default}
 
 
@@ -1198,8 +1260,19 @@ def _splitparts_run_done(pid: str, opts: dict) -> None:
                 draft["done"] = None
                 progress(state="changed", message=_SPLITPARTS_CHANGED_MSG)
                 return
+        into = opts.get("into") or {}   # absent from opts stored before into existed
         plan = spa.done_plan(draft, opts["original"], opts.get("part"),
-                             names=opts.get("names"), remove_batch=REMOVE_BATCH)
+                             names=opts.get("names"), remove_batch=REMOVE_BATCH,
+                             into=into, homes=_splitparts_into_homes(into))
+        if first_attempt:
+            # The route checked this already; checked again here because the
+            # runner is what writes. A resume does not: see the done route.
+            problem = _splitparts_into_problem(pid, into)
+            if problem:
+                draft["done"] = None
+                progress(state="error", message=problem)
+                return
+        steps = len(plan["new_parts"]) + len(plan["into_parts"])
         # Not saved yet on a first attempt: `done` locks the split, and
         # nothing is worth locking it for until the first write has landed
         # (a quota trip on create #1 must leave moves and Suggest open).
@@ -1261,8 +1334,51 @@ def _splitparts_run_done(pid: str, opts: dict) -> None:
                 save()
             created.append({"id": new_id, "name": name, "count": len(part["uris"])})
 
+        # Into an existing home: only adds, nothing created, marked or filed.
+        # What the home already holds is read from a list PROVEN current —
+        # its snapshot now, the cached tracks only when that matches, a
+        # fresh read otherwise — every time, on a resume too. A song wrongly
+        # believed present would be skipped here and then, in "becomes a
+        # part" mode, removed from the original: lost. Re-deciding on every
+        # pass is also what makes a resume exact: the batches that landed
+        # are in the list (mirrored into the cache with the add's own
+        # snapshot, or found by the re-read when that answer never came
+        # back), so they are neither added twice nor skipped.
+        into_done = []
+        for j, part in enumerate(plan["into_parts"]):
+            key, to_id = part["key"], part["to_id"]
+            progress(phase=f"adding to “{part['to_name']}” ({j + 1} of {len(plan['into_parts'])})",
+                     done=len(plan["new_parts"]) + j)
+            counts = state.setdefault("into_added", {})
+            already = state.setdefault("into_held", {})
+            if key not in state["filled"]:
+                snap = sp.snapshot(to_id)
+                home_tracks = _cached_tracks(to_id, snap)
+                present = {t.get("uri") for t in home_tracks}
+                todo = [u for u in part["uris"] if u not in present]
+                # Counted on the first pass only (on a resume this part's own
+                # landed batches are "present" too), and saved with the first
+                # batch, not before it: nothing is worth locking the split
+                # for until a write has landed.
+                if key not in already:
+                    already[key] = len(part["uris"]) - len(todo)
+                uris_now = [t["uri"] for t in home_tracks if t.get("uri")]
+                known = {**full, **{t["uri"]: t for t in home_tracks if t.get("uri")}}
+                for b in range(0, len(todo), 100):
+                    batch = todo[b:b + 100]
+                    snap = sp.add_to_playlist(to_id, batch)
+                    uris_now += batch
+                    counts[key] = counts.get(key, 0) + len(batch)
+                    _splitparts_seed_tracks(to_id, snap, uris_now, known)
+                    _sync_listing_snapshot(to_id, snap, total=len(uris_now))
+                    save()
+                state["filled"].append(key)
+                save()
+            into_done.append({"key": key, "id": to_id, "name": part["to_name"],
+                              "count": counts.get(key, 0), "already": already.get(key, 0)})
+
         if not state["original_done"]:
-            progress(phase="updating the original", done=len(plan["new_parts"]))
+            progress(phase="updating the original", done=steps)
             if opts["original"] == "subset":
                 new_name = roles.mark_subset_name(draft["name"])
                 if new_name != draft["name"]:
@@ -1285,8 +1401,8 @@ def _splitparts_run_done(pid: str, opts: dict) -> None:
         if opts.get("folder"):
             _splitparts_file(created, opts["folder"])
         spa.drop_draft(store, pid)
-        progress(state="done", phase="done", done=len(plan["new_parts"]), message=None,
-                 summary={"created": created, "original": opts["original"],
+        progress(state="done", phase="done", done=steps, message=None,
+                 summary={"created": created, "into": into_done, "original": opts["original"],
                           "empty": plan["empty"], "local": plan["local"],
                           # The client watches filing per created id, and in
                           # subset mode the original is no longer a home, so
@@ -1314,13 +1430,24 @@ def splitparts_done(pid: str, body: SplitDoneIn):
     # stored "part" choice.
     started = draft.get("done")
     check = started["opts"] if started is not None else {
-        "names": body.names, "folder": body.folder, "original": body.original, "part": body.part}
+        "names": body.names, "folder": body.folder, "original": body.original, "part": body.part,
+        "into": body.into}
+    into = check.get("into") or {}
     try:
         plan = spa.done_plan(draft, check["original"], check.get("part"),
-                             names=check.get("names"), remove_batch=REMOVE_BATCH)
+                             names=check.get("names"), remove_batch=REMOVE_BATCH,
+                             into=into, homes=_splitparts_into_homes(into))
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    problem = _splitparts_name_problem([p["name"] for p in plan["new_parts"]])
+    # The into targets, like the folder below, are checked on a FIRST
+    # attempt only. A resume keeps the target it started with even once it
+    # stopped being offered (unmarked as a home, renamed 🗄️): refusing
+    # would strand the split, since moves, Suggest and Discard all 409
+    # once Done has started, and finishing only ever ADDS songs to the
+    # playlist the user confirmed — nothing can be lost by it. The locked
+    # finish screen names that playlist, and Abandon stays the way out.
+    problem = _splitparts_into_problem(pid, into) if started is None else None
+    problem = problem or _splitparts_name_problem([p["name"] for p in plan["new_parts"]])
     if not problem and started is None:
         # First attempt only: on a resume the parts already created are in
         # the listing under these very names.
@@ -1352,13 +1479,13 @@ def splitparts_done(pid: str, body: SplitDoneIn):
             raise HTTPException(409, "already running")
         _splitparts_job.clear()
         _splitparts_job.update({"pid": pid, "state": "running", "phase": "starting", "kind": "done",
-                                "done": 0, "total": plan["creates"], "message": None,
-                                "summary": None})
+                                "done": 0, "total": plan["creates"] + len(plan["into_parts"]),
+                                "message": None, "summary": None})
     # The body's own opts still seed a FIRST attempt (the runner has nothing
     # stored yet to prefer); a resume ignores them regardless, inside the
     # runner itself.
     opts = {"names": body.names, "folder": body.folder, "original": body.original,
-            "part": body.part}
+            "part": body.part, "into": body.into}
     if _splitparts_threaded:
         threading.Thread(target=_splitparts_run_done, args=(pid, opts), daemon=True).start()
     else:
