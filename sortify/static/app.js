@@ -46,10 +46,10 @@ function show(view) {
   // held the auto-resume back until the user found their way back here.
   previewHold.stop();
   for (const v of views) $("view-" + v).hidden = v !== view;
-  // Leaving the Split tab must stop its progress polling and any live
-  // preview — otherwise either keeps running, unseen, behind whatever view
-  // comes next.
-  if (view !== "split") { spStopPolling(); spStopPreview(); }
+  // Leaving the Split tab must stop its progress polling — otherwise it
+  // keeps running, unseen, behind whatever view comes next. (Its preview is
+  // the house player, stopped above.)
+  if (view !== "split") spStopPolling();
   // The input switcher and now-actions live in the merged header; this class
   // is what shows them on the Now view and hides them everywhere else.
   document.body.classList.toggle("on-now", view === "now");
@@ -3094,7 +3094,8 @@ function openPicker(homesMap, onPick, onCreate, onHomeless, verb = "File here",
     // Recency first: the home you filed into most recently is the likeliest
     // target again (ISO Zulu stamps compare fine as strings; homes never
     // added to sink to the bottom in the old folder → name order).
-    const homes = [...homesMap.values()].sort((a, b) =>
+    // `opts.keepOrder`: the caller's list is already in the order to show.
+    const homes = opts.keepOrder ? [...homesMap.values()] : [...homesMap.values()].sort((a, b) =>
       (b.last_added_at || "").localeCompare(a.last_added_at || "") ||
       (a.folder || "").localeCompare(b.folder || "") || a.name.localeCompare(b.name));
     let shown = 0;
@@ -3268,6 +3269,12 @@ const previewHold = (() => {
   // Player state: every clip resolved so far (pages accumulate), the next
   // page cursor, and the index of the clip being played.
   let clips = [], nextOffset = null, idx = -1, pid = null, title = "", total = 0, fallback = [];
+  // Where the pages come from: `pageUrl(null)` is the first page, then
+  // `pageUrl(offset)` for each next one. A playlist's medley by default;
+  // openList hands in another source (a split part's songs).
+  let pageUrl = null;
+  const playlistPages = (p) => (offset) =>
+    offset == null ? `/api/playlist_preview/${p}` : `/api/playlist_preview/${p}?offset=${offset}`;
 
   // Where each playlist's preview stood, so reopening one continues where it
   // left off instead of starting over. A preview serves one decision —
@@ -3489,7 +3496,7 @@ const previewHold = (() => {
       }
       render("loading…");
       try {
-        const d = await api(`/api/playlist_preview/${pid}?offset=${nextOffset}`);
+        const d = await api(pageUrl(nextOffset));
         if (mySeq !== seq) return;
         clips = clips.concat(d.clips);   // an all-miss page just loops for the next
         nextOffset = d.next_offset;
@@ -3535,7 +3542,11 @@ const previewHold = (() => {
     render();
   }
 
-  async function open(p, t, a) {
+  // `pages`, when given, replaces the playlist medley as the page source;
+  // `p` is then only the key its position stash is kept under. Such a list
+  // never resumes a stash: it is opened on one chosen song, and must start
+  // there (its order can also have changed since, under the stash).
+  async function open(p, t, a, pages = null) {
     seq++; const mySeq = seq;
     // Whatever was playing keeps its place first — replacing the popup with
     // another playlist's must not forget where this one stood.
@@ -3545,6 +3556,7 @@ const previewHold = (() => {
     const uri = (nowState && nowState.track && nowState.track.uri) || null;
     if (uri !== resumeTrack) { resumeAt.clear(); resumeTrack = uri; }
     pid = p; title = t || "preview"; clips = []; nextOffset = null; idx = -1; fallback = [];
+    pageUrl = pages || playlistPages(p);
     total = 0; needsTap = false; act = a || null; resumed = false; deadClips = 0;
     // The track this popup's action belongs to, so a decision can't land on
     // a different one (see the pv-act handler).
@@ -3568,7 +3580,7 @@ const previewHold = (() => {
     pop().hidden = false;
     // Lets the picker keep its last rows clear of the card (see style.css).
     document.body.classList.add("previewing");
-    const saved = resumeAt.get(p);
+    const saved = pages ? null : resumeAt.get(p);
     if (saved) {
       // Same playlist, same playing track: continue where it left off.
       ({ clips, nextOffset, total, fallback } = saved);
@@ -3577,7 +3589,7 @@ const previewHold = (() => {
     }
     render("previewing…");
     try {
-      const d = await api(`/api/playlist_preview/${pid}`);
+      const d = await api(pageUrl(null));
       if (mySeq !== seq) return;   // closed (or replaced) before the answer
       clips = d.clips; nextOffset = d.next_offset; total = d.total; fallback = d.tracks;
       if (clips.length || nextOffset != null) playAt(0);
@@ -3664,6 +3676,9 @@ const previewHold = (() => {
       row.oncontextmenu = (e) => e.preventDefault();  // long-press menu would steal the hold
     },
     consumeClick() { const f = fired; fired = false; return f; },
+    // The player opened by a tap rather than a hold, on a caller's own page
+    // source (see open). `key` keeps its stash apart from real playlists.
+    openList: (key, title_, pages) => open(key, title_, null, pages),
     stop: (hard) => close(hard),
   };
 })();
@@ -3701,131 +3716,62 @@ let spFilingTimer = null;
 const SP_MIN = 2, SP_MAX = 6;
 
 // ---- tap = preview ----------------------------------------------------------
-// One clip at a time. Spotify is paused by the phone when the clip takes the
-// audio, and given back once when previewing ends — only if it was playing
-// when THIS session's first tap landed, and only once a clip of ours has
-// actually taken that focus (a 404 or a refused play never took it).
-let spAudio = null;
-let spAudioUri = null;
-let spAudioPending = false;   // spAudio exists but play() has not yet succeeded
-let spAudioRefused = false;   // play() was refused PERMISSION (iOS) — tap again to retry
-let spResumeOwed = false;
-let spSessionPlaying = false; // was Spotify playing when this preview session began
-
-function spStopPreview(resume = true) {
-  if (spAudio) { spAudio.onended = null; spAudio.onerror = null; spAudio.pause(); spAudio.src = ""; }
-  spAudio = null;
-  spAudioPending = false;
-  spAudioRefused = false;
-  const was = spAudioUri;
-  spAudioUri = null;
-  if (resume && spResumeOwed) {
-    spResumeOwed = false;
-    spSessionPlaying = false;
-    // Like the house player's own resume (previewHold.resumeSpotify): a
-    // failure — ok:false, or the call itself rejecting — says so rather
-    // than leaving Spotify silently paused with no visible way back.
-    api("/api/preview_resume", {}).then((r) => {
-      if (!r || r.ok === false) toast("preview over — press play in Spotify");
-    }).catch(() => toast("preview over — press play in Spotify"));
-  }
-  if (was && spDraft && !$("sp-parts").hidden) renderSpList();
+// The house player (previewHold), opened on the tapped song and walking on
+// down the part in its list order — the same controls, fades, "not this
+// song" and Spotify pause/resume rules as every other preview in the app.
+// Pages come from the part's own endpoint (zero Spotify calls).
+function spPreview(uri) {
+  const part = spPart(spShown);
+  if (!part) return;
+  const base = `${spUrl("/preview")}?key=${encodeURIComponent(part.key)}`;
+  previewHold.openList(`split:${spPid}:${part.key}`, part.name, (offset) =>
+    offset == null ? `${base}&start=${encodeURIComponent(uri)}` : `${base}&offset=${offset}`);
 }
 
-// A clip that failed to LOAD or DECODE — an expired CDN token, a 403/404, a
-// network hiccup — is never a permission refusal: retrying play() on the
-// same dead element only rejects the same way forever. Fetch a fresh URL on
-// the next tap instead. Shared by a rejected play() and a later onerror (a
-// clip that dies mid-playback, not just at the start).
-function spClipFailed() {
-  if (!spAudio) return;
-  // true, not false: a clip that already took Spotify's focus (resume is
-  // owed) must give it back now — the owed flag only ever arms once play()
-  // has actually resolved, so this is a no-op for a clip that never played.
-  spStopPreview(true);
-  toast("this preview failed — tap to try again");
+// ---- the row's icon: move the song to another playlist instead --------------
+// A tap on it (never a drag — a press on it that moves lifts the song like
+// the rest of the row) opens the picker on every playlist the song can go
+// to; a pick moves it there at once: added there first, then removed from
+// the playlist being split (2 calls). No undo.
+const ICON_ELSEWHERE = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>';
+
+async function spOpenElsewhere(uri) {
+  const pid = spPid, gen = spDraftGen;
+  let targets;
+  try {
+    targets = (await api(spUrl("/targets", pid))).targets || [];
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  if (pid !== spPid || gen !== spDraftGen || $("sp-parts").hidden) return;
+  const map = new Map(targets.map((t) => [t.id, t]));
+  // The server's order (by name); no hold-to-preview on these rows, and no
+  // keyboard thrown over the list on open — the box is one tap away.
+  openPicker(map, (id) => spElsewhere(uri, id), null, null, "Move here", "home",
+             { focus: false, preview: false, keepOrder: true });
 }
 
-async function spPreview(uri) {
-  // iOS: a previous tap's play() on this exact row was refused PERMISSION
-  // (NotAllowedError). Retry it SYNCHRONOUSLY, before any await, on the
-  // same Audio object — no new fetch, no new Audio — since iOS only grants
-  // playback inside the very gesture handler that asks for it, never one
-  // that resumes after an awaited fetch has already returned.
-  if (spAudio && spAudioUri === uri && spAudioRefused) {
-    const a = spAudio;
-    // Cleared BEFORE awaiting, not after: while this retry's own play() is
-    // buffering it is no longer "refused", so a third tap landing in that
-    // window stops the clip (the branch below) instead of matching this one
-    // again and calling play() on it a second time.
-    spAudioRefused = false;
-    try {
-      await a.play();
-    } catch (e) {
-      // Quiet when this exact attempt was superseded (spAudio !== a) or
-      // simply aborted by a stop that raced it — neither is a failure.
-      if (spAudio !== a || (e && e.name === "AbortError")) return;
-      if (e && e.name === "NotAllowedError") {
-        spAudioRefused = true;
-        toast("tap the song again to play its preview");
-        return;
-      }
-      spClipFailed();
-      return;
-    }
-    if (spAudio !== a) return;
-    spAudioPending = false;
-    if (spSessionPlaying) spResumeOwed = true;
-    renderSpList();
-    return;
-  }
-  // Same row, not refused: either genuinely playing, or merely still
-  // buffering — either way a second tap means "stop", never "try again".
-  if (spAudioUri === uri) { spStopPreview(); return; }
-  // A session starts when nothing is playing or pending yet — captured once,
-  // so switching between songs mid-session never re-asks "was it playing".
-  const startingSession = !spAudio;
-  // Unknown counts as playing, as in the house player (previewHold): a
-  // resume owed and not needed costs less than music left paused.
-  if (startingSession) spSessionPlaying = nowState ? !!nowState.is_playing : true;
-  if (spAudio) spStopPreview(false);
-  spAudioUri = uri;
-  let r;
+async function spElsewhere(uri, toId) {
+  const pid = spPid, gen = spDraftGen;
+  let d;
   try {
-    r = await api(`/api/track_preview?pid=${encodeURIComponent(spPid)}&uri=${encodeURIComponent(uri)}`);
+    d = await api(spUrl("/elsewhere", pid), { uri, to_id: toId });
   } catch (e) {
-    if (spAudioUri === uri) spAudioUri = null;
-    toast(e.status === 404 ? "no preview for this one" : e.message);
+    // "now in both playlists" is worth the time to read.
+    toast(e.message, 6000);
     return;
   }
-  if (spAudioUri !== uri) return;        // another tap won the race
-  const a = spAudio = new Audio(r.url);
-  spAudioPending = true;
-  a.onended = () => { if (spAudio === a) spStopPreview(); };
-  a.onerror = () => { if (spAudio === a) spClipFailed(); };
-  try {
-    await a.play();
-  } catch (e) {
-    if (spAudio !== a || (e && e.name === "AbortError")) return;
-    if (e && e.name === "NotAllowedError") {
-      // Keep spAudio/spAudioUri/spAudioPending: the next tap on this same
-      // row retries play() on this object instead of refetching.
-      spAudioRefused = true;
-      toast("tap the song again to play its preview");
-      return;
-    }
-    spClipFailed();
-    return;
-  }
-  if (spAudio !== a) return;
-  spAudioPending = false;
-  if (spSessionPlaying) spResumeOwed = true;
-  renderSpList();
+  if (pid !== spPid || gen !== spDraftGen) return;
+  const { moved_to: to, ...draft } = d;
+  spDraft = draft;
+  if (!$("sp-parts").hidden) renderSpParts();
+  toast(`moved to ${to?.name || "the other playlist"}`);
 }
 
 // ---- touch that moves = drag -------------------------------------------------
 const SP_LIFT_PX = 8;
-let spDrag = null;      // {uri, x0, y0, lifted, ghost, pointerId}
+let spDrag = null;      // {uri, x0, y0, lifted, ghost, pointerId, onIcon}
 let spDropKey = null;   // the chip under a lifted song
 
 function spChipAt(x, y) {
@@ -3842,13 +3788,13 @@ function spHighlight(key) {
   });
 }
 
-function spPointerDown(uri, x, y, id) {
+function spPointerDown(uri, x, y, id, onIcon = false) {
   // A new touch always ends whatever drag is already in progress — without
   // this a second finger silently overwrote spDrag, orphaning the first
   // finger's ghost and leaving its eventual pointerup to act on someone
   // else's drag.
   spEndDrag();
-  spDrag = { uri, x0: x, y0: y, lifted: false, ghost: null, pointerId: id };
+  spDrag = { uri, x0: x, y0: y, lifted: false, ghost: null, pointerId: id, onIcon };
 }
 
 function spPointerMove(x, y, id) {
@@ -3885,8 +3831,28 @@ async function spPointerUp(x, y, id) {
   const lifted = spDrag.lifted;
   const key = lifted ? spChipAt(x, y) : null;
   const d = spEndDrag();
-  if (!lifted) { await spPreview(d.uri); return; }
+  // Not lifted: a tap — on the icon it moves the song elsewhere, anywhere
+  // else on the row it previews.
+  if (!lifted) {
+    spSwallowGhostClick();
+    if (d.onIcon) spOpenElsewhere(d.uri); else spPreview(d.uri);
+    return;
+  }
   if (key && key !== spShown) await spMove(d.uri, key);
+}
+
+// A phone follows the tap's pointerup with a synthesized click at the same
+// spot — by then the player (or the picker) has been drawn under the finger,
+// so that click landed on its Close button and shut it at once. Capture
+// phase on the document, so it is eaten before any element sees it; one
+// click only, and gone after SP_GHOST_CLICK_MS whether one came or not.
+const SP_GHOST_CLICK_MS = 400;
+function spSwallowGhostClick() {
+  let timer = null;
+  const done = () => { clearTimeout(timer); document.removeEventListener("click", eat, true); };
+  const eat = (e) => { e.preventDefault(); e.stopPropagation(); done(); };
+  document.addEventListener("click", eat, true);
+  timer = setTimeout(done, SP_GHOST_CLICK_MS);
 }
 
 function spPointerCancel(id) {
@@ -3898,7 +3864,8 @@ function spListPointerDown(e) {
   const row = e.target && e.target.closest ? e.target.closest(".sp-song") : null;
   if (!row || (e.button !== undefined && e.button > 0)) return;
   e.preventDefault();
-  spPointerDown(row.dataset.uri, e.clientX, e.clientY, e.pointerId);
+  const onIcon = !!(e.target.closest && e.target.closest(".sp-elsewhere"));
+  spPointerDown(row.dataset.uri, e.clientX, e.clientY, e.pointerId, onIcon);
 }
 document.addEventListener("pointermove", (e) => {
   if (!spDrag) return;
@@ -3988,7 +3955,7 @@ async function spResuggest(n) {
 // Start over opens the counter, at the current count; Suggest from there
 // replaces the draft, and "Keep this split" goes back to it untouched.
 function spStartOver() {
-  spStopPreview();
+  previewHold.stop();
   spN = spDraft?.n || 2;
   renderSpSetup("");
 }
@@ -3996,7 +3963,7 @@ function spStartOver() {
 async function spDiscard() {
   if (spDraft.edited && !confirm("Discard this split? Your moves and part changes are lost. Nothing in Spotify changes.")) return;
   const pid = spPid, gen = spDraftGen;
-  spStopPreview();
+  previewHold.stop();
   try {
     await api(spUrl("", pid), null, "DELETE");
   } catch (e) {
@@ -4031,8 +3998,7 @@ const spUrl = (tail = "", pid = spPid) => `/api/splitparts/${encodeURIComponent(
 
 async function showSplit() {
   spStopPolling();
-  spStopPreview();
-  show("split");
+  show("split");   // stops the preview player too
   spSection("sp-pick");
   $("sp-homes").innerHTML = '<p class="hint">loading…</p>';
   const token = spPollToken;
@@ -4146,7 +4112,7 @@ async function openSpHome(home) {
   }
   spN = 2; renderSpSetup("");
 }
-$("sp-back").onclick = () => { spStopPolling(); spStopPreview(); showSplit(); };
+$("sp-back").onclick = () => { spStopPolling(); showSplit(); };
 
 function renderSpSetup(msg) {
   spPanel("sp-setup");
@@ -4162,7 +4128,7 @@ $("sp-plus").onclick = () => { spN = Math.min(SP_MAX, spN + 1); $("sp-n").textCo
 $("sp-suggest").onclick = () => { if (spConfirmReplace(spN)) return spSuggest(spN); };
 
 async function spSuggest(n) {
-  spStopPreview();
+  previewHold.stop();
   spN = n;
   try {
     await api(spUrl("/suggest"), { n });
@@ -4258,7 +4224,7 @@ function spSummaryKey(pid, summary) {
 }
 
 async function spOpenDone() {
-  spStopPreview();   // no clip plays on under the Done screen
+  previewHold.stop();   // no clip plays on under the Done screen
   if (spDoneChoicePid !== spPid || spDoneChoiceGen !== spDraftGen) {
     spDoneChoice = { original: "subset", part: spDraft.parts[0]?.key || null,
                      folder: undefined, names: {} };
@@ -4745,15 +4711,14 @@ function renderSpList() {
   $("sp-list").innerHTML = part && part.uris.length
     ? part.uris.map((u) => {
         const s = spDraft.songs[u] || { name: u, artists: "" };
-        // Not merely "the row this uri belongs to" — spAudioUri is set
-        // before the fetch even starts, while spAudio itself (and so
-        // spAudioPending) doesn't exist yet, and a refused or still-
-        // buffering clip keeps both set without having taken audio focus.
-        // None of those earn the highlight until there's a real spAudio
-        // with spAudioPending cleared (see spPreview).
-        return `<div class="sp-song${spAudio && u === spAudioUri && !spAudioPending ? " playing" : ""}" data-uri="${esc(u)}">
-          <span class="sp-song-name">${esc(s.name)}${unknown.has(u) ? ' <span class="sp-unknown" title="no Last.fm data — check where it landed">?</span>' : ""}</span>
-          <span class="sp-song-artist">${esc(s.artists)}</span>
+        // The icon sits inside the row, so pressing it starts the row's own
+        // drag; only a tap on it is its own (see spPointerUp).
+        return `<div class="sp-song" data-uri="${esc(u)}">
+          <span class="sp-song-text">
+            <span class="sp-song-name">${esc(s.name)}${unknown.has(u) ? ' <span class="sp-unknown" title="no Last.fm data — check where it landed">?</span>' : ""}</span>
+            <span class="sp-song-artist">${esc(s.artists)}</span>
+          </span>
+          <button type="button" class="icon-btn sp-elsewhere" aria-label="Move to another playlist">${ICON_ELSEWHERE}</button>
         </div>`;
       }).join("")
     : '<p class="hint">no songs in this part yet — drag some onto its chip</p>';
@@ -4822,10 +4787,6 @@ document.addEventListener("visibilitychange", () => {
   // cut, not a fade — a hidden tab's timers are clamped, so a fade would go
   // on sounding over the music the close's resume just brought back.
   if (document.hidden) previewHold.stop(true);
-  // Same reasoning as previewHold's own stop: a locked phone has no visible
-  // player either, and a split-tab clip left running would keep Spotify
-  // paused with nothing on screen to say why.
-  if (document.hidden) spStopPreview();
   // Manual mode means almost exactly that — the refocus poll doesn't fire,
   // with one exception: a song that played out while the tab was hidden.
   // Coming back to the tool is "having it open", which is what the user

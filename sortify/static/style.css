@@ -1058,6 +1058,10 @@ kbd {
 /* while the card is up it must not sit on top of the picker's last rows or
    its Cancel button — the row just held is usually the one underneath it */
 body.previewing .picker-inner { max-height: min(80vh, calc(100dvh - 19rem)); }
+/* the same card over the Split tab: the part's last rows must scroll clear
+   of it (it floats ~14rem up from the bottom edge: 4.2rem offset plus its
+   own height with the big controls) */
+body.previewing #sp-list { padding-bottom: 15rem; }
 .picker-row .p-name { display: block; font-weight: 600; }
 .picker-row .p-sub { display: block; color: var(--muted); font-size: .78rem; margin-top: .1rem; }
 .picker-create .p-name { color: var(--accent); }
@@ -1245,12 +1249,19 @@ body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { t
 .sp-song {
   touch-action: none; user-select: none; -webkit-user-select: none;
   padding: .55rem .7rem; margin: .3rem 0; border-radius: 10px; background: var(--card);
-  cursor: grab;
+  cursor: grab; display: flex; align-items: center; gap: .5rem;
 }
+.sp-song-text { flex: 1; min-width: 0; }
 .sp-song-name, .sp-song-artist { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* "Move to another playlist": a tap target at the row's right end. A press
+   on it that moves still drags the song (it inherits the row's
+   touch-action: none). */
+.sp-song .sp-elsewhere {
+  flex: none; color: var(--muted); background: transparent; border-color: transparent;
+  touch-action: none; margin: -.4rem -.4rem -.4rem 0;   /* full 48px target, row height unchanged */
+}
 .sp-song-artist { color: var(--muted); font-size: .85rem; }
 .sp-unknown { color: var(--muted); font-weight: 700; }
-.sp-song.playing { outline: 2px solid var(--accent); }
 .sp-ghost {
   position: fixed; z-index: 30; pointer-events: none; transform: translate(-50%, -120%);
   max-width: 70vw; padding: .45rem .8rem; border-radius: 10px;

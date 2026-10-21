@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import logging
@@ -649,6 +650,8 @@ class SplitRemoveIn(BaseModel):
 
 
 _SPLITPARTS_DONE_STARTED_MSG = "Done has already started for this split — press Done again to finish it"
+_SPLITPARTS_CHANGED_MSG = ("the playlist changed in Spotify since the suggestion — "
+                           "re-read it to continue")
 
 
 def _splitparts_home(pid: str) -> dict:
@@ -958,6 +961,94 @@ def splitparts_remove_part(pid: str, key: str, body: SplitRemoveIn):
     return spa.without_tracks(draft)
 
 
+def _splitparts_targets(pid: str) -> list[dict]:
+    # The cached listing, never sp.my_playlists(): a cold one is ~21 calls.
+    listing = (store.cache().get("playlist_list") or {}).get("items") or []
+    return spa.move_targets(listing, pid, store.folders(), LIKED_ID)
+
+
+@app.get("/api/splitparts/{pid}/targets")
+def splitparts_targets(pid: str):
+    """The playlists a song of this split can be moved to instead. Zero calls."""
+    return {"targets": _splitparts_targets(pid)}
+
+
+class SplitElsewhereIn(BaseModel):
+    uri: str
+    to_id: str
+
+
+@app.post("/api/splitparts/{pid}/elsewhere")
+def splitparts_elsewhere(pid: str, body: SplitElsewhereIn):
+    """Move one song out of the split's playlist into another playlist,
+    right away (3 calls: the snapshot, the add, the removal; when the
+    destination's cache holds the song, its snapshot is read instead of
+    the add when it proves the cache current — still 3). The playlist must still be the
+    one the draft knows — otherwise the draft would adopt the removal's
+    snapshot over changes it never saw, and Done's "the playlist changed"
+    guard would wave them through. The add goes first, so a failure can
+    never lose the song: an add that fails changes nothing, and a removal
+    that fails after it leaves the song in both playlists and says so (a
+    retry then skips the add and only removes)."""
+    # Held across the Spotify calls on purpose: a move, a part change or a
+    # Done started mid-move waits for it rather than interleaving with it.
+    # One user on one phone, so the wait (a second or so) is acceptable.
+    with spa._lock:
+        draft = _splitparts_draft(pid)
+        if draft.get("done") is not None:
+            raise HTTPException(409, _SPLITPARTS_DONE_STARTED_MSG)
+        with _splitparts_job_lock:
+            running = (_splitparts_job.get("state") == "running"
+                       and _splitparts_job.get("pid") == pid)
+        if running:
+            raise HTTPException(409, "already running")
+        uri = body.uri
+        if not spa.has_song(draft, uri):
+            raise HTTPException(400, "that song is not in this split")
+        if ((draft.get("songs") or {}).get(uri) or {}).get("local"):
+            raise HTTPException(400, "a local file cannot be added through Spotify's API")
+        if body.to_id == pid:
+            raise HTTPException(400, "that is the playlist being split")
+        target = next((t for t in _splitparts_targets(pid) if t["id"] == body.to_id), None)
+        if target is None:
+            raise HTTPException(400, "not a playlist this song can be moved to")
+        if sp.snapshot(pid) != draft["snapshot_id"]:
+            raise HTTPException(409, _SPLITPARTS_CHANGED_MSG)
+        # A song the destination already holds is not added a second time
+        # (the retry after a "now in both playlists" error) — but only when
+        # the cached track list is proven current: it can be days old, and a
+        # song since removed from the destination in Spotify would otherwise
+        # be skipped here, removed below, and end up in neither playlist.
+        # Its snapshot is the proof (1 call); on a mismatch, or nothing
+        # cached to compare, add as usual — a duplicate is the safe side.
+        dest = store.cache()["playlists"].get(body.to_id) or {}
+        held = any(t.get("uri") == uri for t in dest.get("tracks") or [])
+        current = (held and bool(dest.get("snapshot_id"))
+                   and sp.snapshot(body.to_id) == dest["snapshot_id"])
+        if not current:
+            _apply_snapshot(body.to_id, sp.add_to_playlist(body.to_id, [uri]))
+        try:
+            snap = sp.remove_from_playlist(pid, uri)
+        except Exception as exc:
+            # The add landed: mirror that much, it is true.
+            _cache_move(uri, [], body.to_id)
+            _sync_membership(uri, add_to=body.to_id, remove_from=[])
+            log.warning("split: elsewhere removal failed after the add", exc_info=True)
+            raise HTTPException(
+                502, f"added to “{target['name']}”, but removing it from “{draft['name']}” "
+                     f"failed ({exc}) — the song is now in both playlists")
+        _apply_snapshot(pid, snap)
+        _cache_move(uri, [pid], body.to_id)
+        _sync_membership(uri, add_to=body.to_id, remove_from=[pid])
+        entry = store.cache()["playlists"].get(pid)
+        _sync_listing_snapshot(pid, snap, total=len(entry["tracks"]) if entry else None)
+        spa.forget_song(draft, uri)
+        if snap:
+            draft["snapshot_id"] = snap
+        spa.put_draft(store, draft)
+    return {**spa.without_tracks(draft), "moved_to": {"id": target["id"], "name": target["name"]}}
+
+
 class SplitDoneIn(BaseModel):
     names: dict[str, str] = Field(default_factory=dict)
     folder: str | None = None
@@ -1077,9 +1168,7 @@ def _splitparts_run_done(pid: str, opts: dict) -> None:
             progress(phase="checking the playlist")
             if sp.snapshot(pid) != draft["snapshot_id"]:
                 draft["done"] = None
-                progress(state="changed", message=(
-                    "the playlist changed in Spotify since the suggestion — "
-                    "re-read it to continue"))
+                progress(state="changed", message=_SPLITPARTS_CHANGED_MSG)
                 return
         plan = spa.done_plan(draft, opts["original"], opts.get("part"),
                              names=opts.get("names"), remove_batch=REMOVE_BATCH)
@@ -2334,6 +2423,50 @@ _preview_cache: dict[str, tuple[float, dict]] = {}
 _preview_lock = threading.Lock()
 
 
+def _preview_page(candidates: list[dict], offset: int, total: int) -> dict:
+    """One medley page over `candidates` (track dicts with a name and a
+    first artist, in play order), from candidate `offset`: up to
+    PREVIEW_CLIPS Deezer clips, trying at most PREVIEW_MAX_ATTEMPTS songs.
+    Shared by the playlist medley and a split part's player. Call with
+    `_preview_lock` held; caching is the caller's."""
+    rejects = store.preview_rejects()
+    clips = []
+    consumed = 0
+    for t in candidates[offset:offset + PREVIEW_MAX_ATTEMPTS]:
+        if len(clips) >= PREVIEW_CLIPS:
+            break
+        consumed += 1
+        artist = t["artists"][0]["name"]
+        # What the user has already marked as the wrong recording for
+        # this track. Passed INTO the search so it reaches the next
+        # candidate rather than filtering the answer away afterwards.
+        skip = (rejects.get(t.get("uri")) or {}).get("rejected") or []
+        try:
+            rec = _deezer_client().fetch_preview(artist, t["name"], exclude=skip)
+        except Exception:
+            log.warning("deezer preview failed for %r — skipping", t["name"])
+            continue
+        if not rec.get("miss"):
+            # `uri` and `deezer_id` are what let the player say WHICH
+            # recording was wrong when the user marks it — without them
+            # a reject could only name a title, which is the one thing
+            # already known to be ambiguous.
+            clips.append({"name": t["name"], "artist": artist, "url": rec["url"],
+                          "uri": t.get("uri"), "deezer_id": rec.get("deezer_id")})
+    nxt = offset + consumed
+    return {
+        "clips": clips,
+        "next_offset": nxt if nxt < len(candidates) else None,
+        "tracks": [{"name": t["name"], "artist": t["artists"][0]["name"]}
+                   for t in candidates[:PREVIEW_LIST_N]],
+        "total": total,
+    }
+
+
+def _previewable(t: dict) -> bool:
+    return bool(t.get("name") and (t.get("artists") or [{}])[0].get("name"))
+
+
 @app.get("/api/playlist_preview/{playlist_id}")
 def playlist_preview(playlist_id: str, offset: int = 0) -> dict:
     """One PAGE of a hold-to-preview medley: up to PREVIEW_CLIPS Deezer 30s
@@ -2355,66 +2488,53 @@ def playlist_preview(playlist_id: str, offset: int = 0) -> dict:
         cached = _preview_cache.get((playlist_id, offset))
         if cached and time.monotonic() - cached[0] < PREVIEW_TTL:
             return cached[1]
-        rejects = store.preview_rejects()
         candidates = sorted(
-            (t for t in entry.get("tracks") or []
-             if t.get("name") and (t.get("artists") or [{}])[0].get("name")),
+            (t for t in entry.get("tracks") or [] if _previewable(t)),
             key=lambda t: t.get("added_at") or "", reverse=True,
         )
-        clips = []
-        consumed = 0
-        for t in candidates[offset:offset + PREVIEW_MAX_ATTEMPTS]:
-            if len(clips) >= PREVIEW_CLIPS:
-                break
-            consumed += 1
-            artist = t["artists"][0]["name"]
-            # What the user has already marked as the wrong recording for
-            # this track. Passed INTO the search so it reaches the next
-            # candidate rather than filtering the answer away afterwards.
-            skip = (rejects.get(t.get("uri")) or {}).get("rejected") or []
-            try:
-                rec = _deezer_client().fetch_preview(artist, t["name"], exclude=skip)
-            except Exception:
-                log.warning("deezer preview failed for %r — skipping", t["name"])
-                continue
-            if not rec.get("miss"):
-                # `uri` and `deezer_id` are what let the player say WHICH
-                # recording was wrong when the user marks it — without them
-                # a reject could only name a title, which is the one thing
-                # already known to be ambiguous.
-                clips.append({"name": t["name"], "artist": artist, "url": rec["url"],
-                              "uri": t.get("uri"), "deezer_id": rec.get("deezer_id")})
-        nxt = offset + consumed
-        payload = {
-            "clips": clips,
-            "next_offset": nxt if nxt < len(candidates) else None,
-            "tracks": [{"name": t["name"], "artist": t["artists"][0]["name"]}
-                       for t in candidates[:PREVIEW_LIST_N]],
-            "total": len(entry.get("tracks") or []),
-        }
+        payload = _preview_page(candidates, offset, len(entry.get("tracks") or []))
         _preview_cache[(playlist_id, offset)] = (time.monotonic(), payload)
         return payload
 
 
-@app.get("/api/track_preview")
-def track_preview(pid: str, uri: str):
-    """One song's 30 s Deezer clip, for a tap in the Split tab. The song is
-    looked up in that playlist's split draft (no Spotify call); recordings
-    the user marked wrong are skipped, as in the medley player."""
-    draft = spa.get_draft(store, pid) or {}
-    track = next((t for t in draft.get("tracks") or [] if t.get("uri") == uri), None)
-    if track is None or not track.get("artists"):
-        raise HTTPException(404, "not in this split")
-    artist = track["artists"][0].get("name") or ""
-    skip = (store.preview_rejects().get(uri) or {}).get("rejected") or []
-    try:
-        rec = _deezer_client().fetch_preview(artist, track.get("name") or "", exclude=skip)
-    except Exception:
-        log.warning("deezer preview failed for %r", track.get("name"))
-        raise HTTPException(404, "no preview")
-    if rec.get("miss") or not rec.get("url"):
-        raise HTTPException(404, "no preview")
-    return {"url": rec["url"], "uri": uri, "deezer_id": rec.get("deezer_id")}
+@app.get("/api/splitparts/{pid}/preview")
+def splitparts_preview(pid: str, key: str, offset: int = 0, start: str | None = None) -> dict:
+    """The house player over one part of a split: the part's songs in the
+    order the part lists them, from the tapped song (`start`) on the first
+    page. Local files and songs without a name or artist are left out. Zero
+    Spotify calls — the songs come from the draft. A page is cached under
+    the part's exact song list, so a song moved out of the part can never
+    come back from a page resolved before the move."""
+    draft = spa.get_draft(store, pid)
+    if draft is None:
+        raise HTTPException(404, "no split in progress for this playlist")
+    part = next((p for p in draft["parts"] if p["key"] == key), None)
+    if part is None:
+        raise HTTPException(404, f"no part {key!r} in this split")
+    by_uri = {t["uri"]: t for t in draft.get("tracks") or []}
+    candidates = [by_uri[u] for u in part["uris"]
+                  if u in by_uri and not by_uri[u].get("is_local") and _previewable(by_uri[u])]
+    if not offset and start:
+        # A tapped song that cannot play (a local file, no name or artist)
+        # starts the walk at the next one that can, in the part's order.
+        pos = {u: i for i, u in enumerate(part["uris"])}
+        at = pos.get(start)
+        offset = next((i for i, t in enumerate(candidates)
+                       if at is not None and pos[t["uri"]] >= at), 0)
+    digest = hashlib.sha1("\n".join(part["uris"]).encode()).hexdigest()
+    cache_key = ("split", pid, key, offset, digest)
+    with _preview_lock:
+        now = time.monotonic()
+        cached = _preview_cache.get(cache_key)
+        if cached and now - cached[0] < PREVIEW_TTL:
+            return cached[1]
+        payload = _preview_page(candidates, offset, len(part["uris"]))
+        now = time.monotonic()   # resolving the page took Deezer round trips
+        # Every move makes new keys, so the old pages are let go here.
+        for k in [k for k, (at_, _) in _preview_cache.items() if now - at_ >= PREVIEW_TTL]:
+            del _preview_cache[k]
+        _preview_cache[cache_key] = (now, payload)
+        return payload
 
 
 class ExploreIn(BaseModel):

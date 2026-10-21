@@ -221,11 +221,27 @@ escalating penalties. Therefore:
 ## Split a home into parts
 
 - The Split tab (since 2026-10): pick a home, choose 2–6 parts, get a
-  suggestion, drag songs between parts on the phone, tap a song for its
-  30 s Deezer preview, then Done. Spec:
+  suggestion, drag songs between parts on the phone, tap a song to open
+  the house preview player on it (it walks on down that part, via
+  `GET /api/splitparts/{pid}/preview`, zero Spotify calls), then Done. Spec:
   `docs/superpowers/specs/2026-10-20-split-into-parts-design.md`.
-- **Nothing is written to Spotify before Done.** Suggest reads the snapshot
-  (1 call) and the track list only when it moved (~1 per 100).
+- **Nothing is written to Spotify before Done** — with one exception the
+  user triggers per song: the row's "Move to another playlist" icon
+  (`POST /api/splitparts/{pid}/elsewhere`, 3 calls, no undo) first reads the
+  split playlist's snapshot and refuses (409, Done's "changed — re-read"
+  message) if Spotify moved on since the draft, then adds the song to the
+  picked playlist and only then removes it from the one being split, so a
+  failure can leave it in both but never in neither. A destination whose
+  cached tracks already hold the song gets no second add — but only when
+  its snapshot, read then (1 call), still matches the cached one; a stale
+  cache could otherwise skip the add for a song since removed there and
+  leave it in neither. Still 3 calls; it makes the retry after a "now in
+  both playlists" error a clean recovery.
+  It takes the removal's snapshot into the draft, so Done does not see
+  "changed".
+  Its targets (`GET .../targets`) come from the cached listing, zero calls.
+  Suggest reads the snapshot (1 call) and the track list only when it
+  moved (~1 per 100).
 - The grouping (`sortify/splitparts.py`) is pure and offline: artist tags,
   Last.fm getSimilar and artist-similar, average-linkage clustering cut at
   exactly N with slivers folded in. Weights are constants in that file.

@@ -139,6 +139,35 @@ def move(draft: dict, uri: str, to_key: str) -> dict:
     return draft
 
 
+def has_song(draft: dict, uri: str) -> bool:
+    return any(uri in p["uris"] for p in draft["parts"])
+
+
+def forget_song(draft: dict, uri: str) -> dict:
+    """The song left the split's playlist (moved to another one): it goes
+    from every part and from what the draft knows about its songs."""
+    for p in draft["parts"]:
+        p["uris"] = [u for u in p["uris"] if u != uri]
+    draft["unknown"] = [u for u in draft.get("unknown") or [] if u != uri]
+    (draft.get("songs") or {}).pop(uri, None)
+    draft["tracks"] = [t for t in draft.get("tracks") or [] if t.get("uri") != uri]
+    draft["edited"] = True
+    return draft
+
+
+def move_targets(listing: list[dict], pid: str, folders: dict, liked_id: str) -> list[dict]:
+    """Where a song of this split can go instead: every playlist in the
+    cached listing that can take an add, except the split one itself,
+    archived (🗄️) ones and Liked Songs. Sorted by name."""
+    from .playlist_roles import is_archived
+    out = [{"id": p["id"], "name": p.get("name") or "",
+            "folder": (folders.get(p["id"]) or {}).get("path")}
+           for p in listing
+           if p.get("id") and p["id"] not in (pid, liked_id) and p.get("editable")
+           and not is_archived(p.get("name") or "")]
+    return sorted(out, key=lambda t: (t["name"].casefold(), t["id"]))
+
+
 def add_part(draft: dict) -> dict:
     from .splitparts import MAX_PARTS
     if len(draft["parts"]) >= MAX_PARTS:
