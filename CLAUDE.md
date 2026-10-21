@@ -148,9 +148,10 @@ escalating penalties. Therefore:
   — do not "fix" it back to pre-2026 shapes. Batch ADD exists: up to 100 uris
   per playlist-items POST (probed 2026-08-23; 150 → 400). Batch DELETE
   exists too: `DELETE /playlists/{id}/items` with `{"items": [{"uri": …}, …]}`
-  removed two tracks in one call, read back (probed 2026-10-20). Its upper
-  limit is unprobed — assume 100 like add until tested. The old "no batch
-  delete" note was never tested. A dev-mode app CAN publish a playlist: `PUT /playlists/{id}`
+  removed two tracks in one call, read back (probed 2026-10-20), and 100
+  in one call, read back empty (probed 2026-10-21) — so `REMOVE_BATCH` is
+  100, like add. Above 100 is untested. The old "no batch delete" note was
+  never tested. A dev-mode app CAN publish a playlist: `PUT /playlists/{id}`
   with `{"public": true}` sticks, verified by reading `public` back on
   2026-08-31 — so "make it shareable" costs one call per playlist, not a trip
   through the desktop client. Creation still sends `public: false` unless a
@@ -243,9 +244,9 @@ escalating penalties. Therefore:
   removal). It is resumable per add batch (no duplicates), marks every
   created part a home on every pass, and refuses a folder that wasn't
   offered on a first attempt (a resume doesn't refuse one, since filing
-  fails without damage). Batch removal's upper limit is still unprobed;
-  `REMOVE_BATCH` stays 100 until the probe recorded in the plan (Task 1
-  Step 6) has actually been run.
+  fails without damage). Batch removal takes 100 songs per call
+  (`REMOVE_BATCH`, probed 2026-10-21), so "becomes a part" costs one call
+  per 100 songs moved out of the original.
 - Replaced the 2026-08 split (piles, sittings, the queued materialiser):
   all of that code is gone; its data files are moved aside as
   `*.bak-2026-10-20` at rollout.

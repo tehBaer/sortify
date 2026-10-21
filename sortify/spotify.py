@@ -64,9 +64,8 @@ SCOPES = " ".join(
 
 LIKED_ID = "liked"  # pseudo-playlist id for the user's Liked Songs
 
-# Tracks per DELETE /playlists/{id}/items. Batch removal works (two tracks in
-# one call, read back, probed 2026-10-20), but its ceiling is unprobed: 100 is
-# assumed, like batch add's probed 100, until a probe says otherwise.
+# Tracks per DELETE /playlists/{id}/items: 100 removed in one call and read
+# back empty (probed 2026-10-21), the same as batch add. Above 100 untested.
 REMOVE_BATCH = 100
 
 # Local demand ceilings — the hard guarantee against ever earning another
