@@ -672,7 +672,8 @@ def splitparts_homes():
     drafts = store.splitparts()["drafts"]
     folders = store.folders()
     out = []
-    for p in sorted(homes, key=lambda p: (p.get("name") or "").lower()):
+    # A split in progress first: it is the one you came back for.
+    for p in sorted(homes, key=lambda p: (p["id"] not in drafts, (p.get("name") or "").lower())):
         total = p.get("total") or 0
         reason = None
         if total < spp.MIN_TRACKS:
@@ -964,7 +965,8 @@ def splitparts_remove_part(pid: str, key: str, body: SplitRemoveIn):
 def _splitparts_targets(pid: str) -> list[dict]:
     # The cached listing, never sp.my_playlists(): a cold one is ~21 calls.
     listing = (store.cache().get("playlist_list") or {}).get("items") or []
-    return spa.move_targets(listing, pid, store.folders(), LIKED_ID)
+    return spa.move_targets(listing, pid, store.folders(), LIKED_ID,
+                            store.config().get("home_ids") or [])
 
 
 @app.get("/api/splitparts/{pid}/targets")

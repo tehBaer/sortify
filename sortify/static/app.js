@@ -3728,32 +3728,47 @@ function spPreview(uri) {
     offset == null ? `${base}&start=${encodeURIComponent(uri)}` : `${base}&offset=${offset}`);
 }
 
-// ---- the row's icon: move the song to another playlist instead --------------
+// ---- the row's icon: move the song to another home instead -----------------
 // A tap on it (never a drag — a press on it that moves lifts the song like
-// the rest of the row) opens the picker on every playlist the song can go
-// to; a pick moves it there at once: added there first, then removed from
-// the playlist being split (2 calls). No undo.
-const ICON_ELSEWHERE = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>';
+// the rest of the row) opens the picker on the other homes, ready to type —
+// the Now card's magnifier, same glyph and same keyboard; a pick moves the
+// song there at once: added there first, then removed from the playlist
+// being split (3 calls). No undo.
+//
+// The open preview player is closed first: it sits above the picker
+// (z-index), so with it open a tap on a row in the lower part of the list
+// landed on the player and the pick never happened (2026-10-21).
+//
+// The targets are kept per split once fetched (zero calls, but a round
+// trip): a picker opened in the same task as the tap raises the keyboard
+// everywhere, one opened after an await does not on every phone.
+let spTargets = null;   // {pid, map} — the last split's move targets
 
 async function spOpenElsewhere(uri) {
+  previewHold.stop();
   const pid = spPid, gen = spDraftGen;
-  let targets;
-  try {
-    targets = (await api(spUrl("/targets", pid))).targets || [];
-  } catch (e) {
-    toast(e.message);
-    return;
+  if (spTargets?.pid !== pid) {
+    let targets;
+    try {
+      targets = (await api(spUrl("/targets", pid))).targets || [];
+    } catch (e) {
+      toast(e.message);
+      return;
+    }
+    spTargets = { pid, map: new Map(targets.map((t) => [t.id, t])) };
   }
   if (pid !== spPid || gen !== spDraftGen || $("sp-parts").hidden) return;
-  const map = new Map(targets.map((t) => [t.id, t]));
-  // The server's order (by name); no hold-to-preview on these rows, and no
-  // keyboard thrown over the list on open — the box is one tap away.
-  openPicker(map, (id) => spElsewhere(uri, id), null, null, "Move here", "home",
-             { focus: false, preview: false, keepOrder: true });
+  const map = spTargets.map;
+  // The server's order (by name); no hold-to-preview on these rows.
+  openPicker(map, (id) => spElsewhere(uri, id, map.get(id)?.name), null, null, "Move here", "home",
+             { preview: false, keepOrder: true });
 }
 
-async function spElsewhere(uri, toId) {
+async function spElsewhere(uri, toId, toName) {
   const pid = spPid, gen = spDraftGen;
+  // Said at once: the move is three calls, and a tap that answers nothing
+  // for a second reads as a tap that missed.
+  toast(`moving to ${toName || "the other home"}…`);
   let d;
   try {
     d = await api(spUrl("/elsewhere", pid), { uri, to_id: toId });
@@ -3766,7 +3781,7 @@ async function spElsewhere(uri, toId) {
   const { moved_to: to, ...draft } = d;
   spDraft = draft;
   if (!$("sp-parts").hidden) renderSpParts();
-  toast(`moved to ${to?.name || "the other playlist"}`);
+  toast(`moved to ${to?.name || "the other home"}`);
 }
 
 // ---- touch that moves = drag -------------------------------------------------
@@ -4718,7 +4733,7 @@ function renderSpList() {
             <span class="sp-song-name">${esc(s.name)}${unknown.has(u) ? ' <span class="sp-unknown" title="no Last.fm data — check where it landed">?</span>' : ""}</span>
             <span class="sp-song-artist">${esc(s.artists)}</span>
           </span>
-          <button type="button" class="icon-btn sp-elsewhere" aria-label="Move to another playlist">${ICON_ELSEWHERE}</button>
+          <button type="button" class="icon-btn sp-elsewhere" aria-label="Move to another home">${ICON_SEARCH_SM}</button>
         </div>`;
       }).join("")
     : '<p class="hint">no songs in this part yet — drag some onto its chip</p>';
