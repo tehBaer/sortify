@@ -1256,15 +1256,17 @@ body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { t
 .sp-song.playing { outline: 2px solid var(--accent); }
 .sp-song-text { flex: 1; min-width: 0; }
 .sp-song-name, .sp-song-artist { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-/* "Move to another home": a tap target at the row's right end. A press
-   on it that moves still drags the song (it inherits the row's
-   touch-action: none). */
-.sp-song .sp-elsewhere {
+/* "Move to another home" (and "Move back to a buffer" beside it): tap
+   targets at the row's right end. A press on one that moves still drags
+   the song (they inherit the row's touch-action: none). */
+.sp-song .sp-elsewhere, .sp-song .sp-buffer {
   flex: none; color: var(--muted); background: transparent; border-color: transparent;
   touch-action: none; margin: -.4rem -.4rem -.4rem 0;   /* full 48px target, row height unchanged */
 }
-/* The Now card's magnifier, drawn at the size it has there. */
-.sp-song .sp-elsewhere svg { width: 20px; height: 20px; }
+/* "Move back to a buffer" sits just left of it; the two targets meet. */
+.sp-song .sp-buffer { margin-right: 0; }
+/* The Now card's magnifier, drawn at the size it has there; the tray too. */
+.sp-song .sp-elsewhere svg, .sp-song .sp-buffer svg { width: 20px; height: 20px; }
 .sp-song-artist { color: var(--muted); font-size: .85rem; }
 .sp-unknown { color: var(--muted); font-weight: 700; }
 .sp-ghost {
@@ -1283,6 +1285,20 @@ body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { t
 #sp-done h3 { font-size: 1rem; margin: 1.1rem 0 .4rem; }
 .sp-name-row { display: block; margin: .4rem 0; }
 .sp-name-row input { width: 100%; }
+/* A name field with its "<original> //" button beside it. */
+.sp-name-line { display: flex; align-items: center; gap: .4rem; }
+.sp-name-line input { flex: 1; min-width: 0; width: auto; }
+.sp-prefix { flex: none; max-width: 45%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sp-prefix.on { border-color: var(--accent); color: var(--accent); }
+#sp-part-name { margin: .2rem 0 .5rem; }
+.sp-part-name-row { display: block; }
+/* A part going into a home you have says so where its name field was;
+   the two chips under it are the choice. */
+.sp-name-part { margin: .4rem 0 .9rem; }
+.sp-name-part .sp-name-row { margin-bottom: .3rem; }
+.sp-into-to { display: block; padding: .45rem 0; font-weight: 600; }
+.sp-into-choice { display: flex; flex-wrap: wrap; gap: .4rem; }
+.sp-into-choice .chip.on { border-color: var(--accent); color: var(--accent); }
 .sp-orig { display: block; margin: .35rem 0; }
 .sp-warn { color: var(--muted); }
 .sp-cost { margin-top: 1rem; font-weight: 600; }

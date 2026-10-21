@@ -225,13 +225,32 @@ escalating penalties. Therefore:
   the house preview player on it (it walks on down that part, via
   `GET /api/splitparts/{pid}/preview`, zero Spotify calls), then Done. Spec:
   `docs/superpowers/specs/2026-10-20-split-into-parts-design.md`.
-- **A hold on a song plays it in Spotify** (`POST /api/splitparts/{pid}/play`,
-  1 call, `play_in_context`): inside the playlist being split, so the music
-  carries on down it. It closes the preview player without that player's
-  own resume call — the play is the music coming back. A press that moves
-  is still a drag, a quick tap still previews.
+- **A hold on a song plays it in Spotify and opens it in Now**
+  (`POST /api/splitparts/{pid}/play`, 1 call, `play_in_context`): inside
+  the playlist being split, so the music carries on down it. It closes the
+  preview player without that player's own resume call — the play is the
+  music coming back. On success it switches to the Now view so the song's
+  card is up for filing (since 2026-10-21; it used to stay in Split): no
+  poll at once, but Next's settle repoll (`repollAfterPlaybackChange`,
+  900 ms), and `/play` arms the same settle window as Next so an answer
+  still on the song from before is cached only briefly. The cost is the
+  Now polls the view makes anyway. A failed play stays in Split with the
+  error. The draft is untouched. A press that moves is still a drag, a
+  quick tap still previews.
 - **Removing a part** asks where its songs go: each to its best fit, or all
   of them to one part you name (`to` in the remove body). Zero calls.
+- **Parts are named while editing** (2026-10-21): the shown part's name is
+  a field under Done…, saved into the draft on change, never per keystroke
+  (`POST /api/splitparts/{pid}/parts/{key}/name`, zero calls, trimmed,
+  400 when empty, 409 once Done started, sets `edited`). The Done
+  screen's name fields save the same way, so there is one name per part:
+  a save also drops any name typed on the Done screen for that part.
+  Unsaved typed text survives a redraw (a drag, a move) because the field
+  is left alone while it holds some. Beside each name field (not the kept
+  part's, and an into-part has none) a "<original> //" button puts the
+  original's name and " // " in front once, or takes it off when the
+  field already starts with it. Done's name and twin checks apply to the
+  result as to any name. A re-suggest replaces names like everything else.
 - **Nothing is written to Spotify before Done** — with one exception the
   user triggers per song: the row's "Move to another home" icon (the Now
   card's magnifier)
@@ -252,6 +271,16 @@ escalating penalties. Therefore:
   buried them in the search. Opening that picker closes the preview
   player first: the player sits above the picker, and a tap meant for a
   lower row landed on it, so the pick never happened.
+  Beside it, the row's tray icon, "Move back to a buffer" (2026-10-21),
+  is the same move over the other list: `GET .../targets?kind=buffer`
+  gives every input (`_effective_input_ids`, so archived ones are out;
+  never Liked Songs, a read-only one or the split playlist) with its set
+  key, from config and the cached listing, zero calls. The picker shows
+  the set as the grey line, like the Now card's "Move to buffer…", with
+  no create row and no preview. `/elsewhere` accepts a `to_id` from
+  either list, with every guard unchanged; the magnifier's list stays
+  homes only. The two lists are cached per split apart (`spTargets`,
+  `spBuffers`).
   Suggest reads the snapshot (1 call) and the track list only when it
   moved (~1 per 100).
 - The grouping (`sortify/splitparts.py`) is pure and offline: artist tags,
@@ -267,14 +296,32 @@ escalating penalties. Therefore:
   "Abandon" (`POST /api/splitparts/{pid}/abandon`, zero calls) is the way
   out of a failure that repeats: it drops the draft and keeps whatever was
   already created.
-- Done creates and fills the new parts first and touches the original only
-  after that (🐾 rename and dropped from the home lists, or batched
+- Done creates and fills the new parts, then adds the into-parts (below),
+  and touches the original only after all of them (🐾 rename and dropped from the home lists, or batched
   removal). It is resumable per add batch (no duplicates), marks every
   created part a home on every pass, and refuses a folder that wasn't
   offered on a first attempt (a resume doesn't refuse one, since filing
   fails without damage). Batch removal takes 100 songs per call
   (`REMOVE_BATCH`, probed 2026-10-21), so "becomes a part" costs one call
   per 100 songs moved out of the original.
+- **A part can go into a home you already have** instead of becoming a
+  new playlist (since 2026-10-21): the Done screen's "add to an existing
+  home" picks one of the `/targets` homes, sent as `into: {part key: home
+  id}` (the plan takes repeated `into=p2:ID` query pairs). Nothing is
+  created, marked or filed for it, and the twin-name check skips it. Its
+  songs are only added, in batches of 100, after a snapshot read of the
+  home; "already there" is decided from the cached tracks only when that
+  snapshot matches them, else from a fresh read (`_cached_tracks`), on
+  every pass, a resume too. That makes a resume exact (landed batches are
+  in the mirrored cache, or found by the re-read when an add's answer was
+  lost), and a song a stale cache wrongly listed is never skipped and
+  then removed from the original. The plan prices 1 snapshot + the adds
+  per into-part, plus the read only when nothing is cached. The "at least
+  2" rule counts destinations (new + into + the kept part). Targets are
+  checked on a first attempt only: a resume keeps its stored home even
+  once it stopped being offered, since refusing would strand the split
+  and finishing only adds. The summary's `into` says how many were really
+  added (`count`) and how many were there already.
 - Replaced the 2026-08 split (piles, sittings, the queued materialiser):
   all of that code is gone; its data files are moved aside as
   `*.bak-2026-10-20` at rollout.

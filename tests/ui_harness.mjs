@@ -6259,6 +6259,10 @@ run("stopNowPolling()");
           JSON.stringify(log.map((l) => l.path)));
     check("SPX ...and says so", /in Spotify/.test($$("toast").textContent) && /Ronda/.test($$("toast").textContent),
           $$("toast").textContent);
+    // The hold went on to Now (SPN covers that); the rest of this block is
+    // about the parts screen, so come back to it before the settle repoll
+    // (900ms out) can poll a Now view this block has no fixture for.
+    run(`stopNowPolling(); show("split"); spSection("sp-work"); renderSpParts()`);
 
     // 2: a press that moves is a drag, never a play
     resetLog();
@@ -6297,6 +6301,407 @@ run("stopNowPolling()");
   } finally {
     document.elementFromPoint = () => null;
     run(`spStopPolling(); previewHold.stop(true, true); $("picker").hidden = true; nowState = ${savedNow}; show("lists")`);
+  }
+}
+
+// ============================================================================
+// SPI — 2026-10-21 ("At Done"): a part can go into an existing home instead
+// of becoming a new playlist. The choice sits on its row; a pick opens the
+// house picker on the split's homes, the row then says where it goes, and
+// the plan, Confirm, the kept part and the summary all follow it.
+// ============================================================================
+{
+  const savedNow = run("JSON.stringify(nowState)");
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    const songs = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                    u3: { name: "Three", artists: "C", local: false }, u4: { name: "Four", artists: "D", local: false } };
+    const D = { playlist_id: "H5", name: "Big Home", snapshot_id: "s1", n: 3,
+      parts: [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3"] },
+              { key: "p3", name: "blues", uris: ["u4"] }],
+      unknown: [], hint: null, scores: {}, songs, done: null, edited: false };
+    run(`show("split"); nowState = { is_playing: false }; previewHold.stop(true); $("picker").hidden = true; spTargets = null`);
+    run(`spDraft = ${JSON.stringify(D)}; spPid = "H5"; spDoneChoicePid = null; spPlan = null; spShown = "p1";
+         spSection("sp-work"); renderSpParts()`);
+    const plan = (extra) => ({ calls: 8, creates: 3, empty: [], local: [], removals: 0,
+      folders: [], folder: null, into_parts: [], ...extra });
+    const IP2 = encodeURIComponent("p2:TB");
+    routes["GET /api/splitparts/H5/plan?original=subset"] = plan();
+    routes[`GET /api/splitparts/H5/plan?original=subset&into=${IP2}`] = plan({ calls: 7, creates: 2,
+      into_parts: [{ key: "p2", to_id: "TB", to_name: "THROTTLE BACK", count: 1 }] });
+    routes["GET /api/splitparts/H5/targets"] = { targets: [
+      { id: "TB", name: "THROTTLE BACK", folder: "ROOT" }, { id: "A1", name: "alpha", folder: null }] };
+    await run(`spOpenDone()`);
+    const html = () => $$("sp-done").innerHTML;
+    check("SPI each part that would be created offers a new playlist or an existing home",
+          ["p1", "p2", "p3"].every((k) => html().includes(`id="sp-new-${k}"`) && html().includes(`id="sp-into-${k}"`)) &&
+          /a new playlist/.test(html()) && /add to an existing home/.test(html()) && /id="sp-name-p2"/.test(html()),
+          html().slice(0, 600));
+
+    // 1: "add to an existing home" opens the house picker on the homes
+    resetLog();
+    await run(`$("sp-into-p2").onclick()`);
+    await tick();
+    const rows = $$("picker-list").children;
+    check("SPI ...which opens the picker on the split's homes, with no preview",
+          $$("picker").hidden === false && gets("/api/splitparts/H5/targets") === 1 && rows.length === 2 &&
+          /THROTTLE BACK/.test(rows[0].innerHTML) && !log.some((l) => l.path.includes("/preview")),
+          rows.map((r) => r.innerHTML).join(" | "));
+
+    // 2: a pick shows "→ name" in place of the field, and the plan carries it
+    rows[0].onclick();
+    await tick(); await tick();
+    check("SPI a pick shows where the part goes in place of its name field",
+          /→ THROTTLE BACK/.test(html()) && !/id="sp-name-p2"/.test(html()) && /id="sp-name-p1"/.test(html()) &&
+          $$("picker").hidden === true, html().slice(0, 900));
+    check("SPI ...the plan request carries the into pair",
+          gets(`/api/splitparts/H5/plan?original=subset&into=${IP2}`) === 1, JSON.stringify(log.map((l) => l.path)));
+    check("SPI ...and the cost line says what it adds where",
+          /adds 1 song to THROTTLE BACK/.test($$("sp-cost").innerHTML || html()) && /2 new playlists/.test(html()) &&
+          /about 7 calls/.test(html()), html().match(/id="sp-cost"[^>]*>[^<]*/)?.[0]);
+
+    // 3: "a new playlist" brings the field back
+    resetLog();
+    await run(`$("sp-new-p2").onclick()`);
+    await tick();
+    check("SPI 'a new playlist' brings the name field back and drops the into",
+          /id="sp-name-p2"[^>]*value="jazz"/.test(html()) && !/→ THROTTLE BACK/.test(html()) &&
+          gets("/api/splitparts/H5/plan?original=subset") === 1 && /3 new playlists/.test(html()), html().slice(0, 600));
+
+    // 4: Confirm posts into
+    await run(`$("sp-into-p2").onclick()`);
+    await tick();
+    $$("picker-list").children[0].onclick();
+    await tick(); await tick();
+    routes["POST /api/splitparts/H5/done"] = { started: true };
+    routes["GET /api/splitparts/H5/progress"] = { state: "done", phase: "done", done: 3, total: 3, message: null,
+      summary: { created: [{ id: "N1", name: "rock", count: 2 }, { id: "N3", name: "blues", count: 1 }],
+                 into: [{ key: "p2", id: "TB", name: "THROTTLE BACK", count: 1, already: 0 }],
+                 original: "subset", empty: [], local: [], folder: null, name: "Big Home" } };
+    resetLog();
+    await run(`spConfirmDone()`);
+    await tick();
+    const sent = bodies("/api/splitparts/H5/done").filter(Boolean);
+    check("SPI Confirm posts the into choice",
+          sent.length === 1 && JSON.stringify(sent[0].into) === JSON.stringify({ p2: "TB" }), JSON.stringify(sent));
+    check("SPI the summary says what was added where",
+          /added 1 song to <b>THROTTLE BACK<\/b>/.test(html()) && /rock/.test(html()) && /blues/.test(html()), html());
+
+    // 5: the kept part offers no such choice, and becoming it drops its into
+    run(`spDraft = ${JSON.stringify(D)}; spDraftGen++; spDoneChoicePid = null; spPlan = null; spSection("sp-work"); renderSpParts()`);
+    routes["GET /api/splitparts/H5/plan?original=part&part=p1"] = plan({ creates: 2, removals: 2, calls: 6 });
+    routes["GET /api/splitparts/H5/plan?original=part&part=p2"] = plan({ creates: 2, removals: 3, calls: 6 });
+    routes[`GET /api/splitparts/H5/plan?original=part&part=p1&into=${IP2}`] = plan({ creates: 1, removals: 2, calls: 5,
+      into_parts: [{ key: "p2", to_id: "TB", to_name: "THROTTLE BACK", count: 1 }] });
+    await run(`spOpenDone()`);
+    run(`spDoneChoice.original = "part"; spDoneChoice.part = "p1"`);
+    await run(`spRefreshPlan()`);
+    check("SPI the part the original becomes offers no into choice",
+          !/id="sp-into-p1"/.test(html()) && /id="sp-into-p2"/.test(html()) && /keeps the name/.test(html()), html().slice(0, 600));
+    await run(`$("sp-into-p2").onclick()`);
+    await tick();
+    $$("picker-list").children[0].onclick();
+    await tick(); await tick();
+    const pickedInPart = /→ THROTTLE BACK/.test(html()) && gets(`/api/splitparts/H5/plan?original=part&part=p1&into=${IP2}`) === 1;
+    resetLog();
+    $$("sp-orig-part-key").value = "p2";
+    await run(`$("sp-orig-part-key").onchange()`);
+    await tick();
+    check("SPI switching the kept part to one that had an into-target drops that target",
+          pickedInPart && run(`JSON.stringify(spDoneChoice.into)`) === "{}" &&
+          gets("/api/splitparts/H5/plan?original=part&part=p2") === 1 && !/→ THROTTLE BACK/.test(html()) &&
+          !/id="sp-into-p2"/.test(html()), `${pickedInPart} ${run(`JSON.stringify(spDoneChoice.into)`)} ${JSON.stringify(log.map((l) => l.path))}`);
+
+    // 6: the locked finish screen prices and names the stored into
+    const STARTED = { ...D, done: { opts: { original: "subset", part: null, names: {}, folder: null, into: { p2: "TB" } },
+                                    created: { p1: "N1" }, filled: ["p1"], original_done: false } };
+    run(`spDraft = ${JSON.stringify(STARTED)}; spDraftGen++`);
+    resetLog();
+    await run(`renderSpFinish("")`);
+    check("SPI the locked finish screen asks the plan with the stored into and says where the part goes",
+          gets(`/api/splitparts/H5/plan?original=subset&into=${IP2}`) === 1 && /jazz/.test(html()) &&
+          /→ THROTTLE BACK/.test(html()) && /adds 1 song to THROTTLE BACK/.test(html()), html());
+  } finally {
+    run(`spStopPolling(); previewHold.stop(true); $("picker").hidden = true; spTargets = null; nowState = ${savedNow}; show("lists")`);
+  }
+}
+
+// ============================================================================
+// SPB — 2026-10-21: "Move back to a buffer" beside the magnifier. It acts
+// like the magnifier (press and move drags, a hold plays, a tap opens a
+// picker) but its picker lists the inputs, each with its set as the grey
+// line, kept apart from the homes the magnifier lists.
+// ============================================================================
+{
+  const savedNow = run("JSON.stringify(nowState)");
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    const songs = { u1: { name: "Ronda", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                    u3: { name: "Three", artists: "C", local: false } };
+    const D = (parts, extra = {}) => ({ playlist_id: "H6", name: "Big Home", snapshot_id: "s1", n: 2, parts,
+      unknown: [], hint: null, scores: {}, songs, done: null, edited: false, ...extra });
+    const two = () => [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3"] }];
+    run(`show("split"); nowState = { is_playing: false }; previewHold.stop(true); $("picker").hidden = true;
+         spTargets = null; spBuffers = null`);
+    run(`spDraft = ${JSON.stringify(D(two()))}; spPid = "H6"; spShown = "p1"; spSection("sp-work"); renderSpParts()`);
+    // icon: "buffer", "elsewhere" or null — what closest() finds above the target
+    const press = (uri, icon, x, y, id) => run(`spListPointerDown({
+      target: { closest: (sel) => sel === ".sp-song" ? { dataset: { uri: ${JSON.stringify(uri)} } }
+                                : sel === ".sp-buffer" ? (${JSON.stringify(icon)} === "buffer" ? {} : null)
+                                : sel === ".sp-elsewhere" ? (${JSON.stringify(icon)} === "elsewhere" ? {} : null) : null },
+      clientX: ${x}, clientY: ${y}, pointerId: ${id}, preventDefault() {} })`);
+    const listHtml = () => $$("sp-list").innerHTML;
+    check("SPB every song row carries both icons, the tray labelled 'Move back to a buffer'",
+          (listHtml().match(/class="[^"]*sp-buffer[^"]*"[^>]*aria-label="Move back to a buffer"[^>]*>\s*<svg/g) || []).length === 2 &&
+          (listHtml().match(/aria-label="Move to another home"/g) || []).length === 2 &&
+          listHtml().includes(run("ICON_INBOX_SM")), listHtml().slice(0, 500));
+
+    routes["GET /api/splitparts/H6/targets?kind=buffer"] = { targets: [
+      { id: "B1", name: "[Hazy]", set: "buffer" }, { id: "B2", name: "Progressive rock", set: "the-bomb" }] };
+    routes["GET /api/splitparts/H6/targets"] = { targets: [{ id: "A1", name: "alpha", folder: "ROOT / Mix" }] };
+
+    // 1: a tap on the tray opens the buffer picker, no preview
+    resetLog();
+    press("u1", "buffer", 10, 10, 61);
+    await run(`spPointerUp(10, 10, 61)`);
+    await tick();
+    const rows = $$("picker-list").children;
+    check("SPB a tap on the tray opens the picker on the inputs, set as the grey line",
+          $$("picker").hidden === false && gets("/api/splitparts/H6/targets?kind=buffer") === 1 &&
+          gets("/api/splitparts/H6/targets") === 0 && rows.length === 2 &&
+          rows.some((r) => /\[Hazy\]/.test(r.innerHTML) && /p-sub">buffer</.test(r.innerHTML)) &&
+          rows.some((r) => /Progressive rock/.test(r.innerHTML) && /p-sub">the bomb</.test(r.innerHTML)),
+          rows.map((r) => r.innerHTML).join(" | "));
+    check("SPB ...with no preview and no create row",
+          !log.some((l) => l.path.includes("/preview")) && $$("preview-pop").hidden === true &&
+          !rows.some((r) => /picker-create/.test(r.className)), JSON.stringify(log.map((l) => l.path)));
+
+    // 2: a pick moves the song through /elsewhere
+    routes["POST /api/splitparts/H6/elsewhere"] = { ...D([{ key: "p1", name: "rock", uris: ["u2"] },
+      { key: "p2", name: "jazz", uris: ["u3"] }], { edited: true }), moved_to: { id: "B1", name: "[Hazy]" } };
+    rows.find((r) => /\[Hazy\]/.test(r.innerHTML)).onclick();
+    const early = $$("toast").textContent;
+    await tick(); await tick();
+    const sent = bodies("/api/splitparts/H6/elsewhere").filter(Boolean);
+    check("SPB a pick posts /elsewhere with that input's id",
+          sent.length === 1 && sent[0].uri === "u1" && sent[0].to_id === "B1", JSON.stringify(sent));
+    check("SPB ...saying 'moving to' at once, then 'moved to', and the song leaves the list",
+          early === "moving to [Hazy]…" && $$("toast").textContent === "moved to [Hazy]" && !/data-uri="u1"/.test(listHtml()),
+          `${early} | ${$$("toast").textContent}`);
+
+    // 3: the buffer list is kept per split, and the magnifier still lists homes
+    resetLog();
+    press("u2", "elsewhere", 10, 10, 62);
+    await run(`spPointerUp(10, 10, 62)`);
+    await tick();
+    check("SPB the magnifier still opens the homes list, asked for apart from the buffers",
+          $$("picker").hidden === false && gets("/api/splitparts/H6/targets") === 1 &&
+          $$("picker-list").children.length === 1 && /alpha/.test($$("picker-list").children[0].innerHTML),
+          $$("picker-list").children.map((r) => r.innerHTML).join(" | "));
+    run(`$("picker").hidden = true`);
+    resetLog();
+    press("u2", "buffer", 10, 10, 63);
+    await run(`spPointerUp(10, 10, 63)`);
+    check("SPB a second tray tap opens at once, without asking again",
+          $$("picker").hidden === false && gets("/api/splitparts/H6/targets?kind=buffer") === 0 &&
+          /\[Hazy\]/.test($$("picker-list").children.map((r) => r.innerHTML).join(" ")), JSON.stringify(log.map((l) => l.path)));
+    run(`$("picker").hidden = true`);
+
+    // 4: press on the tray and move: a drag, no picker
+    resetLog();
+    routes["POST /api/splitparts/H6/move"] = D([{ key: "p1", name: "rock", uris: [] }, { key: "p2", name: "jazz", uris: ["u3", "u2"] }]);
+    document.elementFromPoint = () => ({ closest: () => ({ dataset: { key: "p2" } }) });
+    press("u2", "buffer", 10, 10, 64);
+    run(`spPointerMove(10, 40, 64)`);
+    const lifted = document.body.children.some((c) => c.className === "sp-ghost");
+    await run(`spPointerUp(10, 40, 64)`);
+    await tick();
+    document.elementFromPoint = () => null;
+    const mv = bodies("/api/splitparts/H6/move").filter(Boolean);
+    check("SPB a press on the tray that moves drags the song, with no picker",
+          lifted && mv.length === 1 && mv[0].uri === "u2" && mv[0].to === "p2" && $$("picker").hidden === true &&
+          gets("/api/splitparts/H6/targets?kind=buffer") === 0, JSON.stringify(mv));
+  } finally {
+    document.elementFromPoint = () => null;
+    run(`spStopPolling(); previewHold.stop(true); $("picker").hidden = true; spTargets = null; spBuffers = null; nowState = ${savedNow}; show("lists")`);
+  }
+}
+
+// ============================================================================
+// SPN — 2026-10-21: a hold opens the song in Now. It still plays it in
+// Spotify (the same /play), then shows the Now view and repolls once Spotify
+// has settled, so the card ends on that song. A failed play stays on Split.
+// ============================================================================
+{
+  const savedNow = run("JSON.stringify(nowState)");
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    const songs = { u1: { name: "Ronda", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false } };
+    const D = { playlist_id: "H4", name: "Big Home", snapshot_id: "s1", n: 2,
+      parts: [{ key: "p1", name: "rock", uris: ["u1"] }, { key: "p2", name: "jazz", uris: ["u2"] }],
+      unknown: [], hint: null, scores: {}, songs, done: null, edited: false };
+    setNow({ playing: true, is_playing: true, poll_after_ms: 999999, progress_ms: 1000,
+             track: { uri: "u1", name: "Ronda", artists: [{ name: "A" }], duration_ms: 200000, sortable: true },
+             context: { id: "H4", name: "Big Home", is_input: false }, suggestions: [] });
+    run(`nowState = { playing: true, is_playing: true, track: { uri: "before" } }`);
+    run(`show("split"); previewHold.stop(true); $("picker").hidden = true`);
+    run(`spDraft = ${JSON.stringify(D)}; spPid = "H4"; spShown = "p1"; spSection("sp-work"); renderSpParts()`);
+    const draftBefore = run("JSON.stringify(spDraft)");
+
+    // 1: a hold plays it, then opens Now, which polls once Spotify settled
+    routes["POST /api/splitparts/H4/play"] = { ok: true };
+    run(`spPointerDown("u1", 10, 10, 71)`);
+    await wait(650);
+    check("SPN a hold posts /play, then shows the Now view",
+          bodies("/api/splitparts/H4/play").filter(Boolean).length === 1 &&
+          $$("view-now").hidden === false && $$("view-split").hidden === true,
+          `now=${$$("view-now").hidden} split=${$$("view-split").hidden} ${JSON.stringify(log.map((l) => l.path))}`);
+    check("SPN ...and says it is opening it there", /Ronda/.test($$("toast").textContent) && /Now/.test($$("toast").textContent),
+          $$("toast").textContent);
+    await run(`spPointerUp(10, 10, 71)`);
+    await wait(1000); await tick();
+    check("SPN ...a moment later it polls /api/now and the card is on that song",
+          gets("/api/now?light=1&force=1") >= 1 && run("nowState.track?.uri") === "u1",
+          `${run("nowState.track?.uri")} ${JSON.stringify(log.map((l) => l.path))}`);
+    check("SPN ...its release opened no preview or picker, and the draft is untouched",
+          !log.some((l) => l.path.includes("/preview") || l.path.includes("/targets")) &&
+          run("JSON.stringify(spDraft)") === draftBefore, "");
+
+    // 2: a failed play stays on Split, says why, and polls nothing
+    run(`stopNowPolling(); show("split"); spSection("sp-work"); renderSpParts()`);
+    resetLog();
+    routes["POST /api/splitparts/H4/play"] = { status: 400, body: {
+      detail: "No active Spotify device — start playing something in Spotify first." } };
+    run(`spPointerDown("u1", 10, 10, 72)`);
+    await wait(650);
+    await run(`spPointerUp(10, 10, 72)`);
+    await wait(1000);
+    check("SPN a failed play stays on Split with the error toast",
+          $$("view-split").hidden === false && $$("view-now").hidden === true &&
+          /No active Spotify device/.test($$("toast").textContent) && gets("/api/now?light=1&force=1") === 0,
+          `${$$("toast").textContent} ${JSON.stringify(log.map((l) => l.path))}`);
+  } finally {
+    setNow({ status: 200, body: { playing: false, poll_after_ms: 999999 } });
+    run(`stopNowPolling(); spStopPolling(); previewHold.stop(true, true); $("picker").hidden = true; nowState = ${savedNow}; show("lists")`);
+  }
+}
+
+// ============================================================================
+// SPR — 2026-10-21: name the parts while editing. The shown part's name is a
+// field on the parts screen, saved into the draft on change (not per key);
+// a redraw mid-typing keeps the text; the "<original> //" button prefixes
+// once and toggles off, here and on the Done screen; Done prefills from it.
+// ============================================================================
+{
+  const savedNow = run("JSON.stringify(nowState)");
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    const songs = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                    u3: { name: "Three", artists: "C", local: false } };
+    const parts = (n1 = "rock", n2 = "jazz") => [{ key: "p1", name: n1, uris: ["u1", "u2"] }, { key: "p2", name: n2, uris: ["u3"] }];
+    const D = (ps, extra = {}) => ({ playlist_id: "H3", name: "Big Home", snapshot_id: "s1", n: 2, parts: ps,
+      unknown: [], hint: null, scores: {}, songs, done: null, edited: false, ...extra });
+    run(`show("split"); nowState = { is_playing: false }; previewHold.stop(true); $("picker").hidden = true; spTargets = null`);
+    run(`spDraft = ${JSON.stringify(D(parts()))}; spPid = "H3"; spShown = "p1"; spDraftGen++; spDoneChoicePid = null;
+         spSection("sp-work"); renderSpParts()`);
+    const field = () => $$("sp-part-name-input");
+    const names = () => bodies("/api/splitparts/H3/parts/p1/name").filter(Boolean).map((b) => b.name);
+    check("SPR the parts screen shows the shown part's name in a field, with the original's // button",
+          /id="sp-part-name-input"/.test($$("sp-part-name").innerHTML) && field().value === "rock" &&
+          /id="sp-part-prefix"[^>]*>Big Home \/\//.test($$("sp-part-name").innerHTML), $$("sp-part-name").innerHTML);
+
+    // 1: typing posts nothing; a change saves it, and the chip follows
+    routes["POST /api/splitparts/H3/parts/p1/name"] = (opts) => D(parts(JSON.parse(opts.body).name.trim()), { edited: true });
+    field().value = "Loud";
+    field().oninput();
+    check("SPR typing alone posts nothing", names().length === 0, JSON.stringify(log.map((l) => l.path)));
+    await run(`$("sp-part-name-input").onchange()`);
+    await tick();
+    check("SPR a change saves the name into the draft", JSON.stringify(names()) === '["Loud"]', JSON.stringify(names()));
+    check("SPR ...and the chip shows it", /data-key="p1"[\s\S]*?sp-chip-name">Loud</.test($$("sp-chips").innerHTML) &&
+          run("spPart('p1').name") === "Loud", $$("sp-chips").innerHTML.slice(0, 200));
+
+    // 2: a redraw from something else (a move) keeps what is being typed
+    resetLog();
+    field().value = "Louder and mo";
+    field().oninput();
+    routes["POST /api/splitparts/H3/move"] = D([{ key: "p1", name: "Loud", uris: ["u2"] }, { key: "p2", name: "jazz", uris: ["u3", "u1"] }]);
+    await run(`spMove("u1", "p2")`);
+    check("SPR a redraw mid-typing keeps the typed text", field().value === "Louder and mo" && names().length === 0,
+          `value=${field().value}`);
+    run(`renderSpParts()`);
+    check("SPR ...through any number of redraws", field().value === "Louder and mo", `value=${field().value}`);
+
+    // 3: the // button prefixes once, shows on, and a second tap takes it off
+    resetLog();
+    field().value = "loud";
+    field().oninput();
+    await run(`$("sp-part-prefix").onclick()`);
+    await tick();
+    const once = field().value;
+    const onAfter = $$("sp-part-prefix").classList.contains("on");
+    await run(`$("sp-part-prefix").onclick()`);
+    await tick();
+    const off = field().value;
+    const offAfter = $$("sp-part-prefix").classList.contains("on");
+    await run(`$("sp-part-prefix").onclick()`);
+    await tick();
+    check("SPR the // button prefixes the original's name once, and shows on",
+          once === "Big Home // loud" && onAfter === true, `${once} on=${onAfter}`);
+    check("SPR ...a tap when on takes the prefix off, and another puts back just one",
+          off === "loud" && offAfter === false && field().value === "Big Home // loud", `${off} | ${field().value}`);
+    check("SPR ...each tap saves the name", JSON.stringify(names()) === JSON.stringify(["Big Home // loud", "loud", "Big Home // loud"]),
+          JSON.stringify(names()));
+
+    // 4: the Done screen prefills from the drafted name, even over a name
+    // typed there earlier for that part, and has the // button too
+    run(`spDraft = ${JSON.stringify(D(parts("Big Home // loud")))}; renderSpParts()`);
+    routes["GET /api/splitparts/H3/plan?original=subset"] = { calls: 6, creates: 2, empty: [], local: [], removals: 0,
+      folders: [], folder: null, into_parts: [] };
+    run(`spDoneChoicePid = spPid; spDoneChoiceGen = spDraftGen; spPlan = null;
+         spDoneChoice = { original: "subset", part: "p1", folder: "", names: { p1: "typed on Done", p2: "jazz" }, into: {} }`);
+    await run(`$("sp-part-name-input").onchange()`);   // unchanged: saves nothing, but clears nothing either
+    field().value = "Big Home // softer";
+    field().oninput();
+    await run(`$("sp-part-name-input").onchange()`);
+    await tick();
+    await run(`spOpenDone()`);
+    check("SPR the Done screen prefills from the name set on the parts screen",
+          $$("sp-name-p1").value === "Big Home // softer" && /id="sp-name-p1"[^>]*value="Big Home \/\/ softer"/.test($$("sp-done").innerHTML),
+          $$("sp-name-p1").value);
+    check("SPR ...and has the // button beside each name field, on where the name already has it",
+          /id="sp-prefix-p1"[^>]*class="[^"]*\bon\b/.test($$("sp-done").innerHTML) && /id="sp-prefix-p2"/.test($$("sp-done").innerHTML),
+          $$("sp-done").innerHTML.slice(0, 900));
+    resetLog();
+    routes["POST /api/splitparts/H3/parts/p2/name"] = (opts) => D(parts("Big Home // softer", JSON.parse(opts.body).name.trim()), { edited: true });
+    await run(`$("sp-prefix-p2").onclick()`);
+    await tick();
+    check("SPR ...where a tap prefixes the field and saves it",
+          $$("sp-name-p2").value === "Big Home // jazz" &&
+          JSON.stringify(bodies("/api/splitparts/H3/parts/p2/name").filter(Boolean).map((b) => b.name)) === '["Big Home // jazz"]',
+          `${$$("sp-name-p2").value} ${JSON.stringify(log.map((l) => l.path))}`);
+
+    // 5: the kept part and an into-part have no // button
+    routes["GET /api/splitparts/H3/plan?original=part&part=p1"] = { calls: 4, creates: 1, empty: [], local: [], removals: 1,
+      folders: [], folder: null, into_parts: [] };
+    run(`spDoneChoice.original = "part"; spDoneChoice.part = "p1"`);
+    await run(`spRefreshPlan()`);
+    const keptNoButton = !/id="sp-prefix-p1"/.test($$("sp-done").innerHTML) && /id="sp-prefix-p2"/.test($$("sp-done").innerHTML);
+    routes[`GET /api/splitparts/H3/plan?original=part&part=p1&into=${encodeURIComponent("p2:TB")}`] = { calls: 4, creates: 0,
+      empty: [], local: [], removals: 1, folders: [], folder: null,
+      into_parts: [{ key: "p2", to_id: "TB", to_name: "THROTTLE BACK", count: 1 }] };
+    run(`spDoneChoice.into = { p2: { id: "TB", name: "THROTTLE BACK" } }`);
+    await run(`spRefreshPlan()`);
+    check("SPR the kept part and a part going into a home have no // button",
+          keptNoButton && !/id="sp-prefix-p2"/.test($$("sp-done").innerHTML) && /→ THROTTLE BACK/.test($$("sp-done").innerHTML),
+          $$("sp-done").innerHTML.slice(0, 900));
+  } finally {
+    run(`spStopPolling(); previewHold.stop(true); $("picker").hidden = true; spTargets = null; nowState = ${savedNow}; show("lists")`);
   }
 }
 
