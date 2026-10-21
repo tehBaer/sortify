@@ -6169,6 +6169,50 @@ run("stopNowPolling()");
   }
 }
 
+// ============================================================================
+// SPH — 2026-10-21: the song the preview player is on is marked in the list,
+// moves with "next", and the mark goes when the player closes.
+// ============================================================================
+{
+  const savedNow = run("JSON.stringify(nowState)");
+  try {
+    resetLog();
+    AudioStub.made.length = 0; AudioStub.refuse = false;
+    const songs = { u1: { name: "One", artists: "A", local: false }, u2: { name: "Two", artists: "B", local: false },
+                    u3: { name: "Three", artists: "C", local: false } };
+    const D = { playlist_id: "H7", name: "Big Home", snapshot_id: "s1", n: 2,
+      parts: [{ key: "p1", name: "rock", uris: ["u1", "u2"] }, { key: "p2", name: "jazz", uris: ["u3"] }],
+      unknown: [], hint: null, scores: {}, songs, done: null, edited: false };
+    run(`show("split"); nowState = { is_playing: false }; previewHold.stop(true)`);
+    run(`spDraft = ${JSON.stringify(D)}; spPid = "H7"; spShown = "p1"; spSection("sp-work"); renderSpParts()`);
+    const clip = (u, n) => ({ name: songs[u].name, artist: songs[u].artists, url: `https://cdn/sph-${u}-${n}.mp3`, uri: u, deezer_id: n });
+    routes["GET /api/splitparts/H7/preview?key=p1&start=u1"] = { clips: [clip("u1", 1), clip("u2", 2)], next_offset: null, tracks: [], total: 2 };
+    // The row the app re-classes in place: the stub hands back one element
+    // per selector, the same one each time, as a real DOM would for a row.
+    const row = (u) => $$("sp-list").querySelector(`.sp-song[data-uri="${u}"]`);
+    const marked = (u) => row(u).classList.contains("playing");
+
+    run(`spPointerDown("u1", 10, 10, 41)`);
+    await run(`spPointerUp(10, 10, 41)`);
+    await tick(); await tick();
+    check("SPH the song the player is on is marked in the list",
+          marked("u1") && !marked("u2") && run("spPlaying") === "u1", `spPlaying=${run("spPlaying")}`);
+    run(`$("pv-next").onclick()`);
+    await tick();
+    check("SPH ...the mark moves with next",
+          marked("u2") && !marked("u1") && run("spPlaying") === "u2", `spPlaying=${run("spPlaying")}`);
+    run(`renderSpList()`);
+    check("SPH ...and a redraw of the list keeps it on the right row",
+          /class="sp-song playing" data-uri="u2"/.test($$("sp-list").innerHTML) &&
+          ($$("sp-list").innerHTML.match(/sp-song playing/g) || []).length === 1, $$("sp-list").innerHTML.slice(0, 200));
+    run(`previewHold.stop(true)`);
+    check("SPH ...and goes when the player closes",
+          run("spPlaying") === null && !marked("u2"), `spPlaying=${run("spPlaying")}`);
+  } finally {
+    run(`spStopPolling(); previewHold.stop(true); nowState = ${savedNow}; show("lists")`);
+  }
+}
+
 // ---- summary ---------------------------------------------------------------
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

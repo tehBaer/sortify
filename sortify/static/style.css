@@ -1251,6 +1251,8 @@ body.on-now header:has(> #nav-pop:not([hidden]), > #input-pop:not([hidden])) { t
   padding: .55rem .7rem; margin: .3rem 0; border-radius: 10px; background: var(--card);
   cursor: grab; display: flex; align-items: center; gap: .5rem;
 }
+/* The song the preview player is on. */
+.sp-song.playing { outline: 2px solid var(--accent); }
 .sp-song-text { flex: 1; min-width: 0; }
 .sp-song-name, .sp-song-artist { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* "Move to another home": a tap target at the row's right end. A press
