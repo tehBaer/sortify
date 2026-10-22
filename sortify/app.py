@@ -3014,11 +3014,59 @@ def _home_folder_choices(cfg: dict, top_home_id: str | None) -> tuple[list[dict]
     return choices, None
 
 
+# A song playing from an inbox that our copy of the inbox does not hold is
+# either autoplay or a song added in Spotify since the copy was read — the
+# listing that would say so is only refreshed by hand. One snapshot read tells
+# them apart (2026-10-22, "Splitting An Atom" in [FILTER Y]). Keyed by
+# (inbox, song): once each, whatever the answer, so a poll never repeats it.
+_context_rechecked: dict[tuple[str, str], float] = {}
+_context_recheck_lock = threading.Lock()
+CONTEXT_RECHECK_KEEP = 64
+
+
+def _recheck_context(np: dict, state: dict) -> None:
+    """Re-read the playing inbox when it may have changed under our copy.
+
+    1 call (the snapshot) for a song the copy does not hold, plus the read
+    (~1 per 100 songs) only when the snapshot moved. Updates the track cache,
+    the listing and the profile's membership set, so the card's chips — and
+    the drift banner that keys off them — see the song."""
+    ctx = np.get("context_playlist_id")
+    uri = (np.get("track") or {}).get("uri")
+    if not ctx or not uri or ctx == LIKED_ID or ctx not in (state.get("input_ids") or ()):
+        return
+    entry = next((l for l in state.get("inputs") or [] if l["id"] == ctx), None)
+    if entry is None or uri in entry["uris"]:
+        return
+    with _context_recheck_lock:
+        if (ctx, uri) in _context_rechecked:
+            return
+        _context_rechecked[(ctx, uri)] = time.time()
+        while len(_context_rechecked) > CONTEXT_RECHECK_KEEP:
+            _context_rechecked.pop(next(iter(_context_rechecked)))
+    try:
+        snap = sp.snapshot(ctx)
+        cached = (store.cache()["playlists"].get(ctx) or {}).get("snapshot_id")
+        if not snap or snap == cached:
+            return   # the song really is not in it: autoplay
+        tracks = _cached_tracks(ctx, snap)
+    except SpotifyError as e:
+        log.info("now: recheck of %s skipped (%s)", ctx, e)
+        return
+    _sync_listing_snapshot(ctx, snap, total=len(tracks))
+    with _profile_lock:
+        for l in _profile_state.get("inputs") or []:
+            if l["id"] == ctx:
+                l["uris"] = {t["uri"] for t in tracks}
+                l["unplayable"] = {t["uri"] for t in tracks if _unplayable(t)}
+
+
 def _suggestion_payload(np: dict) -> dict:
     """The suggestion side of the now card — everything that needs profiles,
     tag maps, or CPU beyond naming the track. Shared verbatim by the one-shot
     /api/now and the two-phase /api/now/suggest so the pair cannot drift."""
     state = _ensure_profiles()
+    _recheck_context(np, state)
     track = np["track"]
     sortable = _now_sortable(track)
     # Guard-on-read, fresh on every request — same reasoning as `triage`'s own
@@ -3575,6 +3623,11 @@ def _sync_membership(uri: str, add_to: str | None, remove_from: list[str] | None
     profile, and the next rebuild reconciles it from the real listing anyway.
     """
     gone = set(remove_from or [])
+    # Out of these by our own hand: never a reason to re-check them while it
+    # plays (see _recheck_context).
+    with _context_recheck_lock:
+        for pid in gone:
+            _context_rechecked[(pid, uri)] = time.time()
     for l in _profile_state.get("inputs", []):
         if l["id"] == add_to:
             l["uris"].add(uri)
