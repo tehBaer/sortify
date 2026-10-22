@@ -165,6 +165,13 @@ escalating penalties. Therefore:
   playlist's own. The input switcher's count leaves out `_unplayable` songs
   (`playable` False, or no title: how the API returns a pulled song); they
   stay members everywhere else.
+- **Playback can be a relinked stand-in too** (seen 2026-10-22): /me/player
+  reports a different track id than the playlist holds — same name,
+  artists and length. `_own_copy` maps the now answer back to the context
+  playlist's own uri from the cached track list (zero calls, one
+  unambiguous match or nothing; `played_uri` keeps the reported one), or
+  the card reads the song as having dropped out of the inbox it is
+  playing from.
 
 ## Playlist folders (how folder paths work — costs zero API calls)
 
