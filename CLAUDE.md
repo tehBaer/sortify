@@ -175,6 +175,15 @@ escalating penalties. Therefore:
   unambiguous match or nothing; `played_uri` keeps the reported one), or
   the card reads the song as having dropped out of the inbox it is
   playing from.
+- **cache.json has one lock** (`_LIST_LOCK`, reentrant, in spotify.py):
+  every read-modify-write of it holds the lock from read to save, in
+  spotify.py and app.py alike, and never across a network call. Two
+  unlocked writers lost a write on 2026-10-22. Our own writes move the
+  listing's snapshot with the track cache's (`_apply_snapshot`), so a
+  snapshot in the cache is the playlist's real one and a profile rebuild
+  re-reads only what changed elsewhere. A caller arriving during the first
+  profile build after a restart waits for it (503 after 90 s), instead of
+  failing on a half-built state.
 - **An inbox can change in Spotify under our copy of it** (the listing is
   only refreshed by hand). When the song playing from an inbox is not in
   our copy, `_recheck_context` reads that inbox's snapshot once (1 call)

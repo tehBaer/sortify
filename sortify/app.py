@@ -1268,12 +1268,13 @@ def _splitparts_seed_tracks(pid: str, snapshot_id: str | None, uris: list[str],
     richest track dict we hold (the original's cached tracks)."""
     if not snapshot_id:
         return
-    cache = store.cache()
-    entry = cache["playlists"].get(pid) or {}
-    entry.update({"snapshot_id": snapshot_id, "fetched_at": time.time(),
-                  "tracks": [full[u] for u in uris if u in full]})
-    cache["playlists"][pid] = entry
-    store.save_cache(cache)
+    with _LIST_LOCK:
+        cache = store.cache()
+        entry = cache["playlists"].get(pid) or {}
+        entry.update({"snapshot_id": snapshot_id, "fetched_at": time.time(),
+                      "tracks": [full[u] for u in uris if u in full]})
+        cache["playlists"][pid] = entry
+        store.save_cache(cache)
 
 
 def _splitparts_file(created: list[dict], folder: str) -> None:
@@ -1802,13 +1803,14 @@ def _cached_tracks(pid: str, snapshot_id: str | None) -> list[dict]:
         elif snapshot_id and entry.get("snapshot_id") == snapshot_id:
             return entry["tracks"]
     tracks = sp.playlist_tracks(pid)
-    cache = store.cache()
-    cache["playlists"][pid] = {
-        "snapshot_id": snapshot_id,
-        "tracks": tracks,
-        "fetched_at": time.time(),
-    }
-    store.save_cache(cache)
+    with _LIST_LOCK:
+        cache = store.cache()
+        cache["playlists"][pid] = {
+            "snapshot_id": snapshot_id,
+            "tracks": tracks,
+            "fetched_at": time.time(),
+        }
+        store.save_cache(cache)
     return tracks
 
 
@@ -1829,6 +1831,9 @@ def _resolve_homes(cfg: dict, playlists: list[dict], exclude: str, input_ids: se
 PROFILE_TTL = 600  # rebuild at most every 10 min; snapshot cache does the rest
 _profile_state: dict = {"built_at": 0.0}
 _profile_lock = threading.Lock()
+# Wakes callers waiting on a FIRST build (nothing cached to serve them yet).
+_profile_built = threading.Condition(_profile_lock)
+PROFILE_FIRST_WAIT = 90.0   # seconds; past it the caller gets a 503 and polls again
 
 
 def _ensure_profiles(force: bool = False) -> dict:
@@ -1865,18 +1870,33 @@ def _ensure_profiles(force: bool = False) -> dict:
 
     if not mine:
         # First-ever build, contended: wait for the winner rather than start
-        # a second full fetch of the same thing.
-        with _profile_lock:
+        # a second full fetch of the same thing. Taking the lock alone did not
+        # wait — the build runs outside it — so every poll in the first
+        # seconds after a restart got the empty state and died on
+        # KeyError: 'playlists' (2026-10-22).
+        deadline = time.time() + PROFILE_FIRST_WAIT
+        with _profile_built:
+            while "playlists" not in _profile_state:
+                left = deadline - time.time()
+                if not _profile_state.get("building") or left <= 0:
+                    raise HTTPException(503, "suggestions are still being built — try again in a moment")
+                _profile_built.wait(left)
             return _profile_state
 
     try:
         built = _build_profiles()
-    finally:
-        with _profile_lock:
+    except BaseException:
+        with _profile_built:
             _profile_state["building"] = False
+            _profile_built.notify_all()
+        raise
 
-    with _profile_lock:
+    # Swapped in and released in one step, so no caller sees "not building"
+    # before the new profiles are there.
+    with _profile_built:
         _profile_state.update(built)
+        _profile_state["building"] = False
+        _profile_built.notify_all()
         return _profile_state
 
 
@@ -3443,29 +3463,30 @@ def _cache_move(uri: str, from_ids: list[str] | None, to_id: str | None) -> dict
     at once (the input sweep, see `act`) — and they have to be mirrored in one
     read-modify-write, or each save would clobber the last one's removal.
     """
-    cache = store.cache()
-    track = None
-    for pid in cache["playlists"]:
-        for t in cache["playlists"][pid]["tracks"]:
-            if t["uri"] == uri:
-                track = t
+    with _LIST_LOCK:
+        cache = store.cache()
+        track = None
+        for pid in cache["playlists"]:
+            for t in cache["playlists"][pid]["tracks"]:
+                if t["uri"] == uri:
+                    track = t
+                    break
+            if track:
                 break
-        if track:
-            break
-    for from_id in from_ids or []:
-        if from_id in cache["playlists"]:
-            entry = cache["playlists"][from_id]
-            entry["tracks"] = [t for t in entry["tracks"] if t["uri"] != uri]
-    if to_id and to_id in cache["playlists"]:
-        if track:
-            dest = cache["playlists"][to_id]["tracks"]
-            if not any(t["uri"] == uri for t in dest):
-                dest.append(track)
-        else:
-            # We no longer have the track dict; force a refetch next triage.
-            cache["playlists"][to_id]["snapshot_id"] = None
-    _count_move(cache, from_ids, to_id)
-    store.save_cache(cache)
+        for from_id in from_ids or []:
+            if from_id in cache["playlists"]:
+                entry = cache["playlists"][from_id]
+                entry["tracks"] = [t for t in entry["tracks"] if t["uri"] != uri]
+        if to_id and to_id in cache["playlists"]:
+            if track:
+                dest = cache["playlists"][to_id]["tracks"]
+                if not any(t["uri"] == uri for t in dest):
+                    dest.append(track)
+            else:
+                # We no longer have the track dict; force a refetch next triage.
+                cache["playlists"][to_id]["snapshot_id"] = None
+        _count_move(cache, from_ids, to_id)
+        store.save_cache(cache)
     return track
 
 
@@ -3498,11 +3519,24 @@ def _count_move(cache: dict, from_ids: list[str] | None, to_id: str | None) -> N
 
 
 def _apply_snapshot(pid: str, snapshot_id: str | None) -> None:
+    """Our own write landed: the playlist is at `snapshot_id` now, in the
+    track cache AND the listing. Moving only the track cache left the listing
+    behind, and the next profile rebuild read the mismatch as a change made
+    elsewhere: it re-read the playlist (a call per filing, on the polling
+    path) and labelled the fresh copy with the listing's stale snapshot, so
+    nothing could tell a current copy from an old one (2026-10-22). The
+    content stays true without that re-read: `_cache_move` mirrors the
+    move, and marks the copy unknown when it can't."""
     if not snapshot_id:
         return
-    cache = store.cache()
-    if pid in cache["playlists"]:
-        cache["playlists"][pid]["snapshot_id"] = snapshot_id
+    with _LIST_LOCK:
+        cache = store.cache()
+        if pid in cache["playlists"]:
+            cache["playlists"][pid]["snapshot_id"] = snapshot_id
+        for p in (cache.get("playlist_list") or {}).get("items") or []:
+            if p.get("id") == pid:
+                p["snapshot_id"] = snapshot_id
+                break
         store.save_cache(cache)
 
 
@@ -3628,10 +3662,10 @@ def _sync_membership(uri: str, add_to: str | None, remove_from: list[str] | None
     offering the home the song had just been filed into as a fresh guess.
 
     A mirror, not an invalidation: dropping `built_at` would make the next
-    poll rebuild every profile, and a rebuild re-reads any home whose snapshot
-    has moved — which `_apply_snapshot` guarantees for the one just written
-    to. That is a Spotify call per filed home, landing on the polling path.
-    Two set operations cost nothing and say the same true thing.
+    poll rebuild every profile — and the rebuild is the slow path. Two set
+    operations cost nothing and say the same true thing. (`_apply_snapshot`
+    moves the listing's snapshot too since 2026-10-22, so a rebuild no longer
+    re-reads a home just because we filed into it.)
 
     Only `uris` is mirrored. The scoring profile (artist and tag counts) stays
     at its build-time values: one track cannot meaningfully move a home's
