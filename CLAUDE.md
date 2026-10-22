@@ -172,6 +172,12 @@ escalating penalties. Therefore:
   unambiguous match or nothing; `played_uri` keeps the reported one), or
   the card reads the song as having dropped out of the inbox it is
   playing from.
+- **An inbox can change in Spotify under our copy of it** (the listing is
+  only refreshed by hand). When the song playing from an inbox is not in
+  our copy, `_recheck_context` reads that inbox's snapshot once (1 call)
+  and re-reads it only if it moved (~1 per 100) — else it is autoplay.
+  Once per (inbox, song), whatever the answer or error, so polling never
+  repeats it; a song already in the copy costs nothing.
 
 ## Playlist folders (how folder paths work — costs zero API calls)
 
