@@ -2277,6 +2277,40 @@ def _now_ttl(value: dict | None) -> float:
     return max(NOW_TTL_MIN, min(remaining + 1, NOW_TTL_MAX))
 
 
+RELINK_DURATION_SLACK_MS = 2000
+
+
+def _own_copy(value: dict | None) -> dict | None:
+    """The now answer with a relinked stand-in read as the context
+    playlist's own copy.
+
+    Spotify can play a stand-in of a playlist's song — same name, artists
+    and length under another track id — and /me/player reports the stand-in.
+    Membership, filing and removal all need the playlist's own uri, so a
+    song playing from [FILTER Y] read as having dropped out of it
+    (2026-10-22). Matched from the cached track list only, zero calls; one
+    unambiguous candidate or nothing. `played_uri` keeps what was reported."""
+    track = (value or {}).get("track") or {}
+    ctx = (value or {}).get("context_playlist_id")
+    uri = track.get("uri")
+    if not ctx or not uri or track.get("is_local"):
+        return value
+    tracks = ((store.cache().get("playlists") or {}).get(ctx) or {}).get("tracks") or []
+    if not tracks or any(t.get("uri") == uri for t in tracks):
+        return value
+    artists = [a.get("id") for a in track.get("artists") or []]
+    dur = track.get("duration_ms")
+    cands = {t["uri"]: t for t in tracks
+             if t.get("uri") and t.get("name") == track.get("name")
+             and [a.get("id") for a in t.get("artists") or []] == artists
+             and dur is not None and t.get("duration_ms") is not None
+             and abs(t["duration_ms"] - dur) <= RELINK_DURATION_SLACK_MS}
+    if len(cands) != 1:
+        return value
+    own = next(iter(cands.values()))
+    return {**value, "track": {**track, "uri": own["uri"], "id": own.get("id"), "played_uri": uri}}
+
+
 def _currently_playing_shared(force: bool = False) -> tuple[dict | None, float]:
     """(value, seconds until it goes stale). N open tabs still cost one call.
 
@@ -2288,7 +2322,7 @@ def _currently_playing_shared(force: bool = False) -> tuple[dict | None, float]:
         age = time.time() - _now_cache["at"]
         if age < (NOW_FORCE_MIN_INTERVAL if force else _now_cache["ttl"]):
             return _now_cache["value"], max(0.0, _now_cache["ttl"] - age)
-        value = sp.currently_playing()
+        value = _own_copy(sp.currently_playing())
         ttl = _now_ttl(value)
         if _skip_settle["uri"] and time.time() < _skip_settle["until"]:
             if ((value or {}).get("track") or {}).get("uri") == _skip_settle["uri"]:
