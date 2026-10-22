@@ -3623,6 +3623,11 @@ def _sync_membership(uri: str, add_to: str | None, remove_from: list[str] | None
     profile, and the next rebuild reconciles it from the real listing anyway.
     """
     gone = set(remove_from or [])
+    # Out of these by our own hand: never a reason to re-check them while it
+    # plays (see _recheck_context).
+    with _context_recheck_lock:
+        for pid in gone:
+            _context_rechecked[(pid, uri)] = time.time()
     for l in _profile_state.get("inputs", []):
         if l["id"] == add_to:
             l["uris"].add(uri)

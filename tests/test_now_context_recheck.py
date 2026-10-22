@@ -126,3 +126,13 @@ def test_a_failed_check_is_quiet_and_not_retried_every_poll(env, monkeypatch):
 
     assert chip(p)["has_track"] is False
     assert env.calls == [("snapshot", "fy")]
+
+
+def test_a_song_we_filed_out_of_the_inbox_is_not_checked(env):
+    # Filing the playing song out of the inbox makes it a non-member by our
+    # own hand; checking would spend a call on every filing.
+    appmod._sync_membership("spotify:track:z", None, ["fy"])
+
+    p = env.payload("z")
+
+    assert chip(p)["has_track"] is False and env.calls == []
