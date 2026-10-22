@@ -95,3 +95,31 @@ def test_matching_costs_no_call(monkeypatch):
     _currently_playing_shared()
 
     assert calls == [1]
+
+
+def test_a_stand_in_with_another_title_style_and_featured_id_still_matches(monkeypatch):
+    # 2026-10-22: playing "Crossing Beyond (Govinda Remix)", the playlist holds
+    # "Crossing Beyond - Govinda Remix"; same album and length, the first
+    # artist the same, the remixer under another artist id.
+    dd = {"id": "dd", "name": "Desert Dwellers"}
+    own = {**OWN, "uri": "spotify:track:cb", "id": "cb", "name": "Crossing Beyond - Govinda Remix",
+           "artists": [dd, {"id": "gov1", "name": "Govinda"}], "duration_ms": 342068}
+    cache = appmod.store.cache()
+    cache["playlists"]["FY"]["tracks"].append(own)
+    appmod.store.save_cache(cache)
+    monkeypatch.setattr(appmod.sp, "currently_playing", lambda: answer(
+        name="Crossing Beyond (Govinda Remix)", artists=[dd, {"id": "gov2", "name": "Govinda"}],
+        duration_ms=342068))
+
+    value, _ = _currently_playing_shared()
+
+    assert value["track"]["uri"] == "spotify:track:cb"
+
+
+def test_another_first_artist_never_matches(monkeypatch):
+    monkeypatch.setattr(appmod.sp, "currently_playing", lambda: answer(
+        artists=[{"id": "x", "name": "Somebody Else"}, *M]))
+
+    value, _ = _currently_playing_shared()
+
+    assert value["track"]["uri"] == "spotify:track:standin"

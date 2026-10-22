@@ -2280,6 +2280,17 @@ def _now_ttl(value: dict | None) -> float:
 RELINK_DURATION_SLACK_MS = 2000
 
 
+def _title_key(name: str | None) -> str:
+    """A title with case, brackets, dashes and other punctuation folded away."""
+    return " ".join(re.sub(r"[^\w]+", " ", (name or "").casefold()).split())
+
+
+def _lead_artist(track: dict) -> set[str]:
+    """The first artist, by id and by folded name: either may differ."""
+    a = (track.get("artists") or [{}])[0] or {}
+    return {x for x in (a.get("id"), (a.get("name") or "").casefold() or None) if x}
+
+
 def _own_copy(value: dict | None) -> dict | None:
     """The now answer with a relinked stand-in read as the context
     playlist's own copy.
@@ -2298,11 +2309,15 @@ def _own_copy(value: dict | None) -> dict | None:
     tracks = ((store.cache().get("playlists") or {}).get(ctx) or {}).get("tracks") or []
     if not tracks or any(t.get("uri") == uri for t in tracks):
         return value
-    artists = [a.get("id") for a in track.get("artists") or []]
+    # Loose on the title's punctuation and on featured artists' ids — the
+    # stand-in for "Crossing Beyond - Govinda Remix" was "Crossing Beyond
+    # (Govinda Remix)", its remixer under another artist id — strict on the
+    # lead artist and the length.
+    name, lead = _title_key(track.get("name")), _lead_artist(track)
     dur = track.get("duration_ms")
     cands = {t["uri"]: t for t in tracks
-             if t.get("uri") and t.get("name") == track.get("name")
-             and [a.get("id") for a in t.get("artists") or []] == artists
+             if t.get("uri") and name and _title_key(t.get("name")) == name
+             and lead and _lead_artist(t) & lead
              and dur is not None and t.get("duration_ms") is not None
              and abs(t["duration_ms"] - dur) <= RELINK_DURATION_SLACK_MS}
     if len(cands) != 1:
