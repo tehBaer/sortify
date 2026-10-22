@@ -146,10 +146,13 @@ class AuthFlowError(SpotifyError):
     "start again" instead of "try again"."""
 
 
-# Serialises read-modify-write on cache["playlist_list"] between the refresh
-# that replaces the listing and the prune that removes an unfollowed
-# playlist from it.
-_LIST_LOCK = threading.Lock()
+# THE cache lock: every read-modify-write of cache.json holds it from its
+# read to its save — the listing and the track caches alike, in this file and
+# in app.py. cache.json is one file; two writers interleaving lost one write
+# (2026-10-22: a re-read inbox's listing sync vanished under a profile
+# rebuild's track-cache save). Reentrant, because app.py's writers call each
+# other. Never hold it across a network call.
+_LIST_LOCK = threading.RLock()
 
 
 def pkce_pair() -> tuple[str, str]:
@@ -412,11 +415,12 @@ class Spotify:
         self._store_token_response(payload, clear_pending=True)
         # The token exchange (accounts.spotify.com) can succeed while the API
         # (api.spotify.com) is rate-cooled — auth is done either way.
-        cache = self.store.cache()
         try:
             me = self.get("/me")
-            cache["me"] = {"id": me["id"], "name": me.get("display_name") or me["id"]}
-            self.store.save_cache(cache)
+            with _LIST_LOCK:
+                cache = self.store.cache()
+                cache["me"] = {"id": me["id"], "name": me.get("display_name") or me["id"]}
+                self.store.save_cache(cache)
         except SpotifyError:
             pass
         return cache.get("me") or {"id": None, "name": "connected"}
