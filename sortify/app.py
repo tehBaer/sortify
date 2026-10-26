@@ -2305,6 +2305,27 @@ def _title_key(name: str | None) -> str:
     return " ".join(re.sub(r"[^\w]+", " ", (name or "").casefold()).split())
 
 
+# Words a release adds to a title without making it another recording.
+_VERSION_WORDS = frozenset({"remastered", "remaster", "digitally", "digital", "bonus",
+                            "track", "mono", "stereo", "version", "edition", "deluxe",
+                            "anniversary", "expanded", "original"})
+
+
+def _same_title(a: str, b: str) -> bool:
+    """Folded titles equal, or one is the other plus only version words
+    ("Shibuia" / "Shibuia - Remastered", 2026-10-26). "Live", "Remix" or any
+    other word means another recording, and no match."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long_ = sorted((a.split(), b.split()), key=len)
+    if long_[:len(short)] != short:
+        return False
+    return all(w in _VERSION_WORDS or (w.isdigit() and len(w) in (2, 4))
+               for w in long_[len(short):])
+
+
 def _lead_artist(track: dict) -> set[str]:
     """The first artist, by id and by folded name: either may differ."""
     a = (track.get("artists") or [{}])[0] or {}
@@ -2336,7 +2357,7 @@ def _own_copy(value: dict | None) -> dict | None:
     name, lead = _title_key(track.get("name")), _lead_artist(track)
     dur = track.get("duration_ms")
     cands = {t["uri"]: t for t in tracks
-             if t.get("uri") and name and _title_key(t.get("name")) == name
+             if t.get("uri") and name and _same_title(_title_key(t.get("name")), name)
              and lead and _lead_artist(t) & lead
              and dur is not None and t.get("duration_ms") is not None
              and abs(t["duration_ms"] - dur) <= RELINK_DURATION_SLACK_MS}

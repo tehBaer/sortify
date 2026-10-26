@@ -123,3 +123,36 @@ def test_another_first_artist_never_matches(monkeypatch):
     value, _ = _currently_playing_shared()
 
     assert value["track"]["uri"] == "spotify:track:standin"
+
+
+def _with(own, monkeypatch, **playing):
+    cache = appmod.store.cache()
+    cache["playlists"]["FY"]["tracks"].append(own)
+    appmod.store.save_cache(cache)
+    monkeypatch.setattr(appmod.sp, "currently_playing", lambda: answer(**playing))
+    return _currently_playing_shared()[0]["track"]["uri"]
+
+
+BMO = [{"id": "bmo", "name": "Black Mighty Orchestra"}]
+
+
+def test_a_title_differing_only_by_version_words_matches(monkeypatch):
+    # 2026-10-26: playing "Shibuia", the inbox holds "Shibuia - Remastered".
+    own = {**OWN, "uri": "spotify:track:sh", "id": "sh", "name": "Shibuia - Remastered",
+           "artists": BMO, "duration_ms": 169773}
+    assert _with(own, monkeypatch, name="Shibuia", artists=BMO, duration_ms=169773) == "spotify:track:sh"
+
+
+@pytest.mark.parametrize("held", ["Shibuia - 2011 Remaster", "Shibuia (Remastered 2009)",
+                                  "Shibuia - Bonus Track", "Shibuia - Mono Version"])
+def test_other_version_words_match_too(monkeypatch, held):
+    own = {**OWN, "uri": "spotify:track:sh", "id": "sh", "name": held, "artists": BMO,
+           "duration_ms": 169773}
+    assert _with(own, monkeypatch, name="Shibuia", artists=BMO, duration_ms=169773) == "spotify:track:sh"
+
+
+@pytest.mark.parametrize("held", ["Shibuia - Live", "Shibuia - Club Remix", "Shibuia Nights"])
+def test_a_title_with_more_than_version_words_does_not(monkeypatch, held):
+    own = {**OWN, "uri": "spotify:track:sh", "id": "sh", "name": held, "artists": BMO,
+           "duration_ms": 169773}
+    assert _with(own, monkeypatch, name="Shibuia", artists=BMO, duration_ms=169773) == "spotify:track:standin"
