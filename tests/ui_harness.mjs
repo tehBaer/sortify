@@ -2950,11 +2950,13 @@ run("stopNowPolling()");
   check("AD ...not as a banner on the card",
         !html().includes("np-adrift") && !html().includes("btn-now-back"), html().slice(0, 200));
   check("AD ...the switcher names the list that ran out",
-        /\[Hazy\] ran out/.test($$("input-switch-label").textContent) &&
+        /\[Hazy\] · song not in it/.test($$("input-switch-label").textContent) &&
         $$("btn-input-switch").classList.contains("adrift"),
         `label=${$$("input-switch-label").textContent}`);
   check("AD ...and the strip offers it back",
         /Play \[Hazy\] again/.test(strip()), strip());
+  check("AD ...saying what it knows, not guessing autoplay",
+        /not in any of your lists/.test(strip()) && !/autoplay/.test(strip()), strip());
 
   resetLog();
   run(`$("btn-now-back").onclick()`);
@@ -3007,7 +3009,7 @@ run("stopNowPolling()");
   check("AD the input still reported as context, the song in nothing: the strip is up",
         up() && /Play \[Disco\] again/.test(strip()), strip());
   check("AD ...the switcher names that input as the one that ran out",
-        /\[Disco\] ran out/.test($$("input-switch-label").textContent),
+        /\[Disco\] · song not in it/.test($$("input-switch-label").textContent),
         `label=${$$("input-switch-label").textContent}`);
   run(`$("btn-adrift-close").onclick()`);
   await paint(tail);

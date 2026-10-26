@@ -1075,12 +1075,16 @@ function paintNowControls(d) {
   const playingRow = d.playing && ctx?.is_input
     ? playable.find((l) => l.id === ctx.id) : null;
   paintSwitchCount(playingRow ? playingRow.total : null);
-  // The autoplay tail wears the switcher's own face: the list that ran out,
-  // in the accent, where the name of the list you are filing out of sits.
+  // A song in none of your lists wears the switcher's own face: the list it
+  // is playing from, in the accent, where the name of the list you are
+  // filing out of sits. Said as a fact, not a cause: Spotify can play a song
+  // a list no longer holds for reasons other than autoplay (one sortify just
+  // filed out of it but Spotify had queued, a recommendation mixed in), and
+  // "ran out" was wrong for those (2026-10-26).
   const drift = adrift(d);
   $("input-switch-label").textContent = d.playing
     ? (drift
-        ? (ranOutOf(d)?.name ? `${ranOutOf(d).name} ran out` : "autoplay")
+        ? (ranOutOf(d)?.name ? `${ranOutOf(d).name} · song not in it` : "not in your lists")
         : ctx?.name
         ? (ctx.is_input ? ctx.name : `${ctx.name} (not an input)`)
         : "not playing from a playlist")
@@ -1108,7 +1112,7 @@ function paintAdrift(d) {
   const show = !!(d && adrift(d) && name && adriftDismissed !== list.id);
   strip.hidden = !show;
   if (!show) { strip.innerHTML = ""; return; }
-  strip.innerHTML = `<span class="ad-head">${ICON_ADRIFT}<span>autoplay took over</span></span>
+  strip.innerHTML = `<span class="ad-head">${ICON_ADRIFT}<span>not in any of your lists</span></span>
     <button id="btn-now-back" class="ad-back">Play ${esc(name)} again</button>
     <button id="btn-adrift-close" class="ad-close" title="Dismiss" aria-label="Dismiss">✕</button>`;
   $("btn-now-back").onclick = () => pickInput(list.id, list.name);
